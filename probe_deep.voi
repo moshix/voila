@@ -1,0 +1,28 @@
+package main
+
+struct S0 { f1 S1, f2 S2, f3 S3, f4 S4, f5 S5, f6 S6, f7 S7, f8 S8, f9 S9, f10 S10, f11 S11, f12 S12, f13 S13, f14 S14, f15 S15, f16 S16, f17 S17, f18 S18, f19 S19, f20 S20, f21 S21, f22 S22, f23 S23 }
+struct S1 { f2 S2, f3 S3, f4 S4, f5 S5, f6 S6, f7 S7, f8 S8, f9 S9, f10 S10, f11 S11, f12 S12, f13 S13, f14 S14, f15 S15, f16 S16, f17 S17, f18 S18, f19 S19, f20 S20, f21 S21, f22 S22, f23 S23 }
+struct S2 { f3 S3, f4 S4, f5 S5, f6 S6, f7 S7, f8 S8, f9 S9, f10 S10, f11 S11, f12 S12, f13 S13, f14 S14, f15 S15, f16 S16, f17 S17, f18 S18, f19 S19, f20 S20, f21 S21, f22 S22, f23 S23 }
+struct S3 { f4 S4, f5 S5, f6 S6, f7 S7, f8 S8, f9 S9, f10 S10, f11 S11, f12 S12, f13 S13, f14 S14, f15 S15, f16 S16, f17 S17, f18 S18, f19 S19, f20 S20, f21 S21, f22 S22, f23 S23 }
+struct S4 { f5 S5, f6 S6, f7 S7, f8 S8, f9 S9, f10 S10, f11 S11, f12 S12, f13 S13, f14 S14, f15 S15, f16 S16, f17 S17, f18 S18, f19 S19, f20 S20, f21 S21, f22 S22, f23 S23 }
+struct S5 { f6 S6, f7 S7, f8 S8, f9 S9, f10 S10, f11 S11, f12 S12, f13 S13, f14 S14, f15 S15, f16 S16, f17 S17, f18 S18, f19 S19, f20 S20, f21 S21, f22 S22, f23 S23 }
+struct S6 { f7 S7, f8 S8, f9 S9, f10 S10, f11 S11, f12 S12, f13 S13, f14 S14, f15 S15, f16 S16, f17 S17, f18 S18, f19 S19, f20 S20, f21 S21, f22 S22, f23 S23 }
+struct S7 { f8 S8, f9 S9, f10 S10, f11 S11, f12 S12, f13 S13, f14 S14, f15 S15, f16 S16, f17 S17, f18 S18, f19 S19, f20 S20, f21 S21, f22 S22, f23 S23 }
+struct S8 { f9 S9, f10 S10, f11 S11, f12 S12, f13 S13, f14 S14, f15 S15, f16 S16, f17 S17, f18 S18, f19 S19, f20 S20, f21 S21, f22 S22, f23 S23 }
+struct S9 { f10 S10, f11 S11, f12 S12, f13 S13, f14 S14, f15 S15, f16 S16, f17 S17, f18 S18, f19 S19, f20 S20, f21 S21, f22 S22, f23 S23 }
+struct S10 { f11 S11, f12 S12, f13 S13, f14 S14, f15 S15, f16 S16, f17 S17, f18 S18, f19 S19, f20 S20, f21 S21, f22 S22, f23 S23 }
+struct S11 { f12 S12, f13 S13, f14 S14, f15 S15, f16 S16, f17 S17, f18 S18, f19 S19, f20 S20, f21 S21, f22 S22, f23 S23 }
+struct S12 { f13 S13, f14 S14, f15 S15, f16 S16, f17 S17, f18 S18, f19 S19, f20 S20, f21 S21, f22 S22, f23 S23 }
+struct S13 { f14 S14, f15 S15, f16 S16, f17 S17, f18 S18, f19 S19, f20 S20, f21 S21, f22 S22, f23 S23 }
+struct S14 { f15 S15, f16 S16, f17 S17, f18 S18, f19 S19, f20 S20, f21 S21, f22 S22, f23 S23 }
+struct S15 { f16 S16, f17 S17, f18 S18, f19 S19, f20 S20, f21 S21, f22 S22, f23 S23 }
+struct S16 { f17 S17, f18 S18, f19 S19, f20 S20, f21 S21, f22 S22, f23 S23 }
+struct S17 { f18 S18, f19 S19, f20 S20, f21 S21, f22 S22, f23 S23 }
+struct S18 { f19 S19, f20 S20, f21 S21, f22 S22, f23 S23 }
+struct S19 { f20 S20, f21 S21, f22 S22, f23 S23 }
+struct S20 { f21 S21, f22 S22, f23 S23 }
+struct S21 { f22 S22, f23 S23 }
+struct S22 { f23 S23 }
+struct S23 { v int }
+
+func main() { say "ok" }

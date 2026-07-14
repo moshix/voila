@@ -17,6 +17,9 @@ const COL_OPCODE  = 17
 const COL_OPERAND = 26
 const COL_COMMENT = 48
 
+// Indexing a str is O(i) in the runtime — it decodes from the start — so a
+// hand-rolled loop counting continuation bytes is QUADRATIC. Materialising the
+// runes once is the cheaper of the two.
 func rune_len(s str) int { return len(runes(s)) }
 
 func spaces(n int) str {

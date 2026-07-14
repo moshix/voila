@@ -1,0 +1,38 @@
+package main
+
+struct Box { v int }
+
+func consume(own b Box) int { return b.v }
+func take(own s str) int { return len(s) }
+func borrow(b Box) int { return b.v }
+
+func main() {
+    // 1. plain move then use
+    let a = Box{v: 1}
+    consume(a)
+    say a.v
+
+    // 2. reassignment revives
+    var c = Box{v: 3}
+    consume(c)
+    c = Box{v: 4}
+    say c.v            // legal — must NOT be reported
+
+    // 3. drop
+    var d = Box{v: 5}
+    drop d
+    say d.v
+
+    // 4. move inside an if body — Go is conservative and does NOT report
+    var e = Box{v: 6}
+    if true {
+        consume(e)
+    }
+    say e.v            // not reported by Go
+
+    // 5. moved, then used AND rebound in one stmt
+    var f = Box{v: 7}
+    consume(f)
+    let g = f.v
+    say g
+}

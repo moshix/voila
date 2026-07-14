@@ -1,0 +1,23 @@
+package main
+
+use "std/fmt"
+
+exception Bad { msg str }
+
+func sink(s str) {}
+func sinkt(t (str, str)) {}
+func sinkv(xs ...str) {}
+func maybe(s str) str! { return s }
+func opt(s str) ?str { return s }
+func work(s str) int { return len(s) }
+
+func main() {
+    sink("interp: {fmt.sprintf("INTERP %s %s", 1)}")     // INTERP part
+    sink(try maybe(fmt.sprintf("TRY %s %s", 1)))         // TRYEXPR operand
+    sink(must maybe(fmt.sprintf("MUST %s %s", 1)))       // MUSTEXPR operand
+    sink(opt(fmt.sprintf("ELSEX %s %s", 1)) else "d")    // ELSEEXPR x
+    sink(opt("q") else fmt.sprintf("ELSEALT %s %s", 1))  // ELSEEXPR alt
+    sinkt((fmt.sprintf("TUP %s %s", 1), "b"))            // TUPLE element
+    sinkv([fmt.sprintf("SPREAD %s %s", 1)]...)           // SLICELIT in spread ARG
+    spawn work(fmt.sprintf("SPAWN %s %s", 1))            // SPAWNEXPR call
+}

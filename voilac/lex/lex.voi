@@ -22,6 +22,15 @@ struct Lexer {
     seen  bool  // has anything been emitted on this line?
     Errs  []str
     kw    map[str]int
+
+    // The operator tables, built once. They are constant, and rebuilding them
+    // inside the scan loop cost three slice allocations PER TOKEN.
+    o3 []str
+    c3 []int
+    o2 []str
+    c2 []int
+    o1 []str
+    c1 []int
 }
 
 func New(file str, src str) Lexer { return NewAt(file, src, 1, 1) }
@@ -35,7 +44,10 @@ func NewAt(file str, src str, line int, col int) Lexer {
         kw[w] = tok.KW_FIRST + i
     }
     var lx = Lexer{src: src, file: file, pos: 0, line: line, col: col,
-                   last: tok.EOF, seen: false, Errs: [], kw: kw}
+                   last: tok.EOF, seen: false, Errs: [], kw: kw,
+                   o3: tok.Ops3(), c3: tok.Ops3Code(),
+                   o2: tok.Ops2(), c2: tok.Ops2Code(),
+                   o1: tok.Ops1(), c1: tok.Ops1Code()}
     // A shebang line is skipped entirely (§1, script form).
     if str.starts_with(src, "#!") {
         while lx.pos < len(src) and lx.at(lx.pos) != 10 {
@@ -216,24 +228,18 @@ impl Lexer {
         }
 
         // Operators, longest match first.
-        let o3 = tok.Ops3()
-        let c3 = tok.Ops3Code()
-        each i, op in o3 {
-            if self.match_op(op) { return self.emit(c3[i], op, line, col) }
+        each i, op in self.o3 {
+            if self.match_op(op) { return self.emit(self.c3[i], op, line, col) }
         }
-        let o2 = tok.Ops2()
-        let c2 = tok.Ops2Code()
-        each i, op in o2 {
-            if self.match_op(op) { return self.emit(c2[i], op, line, col) }
+        each i, op in self.o2 {
+            if self.match_op(op) { return self.emit(self.c2[i], op, line, col) }
         }
         if c == 59 {
             self.advance()
             return self.emit(tok.SEMI, ";", line, col)
         }
-        let o1 = tok.Ops1()
-        let c1 = tok.Ops1Code()
-        each i, op in o1 {
-            if self.match_op(op) { return self.emit(c1[i], op, line, col) }
+        each i, op in self.o1 {
+            if self.match_op(op) { return self.emit(self.c1[i], op, line, col) }
         }
 
         let bad = self.advance()

@@ -1291,8 +1291,8 @@ static Value G[240];
 
 static const char *const tf0[] = {"Kind", "Lit", "Line", "Col", "Parts", "IsExpr", "PartLine", "PartCol", "Virtual"};
 static const char *const tt0[] = {"int", "str", "int", "int", "[]str", "[]bool", "[]int", "[]int", "bool"};
-static const char *const tf1[] = {"src", "file", "pos", "line", "col", "last", "seen", "Errs", "kw"};
-static const char *const tt1[] = {"str", "str", "int", "int", "int", "int", "bool", "[]str", "map[str]int"};
+static const char *const tf1[] = {"src", "file", "pos", "line", "col", "last", "seen", "Errs", "kw", "o3", "c3", "o2", "c2", "o1", "c1"};
+static const char *const tt1[] = {"str", "str", "int", "int", "int", "int", "bool", "[]str", "map[str]int", "[]str", "[]int", "[]str", "[]int", "[]str", "[]int"};
 static const char *const tf2[] = {"Kind", "Line", "Col", "Ival", "Ival2", "Sval", "Kids"};
 static const char *const tt2[] = {"int", "int", "int", "int", "int", "str", "[]int"};
 static const char *const tf3[] = {"Nodes"};
@@ -1359,7 +1359,7 @@ static const char *const tf33[] = {"mod", "T", "file", "b", "fnIdx", "natIdx", "
 static const char *const tt33[] = {"ir.Module", "ast.Tree", "int", "str.Builder", "map[str]int", "map[str]int", "[]str", "map[str]int", "[]str", "map[str][]cg.FieldDefault", "[]ir.Instr", "int", "[]str", "set[str]", "set[str]", "map[str]str", "map[str]str"};
 static const VlType g_types[] = {
   {"tok.Token", 9, tf0, tt0},
-  {"lex.Lexer", 9, tf1, tt1},
+  {"lex.Lexer", 15, tf1, tt1},
   {"ast.Node", 7, tf2, tt2},
   {"ast.Tree", 1, tf3, tt3},
   {"par.Parser", 8, tf4, tt4},
@@ -2970,11 +2970,11 @@ static Value vf_11(Value *argv, int argc, VlFrame *up) {
 
 /* lex.NewAt — func lex.NewAt(file str, src str, line int, col int) lex.Lexer */
 static Value vf_12(Value *argv, int argc, VlFrame *up) {
-  VlFrame *F = vl_frame_new(29, up);
+  VlFrame *F = vl_frame_new(35, up);
   vl_frame_push(F);
   Value __ret = vl_unit();
   (void)argc;
-  for (int i = 0; i < argc && i < 29; i++) vl_set(&F->r[i], vl_retain(argv[i]));
+  for (int i = 0; i < argc && i < 35; i++) vl_set(&F->r[i], vl_retain(argv[i]));
   vl_set(&F->r[4], vl_map_new());
   vl_set(&F->r[5], vf_1(NULL, 0, NULL));
   vl_set(&F->r[6], vl_iter(F->r[5]));
@@ -2991,40 +2991,46 @@ static Value vf_12(Value *argv, int argc, VlFrame *up) {
   vl_set(&F->r[12], vl_retain(G[0]));
   vl_set(&F->r[13], vl_retain(K[263]));
   vl_set(&F->r[14], vl_slice_new(0));
-  const char *cn13[] = {"src", "file", "pos", "line", "col", "last", "seen", "Errs", "kw"};
-  Value cv13[] = {F->r[1], F->r[0], F->r[11], F->r[2], F->r[3], F->r[12], F->r[13], F->r[14], F->r[4]};
-  vl_set(&F->r[15], vl_struct_new("lex.Lexer", NULL, 0, cn13, cv13, 9));
-  vl_set(&F->r[16], vl_retain(K[277]));
-  Value a15[] = {F->r[1], F->r[16]};
-  vl_set(&F->r[17], NAT[2](a15, 2, NULL));
-  if (!vl_truthy(F->r[17])) goto L3;
+  vl_set(&F->r[15], vf_2(NULL, 0, NULL));
+  vl_set(&F->r[16], vf_3(NULL, 0, NULL));
+  vl_set(&F->r[17], vf_4(NULL, 0, NULL));
+  vl_set(&F->r[18], vf_5(NULL, 0, NULL));
+  vl_set(&F->r[19], vf_6(NULL, 0, NULL));
+  vl_set(&F->r[20], vf_7(NULL, 0, NULL));
+  const char *cn19[] = {"src", "file", "pos", "line", "col", "last", "seen", "Errs", "kw", "o3", "c3", "o2", "c2", "o1", "c1"};
+  Value cv19[] = {F->r[1], F->r[0], F->r[11], F->r[2], F->r[3], F->r[12], F->r[13], F->r[14], F->r[4], F->r[15], F->r[16], F->r[17], F->r[18], F->r[19], F->r[20]};
+  vl_set(&F->r[21], vl_struct_new("lex.Lexer", NULL, 0, cn19, cv19, 15));
+  vl_set(&F->r[22], vl_retain(K[277]));
+  Value a21[] = {F->r[1], F->r[22]};
+  vl_set(&F->r[23], NAT[2](a21, 2, NULL));
+  if (!vl_truthy(F->r[23])) goto L3;
  L5: ;
   vl_check_cancelled();
-  vl_set(&F->r[19], vl_field(F->r[15], "pos"));
-  Value a19[] = {F->r[1]};
-  vl_set(&F->r[20], NAT[3](a19, 1, NULL));
-  vl_set(&F->r[21], vl_cmplt(F->r[19], F->r[20]));
-  if (!vl_truthy(F->r[21])) goto L7;
-  vl_set(&F->r[22], vl_field(F->r[15], "pos"));
-  Value a23[] = {F->r[22]};
-  vl_set(&F->r[23], vl_callm(F->r[15], "at", a23, 1));
-  vl_set(&F->r[24], vl_retain(K[109]));
-  vl_set(&F->r[25], vl_cmpne(F->r[23], F->r[24]));
-  vl_set(&F->r[18], vl_retain(F->r[25]));
+  vl_set(&F->r[25], vl_field(F->r[21], "pos"));
+  Value a25[] = {F->r[1]};
+  vl_set(&F->r[26], NAT[3](a25, 1, NULL));
+  vl_set(&F->r[27], vl_cmplt(F->r[25], F->r[26]));
+  if (!vl_truthy(F->r[27])) goto L7;
+  vl_set(&F->r[28], vl_field(F->r[21], "pos"));
+  Value a29[] = {F->r[28]};
+  vl_set(&F->r[29], vl_callm(F->r[21], "at", a29, 1));
+  vl_set(&F->r[30], vl_retain(K[109]));
+  vl_set(&F->r[31], vl_cmpne(F->r[29], F->r[30]));
+  vl_set(&F->r[24], vl_retain(F->r[31]));
   goto L8;
  L7: ;
-  vl_set(&F->r[18], vl_retain(K[263]));
+  vl_set(&F->r[24], vl_retain(K[263]));
  L8: ;
-  if (!vl_truthy(F->r[18])) goto L6;
-  vl_set(&F->r[26], vl_retain(K[1]));
-  vl_set(&F->r[27], vl_field(F->r[15], "pos"));
-  vl_set(&F->r[28], vl_add(F->r[27], F->r[26]));
-  vl_setfld(F->r[15], "pos", vl_retain(F->r[28]));
+  if (!vl_truthy(F->r[24])) goto L6;
+  vl_set(&F->r[32], vl_retain(K[1]));
+  vl_set(&F->r[33], vl_field(F->r[21], "pos"));
+  vl_set(&F->r[34], vl_add(F->r[33], F->r[32]));
+  vl_setfld(F->r[21], "pos", vl_retain(F->r[34]));
   goto L5;
  L6: ;
  L3: ;
  L4: ;
-  __ret = vl_retain(F->r[15]); goto __exit;
+  __ret = vl_retain(F->r[21]); goto __exit;
   __ret = vl_unit(); goto __exit;
  __exit: ;
   vl_frame_pop_run_defers(F);
@@ -3763,36 +3769,36 @@ static Value vf_24(Value *argv, int argc, VlFrame *up) {
   __ret = vl_retain(F->r[36]); goto __exit;
  L9: ;
  L10: ;
-  vl_set(&F->r[37], vf_2(NULL, 0, NULL));
-  vl_set(&F->r[38], vf_3(NULL, 0, NULL));
-  vl_set(&F->r[39], vl_iter(F->r[37]));
+  vl_set(&F->r[37], vl_field(F->r[0], "o3"));
+  vl_set(&F->r[38], vl_iter(F->r[37]));
  L19: ;
-  { Value ik61, iv61;
-    if (!vl_iter_next(F->r[39], &ik61, &iv61)) goto L20;
-    vl_set(&F->r[40], ik61); vl_set(&F->r[41], iv61); }
-  Value a62[] = {F->r[41]};
-  vl_set(&F->r[42], vl_callm(F->r[0], "match_op", a62, 1));
-  if (!vl_truthy(F->r[42])) goto L21;
-  vl_set(&F->r[43], vl_index(F->r[38], F->r[40]));
-  Value a65[] = {F->r[43], F->r[41], F->r[1], F->r[2]};
+  { Value ik60, iv60;
+    if (!vl_iter_next(F->r[38], &ik60, &iv60)) goto L20;
+    vl_set(&F->r[39], ik60); vl_set(&F->r[40], iv60); }
+  Value a61[] = {F->r[40]};
+  vl_set(&F->r[41], vl_callm(F->r[0], "match_op", a61, 1));
+  if (!vl_truthy(F->r[41])) goto L21;
+  vl_set(&F->r[42], vl_field(F->r[0], "c3"));
+  vl_set(&F->r[43], vl_index(F->r[42], F->r[39]));
+  Value a65[] = {F->r[43], F->r[40], F->r[1], F->r[2]};
   vl_set(&F->r[44], vl_callm(F->r[0], "emit", a65, 4));
   __ret = vl_retain(F->r[44]); goto __exit;
  L21: ;
  L22: ;
   goto L19;
  L20: ;
-  vl_set(&F->r[45], vf_4(NULL, 0, NULL));
-  vl_set(&F->r[46], vf_5(NULL, 0, NULL));
-  vl_set(&F->r[47], vl_iter(F->r[45]));
+  vl_set(&F->r[45], vl_field(F->r[0], "o2"));
+  vl_set(&F->r[46], vl_iter(F->r[45]));
  L23: ;
-  { Value ik71, iv71;
-    if (!vl_iter_next(F->r[47], &ik71, &iv71)) goto L24;
-    vl_set(&F->r[48], ik71); vl_set(&F->r[49], iv71); }
-  Value a72[] = {F->r[49]};
-  vl_set(&F->r[50], vl_callm(F->r[0], "match_op", a72, 1));
-  if (!vl_truthy(F->r[50])) goto L25;
-  vl_set(&F->r[51], vl_index(F->r[46], F->r[48]));
-  Value a75[] = {F->r[51], F->r[49], F->r[1], F->r[2]};
+  { Value ik70, iv70;
+    if (!vl_iter_next(F->r[46], &ik70, &iv70)) goto L24;
+    vl_set(&F->r[47], ik70); vl_set(&F->r[48], iv70); }
+  Value a71[] = {F->r[48]};
+  vl_set(&F->r[49], vl_callm(F->r[0], "match_op", a71, 1));
+  if (!vl_truthy(F->r[49])) goto L25;
+  vl_set(&F->r[50], vl_field(F->r[0], "c2"));
+  vl_set(&F->r[51], vl_index(F->r[50], F->r[47]));
+  Value a75[] = {F->r[51], F->r[48], F->r[1], F->r[2]};
   vl_set(&F->r[52], vl_callm(F->r[0], "emit", a75, 4));
   __ret = vl_retain(F->r[52]); goto __exit;
  L25: ;
@@ -3810,18 +3816,18 @@ static Value vf_24(Value *argv, int argc, VlFrame *up) {
   __ret = vl_retain(F->r[58]); goto __exit;
  L27: ;
  L28: ;
-  vl_set(&F->r[59], vf_6(NULL, 0, NULL));
-  vl_set(&F->r[60], vf_7(NULL, 0, NULL));
-  vl_set(&F->r[61], vl_iter(F->r[59]));
+  vl_set(&F->r[59], vl_field(F->r[0], "o1"));
+  vl_set(&F->r[60], vl_iter(F->r[59]));
  L29: ;
-  { Value ik89, iv89;
-    if (!vl_iter_next(F->r[61], &ik89, &iv89)) goto L30;
-    vl_set(&F->r[62], ik89); vl_set(&F->r[63], iv89); }
-  Value a90[] = {F->r[63]};
-  vl_set(&F->r[64], vl_callm(F->r[0], "match_op", a90, 1));
-  if (!vl_truthy(F->r[64])) goto L31;
-  vl_set(&F->r[65], vl_index(F->r[60], F->r[62]));
-  Value a93[] = {F->r[65], F->r[63], F->r[1], F->r[2]};
+  { Value ik88, iv88;
+    if (!vl_iter_next(F->r[60], &ik88, &iv88)) goto L30;
+    vl_set(&F->r[61], ik88); vl_set(&F->r[62], iv88); }
+  Value a89[] = {F->r[62]};
+  vl_set(&F->r[63], vl_callm(F->r[0], "match_op", a89, 1));
+  if (!vl_truthy(F->r[63])) goto L31;
+  vl_set(&F->r[64], vl_field(F->r[0], "c1"));
+  vl_set(&F->r[65], vl_index(F->r[64], F->r[61]));
+  Value a93[] = {F->r[65], F->r[62], F->r[1], F->r[2]};
   vl_set(&F->r[66], vl_callm(F->r[0], "emit", a93, 4));
   __ret = vl_retain(F->r[66]); goto __exit;
  L31: ;

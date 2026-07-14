@@ -53,7 +53,7 @@ func main() {
     if mode == "blob" { return }
 
     if mode == "seed" {
-        sh("cp", [voila, OUT])
+        install(voila, OUT)
         ok(OUT || " (the seed itself)")
         return
     }
@@ -93,11 +93,14 @@ func main() {
         warn("bootstrap/voilac.c is stale — run: voila run tools/build.voi reseed")
     }
 
-    sh("cp", [two, OUT])
+    // Unlink before copying. `cp` over an existing binary reuses the inode,
+    // and macOS keeps the code signature cached against it — the new contents
+    // then fail validation and the kernel SIGKILLs the process on exec.
+    install(two, OUT)
     ok(OUT)
     // The toolchain is `voila`, and the manual says so. `voilac/` is the
     // compiler's SOURCE directory, so the binary cannot be called that.
-    sh("cp", [two, "voila"])
+    install(two, "voila")
     ok("./voila")
     sh("rm", ["-rf", BUILD])
     head("done — ./voila is ready")
@@ -199,6 +202,16 @@ func must_run(prog str, args []str) {
 
 func sh(prog str, args []str) {
     os.run(prog, args)
+}
+
+// install replaces a binary. The unlink is not paranoia: overwriting a Mach-O
+// in place leaves the kernel holding a signature computed over the OLD bytes,
+// and the next exec of it dies with SIGKILL.
+func install(src str, dst str) {
+    os.remove(dst)
+    if os.run("cp", [src, dst]) != 0 {
+        fail("cannot install " || dst)
+    }
 }
 
 func read_or(p str, dflt str) str {
