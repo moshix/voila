@@ -1,0 +1,111 @@
+// Chapter 8 — the eight queens, searched in parallel.
+//
+// The search tree of Chapter 6 splits cleanly at the root: the queen of
+// column 0 stands on exactly one of N rows, and those N sub-searches are
+// wholly independent. So the work divides itself. Each task counts the
+// solutions below one root row and posts the count on a channel; the
+// group joins them all before the count is read.
+use "std/fmt"
+use "std/time"
+
+struct Search {
+    n     int
+    board []int
+    count int
+}
+
+impl Search {
+    func safe(self, row int, col int) bool {
+        var c = 0
+        while c < col {
+            let r = self.board[c]
+            if r == row { return false }
+            if r - c == row - col { return false }
+            if r + c == row + col { return false }
+            c += 1
+        }
+        return true
+    }
+
+    func place(mut self, col int) {
+        if col == self.n {
+            self.count += 1
+            return
+        }
+        for row in 0..self.n {
+            if self.safe(row, col) {
+                self.board[col] = row
+                self.place(col + 1)
+                self.board[col] = 0 - 1
+            }
+        }
+    }
+}
+
+// branch counts every solution whose first queen stands on `row`. It is a
+// plain function: a task's body must not capture the loop variable that
+// produced it (see the Programming Note in 8.3), so the row is a
+// PARAMETER, and the task owns everything it touches.
+func branch(n int, row int, out chan[int]) {
+    var s = Search{n: n, board: make([]int, n), count: 0}
+    for c in 0..n {
+        s.board[c] = 0 - 1
+    }
+    s.board[0] = row
+    s.place(1)
+    out <- s.count
+}
+
+// serial is Chapter 6's search, for comparison.
+func serial(n int) int {
+    var s = Search{n: n, board: make([]int, n), count: 0}
+    for c in 0..n {
+        s.board[c] = 0 - 1
+    }
+    s.place(0)
+    return s.count
+}
+
+func parallel(n int) int {
+    let out = chan[int](n)
+    group {
+        for row in 0..n {
+            spawn branch(n, row, out)
+        }
+        // The group joins every task at the closing brace, so the counts
+        // are all posted by the time the loop below has drained them.
+        var total = 0
+        for i in 0..n {
+            total += <-out
+        }
+        return total
+    }
+    return 0
+}
+
+func main() {
+    let n = 11
+
+    // Each elapsed time must be taken WHERE it is true, not at the end:
+    // time.since(t) is evaluated when it is called, not when t was set.
+    let t0 = time.now()
+    let a = serial(n)
+    let ser = time.since(t0)
+
+    let t1 = time.now()
+    let b = parallel(n)
+    let par = time.since(t1)
+
+
+    fmt.printf("N = %d\n\n", n)
+    fmt.printf("%-10s %8s %10s\n", "SEARCH", "COUNT", "ELAPSED")
+    fmt.printf("%-10s %8d %8d ms\n", "SERIAL", a, ser.millis())
+    fmt.printf("%-10s %8d %8d ms\n", "PARALLEL", b, par.millis())
+
+    if a != b {
+        say "*** THE TWO SEARCHES DISAGREE — THAT IS A DEFECT ***"
+    } else {
+        say ""
+        say "BOTH SEARCHES AGREE:", a, "SOLUTIONS."
+    }
+}

@@ -1,0 +1,4 @@
+after deposit : 100.00
+rejected      : deposit must be positive
+overdrawn     : wanted 500.00, had 100.00
+after withdraw: 60.00

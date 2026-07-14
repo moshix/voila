@@ -1,0 +1,69 @@
+// Chapter 5 — structures, enumerations, MATCH, and the two error models.
+use "std/fmt"
+
+struct Account {
+    id      str
+    holder  str
+    balance dec = 0d
+}
+
+enum Txn {
+    Deposit(amount dec)
+    Withdraw(amount dec)
+    Close
+}
+
+exception Overdrawn {
+    id   str
+    want dec
+    have dec
+}
+
+impl Account {
+    // A method that reports an EXPECTED failure returns a value of type
+    // `dec!` — an error VALUE. The caller must deal with it.
+    func apply(mut self, t Txn) dec! throws Overdrawn {
+        match t {
+            Deposit(a) => {
+                if a <= 0d { return err("deposit must be positive") }
+                self.balance += a
+            }
+            Withdraw(a) => {
+                // An UNEXPECTED failure — a bug or a broken invariant —
+                // is thrown. It unwinds; it is not part of the signature
+                // of every caller in between.
+                if a > self.balance {
+                    throw Overdrawn{id: self.id, want: a, have: self.balance}
+                }
+                self.balance -= a
+            }
+            Close => self.balance = 0d
+        }
+        return self.balance
+    }
+}
+
+func main() {
+    var acct = Account{id: "0001", holder: "M. CARDINAL"}
+
+    // `try` propagates an error value; `else` supplies an alternative.
+    let b1 = try acct.apply(Deposit(100d)) else 0d
+    fmt.printf("after deposit : %s\n", b1.format(2))
+
+    // An error VALUE is inspected with match — no exception is raised.
+    match acct.apply(Deposit(0d - 5d)) {
+        Ok(b)  => say "unexpected:", b
+        Err(e) => say "rejected      :", e.message()
+    }
+
+    // An EXCEPTION is caught by type.
+    try {
+        acct.apply(Withdraw(500d))
+    } catch e: Overdrawn {
+        fmt.printf("overdrawn     : wanted %s, had %s\n",
+                   e.want.format(2), e.have.format(2))
+    }
+
+    let b2 = must acct.apply(Withdraw(40d))
+    fmt.printf("after withdraw: %s\n", b2.format(2))
+}

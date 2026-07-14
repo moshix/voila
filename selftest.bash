@@ -83,6 +83,44 @@ if [ "${1:-}" != quick ]; then
     ok "samples: $spass matched"
 fi
 
+# ---------------------------------------------------------------- the guide
+# Every program printed in GettingStartedWithVoila.md is compiled and run here.
+# A tutorial whose programs do not work is worse than no tutorial: the reader
+# cannot tell whether the language or their typing is at fault.
+bold "==> the programs in GettingStartedWithVoila.md"
+gpass=0
+for f in samples/guide/g0*.voi; do
+    n="$(basename "${f%.voi}")"
+    want="samples/guide/golden/$n.out"
+    [ -f "$want" ] || continue
+    exe="$TMP/$n"
+    if ! "$VOILA" build "$f" -o "$exe" >"$TMP/build.log" 2>&1; then
+        bad "$n: build failed"
+        head -3 "$TMP/build.log" | sed 's/^/      /'
+        fail=$((fail + 1))
+        continue
+    fi
+    # g08 reports elapsed times, which are not reproducible; the counts are.
+    "$exe" 2>&1 | grep -v " ms$" > "$TMP/got.txt"
+    if cmp -s "$TMP/got.txt" "$want"; then
+        gpass=$((gpass + 1))
+    else
+        bad "$n: output differs from the golden"
+        diff "$want" "$TMP/got.txt" | head -6 | sed 's/^/      /'
+        fail=$((fail + 1))
+    fi
+done
+# The guide's multi-package example.
+if "$VOILA" build samples/guide/queens/main.voi -o "$TMP/gq" >/dev/null 2>&1 &&
+   "$TMP/gq" > "$TMP/gq.out" 2>&1 &&
+   cmp -s "$TMP/gq.out" samples/guide/golden/queens.out; then
+    gpass=$((gpass + 1))
+else
+    bad "the guide's package example"
+    fail=$((fail + 1))
+fi
+ok "guide: $gpass programs"
+
 # ---------------------------------------------------------------- multi-package
 bold "==> multi-package program"
 if "$VOILA" build tests/multipkg/main.voi -o "$TMP/mp" >/dev/null 2>&1; then

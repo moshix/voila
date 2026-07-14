@@ -1,0 +1,36 @@
+// Chapter 4 — PARSE and exact decimal arithmetic.
+//
+// PARSE is inherited from REXX. It takes a subject and a TEMPLATE, and
+// splits the subject into the named variables without any index
+// arithmetic. Column numbers give fixed-width (card image) records.
+use "std/fmt"
+use "std/str"
+
+// A fixed-width dataset, as a mainframe would hold it.
+//        1         2         3         4
+// 234567890123456789012345678901234567890
+let records = [
+    "0001 CHAIR           000012 0049.95",
+    "0002 DESK            000003 0299.00",
+    "0003 LAMP            000027 0019.50",
+]
+
+numeric digits 15
+
+var grand = 0d
+say "ITEM DESCRIPTION           QTY      UNIT        VALUE"
+say "---- ----------------- ------ --------- ------------"
+
+each rec in records {
+    parse rec item 6 desc 22 qty 29 price
+    let q = int(str.trim(qty))
+    let p = to_dec(str.trim(price))
+    let value = dec(q) * p
+    grand += value
+    fmt.printf("%-4s %-17s %6d %9s %12s\n",
+               str.trim(item), str.trim(desc), q,
+               p.format(2), value.format(2))
+}
+
+say "---- ----------------- ------ --------- ------------"
+fmt.printf("%-39s %12s\n", "GRAND TOTAL", grand.format(2))

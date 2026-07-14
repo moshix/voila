@@ -1,0 +1,26 @@
+// Chapter 3 — loops, conditions, and a printed report.
+//
+// A Voilà program may be written in SCRIPT form (statements at the top
+// level, as here) or in PROCEDURE form (a func main). Both are compiled.
+use "std/fmt"
+
+let cities = ["ARMONK", "POUGHKEEPSIE", "ENDICOTT", "BOEBLINGEN"]
+let temps  = [18, 22, 15, 24]
+
+say "STATION          TEMP   CLASS"
+say "---------------- ----   ---------"
+
+each i, city in cities {
+    let t = temps[i]
+    var class = "MILD"
+    if t >= 22 {
+        class = "WARM"
+    } else if t < 16 {
+        class = "COOL"
+    }
+    fmt.printf("%-16s %4d   %s\n", city, t, class)
+}
+
+say ""
+say "STATIONS REPORTED:", len(cities)
+say "MEAN TEMPERATURE :", sum(temps)//len(temps)   // floor division: no spaces

@@ -1,0 +1,93 @@
+// Chapter 6 — the eight queens: a backtracking search.
+//
+// Place N queens on an N x N board so that no two attack each other.
+// The search is depth-first over the COLUMNS: column by column, try each
+// row; if the placement is safe, descend; if the descent fails, take the
+// queen back (that is the "backtracking") and try the next row.
+//
+// `board[c] = r` means: the queen of column c stands on row r.
+use "std/fmt"
+
+struct Search {
+    n       int
+    board   []int    // board[c] = the row of the queen in column c
+    count   int      // solutions found
+    nodes   int      // placements tried — the cost of the search
+    first   []int    // the first solution, kept for printing
+}
+
+impl Search {
+    // safe reports whether a queen at (row, col) is attacked by any queen
+    // already placed in columns 0 .. col-1.
+    func safe(self, row int, col int) bool {
+        var c = 0
+        while c < col {
+            let r = self.board[c]
+            if r == row { return false }                  // same row
+            if r - c == row - col { return false }        // same \ diagonal
+            if r + c == row + col { return false }        // same / diagonal
+            c += 1
+        }
+        return true
+    }
+
+    // place fills columns col .. n-1. It returns nothing: the results are
+    // accumulated on self.
+    func place(mut self, col int) {
+        if col == self.n {
+            self.count += 1
+            if len(self.first) == 0 {
+                each r in self.board { self.first.append(r) }
+            }
+            return
+        }
+        for row in 0..self.n {
+            self.nodes += 1
+            if self.safe(row, col) {
+                self.board[col] = row
+                self.place(col + 1)      // descend
+                self.board[col] = 0 - 1  // take it back
+            }
+        }
+    }
+}
+
+// solve counts every solution for a board of size n.
+func solve(n int) Search {
+    var s = Search{n: n, board: make([]int, n), count: 0, nodes: 0, first: []}
+    for c in 0..n {
+        s.board[c] = 0 - 1
+    }
+    s.place(0)
+    return s
+}
+
+// draw renders one solution as a chess board.
+func draw(sol []int, n int) {
+    for r in 0..n {
+        var line = ""
+        for c in 0..n {
+            if sol[c] == r {
+                line = line || " Q"
+            } else {
+                line = line || " ."
+            }
+        }
+        say line
+    }
+}
+
+func main() {
+    say "N   SOLUTIONS      NODES"
+    say "-   ---------  ---------"
+    for n in 1..11 {
+        let s = solve(n)
+        fmt.printf("%d   %9d  %9d\n", n, s.count, s.nodes)
+    }
+
+    say ""
+    say "THE FIRST SOLUTION FOR N = 8"
+    say ""
+    let eight = solve(8)
+    draw(eight.first, 8)
+}

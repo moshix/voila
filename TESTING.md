@@ -40,7 +40,15 @@ interpreter was the oracle; these files are its verdicts, frozen. The compiler i
 still held to them, so its behaviour cannot drift away from the semantics the
 language was specified with — even though the oracle itself is gone.
 
-### 3. The negative fixtures
+### 3. The guide
+
+Every program printed in [GettingStartedWithVoila.md](GettingStartedWithVoila.md)
+lives in `samples/guide/`, is compiled and run by `selftest.bash`, and is
+compared against a golden. A tutorial whose programs do not work is worse than
+no tutorial — the reader cannot tell whether the language or their typing is at
+fault — so the guide cannot drift from the compiler without the suite going red.
+
+### 4. The negative fixtures
 
 `tests/negative/*.voi` are programs the checker must **reject**: an ownership
 cycle, a lossy widening, a non-exhaustive `match`, a use-after-move, a borrow
@@ -52,7 +60,7 @@ a nonexistent import, a variant name claimed by two packages.
 A compiler that accepts everything is not a compiler. `selftest.bash` fails if
 any of these is accepted, and it compares the diagnostic text.
 
-### 4. Memory
+### 5. Memory
 
 Voilà refcounts and has no garbage collector, so a leak is a defect in the
 runtime or in the code the backend emits — not a matter of timing.

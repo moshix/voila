@@ -546,17 +546,25 @@ impl Gen {
 
     func emit_func(mut self, idx int, f ir.Func) {
         if f.LoopCapture != "" {
+            // The message is what a user sees. It must say what is wrong,
+            // why the compiler will not guess, and what to write instead.
             self.failf(fmt.sprintf(
-                "cgen: %s captures `%s`, which is declared inside a loop.\n" ||
-                "  Each iteration is a separate binding, and native builds " ||
-                "cannot yet\n" ||
-                "  give each one its own frame — the interpreter and the " ||
-                "binary would\n" ||
-                "  disagree, so the build is refused rather than silently " ||
-                "differ.\n" ||
-                "  Workaround: build the closure in a helper function that " ||
-                "takes the\n" ||
-                "  value as a parameter.", f.Name, f.LoopCapture))
+                "%s captures `%s`, which is declared inside a loop.\n" ||
+                "  Each iteration of the loop is a SEPARATE binding of " ||
+                "`%s`, but a\n" ||
+                "  closure captures the enclosing frame, and a frame is per " ||
+                "procedure —\n" ||
+                "  so every closure would end up sharing the LAST value. " ||
+                "Rather than\n" ||
+                "  answer differently from the specification, the compiler " ||
+                "refuses.\n" ||
+                "\n" ||
+                "  Write a helper that takes the value as a parameter, so " ||
+                "the closure\n" ||
+                "  owns its own copy:\n" ||
+                "\n" ||
+                "      for row in 0..n \{ spawn branch(n, row, out) \}",
+                f.Name, f.LoopCapture, f.LoopCapture))
         }
         self.p(fmt.sprintf("/* %s — %s */", f.Name, f.Sig))
         self.p(fmt.sprintf("static Value %s(Value *argv, int argc, " ||

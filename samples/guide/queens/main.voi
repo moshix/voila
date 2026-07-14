@@ -1,0 +1,9 @@
+use "queens/board"
+use "std/fmt"
+
+func main() {
+    for n in 4..9 {
+        var s = board.New(n)
+        fmt.printf("N = %2d   SOLUTIONS = %4d\n", n, s.Solve())
+    }
+}

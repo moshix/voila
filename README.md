@@ -219,9 +219,12 @@ never could. Both are in [BOOTSTRAP.md](BOOTSTRAP.md).
 - ⬜ `std/regex`, `std/http` in C; `voila fmt/test/repl`; the flow-sensitive
   borrow checker
 
-📕 **Docs:** the [Programming Manual](programming_manual.md) — written in
-the house style of the IBM mainframe language references, syntax diagrams
-included — and the [Language Specification](voila_specification.md).
+📕 **Docs:** start with **[Getting Started](GettingStartedWithVoila.md)** — a
+tutorial from `hello.voi` to a parallel eight-queens solver, every program
+tested on every build. Then the [Programming Manual](programming_manual.md),
+the reference — written in the house style of the IBM mainframe language
+references, syntax diagrams included — and the
+[Language Specification](voila_specification.md).
 
 ---
 

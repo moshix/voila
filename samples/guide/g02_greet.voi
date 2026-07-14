@@ -1,0 +1,17 @@
+// Chapter 2 — data items, assignment, and the SAY statement.
+use "std/str"
+
+let name    = "OPERATOR"
+let planet  = "Earth"
+let year    = 2026
+let pi      = 3.14159
+let balance = 1234.56d          // exact decimal, not binary floating point
+
+say "Greetings, {str.title(str.lower(name))} of {planet}."
+say "The year is {year}; pi is about {pi}."
+say "Your balance is {balance} — and it is EXACT."
+
+var count = 0
+count += 1
+count += 1
+say "COUNT =", count

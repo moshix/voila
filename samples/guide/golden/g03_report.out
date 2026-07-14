@@ -1,0 +1,9 @@
+STATION          TEMP   CLASS
+---------------- ----   ---------
+ARMONK             18   MILD
+POUGHKEEPSIE       22   WARM
+ENDICOTT           15   COOL
+BOEBLINGEN         24   WARM
+
+STATIONS REPORTED: 4
+MEAN TEMPERATURE : 19

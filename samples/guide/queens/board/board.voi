@@ -1,0 +1,50 @@
+// board — the search, as a package. A directory is a package; a name that
+// begins with a capital is exported from it.
+package board
+
+struct Search {
+    N     int
+    Count int
+    board []int      // lower case: private to this package
+}
+
+func New(n int) Search {
+    var s = Search{N: n, Count: 0, board: make([]int, n)}
+    for c in 0..n {
+        s.board[c] = 0 - 1
+    }
+    return s
+}
+
+impl Search {
+    func Solve(mut self) int {
+        self.place(0)
+        return self.Count
+    }
+
+    func safe(self, row int, col int) bool {
+        var c = 0
+        while c < col {
+            let r = self.board[c]
+            if r == row { return false }
+            if r - c == row - col { return false }
+            if r + c == row + col { return false }
+            c += 1
+        }
+        return true
+    }
+
+    func place(mut self, col int) {
+        if col == self.N {
+            self.Count += 1
+            return
+        }
+        for row in 0..self.N {
+            if self.safe(row, col) {
+                self.board[col] = row
+                self.place(col + 1)
+                self.board[col] = 0 - 1
+            }
+        }
+    }
+}

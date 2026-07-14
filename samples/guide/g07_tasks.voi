@@ -1,0 +1,60 @@
+// Chapter 7 — tasks, channels, and structured concurrency.
+//
+// A GROUP is a region. Tasks may be SPAWNed only inside one, and the
+// group does not end until every task it started has ended. There is no
+// way to leak a task: the brace that closes the group joins them all.
+use "std/fmt"
+use "std/time"
+
+func worker(id int, jobs chan[int], results chan[int]) {
+    each j in jobs {
+        // Pretend the work takes a while.
+        time.sleep(10 * time.Millisecond)
+        results <- j * j
+    }
+}
+
+func main() {
+    let jobs    = chan[int](16)
+    let results = chan[int](16)
+
+    group {
+        // Three workers draw from one queue.
+        for w in 1..4 {
+            spawn worker(w, jobs, results)
+        }
+
+        // Feed the queue, then close it: the workers' `each` ends when a
+        // closed channel is drained.
+        for j in 1..9 {
+            jobs <- j
+        }
+        close(jobs)
+
+        // Collect exactly as many answers as we posted.
+        var total = 0
+        for i in 0..8 {
+            total += <-results
+        }
+        say "SUM OF SQUARES 1..8 =", total
+    }
+    say "ALL TASKS JOINED."
+
+    // SELECT waits on whichever channel is ready first.
+    let fast = chan[str](1)
+    let slow = chan[str](1)
+    group {
+        spawn deliver(fast, "FAST", 10 * time.Millisecond)
+        spawn deliver(slow, "SLOW", 200 * time.Millisecond)
+
+        select {
+            case let m = <-fast: say "FIRST TO ARRIVE:", m
+            case let m = <-slow: say "FIRST TO ARRIVE:", m
+        }
+    }
+}
+
+func deliver(ch chan[str], msg str, after dur) {
+    time.sleep(after)
+    ch <- msg
+}
