@@ -25,11 +25,20 @@ struct Node {
 
 struct Tree {
     Nodes []Node
+
+    // A node knows its line and column but not its file — the loader flattens
+    // every package into ONE arena, and a Line field per node would carry a
+    // file name that is the same for thousands of nodes in a row. Instead the
+    // arena records where each file's nodes BEGIN; FileOf finds the file by
+    // range. Without this a diagnostic in an imported package is reported
+    // against the entry file, at a line that may not even exist there.
+    Files  []str
+    Starts []int
 }
 
 func NewTree() Tree {
     // Node 0 is the nil node: an absent child is 0, never a valid index.
-    var t = Tree{Nodes: []}
+    var t = Tree{Nodes: [], Files: [], Starts: []}
     t.Nodes.append(Node{Kind: NIL_NODE, Line: 0, Col: 0, Ival: 0, Ival2: 0,
                         Sval: "", Kids: []})
     return t
@@ -70,6 +79,29 @@ impl Tree {
 
     func AddKid(mut self, id int, v int) {
         self.Nodes[id].Kids.append(v)
+    }
+
+    // BeginFile records that the nodes added from here on come from `name`.
+    // The loader calls it before grafting each file.
+    func BeginFile(mut self, name str) {
+        self.Files.append(name)
+        self.Starts.append(len(self.Nodes))
+    }
+
+    // FileOf names the file a node came from, or "" when the arena was built
+    // without file bookkeeping (a single-file parse).
+    func FileOf(self, id int) str {
+        var best = ""
+        var i = 0
+        while i < len(self.Starts) {
+            if self.Starts[i] <= id {
+                best = self.Files[i]
+            } else {
+                break
+            }
+            i += 1
+        }
+        return best
     }
 
     // Graft copies every node of another tree into this arena and returns the

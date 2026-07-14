@@ -1,0 +1,7 @@
+package lib
+
+// A checker diagnostic raised HERE must be reported against this file, at this
+// line — not against the entry file, which is shorter than this one.
+struct Holder { r &int }
+
+func Use() int { return 1 }

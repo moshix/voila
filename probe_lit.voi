@@ -1,8 +1,0 @@
-func main() {
-    let a i8 = 300
-    let b i8 = 0xFFFF
-    let c i8 = 1_000
-    let d i8 = 0b100000000
-    let e i8 = 0o777
-    say a, b, c, d, e
-}

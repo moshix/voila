@@ -1,3 +1,2 @@
-error: type `Node` forms an ownership cycle through field `parent`
-owning edge back to `Node`
+type `Node` forms an ownership cycle through field `parent`
 use `weak[Node]` for a back-edge

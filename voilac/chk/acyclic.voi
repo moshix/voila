@@ -35,15 +35,17 @@ impl Checker {
             }
         }
 
-        // One DFS per type. A type with no outgoing edge visits nothing, so
-        // sweeping every name is the same walk the Go checker makes over the
-        // edge map's keys.
-        each name in self.sNames {
-            self.acyc_visit(name, name, [name])
+        // Index the edges by source ONCE. Scanning the whole edge list at every
+        // DFS node made a dense (and perfectly legal) type graph take minutes:
+        // 24 mutually-referencing structs went from 0.7 s to 107 s.
+        self.adj = make(map[str][]int)
+        each i, e in self.edges {
+            if not (e.from in self.adj) { self.adj[e.from] = [] }
+            self.adj[e.from].append(i)
         }
-        each name in self.eNames {
-            self.acyc_visit(name, name, [name])
-        }
+
+        each name in self.sNames { self.acyc_check(name) }
+        each name in self.eNames { self.acyc_check(name) }
     }
 
     // own_edge records the owning edge a field carries, if any.
@@ -71,41 +73,39 @@ impl Checker {
         self.edges.append(Edge{from: from, to: to, field: fd.Sval, node: te})
     }
 
-    // acyc_visit walks the owning edges out of `cur`, looking for a way back
-    // to `start`. `path` is the set of types already on the DFS stack, carried
-    // as a slice: a cycle is short, and copying it keeps the recursion free of
-    // aliasing.
-    func acyc_visit(mut self, start str, cur str, path []str) {
-        each e in self.edges {
-            if e.from != cur { continue }
-            if e.to == start {
-                // The cycle closes here. Report the closing edge once, keyed
-                // by the field it lives in.
-                let key = e.from || "." || e.field
-                if key in self.reported { continue }
-                self.reported.add(key)
-                self.report_at(e.node,
-                               "type `{start}` forms an ownership cycle " ||
-                               "through field `{e.field}`")
-                continue
-            }
-            if not on_path(path, e.to) {
-                self.acyc_visit(start, e.to, extend(path, e.to))
+    // acyc_check reports every owning edge that closes a cycle back to `start`.
+    //
+    // An edge u → start closes a cycle exactly when u is REACHABLE from start.
+    // So the rule needs one reachability sweep per type — O(V+E) — not an
+    // enumeration of every simple path, which is exponential: 24 mutually
+    // referencing (and perfectly legal, acyclic) structs took over two minutes
+    // that way, and this answers in milliseconds.
+    func acyc_check(mut self, start str) {
+        var seen = set([])
+        var stack = [start]
+        while len(stack) > 0 {
+            let cur = stack[len(stack) - 1]
+            stack = stack[0..len(stack) - 1]
+            if not (cur in self.adj) { continue }
+            each i in self.adj[cur] {
+                let e = self.edges[i]
+                if e.to == start {
+                    // The cycle closes here. Report the closing edge once,
+                    // keyed by the field it lives in.
+                    let key = e.from || "." || e.field
+                    if key in self.reported { continue }
+                    self.reported.add(key)
+                    self.report_at(e.node,
+                                   "type `{start}` forms an ownership cycle " ||
+                                   "through field `{e.field}`; use " ||
+                                   "`weak[{start}]` for a back-edge")
+                    continue
+                }
+                if not (e.to in seen) {
+                    seen.add(e.to)
+                    stack.append(e.to)
+                }
             }
         }
     }
-}
-
-func on_path(path []str, name str) bool {
-    each p in path {
-        if p == name { return true }
-    }
-    return false
-}
-
-func extend(path []str, name str) []str {
-    var out = []
-    each p in path { out.append(p) }
-    out.append(name)
-    return out
 }

@@ -107,25 +107,29 @@ fi
 bold "==> negative: invalid programs must be rejected"
 npass=0
 for f in tests/negative/*.voi; do
-    want="${f%.voi}.err"
+    want="${f%.voi}.expect"
     got="$("$VOILA" check "$f" 2>&1)"
     if [ -z "$got" ] || [ "$got" = ok ]; then
         bad "$(basename "$f"): ACCEPTED — the checker must reject it"
         fail=$((fail + 1))
         continue
     fi
-    if [ -f "$want" ]; then
-        # The golden holds the stage-0 diagnostic; compare the message text,
-        # which is what a user reads (the rendering differs: stage 0 drew a
-        # caret diagram).
-        wmsg="$(grep -o 'error: .*' "$want" | sed 's/^error: //' | head -1)"
-        gmsg="$(echo "$got" | head -1 | sed 's/^[^ ]*: //')"
-        if [ -n "$wmsg" ] && [ "$wmsg" != "$gmsg" ]; then
-            bad "$(basename "$f"): wrong diagnostic"
-            echo "      want: $wmsg" ; echo "      got:  $gmsg"
-            fail=$((fail + 1))
-            continue
-        fi
+    # Each line of the .expect file is a phrase the diagnostics MUST contain.
+    # (This used to look for a .err file, which never existed, so the golden was
+    # never compared and a checker emitting nonsense would still have passed.)
+    missing=0
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        case "$got" in
+            *"$line"*) ;;
+            *)  bad "$(basename "$f"): the diagnostic does not mention: $line"
+                missing=1 ;;
+        esac
+    done < "$want"
+    if [ "$missing" -eq 1 ]; then
+        echo "      got: $got" | head -2 | sed 's/^/      /'
+        fail=$((fail + 1))
+        continue
     fi
     npass=$((npass + 1))
 done
@@ -144,6 +148,22 @@ for d in tests/multipkg-bad/*/; do
     fi
 done
 ok "multipkg-bad: $mpass rejected"
+
+# ------------------------------------------------------- cross-file diagnostics
+# A diagnostic raised inside an imported package must name THAT file and THAT
+# line. The loader flattens every package into one arena, so this is easy to get
+# wrong — and it was: every diagnostic used to be attributed to the entry file,
+# at a line that need not even exist there.
+bold "==> a diagnostic in an imported package names the right file"
+got="$("$VOILA" check tests/multipkg-diag/main.voi 2>&1)"
+want="$(cat tests/multipkg-diag/expect)"
+case "$got" in
+    *"$want"*) ok "cross-file attribution" ;;
+    *)  bad "cross-file attribution"
+        echo "      want to contain: $want"
+        echo "      got:             $got"
+        fail=$((fail + 1)) ;;
+esac
 
 # ---------------------------------------------------------------- run + cache
 bold "==> the run verb (compile, cache, execute)"

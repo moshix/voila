@@ -79,10 +79,13 @@ item may be repeated.
 ## 1.1 Nature of the Language
 
 Voilà is a statically typed, memory-safe, concurrent programming
-language. One source program may be executed in two ways with identical
-results: interpreted, by the `voila run` command, or packaged into a
-self-contained executable by the `voila build` command. This property is
-called the *Equivalence Guarantee* and is discussed in Chapter 12.
+language. A source program is compiled: the `voila run` command
+compiles it and executes it in one step, and the `voila build` command
+leaves a self-contained executable behind. Both use the same compiler
+and produce the same behavior — the *Equivalence Guarantee*, discussed
+in Chapter 12.
+
+The compiler is itself written in Voilà.
 
 The language derives its design from four ancestors:
 
@@ -664,9 +667,9 @@ impl[T] Stack[T] {
 }
 ```
 
-Constraints name traits. The stage-0 translator erases type parameters
-(the interpreter checks representations at run time); the compiled mode
-of a later stage monomorphizes. Observable behavior is identical.
+Constraints name traits. The translator erases type parameters and the
+runtime checks representations; a later monomorphizing pass will change
+the cost, not the observable behavior.
 
 ---
 
@@ -1263,8 +1266,9 @@ of ownership.
 **context (numeric).** The significant-digit setting governing dec
 arithmetic.
 
-**equivalence guarantee.** The property that interpreted and built
-programs behave identically.
+**equivalence guarantee.** The property that a program behaves
+identically however it is run. It is kept by construction: `voila run`
+compiles and executes, so there is only one engine.
 
 **error value.** A first-class value of type `T!` representing expected
 failure; consumed by `try`, `else`, or MATCH.

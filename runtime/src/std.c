@@ -12,6 +12,9 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 
 static bool eq(const char *a, const char *b) { return strcmp(a, b) == 0; }
 
@@ -595,6 +598,38 @@ BI(os_run) {
   return vl_int(-1);
 }
 
+/* os.exe returns the path of the RUNNING executable. The compiler needs it to
+ * key its build cache on its own identity: without it, upgrading the toolchain
+ * would silently keep running binaries the previous compiler produced. */
+BI(os_exe) {
+  UNUSED;
+  char buf[4096];
+#if defined(__APPLE__)
+  uint32_t n = (uint32_t)sizeof buf;
+  if (_NSGetExecutablePath(buf, &n) != 0) return vl_str("");
+  return vl_str(buf);
+#else
+  ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
+  if (n < 0) return vl_str("");
+  buf[n] = 0;
+  return vl_str(buf);
+#endif
+}
+
+BI(os_mtime) {
+  UNUSED;
+  struct stat st;
+  if (stat(vl_cstr(argv[0]), &st) != 0) return vl_int(0);
+  return vl_int((int64_t)st.st_mtime);
+}
+
+BI(os_size) {
+  UNUSED;
+  struct stat st;
+  if (stat(vl_cstr(argv[0]), &st) != 0) return vl_int(-1);
+  return vl_int((int64_t)st.st_size);
+}
+
 BI(os_pid) {
   UNUSED;
   return vl_int((int64_t)getpid());
@@ -1084,6 +1119,7 @@ static const Entry table[] = {
     {"os.exit", os_exit}, {"os.on_abort", os_on_abort},
     {"os.isdir", os_isdir}, {"os.listdir", os_listdir},
     {"os.run", os_run}, {"os.cwd", os_cwd}, {"os.pid", os_pid},
+    {"os.exe", os_exe}, {"os.mtime", os_mtime}, {"os.size", os_size},
 
     /* math */
     {"math.sqrt", math_sqrt}, {"math.sin", math_sin}, {"math.cos", math_cos},

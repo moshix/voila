@@ -126,6 +126,7 @@ func Load(entry str) Program {
             l.rwScopes = []
             l.rw_file(l.pkgs[pi].trees[fi], l.pkgs[pi].roots[fi])
 
+            mt.BeginFile(l.pkgs[pi].sources[fi])
             let grafted = mt.Graft(l.pkgs[pi].trees[fi],
                                    l.pkgs[pi].roots[fi])
             each d in mt.Get(mt.Kid(grafted, 1)).Kids {
@@ -150,6 +151,7 @@ func Load(entry str) Program {
     l.rwScopes = []
     l.rw_file(p.T, mainRoot)
 
+    mt.BeginFile(entry)
     let mroot = mt.Graft(p.T, mainRoot)
     each d in mt.Get(mt.Kid(mroot, 1)).Kids {
         decls.append(d)

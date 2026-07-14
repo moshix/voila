@@ -172,6 +172,35 @@ func stdOs() *Pkg {
 		return IntV(os.Getpid())
 	})
 
+	// exe/mtime/size exist so the compiler can key its build cache on its own
+	// identity: without them, upgrading the toolchain would silently keep
+	// running binaries the previous compiler produced.
+	p.Funcs["exe"] = bi("exe", func(t *T, args []Value) Value {
+		p, err := os.Executable()
+		if err != nil {
+			return StrV("")
+		}
+		return StrV(p)
+	})
+
+	p.Funcs["mtime"] = bi("mtime", func(t *T, args []Value) Value {
+		t.wantArgs("os.mtime", args, 1, diag.Pos{})
+		info, err := os.Stat(string(t.wantStr(args[0], diag.Pos{})))
+		if err != nil {
+			return IntV(0)
+		}
+		return IntV(info.ModTime().Unix())
+	})
+
+	p.Funcs["size"] = bi("size", func(t *T, args []Value) Value {
+		t.wantArgs("os.size", args, 1, diag.Pos{})
+		info, err := os.Stat(string(t.wantStr(args[0], diag.Pos{})))
+		if err != nil {
+			return IntV(-1)
+		}
+		return IntV(info.Size())
+	})
+
 	p.Funcs["cwd"] = bi("cwd", func(t *T, args []Value) Value {
 		d, err := os.Getwd()
 		if err != nil {

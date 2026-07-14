@@ -186,7 +186,7 @@ impl Checker {
                 let from = scope[v.Sval]
                 if is_numeric(from) and is_numeric(target) {
                     if not widens_to(from, target) {
-                        self.lattice_error(from, target, v.Line, v.Col)
+                        self.lattice_error(from, target, value)
                     }
                 }
             }
@@ -203,14 +203,14 @@ impl Checker {
             let v = to_int(n.Sval, 0)
             if v == nil { return }
             if v < int_lo(target) or v > int_hi(target) {
-                self.report(n.Line, n.Col,
-                            "literal {n.Sval} does not fit in {target}")
+                self.report_at(lit,
+                               "literal {n.Sval} does not fit in {target}")
             }
         } else if n.Kind == ast.FLOAT {
             if is_int_type(target) {
-                self.report(n.Line, n.Col, "float → {target} truncates")
+                self.report_at(lit, "float → {target} truncates")
             } else if target == "dec" {
-                self.report(n.Line, n.Col, "binary float → dec is lossy")
+                self.report_at(lit, "binary float → dec is lossy")
             }
         } else if n.Kind == ast.DEC {
             // Note: `byte` is absent from Go's list here, so a dec literal
@@ -219,20 +219,20 @@ impl Checker {
                target == "i8" or target == "i16" or target == "i32" or
                target == "i64" or target == "u8" or target == "u16" or
                target == "u32" or target == "u64" {
-                self.lattice_error("dec", target, n.Line, n.Col)
+                self.lattice_error("dec", target, lit)
             }
         } else if n.Kind == ast.STR {
             if is_int_type(target) or target == "float" or target == "dec" {
-                self.report(n.Line, n.Col,
-                            "str does not convert implicitly to {target}")
+                self.report_at(lit,
+                               "str does not convert implicitly to {target}")
             }
         }
     }
 
-    func lattice_error(mut self, from str, dst str, line int, col int) {
-        self.report(line, col,
-                    "{from} → {dst} may lose information; implicit " ||
-                    "conversion requires exact representability (§3.2)")
+    func lattice_error(mut self, from str, dst str, node int) {
+        self.report_at(node,
+                       "{from} → {dst} may lose information; implicit " ||
+                       "conversion requires exact representability (§3.2)")
     }
 
     // ------------------------------------------------------------ match
@@ -293,12 +293,15 @@ impl Checker {
                 if sawNil or sawSome { return }
                 if len(missing) == 0 { return }
                 let ename = self.T.Get(en).Sval
-                self.report(mn.Line, mn.Col,
-                            "match on `{ename}` is not exhaustive")
+                // The missing variants ARE the diagnostic: "not exhaustive" on
+                // its own tells a user nothing they did not already know.
+                self.report_at(m,
+                               "match on `{ename}` is not exhaustive; " ||
+                               "missing cases: " || str.join(missing, ", "))
                 return
             }
         }
-        self.report(mn.Line, mn.Col, "match is not exhaustive")
+        self.report_at(m, "match is not exhaustive")
     }
 
     // enum_of finds the enum a variant name belongs to, or 0.
@@ -430,16 +433,16 @@ impl Checker {
         let lit = self.T.Get(fa)
         let want, bad = count_verbs(lit.Sval)
         if bad != "" {
-            self.report(lit.Line, lit.Col,
-                        "unknown format verb %" || bad ||
-                        " in {name} format string")
+            self.report_at(fa,
+                           "unknown format verb %" || bad ||
+                           " in {name} format string")
             return
         }
         let got = len(args) - off - 1
         if want != got {
-            self.report(lit.Line, lit.Col,
-                        "{name} format needs {want} argument(s), " ||
-                        "call passes {got}")
+            self.report_at(fa,
+                           "{name} format needs {want} argument(s), " ||
+                           "call passes {got}")
         }
     }
 }

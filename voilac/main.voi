@@ -155,10 +155,17 @@ func run(prog load.Program, csrc str, args []str) {
 // into the hash in its place would silently drop that file's content from the
 // key, which is how a stale binary gets run forever.
 //
-// The compiler's own identity is not part of the key. After rebuilding the
-// compiler, clear ~/.cache/voila to force a recompile.
+// The COMPILER's identity is part of the key too — its size and modification
+// time. A new compiler emits different code, so every cached binary the old one
+// produced is stale the moment the toolchain is rebuilt. Without this, `voila
+// run` would go on executing binaries built by a compiler that no longer
+// exists, and a bug fix would appear not to work.
 func source_key(prog load.Program) int {
     var h = -3750763034362895579          // the FNV-1a 64-bit offset basis
+    let exe = os.exe()
+    h = fnv_into(h, exe)
+    h = fnv_into(h, str(os.size(exe)))
+    h = fnv_into(h, str(os.mtime(exe)))
     each i, p in prog.Paths {
         h = fnv_into(h, prog.Sources[i])
         match os.read(p) {

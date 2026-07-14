@@ -42,6 +42,7 @@ func init() {
 		"os.read", "os.write", "os.open", "os.create", "os.exists", "os.remove",
 		"os.args", "os.env", "os.exit", "os.on_abort", "os.stderr", "os.stdout",
 		"os.isdir", "os.listdir", "os.run", "os.cwd", "os.pid",
+		"os.exe", "os.mtime", "os.size",
 		"math.sqrt", "math.sin", "math.cos", "math.tan", "math.asin",
 		"math.acos", "math.atan", "math.ln", "math.log2", "math.log10",
 		"math.exp", "math.pow", "math.hypot", "math.mod", "math.pi", "math.e",
