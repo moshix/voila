@@ -1,6 +1,9 @@
-# Toolchain binary built at the repo root
+# Toolchain binaries
 /voila
 /voila.exe
+/godump
+/voilac/voilac-*
+/build/voila*
 
 # Build output directories
 /dist/
