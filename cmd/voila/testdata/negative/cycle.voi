@@ -1,5 +1,0 @@
-struct Node {
-    value  int
-    kids   []shared[Node]
-    parent shared[Node]
-}

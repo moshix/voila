@@ -1,4 +1,0 @@
-i64 → float may lose information
-float → int truncates
-binary float → dec is lossy
-literal 300 does not fit in u8

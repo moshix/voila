@@ -1,4 +1,0 @@
-use "std/fmt"
-func main() {
-    fmt.printf("%d %s\n", 1)
-}

@@ -36,12 +36,34 @@ use "std/str"
 func main() {
     let args = os.args()
     if len(args) < 2 {
-        fmt.eprintf("usage: voilac <build|-S|--emit=c|check|load|ast|tokens> " ||
-                    "<file.voi> [-o out]\n")
+        usage()
         os.exit(2)
     }
-    let verb = args[0]
-    let src = args[1]
+    var verb = args[0]
+    var src = args[1]
+
+    // `voila build -S x.voi` and `voila build --emit=c x.voi` are the forms the
+    // manual documents: -S and --emit=c are options of BUILD, not verbs of
+    // their own. They are accepted bare too, because that is what the compiler
+    // itself has always been driven with.
+    if verb == "build" {
+        var i = 1
+        while i < len(args) {
+            let a = args[i]
+            if a == "-S" or a == "--emit=c" or a == "-c" {
+                verb = a
+            } else if a == "-o" or a == "--keep-c" {
+                i += 1                       // the option's value
+            } else if not str.starts_with(a, "-") {
+                src = a
+            }
+            i += 1
+        }
+    }
+    if src == "" or str.starts_with(src, "-") {
+        usage()
+        os.exit(2)
+    }
 
     // The two front-end-only verbs work on ONE file: no packages, no loader.
     if verb == "tokens" {
@@ -192,6 +214,16 @@ func cache_dir() str {
     let home = os.env("HOME")
     if home == nil { return "/tmp/voila-cache" }
     return path.Join(str(home), ".cache/voila")
+}
+
+func usage() {
+    fmt.eprintf("voila — the Voilà compiler\n\n")
+    fmt.eprintf("  voila run    <file.voi> [args…]   compile (cached) and run\n")
+    fmt.eprintf("  voila build  <file.voi> [-o exe]  compile to a binary\n")
+    fmt.eprintf("  voila build -S      <file.voi>    emit the assembly listing\n")
+    fmt.eprintf("  voila build --emit=c <file.voi>   emit the C\n")
+    fmt.eprintf("  voila check  <file.voi>           verify only\n")
+    fmt.eprintf("\n  ast | tokens | load              dump a front-end stage\n")
 }
 
 func run_tokens(p str) {

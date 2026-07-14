@@ -1,2 +1,0 @@
-match on `Shape` is not exhaustive
-missing cases: Rect

@@ -1,8 +1,0 @@
-enum Shape { Circle(r float), Rect(w float, h float), Empty }
-
-func f(s Shape) {
-    match s {
-        Circle(r) => say r
-        Empty     => say "empty"
-    }
-}
