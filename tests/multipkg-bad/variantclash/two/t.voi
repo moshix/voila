@@ -1,0 +1,3 @@
+package two
+enum T { Empty, Node(a int, b int) }
+func Zero() T { return Empty }

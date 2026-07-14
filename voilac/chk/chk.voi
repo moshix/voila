@@ -1,0 +1,310 @@
+// Package chk implements Voilà's static checks — the self-hosted port of
+// internal/check.
+//
+// It is the pragmatic stage-0 subset: borrow-escape in struct fields (§6.2),
+// the Acyclicity Rule (§6.3), the widening-lattice literal checks (§3.2),
+// match exhaustiveness (§3.5), straight-line use-after-move (§6.1) and the
+// literal format-string checks (§13.1).
+//
+// The Go checker fills a diag.Bag with a message, a span, a label, notes and
+// help; here a diagnostic is only its position and its message text, which
+// must match Go's byte for byte — Check returns them rendered as
+// "<src>:<line>:<col>: <message>", sorted by position exactly as diag.Bag's
+// Render sorts them.
+//
+// The AST is an arena (package ast), so every "node pointer" is an int index
+// and 0 means absent.
+package chk
+
+use "voilac/ast"
+use "std/str"
+
+// Diag is one diagnostic: where, and what.
+struct Diag {
+    Line int
+    Col  int
+    Msg  str
+}
+
+struct Checker {
+    T    ast.Tree
+    file int          // the FILE node
+
+    // The declaration tables, keyed by the FLAT name the loader produced
+    // (`geom.Point`, not `Point`). The Go checker keys three maps the same
+    // way; the parallel name slices give a stable, declaration-order walk
+    // where Go iterates a map.
+    structs map[str]int   // name → STRUCTDEC node
+    enums   map[str]int   // name → ENUMDEC node
+    funcs   map[str]int   // name → FUNC node
+    sNames  []str
+    eNames  []str
+
+    // Acyclicity state (acyclic.voi). A slice cannot be grown through a
+    // parameter, so the owning-edge table and the reported-cycle set live on
+    // the checker rather than being threaded through the DFS.
+    edges    []Edge
+    reported set[str]
+
+    Diags []Diag
+}
+
+// Check runs every static check over a loaded, flattened program and returns
+// the diagnostics — empty when the program is clean.
+func Check(t ast.Tree, file int, srcName str) []str {
+    var c = Checker{
+        T: t, file: file,
+        structs: make(map[str]int), enums: make(map[str]int),
+        funcs: make(map[str]int), sNames: [], eNames: [],
+        edges: [], reported: set([]), Diags: [],
+    }
+    c.collect()
+    c.check_borrow_fields()
+    c.check_acyclicity()
+    c.check_lattice()
+    c.check_exhaustiveness()
+    c.check_moves()
+    c.check_format_strings()
+    return c.render(srcName)
+}
+
+impl Checker {
+    // collect indexes the top-level declarations the checks consult. A
+    // `type X { … }` declaration carries its struct as a child, and the Go
+    // checker files it under the TYPE's name.
+    func collect(mut self) {
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            let n = self.T.Get(d)
+            if n.Kind == ast.STRUCTDEC {
+                self.add_struct(n.Sval, d)
+            } else if n.Kind == ast.ENUMDEC {
+                if not (n.Sval in self.enums) { self.eNames.append(n.Sval) }
+                self.enums[n.Sval] = d
+            } else if n.Kind == ast.FUNC {
+                self.funcs[n.Sval] = d
+            } else if n.Kind == ast.TYPEDEC {
+                let sd = self.T.Kid(d, 0)
+                if sd != 0 { self.add_struct(n.Sval, sd) }
+            }
+        }
+    }
+
+    func add_struct(mut self, name str, node int) {
+        if not (name in self.structs) { self.sNames.append(name) }
+        self.structs[name] = node
+    }
+
+    func report(mut self, line int, col int, msg str) {
+        self.Diags.append(Diag{Line: line, Col: col, Msg: msg})
+    }
+
+    func report_at(mut self, node int, msg str) {
+        let n = self.T.Get(node)
+        self.report(n.Line, n.Col, msg)
+    }
+
+    // ------------------------------------------------------------ borrows
+
+    // check_borrow_fields rejects borrows stored in struct fields (§6.2): a
+    // field outlives the call that lent the value, so a borrow there could
+    // escape.
+    func check_borrow_fields(mut self) {
+        each name in self.sNames {
+            let fields = self.T.Kid(self.structs[name], 0)
+            each f in self.T.Get(fields).Kids {
+                let te = self.T.Get(f).Ival
+                if te != 0 and self.T.Kind(te) == ast.TBORROW {
+                    self.report_at(te, "borrow stored in struct field — " ||
+                                       "borrows cannot escape (§6.2)")
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ output
+
+    // render sorts the diagnostics by position and formats them. The sort is
+    // an INSERTION sort because it must be STABLE: diag.Bag uses
+    // sort.SliceStable, so two diagnostics at one position keep the order the
+    // checks produced them in.
+    func render(self, srcName str) []str {
+        var ds = []
+        each d in self.Diags { ds.append(d) }
+        var i = 1
+        while i < len(ds) {
+            let cur = ds[i]
+            var j = i - 1
+            while j >= 0 and after(ds[j], cur) {
+                ds[j + 1] = ds[j]
+                j -= 1
+            }
+            ds[j + 1] = cur
+            i += 1
+        }
+        var out = []
+        each d in ds {
+            out.append("{srcName}:{d.Line}:{d.Col}: {d.Msg}")
+        }
+        return out
+    }
+
+    // ------------------------------------------------------------ walkers
+
+    // all_stmts lists every statement the Go checker's walkStmts visits, in
+    // the same order: function bodies, impl and exception methods, global
+    // bindings, then the script statements. Expressions are NOT entered, so a
+    // `match` inside a closure literal is invisible to these checks —
+    // exactly as in Go.
+    func all_stmts(self) []int {
+        var out = []
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            let n = self.T.Get(d)
+            if n.Kind == ast.FUNC {
+                each s in self.walk_block(self.T.Kid(d, 0)) { out.append(s) }
+            } else if n.Kind == ast.IMPLDEC {
+                each m in self.T.Get(self.T.Kid(d, 0)).Kids {
+                    each s in self.walk_block(self.T.Kid(m, 0)) {
+                        out.append(s)
+                    }
+                }
+            } else if n.Kind == ast.EXCDEC {
+                each m in self.T.Get(self.T.Kid(d, 1)).Kids {
+                    each s in self.walk_block(self.T.Kid(m, 0)) {
+                        out.append(s)
+                    }
+                }
+            } else if n.Kind == ast.GLOBAL {
+                each s in self.walk_stmt(self.T.Kid(d, 0)) { out.append(s) }
+            }
+        }
+        each s in self.T.Get(self.T.Kid(self.file, 2)).Kids {
+            each x in self.walk_stmt(s) { out.append(x) }
+        }
+        return out
+    }
+
+    func walk_block(self, b int) []int {
+        var out = []
+        if b == 0 { return out }
+        each s in self.T.Get(b).Kids {
+            each x in self.walk_stmt(s) { out.append(x) }
+        }
+        return out
+    }
+
+    func walk_stmt(self, s int) []int {
+        var out = []
+        if s == 0 { return out }
+        out.append(s)
+        let k = self.T.Kind(s)
+        if k == ast.BLOCK {
+            each x in self.walk_block(s) { out.append(x) }
+        } else if k == ast.IF {
+            each x in self.walk_block(self.T.Kid(s, 1)) { out.append(x) }
+            each x in self.walk_stmt(self.T.Kid(s, 2)) { out.append(x) }
+        } else if k == ast.FOR or k == ast.EACH or k == ast.WHILE or
+                  k == ast.GROUP {
+            // for/each/while/group all keep their body in the second slot.
+            each x in self.walk_block(self.T.Kid(s, 1)) { out.append(x) }
+        } else if k == ast.SWITCH {
+            each cs in self.T.Get(self.T.Kid(s, 1)).Kids {
+                each b in self.T.Get(self.T.Kid(cs, 1)).Kids {
+                    each x in self.walk_stmt(b) { out.append(x) }
+                }
+            }
+        } else if k == ast.MATCH {
+            each a in self.T.Get(self.T.Kid(s, 1)).Kids {
+                each b in self.T.Get(self.T.Kid(a, 1)).Kids {
+                    each x in self.walk_stmt(b) { out.append(x) }
+                }
+            }
+        } else if k == ast.SELECTSTMT {
+            each cs in self.T.Get(self.T.Kid(s, 0)).Kids {
+                each b in self.T.Get(self.T.Kid(cs, 2)).Kids {
+                    each x in self.walk_stmt(b) { out.append(x) }
+                }
+            }
+        } else if k == ast.TRYCATCH {
+            each x in self.walk_block(self.T.Kid(s, 0)) { out.append(x) }
+            each cc in self.T.Get(self.T.Kid(s, 1)).Kids {
+                each x in self.walk_block(self.T.Kid(cc, 0)) { out.append(x) }
+            }
+            each x in self.walk_block(self.T.Kid(s, 2)) { out.append(x) }
+        }
+        return out
+    }
+
+    // walk_expr returns e and every sub-expression Go's walkExpr visits, in
+    // the same pre-order. A closure's body is a BLOCK, not an expression, and
+    // is not entered; nor is a spawn block or an `else` whose alternative is a
+    // diverging statement (Go keeps those in AltStmt/Block, which walkExpr
+    // skips).
+    func walk_expr(self, e int) []int {
+        var out = []
+        if e == 0 { return out }
+        out.append(e)
+        let n = self.T.Get(e)
+        let k = n.Kind
+        if k == ast.UNARY or k == ast.TRYEXPR or k == ast.MUSTEXPR or
+           k == ast.ATTEMPT or k == ast.FIELD {
+            each x in self.walk_expr(self.T.Kid(e, 0)) { out.append(x) }
+        } else if k == ast.BINARY or k == ast.INDEX {
+            each x in self.walk_expr(self.T.Kid(e, 0)) { out.append(x) }
+            each x in self.walk_expr(self.T.Kid(e, 1)) { out.append(x) }
+        } else if k == ast.RANGE {
+            each x in self.walk_expr(self.T.Kid(e, 0)) { out.append(x) }
+            each x in self.walk_expr(self.T.Kid(e, 1)) { out.append(x) }
+            each x in self.walk_expr(self.T.Kid(e, 2)) { out.append(x) }
+        } else if k == ast.CALL {
+            each x in self.walk_expr(self.T.Kid(e, 0)) { out.append(x) }
+            each a in self.T.Get(self.T.Kid(e, 1)).Kids {
+                each x in self.walk_expr(self.T.Kid(a, 0)) { out.append(x) }
+            }
+        } else if k == ast.COMPOSITE {
+            each f in n.Kids {
+                each x in self.walk_expr(self.T.Kid(f, 0)) { out.append(x) }
+            }
+        } else if k == ast.SLICELIT or k == ast.TUPLE {
+            each el in n.Kids {
+                each x in self.walk_expr(el) { out.append(x) }
+            }
+        } else if k == ast.INTERP {
+            each p in n.Kids {
+                // A literal part is a STR node; Go stores it as a plain string
+                // with a nil Expr and never visits it.
+                if self.T.Kind(p) != ast.STR {
+                    each x in self.walk_expr(p) { out.append(x) }
+                }
+            }
+        } else if k == ast.ELSEEXPR {
+            each x in self.walk_expr(self.T.Kid(e, 0)) { out.append(x) }
+            if n.Ival2 != 1 {
+                each x in self.walk_expr(self.T.Kid(e, 1)) { out.append(x) }
+            }
+        } else if k == ast.SPAWNEXPR {
+            if n.Ival2 != 1 {
+                each x in self.walk_expr(self.T.Kid(e, 0)) { out.append(x) }
+            }
+        }
+        return out
+    }
+}
+
+// after reports whether a sorts after b by (line, col).
+func after(a Diag, b Diag) bool {
+    if a.Line != b.Line { return a.Line > b.Line }
+    return a.Col > b.Col
+}
+
+// chr renders one byte value as a string.
+func chr(c int) str { return str.from_runes([rune(c)]) }
+
+// has_byte reports whether s contains the byte c.
+func has_byte(s str, c int) bool {
+    var i = 0
+    while i < len(s) {
+        if s[i] == c { return true }
+        i += 1
+    }
+    return false
+}

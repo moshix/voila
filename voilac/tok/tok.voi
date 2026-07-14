@@ -1,0 +1,211 @@
+// Package tok — the token vocabulary of Voilà, and the Token record.
+//
+// Kinds are integer constants rather than an enum: variant names are global
+// across a program (§11.5) and a compiler has hundreds of them, so plain
+// constants keep the namespace clean and make the tables below trivial.
+package tok
+
+struct Token {
+    Kind    int
+    Lit     str
+    Line    int
+    Col     int
+    // An interpolated string carries its pieces: Parts[i] is either literal
+    // text (IsExpr[i] false) or the source of an embedded expression.
+    // PartLine/PartCol locate each piece in the enclosing file, so a
+    // diagnostic inside `"{x + }"` points at the real column.
+    Parts    []str
+    IsExpr   []bool
+    PartLine []int
+    PartCol  []int
+    Virtual bool   // a semicolon inserted at a line end (§2.4)
+}
+
+const EOF     = 0
+const ILLEGAL = 1
+const SEMI    = 2
+const IDENT   = 3
+const INT     = 4
+const FLOAT   = 5
+const DEC     = 6
+const STR     = 7
+const ISTR    = 8
+const RUNE    = 9
+
+// Keywords occupy 100..199, in the order of the reserved-word list (§2.5).
+const KW_FIRST = 100
+const AND       = 100
+const AS        = 101
+const ATTEMPT   = 102
+const BREAK     = 103
+const CASE      = 104
+const CATCH     = 105
+const CHAN      = 106
+const CONST     = 107
+const CONTINUE  = 108
+const DEFER     = 109
+const DROP      = 110
+const EACH      = 111
+const ELSE      = 112
+const ENUM      = 113
+const EXCEPTION = 114
+const FALSE     = 115
+const FINALLY   = 116
+const FOR       = 117
+const FUNC      = 118
+const GROUP     = 119
+const IF        = 120
+const IMPL      = 121
+const IMPORT    = 122
+const IN        = 123
+const LET       = 124
+const MATCH     = 125
+const MUST      = 126
+const MUT       = 127
+const NIL       = 128
+const NOT       = 129
+const NOTHROW   = 130
+const NUMERIC   = 131
+const OR        = 132
+const OWN       = 133
+const PACKAGE   = 134
+const PARSE     = 135
+const RETURN    = 136
+const SAY       = 137
+const SELECT    = 138
+const SELF      = 139
+const SHARED    = 140
+const SPAWN     = 141
+const STRUCT    = 142
+const SWITCH    = 143
+const THROW     = 144
+const THROWS    = 145
+const TRAIT     = 146
+const TRUE      = 147
+const TRY       = 148
+const TYPE      = 149
+const USE       = 150
+const VAR       = 151
+const WEAK      = 152
+const WHILE     = 153
+const YIELD     = 154
+const KW_LAST   = 154
+
+// Operators and punctuation occupy 200+.
+const PLUS      = 200
+const MINUS     = 201
+const STAR      = 202
+const SLASH     = 203
+const FLOORDIV  = 204
+const PERCENT   = 205
+const POWER     = 206
+const CONCAT    = 207
+const SHL       = 208
+const SHR       = 209
+const AMP       = 210
+const PIPE      = 211
+const CARET     = 212
+const TILDE     = 213
+const LT        = 214
+const LE        = 215
+const GT        = 216
+const GE        = 217
+const EQ        = 218
+const NE        = 219
+const ASSIGN    = 220
+const PLUSEQ    = 221
+const MINUSEQ   = 222
+const STAREQ    = 223
+const SLASHEQ   = 224
+const PERCENTEQ = 225
+const CONCATEQ  = 226
+const DEFINE    = 227
+const LPAREN    = 228
+const RPAREN    = 229
+const LBRACKET  = 230
+const RBRACKET  = 231
+const LBRACE    = 232
+const RBRACE    = 233
+const COMMA     = 234
+const DOT       = 235
+const COLON     = 236
+const ARROW     = 237
+const FATARROW  = 238
+const RANGE     = 239
+const RANGEEQ   = 240
+const ELLIPSIS  = 241
+const BANG      = 242
+const QUESTION  = 243
+
+func Keywords() []str {
+    return ["and", "as", "attempt", "break", "case", "catch", "chan", "const",
+            "continue", "defer", "drop", "each", "else", "enum", "exception",
+            "false", "finally", "for", "func", "group", "if", "impl", "import",
+            "in", "let", "match", "must", "mut", "nil", "not", "nothrow",
+            "numeric", "or", "own", "package", "parse", "return", "say",
+            "select", "self", "shared", "spawn", "struct", "switch", "throw",
+            "throws", "trait", "true", "try", "type", "use", "var", "weak",
+            "while", "yield"]
+}
+
+// Ops3, Ops2, Ops1 are matched longest-first by the lexer. The parallel Code
+// tables give each spelling its kind.
+func Ops3() []str  { return ["...", "..=", "||="] }
+func Ops3Code() []int { return [ELLIPSIS, RANGEEQ, CONCATEQ] }
+
+func Ops2() []str {
+    return ["..", "**", "||", "//", "<<", ">>", "<=", ">=", "==", "!=",
+            "+=", "-=", "*=", "/=", "%=", "<-", "=>", ":="]
+}
+func Ops2Code() []int {
+    return [RANGE, POWER, CONCAT, FLOORDIV, SHL, SHR, LE, GE, EQ, NE,
+            PLUSEQ, MINUSEQ, STAREQ, SLASHEQ, PERCENTEQ, ARROW, FATARROW, DEFINE]
+}
+
+func Ops1() []str {
+    return ["+", "-", "*", "/", "%", "&", "|", "^", "~", "<", ">", "=",
+            "(", ")", "[", "]", "\{", "\}", ",", ".", ":", "!", "?"]
+}
+func Ops1Code() []int {
+    return [PLUS, MINUS, STAR, SLASH, PERCENT, AMP, PIPE, CARET, TILDE,
+            LT, GT, ASSIGN, LPAREN, RPAREN, LBRACKET, RBRACKET, LBRACE,
+            RBRACE, COMMA, DOT, COLON, BANG, QUESTION]
+}
+
+func IsKeyword(k int) bool { return k >= KW_FIRST and k <= KW_LAST }
+
+// Name renders a kind for diagnostics and for the token dump the differential
+// test compares against the Go lexer.
+func Name(k int) str {
+    if k == EOF     { return "EOF" }
+    if k == ILLEGAL { return "ILLEGAL" }
+    if k == SEMI    { return "SEMI" }
+    if k == IDENT   { return "IDENT" }
+    if k == INT     { return "INT" }
+    if k == FLOAT   { return "FLOAT" }
+    if k == DEC     { return "DEC" }
+    if k == STR     { return "STR" }
+    if k == ISTR    { return "ISTR" }
+    if k == RUNE    { return "RUNE" }
+    if IsKeyword(k) { return "KW" }
+    return "OP"
+}
+
+// Spelling gives an operator's or keyword's source text.
+func Spelling(k int) str {
+    if IsKeyword(k) { return Keywords()[k - KW_FIRST] }
+    let three = Ops3Code()
+    each i, c in three {
+        if c == k { return Ops3()[i] }
+    }
+    let two = Ops2Code()
+    each i, c in two {
+        if c == k { return Ops2()[i] }
+    }
+    let one = Ops1Code()
+    each i, c in one {
+        if c == k { return Ops1()[i] }
+    }
+    if k == SEMI { return ";" }
+    return Name(k)
+}

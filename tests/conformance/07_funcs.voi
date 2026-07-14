@@ -1,0 +1,56 @@
+struct Point { x float, y float }
+trait Show { func show(self) str }
+impl Show for Point {
+    func show(self) str { return "({self.x}, {self.y})" }
+}
+impl Point {
+    func shift(mut self, dx float) { self.x += dx }
+    func origin() Point { return Point{0.0, 0.0} }
+}
+struct Stack[T] { items []T }
+impl[T] Stack[T] {
+    func push(mut self, own v T) { self.items.append(v) }
+    func pop(mut self) ?T { return self.items.pop() }
+    func depth(self) int { return len(self.items) }
+}
+func divmod(a, b int) (int, int) { return a//b, a % b }
+func greet(name str, greeting str = "Hello") str { return "{greeting}, {name}!" }
+func total(nums ...int) int {
+    var t = 0
+    each n in nums { t += n }
+    return t
+}
+func make_const(n int) fn() int { return fn() int { return n } }
+
+func main() {
+    let p = Point{x: 1.5, y: 2.5}
+    say p.show(), p
+    var q = Point{1.0, 2.0}
+    q.shift(3.0)
+    say q
+    say Point.origin()
+    var st = Stack[int]{items: []}
+    st.push(1)
+    st.push(2)
+    say st.depth(), st.pop(), st.pop(), st.pop()
+    let a, b = divmod(17, 5)
+    say a, b
+    say greet("moshix"), greet("moshix", greeting: "Ciao")
+    say total(1, 2, 3), total([4, 5]...)
+    let double = fn(x int) int { return x * 2 }
+    say double(21), [1,2,3].map(fn(x) { x * x })
+    var counter = 0
+    let inc = fn() { counter += 1 }
+    inc()
+    inc()
+    say counter
+    // A closure over a loop variable must be built through a helper that takes
+    // the value as a parameter: each iteration then has its own binding in
+    // both engines. (Capturing the loop variable directly is refused by the
+    // native backend — see tests/negative/loopcapture.)
+    var fs = []
+    for i in 0..3 { fs.append(make_const(i)) }
+    var got = []
+    each f in fs { got.append(f()) }
+    say fs.len(), got
+}

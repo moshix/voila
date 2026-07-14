@@ -1,0 +1,35 @@
+struct Node {
+    name   str
+    kids   []shared[Node]
+    parent weak[Node]
+}
+func depth(n shared[Node]) int {
+    match n.parent.upgrade() {
+        Some(p) => return 1 + depth(p)
+        nil     => return 0
+    }
+}
+func consume(own v []int) int { return len(v) }
+func main() {
+    let root = shared(Node{name: "root", kids: []})
+    let kid = shared(Node{name: "kid", kids: [], parent: weak(root)})
+    root.kids.append(kid)
+    say depth(root), depth(kid), len(root.kids)
+    say root.name, kid.parent.upgrade().name
+
+    var data = [1, 2, 3]
+    say consume(data)
+
+    var a = [1, 2, 3]
+    let b = a.clone()
+    b.append(4)
+    say a, b
+
+    let c = cell[int](5)
+    say c.get()
+    c.set(6)
+    say c.get()
+
+    let s = shared(42)
+    say s.get()
+}

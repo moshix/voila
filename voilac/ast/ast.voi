@@ -1,0 +1,336 @@
+// Package ast — the syntax tree, as an ARENA.
+//
+// The Acyclicity Rule (§6.3) forbids a type that reaches itself through a
+// scalar owning edge, so `enum Expr { Bin(x Expr, y Expr) }` is not a legal
+// Voilà type. The compiler's own tree is therefore a flat vector of nodes with
+// integer child indices — which is what a serious compiler wants anyway: no
+// pointer chasing, trivial serialisation, and O(1) node access.
+//
+// Every node — expression, statement, declaration, type, pattern — is one
+// Node. Kind says which; Ival, Sval and Kids carry the payload, documented per
+// kind below.
+package ast
+
+use "std/str"
+
+struct Node {
+    Kind  int
+    Line  int
+    Col   int
+    Ival  int    // a node id (a type, a pattern) or an operator kind
+    Ival2 int    // a flag set: parameter mode, inclusivity, box kind
+    Sval  str    // name or literal text
+    Kids  []int  // child node ids — LIST nodes group the variable-length parts
+}
+
+struct Tree {
+    Nodes []Node
+}
+
+func NewTree() Tree {
+    // Node 0 is the nil node: an absent child is 0, never a valid index.
+    var t = Tree{Nodes: []}
+    t.Nodes.append(Node{Kind: NIL_NODE, Line: 0, Col: 0, Ival: 0, Ival2: 0,
+                        Sval: "", Kids: []})
+    return t
+}
+
+impl Tree {
+    func Add(mut self, kind int, line int, col int, ival int, ival2 int,
+             sval str, kids []int) int {
+        let id = len(self.Nodes)
+        self.Nodes.append(Node{Kind: kind, Line: line, Col: col, Ival: ival,
+                               Ival2: ival2, Sval: sval, Kids: kids})
+        return id
+    }
+
+    // List makes a container node: the tree is an arena, so every
+    // variable-length part of a declaration (parameters, arms, cases) hangs
+    // off exactly one LIST child, which keeps child slots positional.
+    func List(mut self, kids []int) int {
+        return self.Add(LIST, 0, 0, 0, 0, "", kids)
+    }
+
+    func Get(self, id int) Node { return self.Nodes[id] }
+
+    func Kind(self, id int) int { return self.Nodes[id].Kind }
+
+    func Kid(self, id int, i int) int {
+        let ks = self.Nodes[id].Kids
+        if i >= len(ks) { return 0 }
+        return ks[i]
+    }
+
+    func NKids(self, id int) int { return len(self.Nodes[id].Kids) }
+
+    // SetKid replaces a child (the parser back-patches while folding).
+    func SetKid(mut self, id int, i int, v int) {
+        self.Nodes[id].Kids[i] = v
+    }
+
+    func AddKid(mut self, id int, v int) {
+        self.Nodes[id].Kids.append(v)
+    }
+
+    // Graft copies every node of another tree into this arena and returns the
+    // new id of `root`. Child ids — and the Ival node-reference of a ref-kind
+    // node — are relocated; the nil node (0) stays 0. This is how the loader
+    // merges a program's packages into a single tree, and how the parser folds
+    // an interpolated string's sub-expressions in.
+    func Graft(mut self, src Tree, root int) int {
+        let base = len(self.Nodes)
+        var j = 1
+        while j < len(src.Nodes) {
+            let n = src.Nodes[j]
+            var kids = []
+            each c in n.Kids {
+                if c == 0 {
+                    kids.append(0)
+                } else {
+                    kids.append(c + base - 1)
+                }
+            }
+            var iv = n.Ival
+            if IsRefKind(n.Kind) and iv != 0 {
+                iv = iv + base - 1
+            }
+            self.Add(n.Kind, n.Line, n.Col, iv, n.Ival2, n.Sval, kids)
+            j += 1
+        }
+        if root == 0 { return 0 }
+        return root + base - 1
+    }
+}
+
+// IsRefKind reports whether a node's Ival holds a node id (a type or a
+// pattern) rather than an operator kind or a flag set. Every arena-relocating
+// operation — Graft, and the dump — depends on this list being complete.
+func IsRefKind(k int) bool {
+    return k == COMPOSITE or k == CLOSURE or k == LET or k == VAR or
+           k == IF or k == ARM or k == TFN or k == PARAM or
+           k == FIELDDECL or k == IMPLDEC or k == TYPEDEC
+}
+
+const NIL_NODE = 0
+const LIST     = 150  // a container: Kids are the members
+
+// ---------------------------------------------------------------- expressions
+
+const IDENT     = 1   // Sval = name
+const SELF      = 2
+const INT       = 3   // Sval = literal text
+const FLOAT     = 4
+const DEC       = 5
+const STR       = 6
+const RUNE      = 7
+const BOOL      = 8   // Ival = 1 true, 0 false; Sval = "true"/"false"
+const NILLIT    = 9
+const INTERP    = 10  // Kids = parts; a part is STR or any expression
+const UNARY     = 11  // Ival = token kind; Kids[0] = operand
+const BINARY    = 12  // Ival = token kind; Kids[0], Kids[1]
+const RANGE     = 13  // Kids = lo, hi, by(0=none); Ival2 = 1 inclusive
+const CALL      = 14  // Kids = callee, LIST of ARG, LIST of type args
+const INDEX     = 15  // Kids = x, index
+const FIELD     = 16  // Kids[0] = x; Sval = name
+const COMPOSITE = 17  // Sval = type name (Pkg.Name); Ival = TNAMED;
+                      // Kids = COMPFIELD…
+const SLICELIT  = 18  // Kids = elements
+const TUPLE     = 19  // Kids = elements (0 = unit)
+const CLOSURE   = 20  // Ival = result type; Ival2 = 1 for `fn own`;
+                      // Kids = block, LIST of PARAM, LIST of captures
+const TRYEXPR   = 21
+const MUSTEXPR  = 22
+const ATTEMPT   = 23
+const ELSEEXPR  = 24  // Kids = x, alt; Ival2 = 1 when alt is a
+                      // diverging statement (return/throw/break/continue)
+const SPAWNEXPR = 25  // Kids[0] = call or block; Ival2 = 1 when a block
+
+// ---------------------------------------------------------------- statements
+
+const BLOCK       = 40  // Kids = statements
+const LET         = 41  // Sval = names joined by ","; Ival = type node;
+                        // Ival2 = 1 for const; Kids[0] = value
+const VAR         = 42  // Sval = name; Ival = type node; Kids[0] = value (0 = zero)
+const ASSIGN      = 43  // Ival = op token; Kids = target, value
+const EXPRSTMT    = 44
+const IF          = 45  // Ival = pattern (0 unless `if let`);
+                        // Kids = cond-or-value, then, else(0)
+const FOR         = 46  // Sval = "var|label"; Kids = iter(0 = infinite), body
+const EACH        = 47  // Sval = "a,b|label"; Kids = iter, body
+const WHILE       = 48  // Sval = label; Kids = cond, body
+const SWITCH      = 49  // Kids = subject, LIST of CASE
+const MATCH       = 50  // Kids = subject, LIST of ARM
+const SELECTSTMT  = 51  // Kids[0] = LIST of SELCASE
+const GROUP       = 52  // Kids = timeout(0), body; Ival2 = 1 for `try group`
+const PARSESTMT   = 53  // Sval = fold; Kids = source, LIST of PARSETERM
+const SAY         = 54  // Kids = arguments
+const DEFERSTMT   = 55  // Kids[0] = call or block; Ival2 = 1 when a block
+const DROP        = 56  // Sval = name
+const RETURN      = 57  // Kids = values
+const BREAK       = 58  // Sval = label
+const CONTINUE    = 59  // Sval = label
+const FALLTHROUGH = 60
+const NUMERIC     = 61  // Ival = digits
+const THROW       = 62  // Kids = value(0 = rethrow), from(0)
+const TRYCATCH    = 63  // Kids = body, LIST of CATCH, finally(0)
+
+// ---------------------------------------------------------------- declarations
+
+const FILE      = 80  // Sval = package name;
+                      // Kids = LIST of USE, LIST of decls, LIST of script
+const USE       = 81  // Sval = "path|alias"; Ival2 = 1 selective, 2 wildcard;
+                      // Kids = the selective names, as IDENT
+const FUNC      = 82  // Sval = name; Ival2 = flags (1 self, 2 mut, 4 own,
+                      // 8 nothrow); Kids = body(0), LIST of PARAM, LIST of
+                      // results, LIST of generics, LIST of throws, default(0)
+const STRUCTDEC = 83  // Sval = name; Kids = LIST of FIELDDECL, LIST of generics
+const ENUMDEC   = 84  // Sval = name; Kids = LIST of VARIANTDEC, LIST of
+                      // generics
+const TRAITDEC  = 85  // Sval = name; Kids[0] = LIST of FUNC
+const IMPLDEC   = 86  // Sval = trait ("" = inherent); Ival = type node;
+                      // Kids = LIST of FUNC, LIST of generics
+const EXCDEC    = 87  // Sval = name; Kids = LIST of FIELDDECL, LIST of FUNC
+const TYPEDEC   = 88  // Sval = name; Ival = target type; Ival2 = 1 for an
+                      // alias; Kids[0] = STRUCTDEC (0 = none)
+const GLOBAL    = 89  // Kids[0] = LET or VAR
+
+// ---------------------------------------------------------------- auxiliary
+
+const PARAM      = 100 // Sval = name; Ival = type node; Kids[0] = default(0);
+                       // Ival2 = mode (0 borrow, 1 mut, 2 own) | 16 variadic
+const FIELDDECL  = 101 // Sval = name; Ival = type node; Kids[0] = default(0)
+const VARIANTDEC = 102 // Sval = name; Kids[0] = LIST of FIELDDECL
+const ARG        = 103 // Sval = name (named arg); Ival = 1 for spread;
+                       // Kids[0] = value
+const CASE       = 104 // Kids = LIST of values (empty = default), LIST of body
+const ARM        = 105 // Ival = pattern; Kids = guard(0), LIST of body
+const SELCASE    = 106 // Ival = kind (0 recv, 1 send, 2 default);
+                       // Sval = "bind,bindok"; Kids = ch, send, LIST of body
+const CATCH      = 107 // Sval = name; Kids = block, LIST of type nodes
+const COMPFIELD  = 108 // Sval = name (""=positional); Kids[0] = value
+const PARSETERM  = 109 // Ival = kind (0 var, 1 discard, 2 lit, 3 col);
+                       // Ival2 = column; Sval = name or literal text
+const GENERIC    = 110 // Sval = "name|bound"
+
+// ---------------------------------------------------------------- types
+
+const TNAMED  = 120 // Sval = name (may be Pkg.Name); Kids = type args
+const TOPTION = 121
+const TRESULT = 122
+const TSLICE  = 123 // Kids[0] = elem; Kids[1] = length expr (0 = slice)
+const TMAP    = 124 // Kids = key, value
+const TSET    = 125
+const TCHAN   = 126
+const TBOX    = 127 // Ival2 = 0 shared, 1 cell, 2 weak; Kids[0] = elem
+const TFN     = 128 // Kids = params… ; Ival = result type
+const TTUPLE  = 129
+const TBORROW = 130
+
+// ---------------------------------------------------------------- patterns
+
+const PWILD    = 140
+const PNIL     = 141
+const PLIT     = 142 // Kids[0] = literal expression
+const PBIND    = 143 // Sval = name
+const PVARIANT = 144 // Sval = name; Kids = sub-patterns
+
+// Parameter modes. A PARAM keeps its mode in Ival2, with bit 16 for variadic.
+const MODE_BORROW = 0
+const MODE_MUT    = 1
+const MODE_OWN    = 2
+
+// KindName renders a node kind for the AST dump the differential test diffs
+// against the Go parser.
+func KindName(k int) str {
+    if k == IDENT     { return "ident" }
+    if k == SELF      { return "self" }
+    if k == INT       { return "int" }
+    if k == FLOAT     { return "float" }
+    if k == DEC       { return "dec" }
+    if k == STR       { return "str" }
+    if k == RUNE      { return "rune" }
+    if k == BOOL      { return "bool" }
+    if k == NILLIT    { return "nil" }
+    if k == INTERP    { return "interp" }
+    if k == UNARY     { return "unary" }
+    if k == BINARY    { return "binary" }
+    if k == RANGE     { return "range" }
+    if k == CALL      { return "call" }
+    if k == INDEX     { return "index" }
+    if k == FIELD     { return "field" }
+    if k == COMPOSITE { return "composite" }
+    if k == SLICELIT  { return "slicelit" }
+    if k == TUPLE     { return "tuple" }
+    if k == CLOSURE   { return "closure" }
+    if k == TRYEXPR   { return "try" }
+    if k == MUSTEXPR  { return "must" }
+    if k == ATTEMPT   { return "attempt" }
+    if k == ELSEEXPR  { return "else" }
+    if k == SPAWNEXPR { return "spawn" }
+    if k == BLOCK     { return "block" }
+    if k == LET       { return "let" }
+    if k == VAR       { return "var" }
+    if k == ASSIGN    { return "assign" }
+    if k == EXPRSTMT  { return "exprstmt" }
+    if k == IF        { return "if" }
+    if k == FOR       { return "for" }
+    if k == EACH      { return "each" }
+    if k == WHILE     { return "while" }
+    if k == SWITCH    { return "switch" }
+    if k == MATCH     { return "match" }
+    if k == SELECTSTMT { return "select" }
+    if k == GROUP     { return "group" }
+    if k == PARSESTMT { return "parse" }
+    if k == SAY       { return "say" }
+    if k == DEFERSTMT { return "defer" }
+    if k == DROP      { return "drop" }
+    if k == RETURN    { return "return" }
+    if k == BREAK     { return "break" }
+    if k == CONTINUE  { return "continue" }
+    if k == FALLTHROUGH { return "fallthrough" }
+    if k == NUMERIC   { return "numeric" }
+    if k == THROW     { return "throw" }
+    if k == TRYCATCH  { return "trycatch" }
+    if k == FILE      { return "file" }
+    if k == USE       { return "use" }
+    if k == FUNC      { return "func" }
+    if k == STRUCTDEC { return "struct" }
+    if k == ENUMDEC   { return "enum" }
+    if k == TRAITDEC  { return "trait" }
+    if k == IMPLDEC   { return "impl" }
+    if k == EXCDEC    { return "exception" }
+    if k == TYPEDEC   { return "typedecl" }
+    if k == GLOBAL    { return "global" }
+    if k == PARAM     { return "param" }
+    if k == FIELDDECL { return "fielddecl" }
+    if k == VARIANTDEC { return "variant" }
+    if k == ARG       { return "arg" }
+    if k == CASE      { return "case" }
+    if k == ARM       { return "arm" }
+    if k == SELCASE   { return "selcase" }
+    if k == CATCH     { return "catch" }
+    if k == COMPFIELD { return "compfield" }
+    if k == PARSETERM { return "term" }
+    if k == GENERIC   { return "generic" }
+    if k == TNAMED    { return "tname" }
+    if k == TOPTION   { return "topt" }
+    if k == TRESULT   { return "tres" }
+    if k == TSLICE    { return "tslice" }
+    if k == TMAP      { return "tmap" }
+    if k == TSET      { return "tset" }
+    if k == TCHAN     { return "tchan" }
+    if k == TBOX      { return "tbox" }
+    if k == TFN       { return "tfn" }
+    if k == TTUPLE    { return "ttuple" }
+    if k == TBORROW   { return "tborrow" }
+    if k == PWILD     { return "pwild" }
+    if k == PNIL      { return "pnil" }
+    if k == PLIT      { return "plit" }
+    if k == PBIND     { return "pbind" }
+    if k == PVARIANT  { return "pvariant" }
+    if k == LIST      { return "list" }
+    if k == NIL_NODE  { return "-" }
+    return "?"
+}
+
+var _u = str.upper

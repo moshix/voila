@@ -1,0 +1,323 @@
+// voilac — the Voilà compiler, written in Voilà.
+//
+//     voilac run    x.voi [args…]    compile (cached) and execute
+//     voilac build  x.voi [-o exe]   compile to a native binary (via cc)
+//     voilac -S     x.voi            emit the VM assembly listing
+//     voilac --emit=c x.voi          emit the C translation unit
+//     voilac check  x.voi            parse and load only
+//     voilac load   x.voi            dump the flattened program
+//     voilac ast    x.voi            dump the parse tree
+//     voilac tokens x.voi            dump the token stream
+//
+// The pipeline is lex → par → load → low → cg → cc.
+//
+// `run` COMPILES AND EXECUTES rather than interpreting. The Equivalence
+// Guarantee (§12) says a program must behave identically however it is run —
+// and the surest way to keep that promise is to have only one engine. `run`
+// caches the binary under ~/.cache/voila keyed by a hash of every source that
+// took part, so the second run of a script costs nothing. (A bytecode VM would
+// buy faster cold starts at the price of a second semantics to keep in step;
+// it stays a future optimisation, not a second source of truth.)
+package main
+
+use "voilac/lex"
+use "voilac/par"
+use "voilac/load"
+use "voilac/chk"
+use "voilac/low"
+use "voilac/cg"
+use "voilac/ir"
+use "voilac/rt"
+use "voilac/path"
+use "std/os"
+use "std/fmt"
+use "std/str"
+
+func main() {
+    let args = os.args()
+    if len(args) < 2 {
+        fmt.eprintf("usage: voilac <build|-S|--emit=c|check|load|ast|tokens> " ||
+                    "<file.voi> [-o out]\n")
+        os.exit(2)
+    }
+    let verb = args[0]
+    let src = args[1]
+
+    // The two front-end-only verbs work on ONE file: no packages, no loader.
+    if verb == "tokens" {
+        run_tokens(src)
+        return
+    }
+    if verb == "ast" {
+        run_ast(src)
+        return
+    }
+
+    // Everything else compiles a whole program.
+    var prog = load.Load(src)
+    report(prog.Errs)
+
+    if verb == "load" {
+        each line in prog.T.Dump(prog.File) {
+            say line
+        }
+        return
+    }
+
+    // Nothing is lowered until the program is verified: the acyclicity rule,
+    // the widening lattice, match exhaustiveness, use-after-move and the printf
+    // checks all run here (§6, §3.2, §3.5, §13.1).
+    report(chk.Check(prog.T, prog.File, src))
+
+    if verb == "check" {
+        say "ok"
+        return
+    }
+
+    var lo = low.New(prog.T, prog.File, src)
+    try {
+        lo.LowerModule()
+    } catch e: low.LowerError {
+        fmt.eprintf("%s:%d:%d: %s\n", src, e.Line, e.Col, e.Msg)
+        os.exit(1)
+    }
+
+    if verb == "-S" {
+        fmt.printf("%s", ir.Listing(lo.M, str.lines(prog.Src)))
+        return
+    }
+
+    var csrc = ""
+    try {
+        csrc = cg.Compile(prog.T, prog.File, lo.M)
+    } catch e: cg.CGenError {
+        fmt.eprintf("%s\n", e.Msg)
+        os.exit(1)
+    }
+
+    if verb == "--emit=c" or verb == "-c" {
+        fmt.printf("%s", csrc)
+        return
+    }
+    if verb == "build" {
+        build(src, csrc, args)
+        return
+    }
+    if verb == "run" {
+        run(prog, csrc, args)
+        return
+    }
+
+    fmt.eprintf("voilac: unknown verb %s\n", verb)
+    os.exit(2)
+}
+
+// run compiles the program (once) and executes it, forwarding the remaining
+// arguments. The binary is cached under ~/.cache/voila, keyed by a hash of
+// every source that took part — so editing any file in any package invalidates
+// it, and an unchanged script starts instantly.
+func run(prog load.Program, csrc str, args []str) {
+    let key = fmt.sprintf("%016x", source_key(prog))
+    let dir = cache_dir()
+    ensure_dir(dir)
+    let exe = path.Join(dir, key)
+
+    if not os.exists(exe) {
+        // The temporary name is per PROCESS, not per cache key: two concurrent
+        // first-runs of the same program would otherwise `cc -o` the SAME file
+        // and race to rename it, and a truncated binary would be cached
+        // forever. The rename itself is atomic, so the loser simply replaces an
+        // identical file.
+        let tmp = exe || ".tmp" || str(os.pid())
+        compile_c(csrc, tmp)
+        if os.run("mv", ["-f", tmp, exe]) != 0 {
+            fmt.eprintf("voilac: cannot install %s\n", exe)
+            os.exit(1)
+        }
+    }
+
+    var rest = []
+    var i = 2
+    while i < len(args) {
+        rest.append(args[i])
+        i += 1
+    }
+    os.exit(os.run(exe, rest))
+}
+
+// source_key hashes the CONTENT of every source file that took part (FNV-1a,
+// 64-bit), so that editing any file of any imported package invalidates the
+// entry — and so that two different programs cannot collide on one key.
+//
+// It hashes prog.Paths, not prog.Sources: a source's DISPLAY name is relative
+// to the module root and cannot be reopened from another working directory. A
+// participating file that cannot be read is a hard error; folding a constant
+// into the hash in its place would silently drop that file's content from the
+// key, which is how a stale binary gets run forever.
+//
+// The compiler's own identity is not part of the key. After rebuilding the
+// compiler, clear ~/.cache/voila to force a recompile.
+func source_key(prog load.Program) int {
+    var h = -3750763034362895579          // the FNV-1a 64-bit offset basis
+    each i, p in prog.Paths {
+        h = fnv_into(h, prog.Sources[i])
+        match os.read(p) {
+            Ok(text) => h = fnv_into(h, text)
+            Err(e)   => {
+                fmt.eprintf("voilac: cannot re-read %s for the run cache\n", p)
+                os.exit(1)
+            }
+        }
+    }
+    return h
+}
+
+func fnv_into(h0 int, s str) int {
+    var h = h0
+    each b in bytes(s) {
+        h = h ^ b
+        h = wrap_mul(h, 1099511628211)
+    }
+    return h
+}
+
+func cache_dir() str {
+    let home = os.env("HOME")
+    if home == nil { return "/tmp/voila-cache" }
+    return path.Join(str(home), ".cache/voila")
+}
+
+func run_tokens(p str) {
+    var lx = lex.New(p, read(p))
+    let ts = lx.Tokens()
+    // The tokens print even when the scan complained, so that the differential
+    // test can compare error recovery too.
+    each line in lex.Dump(ts) {
+        say line
+    }
+    report(lx.Errs)
+}
+
+func run_ast(p str) {
+    var ps = par.New(p, read(p))
+    let root = ps.File()
+    report(ps.Errs)
+    each line in ps.T.Dump(root) {
+        say line
+    }
+}
+
+// build writes the C and libvoila's source into a scratch directory and hands
+// the lot to the system cc. The binary that comes out links libc and nothing
+// else.
+func build(src str, csrc str, args []str) {
+    var out = default_out(src)
+    var keep = ""
+    var i = 2
+    while i < len(args) {
+        if args[i] == "-o" and i + 1 < len(args) {
+            out = args[i + 1]
+            i += 1
+        } else if args[i] == "--keep-c" and i + 1 < len(args) {
+            keep = args[i + 1]
+            i += 1
+        }
+        i += 1
+    }
+
+    compile_c_in(csrc, out, keep)
+    fmt.printf("voilac: built %s\n", out)
+}
+
+// compile_c writes the C and libvoila's source into a scratch directory and
+// hands the lot to the system cc. The binary that comes out links libc and
+// nothing else.
+func compile_c(csrc str, out str) {
+    compile_c_in(csrc, out, "")
+}
+
+func compile_c_in(csrc str, out str, keep str) {
+    // The scratch directory is per PROCESS. A fixed name would let two
+    // concurrent builds — `make -j`, or a test harness — write the runtime into
+    // the same place and delete it from under each other's cc.
+    var dir = keep
+    if dir == "" { dir = "/tmp/voilac-" || str(os.pid()) }
+    ensure_dir(dir)
+
+    let cpath = path.Join(dir, "program.c")
+    match os.write(cpath, csrc) {
+        Ok(u) => u
+        Err(e) => {
+            fmt.eprintf("voilac: cannot write %s\n", cpath)
+            os.exit(1)
+        }
+    }
+    var cfiles = []
+    match rt.WriteTo(dir) {
+        Ok(fs) => cfiles = fs
+        Err(e) => {
+            fmt.eprintf("voilac: cannot write the runtime into %s\n", dir)
+            os.exit(1)
+        }
+    }
+
+    var cargs = ["-std=c11", "-O2", "-I" || dir, "-o", out, cpath]
+    each f in cfiles {
+        cargs.append(f)
+    }
+    cargs.append("-lm")
+    cargs.append("-lpthread")
+
+    let cc = find_cc()
+    let rc = os.run(cc, cargs)
+    if rc != 0 {
+        fmt.eprintf("voilac: %s failed (exit %d); the C is in %s\n", cc, rc, dir)
+        os.exit(1)
+    }
+    if keep == "" {
+        os.run("rm", ["-rf", dir])
+    }
+}
+
+// find_cc honours $CC, then falls back to the platform's `cc`.
+func find_cc() str {
+    let env = os.env("CC")
+    if env != nil {
+        let s = str(env)
+        if s != "" { return s }
+    }
+    return "cc"
+}
+
+func ensure_dir(d str) {
+    if os.isdir(d) { return }
+    // std/os has no mkdir; the compiler already depends on a cc it can exec.
+    os.run("mkdir", ["-p", d])
+}
+
+// default_out strips the extension: `voilac build hello.voi` gives `hello`.
+func default_out(src str) str {
+    let b = path.Base(src)
+    let e = path.Ext(b)
+    if e == "" { return b || ".out" }
+    return b[0..len(b) - len(e)]
+}
+
+func read(p str) str {
+    match os.read(p) {
+        Ok(s) => return s
+        Err(e) => {
+            fmt.eprintf("voilac: cannot read %s\n", p)
+            os.exit(2)
+        }
+    }
+    return ""
+}
+
+func report(errs []str) {
+    if len(errs) == 0 { return }
+    each e in errs {
+        fmt.eprintf("%s\n", e)
+    }
+    os.exit(2)
+}

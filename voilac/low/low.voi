@@ -1,0 +1,648 @@
+// Package low — AST → IR.
+//
+// A faithful port of internal/ir/lower.go. The oracle is the assembly listing:
+// `voila build -S x.voi` and `voilac -S x.voi` must be byte-identical for every
+// source in the repository.
+//
+// The AST is an arena (package ast), so every "node pointer" here is an int
+// index and 0 means absent.
+package low
+
+use "voilac/ast"
+use "voilac/ir"
+use "voilac/tok"
+use "std/str"
+use "std/fmt"
+
+// LowerError is a lowering failure anchored to a source position. Lowering is
+// all-or-nothing: an unsupported construct throws rather than emitting
+// something that would run differently.
+exception LowerError {
+    Msg  str
+    Line int
+    Col  int
+}
+
+// Scope is one lexical scope. Boundary marks a function frame edge: a lookup
+// crossing it resolves as an upvalue (^name), mirroring the interpreter's
+// by-reference closure capture.
+struct Scope {
+    vars     map[str]str   // name → register
+    boundary bool
+}
+
+struct LoopCtx {
+    name       str
+    breakL     str
+    contL      str
+    finDepth   int   // the fins-stack depth when the loop began
+    scopeDepth int
+}
+
+// FinRegion tracks one try statement for exit-edge duplication: a
+// return/break/continue leaving the region must EHPOP (while the protected body
+// is active) and run the finally block — duplicated per exit edge.
+//
+// A group region is the same shape: leaving it early must still join and
+// deliver, exactly as the interpreter's execGroup does on a body panic.
+// The fields cannot be called `finally` or `group`: those are keywords, and a
+// field name is an identifier.
+struct FinRegion {
+    fin      int    // the finally block node (0 = none)
+    ehActive bool
+    loopSeen int    // the loops-stack depth when pushed
+    isGroup  bool
+    tryGroup bool
+}
+
+struct SwitchCtx {
+    bodyLabels []str
+    current    int
+}
+
+// `enum` is a keyword, so the enclosing enum's name is `owner`.
+struct VariantInfo {
+    owner   str
+    payload bool
+}
+
+// FnState snapshots per-function lowering state around a synthetic closure.
+struct FnState {
+    fi         int
+    nextReg    int
+    nextLabel  int
+    pendLabels []str
+    loops      []LoopCtx
+    fins       []FinRegion
+    switches   []SwitchCtx
+    catchRegs  []str
+    curLine    int
+    curFn      str
+    inGlobal   bool
+    scopeLen   int
+}
+
+struct Lowerer {
+    M    ir.Module
+    T    ast.Tree
+    file int          // the FILE node
+
+    // Global classification tables, in source order.
+    globals    set[str]
+    funcs      set[str]
+    funcParams map[str][]str          // callee → parameter names, for named args
+    variants   map[str]VariantInfo
+    structs    set[str]
+    enums      set[str]
+    exceptions set[str]
+    aliases    set[str]
+    prelude    set[str]
+    packages   set[str]
+
+    // Per-function state.
+    fi         int      // index into M.Funcs of the function being lowered
+    nextReg    int
+    nextLabel  int
+    pendLabels []str
+    scopes     []Scope
+    loops      []LoopCtx
+    fins       []FinRegion
+    switches   []SwitchCtx
+    catchRegs  []str
+    curLine    int
+    curFn      str
+    closureSeq map[str]int
+    inGlobal   bool
+}
+
+func New(t ast.Tree, file int, source str) Lowerer {
+    var lo = Lowerer{
+        M: ir.NewModule(source), T: t, file: file,
+        globals: set([]), funcs: set([]), funcParams: make(map[str][]str),
+        variants: make(map[str]VariantInfo),
+        structs: set([]), enums: set([]), exceptions: set([]),
+        aliases: set([]), prelude: set([]), packages: set([]),
+        fi: 0, nextReg: 0, nextLabel: 0, pendLabels: [], scopes: [],
+        loops: [], fins: [], switches: [], catchRegs: [], curLine: 0,
+        curFn: "", closureSeq: make(map[str]int), inGlobal: false,
+    }
+    return lo
+}
+
+impl Lowerer {
+    func fail(self, node int, msg str) throws LowerError {
+        let n = self.T.Get(node)
+        throw LowerError{Msg: msg, Line: n.Line, Col: n.Col}
+    }
+
+    // ------------------------------------------------------------ collect
+
+    func collect(mut self) {
+        each n in PreludeNames() { self.prelude.add(n) }
+        each n in PackageNames() { self.packages.add(n) }
+        // The predeclared exception types are constructible and catchable just
+        // like user ones (§8.2); the runtime knows their field layouts.
+        each n in BuiltinExceptions() { self.exceptions.add(n) }
+
+        let decls = self.T.Kid(self.file, 1)
+        each d in self.T.Get(decls).Kids {
+            let n = self.T.Get(d)
+            if n.Kind == ast.FUNC {
+                self.funcs.add(n.Sval)
+                self.funcParams[n.Sval] = self.param_names(d)
+            } else if n.Kind == ast.STRUCTDEC {
+                self.structs.add(n.Sval)
+            } else if n.Kind == ast.ENUMDEC {
+                self.enums.add(n.Sval)
+                let vs = self.T.Kid(d, 0)
+                each v in self.T.Get(vs).Kids {
+                    let vn = self.T.Get(v)
+                    let fs = self.T.Kid(v, 0)
+                    self.variants[vn.Sval] = VariantInfo{
+                        owner: n.Sval,
+                        payload: self.T.NKids(fs) > 0,
+                    }
+                }
+            } else if n.Kind == ast.EXCDEC {
+                self.exceptions.add(n.Sval)
+            } else if n.Kind == ast.TYPEDEC {
+                if self.T.Kid(d, 0) != 0 {
+                    self.structs.add(n.Sval)
+                } else {
+                    self.aliases.add(n.Sval)
+                }
+            } else if n.Kind == ast.IMPLDEC {
+                let tn = self.named_type_name(n.Ival)
+                let ms = self.T.Kid(d, 0)
+                each m in self.T.Get(ms).Kids {
+                    let mn = self.T.Get(m)
+                    self.funcParams[tn || "." || mn.Sval] = self.param_names(m)
+                }
+            } else if n.Kind == ast.GLOBAL {
+                each nm in self.binding_names(self.T.Kid(d, 0)) {
+                    self.globals.add(nm)
+                }
+            }
+        }
+        // Script-form top-level bindings live in the global scope.
+        let script = self.T.Kid(self.file, 2)
+        each s in self.T.Get(script).Kids {
+            each nm in self.binding_names(s) {
+                self.globals.add(nm)
+            }
+        }
+    }
+
+    func param_names(self, fnode int) []str {
+        var ns = []
+        let ps = self.T.Kid(fnode, 1)
+        each p in self.T.Get(ps).Kids {
+            ns.append(self.T.Get(p).Sval)
+        }
+        return ns
+    }
+
+    func binding_names(self, s int) []str {
+        if s == 0 { return [] }
+        let n = self.T.Get(s)
+        if n.Kind == ast.LET { return str.split(n.Sval, ",") }
+        if n.Kind == ast.VAR { return [n.Sval] }
+        return []
+    }
+
+    func named_type_name(self, te int) str {
+        if te == 0 { return "?" }
+        let n = self.T.Get(te)
+        if n.Kind == ast.TNAMED { return n.Sval }
+        return "?"
+    }
+
+    // ------------------------------------------------------------ module
+
+    func LowerModule(mut self) throws LowerError {
+        self.collect()
+        self.collect_type_decls()
+
+        // $INIT: global initialisers, in declaration order.
+        var globalStmts = []
+        let decls = self.T.Kid(self.file, 1)
+        each d in self.T.Get(decls).Kids {
+            if self.T.Kind(d) == ast.GLOBAL {
+                globalStmts.append(self.T.Kid(d, 0))
+            }
+        }
+        if len(globalStmts) > 0 {
+            self.lower_synthetic("$INIT",
+                                 "module initialization (global bindings)",
+                                 globalStmts, true)
+        }
+        let script = self.T.Get(self.T.Kid(self.file, 2)).Kids
+        if len(script) > 0 {
+            self.lower_synthetic("$SCRIPT", "script-form top-level statements",
+                                 script, true)
+        }
+
+        each d in self.T.Get(decls).Kids {
+            let n = self.T.Get(d)
+            if n.Kind == ast.FUNC {
+                self.lower_func_decl(n.Sval, d)
+            } else if n.Kind == ast.IMPLDEC {
+                let tn = self.named_type_name(n.Ival)
+                each m in self.T.Get(self.T.Kid(d, 0)).Kids {
+                    self.lower_func_decl(tn || "." || self.T.Get(m).Sval, m)
+                }
+            } else if n.Kind == ast.EXCDEC {
+                each m in self.T.Get(self.T.Kid(d, 1)).Kids {
+                    self.lower_func_decl(n.Sval || "." || self.T.Get(m).Sval, m)
+                }
+            }
+        }
+    }
+
+    func render_fields(self, fieldList int) []str {
+        var lines = []
+        each f in self.T.Get(fieldList).Kids {
+            let fn2 = self.T.Get(f)
+            var line = fmt.sprintf("%-8s %s",
+                                   str.upper(self.short_type(fn2.Ival)),
+                                   fn2.Sval)
+            let dflt = self.T.Kid(f, 0)
+            if dflt != 0 {
+                line = line || " = " || self.expr_text(dflt)
+            }
+            lines.append(line)
+        }
+        return lines
+    }
+
+    func collect_type_decls(mut self) {
+        let decls = self.T.Kid(self.file, 1)
+        each d in self.T.Get(decls).Kids {
+            let n = self.T.Get(d)
+            if n.Kind == ast.STRUCTDEC {
+                self.M.Types.append(ir.TypeDecl{
+                    Kind: "STRUCT", Name: n.Sval,
+                    Lines: self.render_fields(self.T.Kid(d, 0)),
+                })
+            } else if n.Kind == ast.TYPEDEC {
+                let sd = self.T.Kid(d, 0)
+                if sd != 0 {
+                    self.M.Types.append(ir.TypeDecl{
+                        Kind: "STRUCT", Name: n.Sval,
+                        Lines: self.render_fields(self.T.Kid(sd, 0)),
+                    })
+                }
+            } else if n.Kind == ast.ENUMDEC {
+                var lines = []
+                each v in self.T.Get(self.T.Kid(d, 0)).Kids {
+                    let vn = self.T.Get(v)
+                    var sig = vn.Sval
+                    let fs = self.T.Kid(v, 0)
+                    if self.T.NKids(fs) > 0 {
+                        var ps = []
+                        each f in self.T.Get(fs).Kids {
+                            let fn2 = self.T.Get(f)
+                            ps.append(fn2.Sval || " " ||
+                                      self.short_type(fn2.Ival))
+                        }
+                        sig = sig || "(" || str.join(ps, ", ") || ")"
+                    }
+                    lines.append("VARIANT  " || sig)
+                }
+                self.M.Types.append(ir.TypeDecl{Kind: "ENUM", Name: n.Sval,
+                                                Lines: lines})
+            } else if n.Kind == ast.EXCDEC {
+                self.M.Types.append(ir.TypeDecl{
+                    Kind: "EXCEPTION", Name: n.Sval,
+                    Lines: self.render_fields(self.T.Kid(d, 0)),
+                })
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ functions
+
+    func save_fn(self) FnState {
+        return FnState{
+            fi: self.fi, nextReg: self.nextReg, nextLabel: self.nextLabel,
+            pendLabels: self.pendLabels, loops: self.loops, fins: self.fins,
+            switches: self.switches, catchRegs: self.catchRegs,
+            curLine: self.curLine, curFn: self.curFn, inGlobal: self.inGlobal,
+            scopeLen: len(self.scopes),
+        }
+    }
+
+    func restore_fn(mut self, s FnState) {
+        self.fi = s.fi
+        self.nextReg = s.nextReg
+        self.nextLabel = s.nextLabel
+        self.pendLabels = s.pendLabels
+        self.loops = s.loops
+        self.fins = s.fins
+        self.switches = s.switches
+        self.catchRegs = s.catchRegs
+        self.curLine = s.curLine
+        self.curFn = s.curFn
+        self.inGlobal = s.inGlobal
+        self.scopes = self.scopes[0..s.scopeLen]
+    }
+
+    // begin_fn starts a new IR function and makes it current.
+    func begin_fn(mut self, name str, sig str, srcLine int) {
+        self.M.Funcs.append(ir.Func{
+            Name: name, Sig: sig, NRegs: 0, Instrs: [], SrcLine: srcLine,
+            Ups: [], LoopCapture: "",
+        })
+        self.fi = len(self.M.Funcs) - 1
+        self.nextReg = 0
+        self.nextLabel = 0
+        self.pendLabels = []
+        self.loops = []
+        self.fins = []
+        self.switches = []
+        self.catchRegs = []
+        self.curLine = 0
+        self.curFn = name
+        self.inGlobal = false
+    }
+
+    func lower_func_decl(mut self, name str, d int) throws LowerError {
+        let saved = self.save_fn()
+        let dn = self.T.Get(d)
+        self.begin_fn(name, self.func_sig(d), dn.Line)
+
+        self.push_scope(true)
+        if (dn.Ival2 & 1) != 0 {
+            self.declare("self")
+        }
+        let ps = self.T.Get(self.T.Kid(d, 1)).Kids
+        each p in ps {
+            self.declare(self.T.Get(p).Sval)
+        }
+        // Callee-side calling convention: defaults and variadic packing are
+        // function prologue (this mirrors the interpreter's bindParams).
+        each p in ps {
+            let pn = self.T.Get(p)
+            if (pn.Ival2 & 16) != 0 {
+                self.emit(dn.Line, "VARARG", [self.lookup_local(pn.Sval)])
+            }
+            let dflt = self.T.Kid(p, 0)
+            if dflt != 0 {
+                let done = self.new_label()
+                self.emit(dn.Line, "ARGDEF",
+                          [self.lookup_local(pn.Sval), done])
+                let rv = self.lower_expr(dflt)
+                self.emit(dn.Line, "MOVE", [self.lookup_local(pn.Sval), rv])
+                self.mark(done)
+            }
+        }
+        let body = self.T.Kid(d, 0)
+        if body != 0 {
+            self.lower_body(body, false)
+        }
+        self.emit(0, "RET", [])
+        self.M.Funcs[self.fi].NRegs = self.nextReg
+        self.pop_scope()
+        self.restore_fn(saved)
+    }
+
+    // lower_synthetic lowers $INIT / $SCRIPT, whose top-level bindings are
+    // globals.
+    func lower_synthetic(mut self, name str, sig str, stmts []int,
+                         global bool) throws LowerError {
+        let saved = self.save_fn()
+        self.begin_fn(name, sig, 0)
+        self.inGlobal = global
+
+        self.push_scope(true)
+        each s in stmts {
+            self.lower_stmt(s)
+        }
+        self.emit(0, "RET", [])
+        self.M.Funcs[self.fi].NRegs = self.nextReg
+        self.pop_scope()
+        self.restore_fn(saved)
+    }
+
+    // lower_closure lowers a closure/defer/spawn body into a synthetic function
+    // and returns its name. Closures capture the enclosing frame by reference:
+    // the new scope is pushed ON TOP of the current stack with a boundary, so
+    // outer names render as ^upvalues.
+    func lower_closure(mut self, params []int, body int, note str,
+                       srcLine int) str throws LowerError {
+        let outer = self.curFn
+        var seq = 0
+        if outer in self.closureSeq { seq = self.closureSeq[outer] }
+        seq += 1
+        self.closureSeq[outer] = seq
+        let name = outer || "$fn" || str(seq)
+
+        let saved = self.save_fn()
+        self.begin_fn(name, note, srcLine)
+
+        self.push_scope(true)   // boundary: outer locals become ^upvalues
+        each p in params {
+            self.declare(self.T.Get(p).Sval)
+        }
+        each p in params {
+            let pn = self.T.Get(p)
+            if (pn.Ival2 & 16) != 0 {
+                self.emit(srcLine, "VARARG", [self.lookup_local(pn.Sval)])
+            }
+            let dflt = self.T.Kid(p, 0)
+            if dflt != 0 {
+                let done = self.new_label()
+                self.emit(srcLine, "ARGDEF",
+                          [self.lookup_local(pn.Sval), done])
+                let rv = self.lower_expr(dflt)
+                self.emit(srcLine, "MOVE", [self.lookup_local(pn.Sval), rv])
+                self.mark(done)
+            }
+        }
+        let last = self.lower_body(body, true)
+        if last != "" {
+            self.emit(0, "RET", [last])   // the trailing-expression value (§10)
+        } else {
+            self.emit(0, "RET", [])
+        }
+        self.M.Funcs[self.fi].NRegs = self.nextReg
+
+        // Does this closure capture a variable declared inside an enclosing
+        // loop? Each iteration is a fresh binding to the interpreter, but one
+        // frame slot to a frame-capturing backend — so the fact must travel in
+        // the IR, and the C backend refuses rather than answering differently.
+        if len(saved.loops) > 0 {
+            let inner = saved.loops[len(saved.loops) - 1]
+            each up in self.M.Funcs[self.fi].Ups {
+                if up.Scope >= inner.scopeDepth {
+                    self.M.Funcs[self.fi].LoopCapture = up.Name
+                    break
+                }
+            }
+        }
+        self.pop_scope()
+        self.restore_fn(saved)
+        return name
+    }
+
+    // ------------------------------------------------------------ emit
+
+    func emit(mut self, line int, op str, args []str) {
+        var ins = ir.Instr{Labels: [], Op: op, Args: args, Pat: 0, Terms: [],
+                           Src: line}
+        if len(self.pendLabels) > 0 {
+            ins.Labels = self.pendLabels
+            self.pendLabels = []
+        }
+        self.M.Funcs[self.fi].Instrs.append(ins)
+    }
+
+    // emit_pat emits an instruction carrying a structured match pattern.
+    func emit_pat(mut self, line int, op str, args []str, pat int) {
+        self.emit(line, op, args)
+        let i = len(self.M.Funcs[self.fi].Instrs) - 1
+        self.M.Funcs[self.fi].Instrs[i].Pat = pat
+    }
+
+    // emit_terms emits an instruction carrying a structured parse template.
+    func emit_terms(mut self, line int, op str, args []str, terms []ir.Term) {
+        self.emit(line, op, args)
+        let i = len(self.M.Funcs[self.fi].Instrs) - 1
+        self.M.Funcs[self.fi].Instrs[i].Terms = terms
+    }
+
+    // note emits a pure comment line into the instruction stream.
+    func note(mut self, text str) {
+        self.M.Funcs[self.fi].Instrs.append(
+            ir.Instr{Labels: [], Op: "*", Args: [text], Pat: 0, Terms: [],
+                     Src: 0})
+    }
+
+    func new_reg(mut self) str {
+        let r = "r" || str(self.nextReg)
+        self.nextReg += 1
+        return r
+    }
+
+    func new_label(mut self) str {
+        self.nextLabel += 1
+        return "L" || str(self.nextLabel)
+    }
+
+    func mark(mut self, label str) {
+        self.pendLabels.append(label)
+    }
+
+    // ------------------------------------------------------------ scopes
+
+    func push_scope(mut self, boundary bool) {
+        self.scopes.append(Scope{vars: make(map[str]str), boundary: boundary})
+    }
+
+    func pop_scope(mut self) {
+        self.scopes = self.scopes[0..len(self.scopes) - 1]
+    }
+
+    // declare binds a fresh register to name in the current scope.
+    func declare(mut self, name str) str {
+        let r = self.new_reg()
+        if name != "_" {
+            self.scopes[len(self.scopes) - 1].vars[name] = r
+        }
+        return r
+    }
+
+    // lookup resolves a name to a local register or to an ^upvalue (having
+    // crossed a function boundary). It returns "" when the name is unknown.
+    // Crossing a boundary records the upvalue's (depth, slot) on the function
+    // being lowered — which is what a code generator needs; the listing keeps
+    // the readable `^name` form.
+    func lookup(mut self, name str) str {
+        var depth = 0
+        var i = len(self.scopes) - 1
+        while i >= 0 {
+            if name in self.scopes[i].vars {
+                let r = self.scopes[i].vars[name]
+                if depth > 0 {
+                    self.record_up(name, depth, r, i)
+                    return "^" || name
+                }
+                return r
+            }
+            if self.scopes[i].boundary { depth += 1 }
+            i -= 1
+        }
+        return ""
+    }
+
+    // is_local reports whether the name resolves without crossing a boundary.
+    func is_local(self, name str) bool {
+        var i = len(self.scopes) - 1
+        while i >= 0 {
+            if name in self.scopes[i].vars { return true }
+            if self.scopes[i].boundary { return false }
+            i -= 1
+        }
+        return false
+    }
+
+    func found(self, name str) bool {
+        var i = len(self.scopes) - 1
+        while i >= 0 {
+            if name in self.scopes[i].vars { return true }
+            i -= 1
+        }
+        return false
+    }
+
+    // record_up notes an upvalue reference on the function being lowered.
+    func record_up(mut self, name str, depth int, reg str, scope int) {
+        if self.M.Funcs[self.fi].HasUp(name) { return }
+        // `int(...)` throws; a lowering bug must not become an uncatchable
+        // ConvError. Only "rN" can reach here, and slot -1 would be visibly
+        // wrong in the listing if that ever stopped being true.
+        var slot = 0 - 1
+        let n = to_int(reg[1..len(reg)])
+        if n != nil { slot = n }
+        self.M.Funcs[self.fi].Ups.append(
+            ir.UpRef{Name: name, Depth: depth, Slot: slot, Scope: scope})
+    }
+
+    func lookup_local(mut self, name str) str {
+        let op = self.lookup(name)
+        if op == "" { return "r?" }
+        return op
+    }
+
+    // ------------------------------------------------------------ blocks
+
+    // lower_body lowers a block's statements in a fresh scope. When wantLast is
+    // true and the final statement is an expression, its register is returned
+    // (the closure trailing-expression value, §10).
+    func lower_body(mut self, b int, wantLast bool) str throws LowerError {
+        self.push_scope(false)
+        let stmts = self.T.Get(b).Kids
+
+        var hasNumeric = false
+        each s in stmts {
+            if self.T.Kind(s) == ast.NUMERIC { hasNumeric = true }
+        }
+        if hasNumeric {
+            self.emit(self.T.Get(b).Line, "NDSAVE", [])
+        }
+        var last = ""
+        each i, s in stmts {
+            if wantLast and i == len(stmts) - 1 and
+               self.T.Kind(s) == ast.EXPRSTMT {
+                last = self.lower_expr(self.T.Kid(s, 0))
+                break
+            }
+            self.lower_stmt(s)
+        }
+        if hasNumeric {
+            self.emit(0, "NDREST", [])
+        }
+        self.pop_scope()
+        return last
+    }
+}

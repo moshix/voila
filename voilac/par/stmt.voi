@@ -1,0 +1,578 @@
+// par/stmt.voi — statements.
+package par
+
+use "voilac/tok"
+use "voilac/ast"
+use "std/str"
+
+impl Parser {
+    func block(mut self) int {
+        let t = self.expect(tok.LBRACE)
+        // A block resets the bracket depth: inside it a composite literal is
+        // once again ambiguous with the block brace (§15, and the Go parser).
+        let saved = self.lev
+        self.lev = 0
+        var ss = []
+        while true {
+            self.skip_semis()
+            if self.at(tok.RBRACE) or self.at(tok.EOF) { break }
+            ss.append(self.stmt())
+        }
+        self.expect(tok.RBRACE)
+        self.lev = saved
+        return self.add(ast.BLOCK, t, 0, 0, "", ss)
+    }
+
+    func stmt(mut self) int {
+        let t = self.cur()
+        let k = t.Kind
+
+        if k == tok.LET or k == tok.CONST { return self.let_stmt() }
+        if k == tok.VAR                   { return self.var_stmt() }
+        if k == tok.IF                    { return self.if_stmt() }
+        if k == tok.FOR or k == tok.EACH or k == tok.WHILE {
+            return self.loop_stmt("")
+        }
+        if k == tok.IDENT {
+            // A label: `outer: for …`.
+            if self.peek(1).Kind == tok.COLON {
+                let k2 = self.peek(2).Kind
+                if k2 == tok.FOR or k2 == tok.EACH or k2 == tok.WHILE {
+                    let label = self.next().Lit
+                    self.next()
+                    return self.loop_stmt(label)
+                }
+            }
+            if t.Lit == "fallthrough" and (self.peek(1).Kind == tok.SEMI or
+                                           self.peek(1).Kind == tok.RBRACE) {
+                self.next()
+                self.expect_semi()
+                return self.add(ast.FALLTHROUGH, t, 0, 0, "", [])
+            }
+            return self.simple_stmt()
+        }
+        if k == tok.SWITCH { return self.switch_stmt() }
+        if k == tok.MATCH  { return self.match_stmt() }
+        if k == tok.SELECT { return self.select_stmt() }
+        if k == tok.GROUP  { return self.group_stmt(0) }
+        if k == tok.PARSE  { return self.parse_stmt() }
+        if k == tok.SAY    { return self.say_stmt() }
+        if k == tok.DEFER  { return self.defer_stmt() }
+
+        if k == tok.DROP {
+            self.next()
+            let n = self.expect(tok.IDENT)
+            self.expect_semi()
+            return self.add(ast.DROP, t, 0, 0, n.Lit, [])
+        }
+        if k == tok.RETURN {
+            self.next()
+            var vs = []
+            if not self.at(tok.SEMI) and not self.at(tok.RBRACE) and
+               not self.at(tok.EOF) {
+                vs.append(self.expr())
+                while self.accept(tok.COMMA) { vs.append(self.expr()) }
+            }
+            self.expect_semi()
+            return self.add(ast.RETURN, t, 0, 0, "", vs)
+        }
+        if k == tok.BREAK or k == tok.CONTINUE {
+            self.next()
+            var label = ""
+            if self.at(tok.IDENT) { label = self.next().Lit }
+            self.expect_semi()
+            var kind = ast.BREAK
+            if k == tok.CONTINUE { kind = ast.CONTINUE }
+            return self.add(kind, t, 0, 0, label, [])
+        }
+        if k == tok.NUMERIC {
+            self.next()
+            let w = self.expect(tok.IDENT)
+            if w.Lit != "digits" { self.error("expected `digits` after `numeric`") }
+            let n = self.expect(tok.INT)
+            // A malformed or missing count is 0, as the Go parser's discarded
+            // Atoi error leaves it — the checker rejects it, but the parser
+            // must keep recovering rather than throw.
+            let d = atoi(n.Lit)
+            self.expect_semi()
+            return self.add(ast.NUMERIC, t, d, 0, "", [])
+        }
+        if k == tok.THROW {
+            self.next()
+            var v = 0
+            var from = 0
+            if not self.at(tok.SEMI) and not self.at(tok.RBRACE) and
+               not self.at(tok.EOF) {
+                v = self.expr()
+                if self.at(tok.IDENT) and self.cur().Lit == "from" {
+                    self.next()
+                    from = self.expr()
+                }
+            }
+            self.expect_semi()
+            return self.add(ast.THROW, t, 0, 0, "", [v, from])
+        }
+        if k == tok.TRY {
+            // Three-way: `try {` → try/catch, `try group` → try-group, else expr.
+            let k1 = self.peek(1).Kind
+            if k1 == tok.LBRACE { return self.trycatch_stmt() }
+            if k1 == tok.GROUP {
+                self.next()
+                return self.group_stmt(1)
+            }
+            return self.simple_stmt()
+        }
+        if k == tok.LBRACE { return self.block() }
+        return self.simple_stmt()
+    }
+
+    func let_stmt(mut self) int {
+        let t = self.cur()
+        var isConst = 0
+        if t.Kind == tok.CONST { isConst = 1 }
+        self.next()
+        var names = [self.expect(tok.IDENT).Lit]
+        while self.accept(tok.COMMA) {
+            names.append(self.expect(tok.IDENT).Lit)
+        }
+        var ty = 0
+        if not self.at(tok.ASSIGN) { ty = self.type_expr() }
+        self.expect(tok.ASSIGN)
+        let v = self.expr()
+        self.expect_semi()
+        return self.add(ast.LET, t, ty, isConst, str.join(names, ","), [v])
+    }
+
+    func var_stmt(mut self) int {
+        let t = self.expect(tok.VAR)
+        let n = self.expect(tok.IDENT)
+        var ty = 0
+        if not self.at(tok.ASSIGN) and not self.at(tok.SEMI) and
+           not self.at(tok.RBRACE) and not self.at(tok.EOF) {
+            ty = self.type_expr()
+        }
+        var v = 0
+        if self.accept(tok.ASSIGN) { v = self.expr() }
+        self.expect_semi()
+        return self.add(ast.VAR, t, ty, 0, n.Lit, [v])
+    }
+
+    func simple_stmt(mut self) int {
+        let t = self.cur()
+        let x = self.expr()
+        let k = self.cur().Kind
+        if k == tok.ASSIGN or k == tok.PLUSEQ or k == tok.MINUSEQ or
+           k == tok.STAREQ or k == tok.SLASHEQ or k == tok.PERCENTEQ or
+           k == tok.CONCATEQ {
+            let op = self.next().Kind
+            let rhs = self.expr()
+            self.expect_semi()
+            return self.add(ast.ASSIGN, t, op, 0, "", [x, rhs])
+        }
+        if k == tok.ARROW {
+            // A channel send: `ch <- v`.
+            self.next()
+            let v = self.expr()
+            self.expect_semi()
+            let send = self.add(ast.BINARY, t, tok.ARROW, 0, "", [x, v])
+            return self.add(ast.EXPRSTMT, t, 0, 0, "", [send])
+        }
+        self.expect_semi()
+        return self.add(ast.EXPRSTMT, t, 0, 0, "", [x])
+    }
+
+    func if_stmt(mut self) int {
+        let t = self.expect(tok.IF)
+        var cond = 0
+        var pat = 0
+        if self.at(tok.LET) {
+            self.next()
+            pat = self.pattern()
+            self.expect(tok.ASSIGN)
+            cond = self.header_expr()
+        } else {
+            cond = self.header_expr()
+        }
+        let then = self.block()
+        var els = 0
+        if self.skip_semis_before(tok.ELSE) {
+            self.next()
+            if self.at(tok.IF) {
+                els = self.if_stmt()
+            } else {
+                els = self.block()
+            }
+        }
+        return self.add(ast.IF, t, pat, 0, "", [cond, then, els])
+    }
+
+    // header_expr parses a condition or iterable, where a composite literal
+    // must be parenthesised (otherwise `if x > 10 {` is ambiguous).
+    func header_expr(mut self) int {
+        let saved = self.noLit
+        self.noLit = 1
+        let e = self.expr()
+        self.noLit = saved
+        return e
+    }
+
+    func loop_stmt(mut self, label str) int {
+        let t = self.cur()
+        let k = t.Kind
+        if k == tok.FOR {
+            self.next()
+            var v = ""
+            var iter = 0
+            if not self.at(tok.LBRACE) {
+                v = self.expect(tok.IDENT).Lit
+                self.expect(tok.IN)
+                iter = self.header_expr()
+            }
+            let body = self.block()
+            return self.add(ast.FOR, t, 0, 0, v || "|" || label, [iter, body])
+        }
+        if k == tok.EACH {
+            self.next()
+            var a = self.expect(tok.IDENT).Lit
+            var b = ""
+            if self.accept(tok.COMMA) { b = self.expect(tok.IDENT).Lit }
+            self.expect(tok.IN)
+            let iter = self.header_expr()
+            let body = self.block()
+            return self.add(ast.EACH, t, 0, 0, a || "," || b || "|" || label,
+                            [iter, body])
+        }
+        if k == tok.WHILE {
+            self.next()
+            let cond = self.header_expr()
+            let body = self.block()
+            return self.add(ast.WHILE, t, 0, 0, label, [cond, body])
+        }
+        self.error("expected loop after label")
+        return self.add(ast.BLOCK, t, 0, 0, "", [])
+    }
+
+    func switch_stmt(mut self) int {
+        let t = self.expect(tok.SWITCH)
+        let subj = self.header_expr()
+        self.expect(tok.LBRACE)
+        var cases = []
+        while true {
+            self.skip_semis()
+            if self.at(tok.RBRACE) or self.at(tok.EOF) { break }
+            let ct = self.cur()
+            var vals = []
+            if self.accept(tok.CASE) {
+                vals.append(self.expr())
+                while self.accept(tok.COMMA) { vals.append(self.expr()) }
+                self.expect(tok.COLON)
+            } else if self.at(tok.IDENT) and self.cur().Lit == "default" {
+                self.next()
+                self.expect(tok.COLON)
+            } else {
+                self.error("expected `case` or `default` in switch")
+                self.next()
+                continue
+            }
+            var body = []
+            while true {
+                self.skip_semis()
+                if self.at(tok.CASE) or self.at(tok.RBRACE) or self.at(tok.EOF) {
+                    break
+                }
+                if self.at(tok.IDENT) and self.cur().Lit == "default" and
+                   self.peek(1).Kind == tok.COLON {
+                    break
+                }
+                body.append(self.stmt())
+            }
+            cases.append(self.add(ast.CASE, ct, 0, 0, "",
+                                  [self.T.List(vals), self.T.List(body)]))
+        }
+        self.expect(tok.RBRACE)
+        return self.add(ast.SWITCH, t, 0, 0, "", [subj, self.T.List(cases)])
+    }
+
+    func match_stmt(mut self) int {
+        let t = self.expect(tok.MATCH)
+        let subj = self.header_expr()
+        self.expect(tok.LBRACE)
+        var arms = []
+        while true {
+            self.skip_semis()
+            if self.at(tok.RBRACE) or self.at(tok.EOF) { break }
+            let at2 = self.cur()
+            let pat = self.pattern()
+            var guard = 0
+            if self.at(tok.IF) {
+                self.next()
+                let saved = self.noLit
+                self.noLit = 1
+                guard = self.expr()
+                self.noLit = saved
+            }
+            self.expect(tok.FATARROW)
+            var body = []
+            if self.at(tok.LBRACE) {
+                let b = self.block()
+                body = self.T.Get(b).Kids
+            } else {
+                body.append(self.stmt())
+            }
+            arms.append(self.add(ast.ARM, at2, pat, 0, "",
+                                 [guard, self.T.List(body)]))
+        }
+        self.expect(tok.RBRACE)
+        return self.add(ast.MATCH, t, 0, 0, "", [subj, self.T.List(arms)])
+    }
+
+    func pattern(mut self) int {
+        let t = self.cur()
+        let k = t.Kind
+        if k == tok.NIL {
+            self.next()
+            return self.add(ast.PNIL, t, 0, 0, "", [])
+        }
+        if k == tok.TRUE or k == tok.FALSE or k == tok.INT or k == tok.FLOAT or
+           k == tok.DEC or k == tok.STR or k == tok.RUNE {
+            return self.add(ast.PLIT, t, 0, 0, "", [self.primary()])
+        }
+        if k == tok.MINUS {
+            return self.add(ast.PLIT, t, 0, 0, "", [self.unary()])
+        }
+        if k == tok.IDENT {
+            let name = self.next().Lit
+            if name == "_" { return self.add(ast.PWILD, t, 0, 0, "", []) }
+            if self.at(tok.LPAREN) {
+                self.next()
+                var subs = []
+                while not self.at(tok.RPAREN) and not self.at(tok.EOF) {
+                    subs.append(self.pattern())
+                    if not self.accept(tok.COMMA) { break }
+                }
+                self.expect(tok.RPAREN)
+                return self.add(ast.PVARIANT, t, 0, 0, name, subs)
+            }
+            // A capitalised bare name is a payload-less variant; lowercase binds.
+            if is_upper_first(name) {
+                return self.add(ast.PVARIANT, t, 0, 0, name, [])
+            }
+            return self.add(ast.PBIND, t, 0, 0, name, [])
+        }
+        self.error("expected pattern, found {self.show()}")
+        self.next()
+        return self.add(ast.PWILD, t, 0, 0, "", [])
+    }
+
+    func select_stmt(mut self) int {
+        let t = self.expect(tok.SELECT)
+        self.expect(tok.LBRACE)
+        var cases = []
+        while true {
+            self.skip_semis()
+            if self.at(tok.RBRACE) or self.at(tok.EOF) { break }
+            let ct = self.cur()
+            var kind = 0
+            var ch = 0
+            var send = 0
+            var bind = ""
+            var bindok = ""
+            if self.accept(tok.CASE) {
+                if self.at(tok.LET) {
+                    self.next()
+                    bind = self.expect(tok.IDENT).Lit
+                    if self.accept(tok.COMMA) {
+                        bindok = self.expect(tok.IDENT).Lit
+                    }
+                    self.expect(tok.ASSIGN)
+                    self.expect(tok.ARROW)
+                    ch = self.expr()
+                } else if self.at(tok.IDENT) and self.peek(1).Kind == tok.DEFINE {
+                    bind = self.next().Lit
+                    self.next()
+                    self.expect(tok.ARROW)
+                    ch = self.expr()
+                } else if self.at(tok.IDENT) and self.peek(1).Kind == tok.COMMA and
+                          self.peek(2).Kind == tok.IDENT and
+                          self.peek(3).Kind == tok.DEFINE {
+                    bind = self.next().Lit
+                    self.next()
+                    bindok = self.next().Lit
+                    self.next()
+                    self.expect(tok.ARROW)
+                    ch = self.expr()
+                } else if self.at(tok.ARROW) {
+                    self.next()
+                    ch = self.expr()
+                } else {
+                    kind = 1
+                    ch = self.expr()
+                    self.expect(tok.ARROW)
+                    send = self.expr()
+                }
+                self.expect(tok.COLON)
+            } else if self.at(tok.IDENT) and self.cur().Lit == "default" {
+                self.next()
+                self.expect(tok.COLON)
+                kind = 2
+            } else {
+                self.error("expected `case` or `default` in select")
+                self.next()
+                continue
+            }
+            var body = []
+            while true {
+                self.skip_semis()
+                if self.at(tok.CASE) or self.at(tok.RBRACE) or self.at(tok.EOF) {
+                    break
+                }
+                if self.at(tok.IDENT) and self.cur().Lit == "default" and
+                   self.peek(1).Kind == tok.COLON {
+                    break
+                }
+                body.append(self.stmt())
+            }
+            cases.append(self.add(ast.SELCASE, ct, kind, 0,
+                                  bind || "," || bindok,
+                                  [ch, send, self.T.List(body)]))
+        }
+        self.expect(tok.RBRACE)
+        return self.add(ast.SELECTSTMT, t, 0, 0, "", [self.T.List(cases)])
+    }
+
+    func group_stmt(mut self, isTry int) int {
+        let t = self.expect(tok.GROUP)
+        var timeout = 0
+        if self.at(tok.IDENT) and self.cur().Lit == "timeout" {
+            self.next()
+            timeout = self.header_expr()
+        }
+        let body = self.block()
+        return self.add(ast.GROUP, t, 0, isTry, "", [timeout, body])
+    }
+
+    func parse_stmt(mut self) int {
+        let t = self.expect(tok.PARSE)
+        var fold = ""
+        if self.at(tok.IDENT) and (self.cur().Lit == "upper" or
+                                   self.cur().Lit == "lower") {
+            fold = self.next().Lit
+        }
+        self.accept(tok.VAR)
+        let src = self.parse_source()
+        var terms = []
+        while not self.at(tok.SEMI) and not self.at(tok.RBRACE) and
+              not self.at(tok.EOF) {
+            let tt = self.cur()
+            if self.at(tok.IDENT) {
+                let n = self.next()
+                terms.append(self.add(ast.PARSETERM, tt, 0, 0, n.Lit, []))
+            } else if self.at(tok.DOT) {
+                self.next()
+                terms.append(self.add(ast.PARSETERM, tt, 1, 0, "", []))
+            } else if self.at(tok.STR) {
+                let s = self.next()
+                terms.append(self.add(ast.PARSETERM, tt, 2, 0, s.Lit, []))
+            } else if self.at(tok.INT) {
+                let n = self.next()
+                terms.append(self.add(ast.PARSETERM, tt, 3, atoi(n.Lit), "",
+                                      []))
+            } else {
+                self.error("unexpected token in parse template")
+                self.next()
+            }
+        }
+        self.expect_semi()
+        return self.add(ast.PARSESTMT, t, 0, 0, fold, [src, self.T.List(terms)])
+    }
+
+    // parse_source: postfix chains limited to calls and indexing, so the
+    // template terms that follow are not swallowed.
+    func parse_source(mut self) int {
+        var x = self.primary()
+        while true {
+            if self.at(tok.LPAREN) {
+                x = self.call_tail(x)
+            } else if self.at(tok.LBRACKET) {
+                x = self.index_tail(x)
+            } else {
+                return x
+            }
+        }
+        return x
+    }
+
+    func say_stmt(mut self) int {
+        let t = self.expect(tok.SAY)
+        var args = []
+        if not self.at(tok.SEMI) and not self.at(tok.RBRACE) and
+           not self.at(tok.EOF) {
+            args.append(self.expr())
+            while self.accept(tok.COMMA) { args.append(self.expr()) }
+        }
+        self.expect_semi()
+        return self.add(ast.SAY, t, 0, 0, "", args)
+    }
+
+    func defer_stmt(mut self) int {
+        let t = self.expect(tok.DEFER)
+        if self.at(tok.LBRACE) {
+            return self.add(ast.DEFERSTMT, t, 0, 1, "", [self.block()])
+        }
+        if self.at(tok.SAY) {
+            // The grammar says call|block, but `defer say "…"` is too natural
+            // to reject; it becomes a one-statement block.
+            let s = self.say_stmt()
+            let b = self.add(ast.BLOCK, t, 0, 0, "", [s])
+            return self.add(ast.DEFERSTMT, t, 0, 1, "", [b])
+        }
+        let c = self.expr()
+        self.expect_semi()
+        return self.add(ast.DEFERSTMT, t, 0, 0, "", [c])
+    }
+
+    func trycatch_stmt(mut self) int {
+        let t = self.expect(tok.TRY)
+        let body = self.block()
+        var catches = []
+        while self.skip_semis_before(tok.CATCH) {
+            let ct = self.next()
+            var name = ""
+            var types = []
+            if self.at(tok.IDENT) {
+                name = self.next().Lit
+                if self.accept(tok.COLON) {
+                    types.append(self.type_expr())
+                    while self.accept(tok.COMMA) {
+                        types.append(self.type_expr())
+                    }
+                }
+            }
+            let cb = self.block()
+            catches.append(self.add(ast.CATCH, ct, 0, 0, name,
+                                    [cb, self.T.List(types)]))
+        }
+        var fin = 0
+        if self.skip_semis_before(tok.FINALLY) {
+            self.next()
+            fin = self.block()
+        }
+        self.expect_semi()
+        return self.add(ast.TRYCATCH, t, 0, 0, "",
+                        [body, self.T.List(catches), fin])
+    }
+}
+
+// atoi parses a decimal count, yielding 0 on anything it cannot read. The
+// throwing `int(s)` would kill the parser on `numeric digits` with no operand.
+func atoi(s str) int {
+    let v = to_int(s)
+    if v == nil { return 0 }
+    return v
+}
+
+func is_upper_first(s str) bool {
+    if len(s) == 0 { return false }
+    let c = s[0]
+    return c >= 65 and c <= 90
+}

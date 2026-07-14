@@ -1,0 +1,82 @@
+// 05_pipeline.voi — channel pipelines and select (§9.2, §9.3): a generator
+// feeds a squarer, the squarer feeds a filter, and the consumer multiplexes
+// between data and a shutdown signal with `select`. Sends MOVE values, so
+// no stage ever aliases another stage's data. The group timeout (§9.5)
+// demonstrates cancellation: a deliberately stuck stage is reaped, and the
+// Timeout exception surfaces at the boundary.
+package main
+
+use "std/fmt"
+use "std/time"
+
+func generator(out chan[int], n int) {
+    for i in 1..=n {
+        out <- i
+    }
+    close(out)
+}
+
+func squarer(inp chan[int], out chan[int]) {
+    each v in inp {
+        out <- v * v
+    }
+    close(out)
+}
+
+func keep_even(inp chan[int], out chan[int]) {
+    each v in inp {
+        if v % 2 == 0 {
+            out <- v
+        }
+    }
+    close(out)
+}
+
+func main() {
+    let raw      = chan[int](4)
+    let squared  = chan[int](4)
+    let filtered = chan[int](4)
+    let sum_ch   = chan[int](1)
+
+    group {
+        spawn generator(raw, 12)
+        spawn squarer(raw, squared)
+        spawn keep_even(squared, filtered)
+        spawn {
+            var sum = 0
+            var received = 0
+            var open = true
+            while open {
+                select {
+                case v, ok := <-filtered:
+                    if ok {
+                        received += 1
+                        sum += v
+                        fmt.printf("even square #%d: %d\n", received, v)
+                    } else {
+                        open = false
+                    }
+                }
+            }
+            sum_ch <- sum
+        }
+    }
+
+    say "pipeline sum:", <-sum_ch
+
+    // Part two: a stage that never produces. The 40ms timeout cancels the
+    // group; the blocked receive throws Cancelled inside the task, the
+    // group joins everything, and Timeout is rethrown here (§8.7).
+    let stuck = chan[int](0)
+    try {
+        group timeout 40 * time.Millisecond {
+            spawn {
+                let v = <-stuck      // blocks forever
+                say "never printed", v
+            }
+        }
+    } catch e: Timeout {
+        say "stuck stage reaped by timeout; suppressed:", len(e.suppressed())
+    }
+    say "done"
+}

@@ -1,0 +1,27 @@
+package geom
+
+// Exported: capitalised. `scale` below is package-private and unreachable
+// from outside — the loader enforces that.
+enum Shape {
+    Circle(r float)
+    Rect(w float, h float)
+}
+
+struct Box { w float, h float }
+
+const UNIT = 1.0
+
+func Area(s Shape) float {
+    match s {
+        Circle(r)  => return 3.0 * r * r
+        Rect(w, h) => return scale(w) * scale(h)
+    }
+}
+
+func scale(x float) float { return x * UNIT }
+
+func MakeBox(w float, h float) Box { return Box{w: w, h: h} }
+
+impl Box {
+    func Area(self) float { return self.w * self.h }
+}

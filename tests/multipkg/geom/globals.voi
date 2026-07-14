@@ -1,0 +1,15 @@
+package geom
+
+// Package-level state, a `parse` that must write it, and a closure default
+// that must see a package constant. All three were silently broken before the
+// loader review.
+var total = "none"
+
+func Set(line str) { parse line total }
+
+func Get() str { return total }
+
+func Defaulted() float {
+    let f = fn(x float = UNIT) float { return x }
+    return f()
+}

@@ -1,0 +1,39 @@
+package main
+
+use "app/geom"
+use "app/report"
+use "app/geom" as g
+
+func main() {
+    let shapes = [Circle(2.0), Rect(3.0, 4.0)]
+    var lines = []
+    each s in shapes {
+        lines.append(report.Describe(s))
+    }
+    report.Render(lines)
+
+    let b = geom.MakeBox(2.0, 5.0)
+    say b, b.Area()
+
+    // A second file of the same package; a cross-package exception; a trait
+    // implemented in one package and called from another; a generic type.
+    say geom.Describe(b)
+    try {
+        let bad = geom.Validate(geom.MakeBox(-1.0, 2.0))
+        say bad
+    } catch e: geom.BadShape {
+        say "caught:", e.why
+    }
+    let p = geom.MakePair(1.5, 2.5)
+    say p, p.a + p.b
+
+    // An alias for an imported package.
+    say g.Area(Circle(1.0))
+
+    geom.Set("hello")
+    say geom.Get(), geom.Defaulted()
+
+    // A local may shadow a package name; the loader must respect that.
+    let geom = 42
+    say geom
+}

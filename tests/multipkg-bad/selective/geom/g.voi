@@ -1,0 +1,2 @@
+package geom
+func Area() int { return 1 }

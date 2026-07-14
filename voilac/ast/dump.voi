@@ -1,0 +1,98 @@
+// ast/dump.voi — the canonical tree dump.
+//
+// One node per line, two spaces of indent per level:
+//
+//     kind [op=…] [i=…] [f=…] [s="…"]
+//
+// An absent child prints as `-`. For the kinds whose Ival holds a node id (a
+// type, a pattern), that node is dumped as an extra final child rather than as
+// a number, so the dump is independent of arena numbering. `cmd/godump ast`
+// prints the very same lines from the Go tree; the differential test diffs the
+// two over every source in the repository.
+package ast
+
+use "std/str"
+use "std/fmt"
+use "voilac/tok"
+
+// OpName renders an operator token for the dump. The parser stores the lexer's
+// token kind in Ival for UNARY, BINARY and ASSIGN; the dump must not depend on
+// the numeric value, so it prints the spelling.
+func OpName(k int) str { return tok.Spelling(k) }
+
+// is_op_kind reports whether Ival holds an operator token.
+func is_op_kind(k int) bool {
+    return k == UNARY or k == BINARY or k == ASSIGN
+}
+
+// The dump relocates nothing, but it must agree with Graft about which nodes
+// carry a node id in Ival — so both ask ast.IsRefKind.
+func is_ref_kind(k int) bool { return IsRefKind(k) }
+
+func Quote(s str) str {
+    var b = str.Builder{}
+    b.write("\"")
+    each c in s {
+        if c == '\\' {
+            b.write("\\\\")
+        } else if c == '"' {
+            b.write("\\\"")
+        } else if c == '\n' {
+            b.write("\\n")
+        } else if c == '\t' {
+            b.write("\\t")
+        } else if c == '\r' {
+            b.write("\\r")
+        } else {
+            b.write(str(c))
+        }
+    }
+    b.write("\"")
+    return b.done()
+}
+
+impl Tree {
+    // Dump renders the subtree rooted at id.
+    func Dump(self, id int) []str {
+        var out = []
+        self.dump_into(id, 0, out)
+        return out
+    }
+
+    func dump_into(self, id int, depth int, out mut []str) {
+        var pad = ""
+        var i = 0
+        while i < depth {
+            pad = pad || "  "
+            i += 1
+        }
+        if id == 0 {
+            out.append(pad || "-")
+            return
+        }
+        let n = self.Get(id)
+        var b = str.Builder{}
+        b.write(pad)
+        b.write(KindName(n.Kind))
+        if is_op_kind(n.Kind) {
+            b.write(" op=")
+            b.write(OpName(n.Ival))
+        } else if not is_ref_kind(n.Kind) and n.Ival != 0 {
+            b.write(fmt.sprintf(" i=%d", n.Ival))
+        }
+        if n.Ival2 != 0 {
+            b.write(fmt.sprintf(" f=%d", n.Ival2))
+        }
+        if len(n.Sval) > 0 {
+            b.write(" s=")
+            b.write(Quote(n.Sval))
+        }
+        out.append(b.done())
+        each k in n.Kids {
+            self.dump_into(k, depth + 1, out)
+        }
+        if is_ref_kind(n.Kind) {
+            self.dump_into(n.Ival, depth + 1, out)
+        }
+    }
+}

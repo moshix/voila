@@ -1,0 +1,9 @@
+42 31 493 10 1000000
+3.14 6.02e+23 1.5e-08
+19.99 3 0.1
+A true H
+tab	here quote"q brace {x}
+raw
+multi
+true false nil
+x=7 sq=49 nest=3

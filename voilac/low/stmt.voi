@@ -1,0 +1,1001 @@
+// low/stmt.voi — statements: AST → IR.
+//
+// A faithful port of internal/ir/lower_stmt.go. The oracle is the assembly
+// listing, so every instruction, register and label must appear in exactly the
+// order the Go lowerer produces them: registers and labels are allocated
+// monotonically, so the ORDER of new_reg/new_label calls is part of the
+// contract, not an implementation detail.
+package low
+
+use "voilac/ast"
+use "voilac/ir"
+use "voilac/tok"
+use "std/str"
+
+// FinReg is the fins-stack element: low.voi's FinRegion, with the two field
+// names Voilà cannot spell. `finally` and `group` are KEYWORDS, so
+// `FinRegion{finally: …}` and `region.group` do not parse (which is why
+// low.voi does not parse either — see the report). The shape is identical and
+// nothing outside this file reads a fins element's fields: low.voi only ever
+// copies the whole slice (save_fn/restore_fn). Fold this back into FinRegion
+// once its fields are renamed.
+// compound_op maps a compound-assignment token to its IR opcode (the Go
+// lowerer's compoundOps table).
+func compound_op(k int) str {
+    if k == tok.PLUSEQ    { return "ADD" }
+    if k == tok.MINUSEQ   { return "SUB" }
+    if k == tok.STAREQ    { return "MUL" }
+    if k == tok.SLASHEQ   { return "DIV" }
+    if k == tok.PERCENTEQ { return "MOD" }
+    if k == tok.CONCATEQ  { return "CAT" }
+    return ""
+}
+
+impl Lowerer {
+    // lower_stmt lowers one statement; `s` is an arena index, and 0 means
+    // "absent" (the Go lowerer's `if s == nil { return }`).
+    func lower_stmt(mut self, s int) throws LowerError {
+        if s == 0 { return }
+        let n = self.T.Get(s)
+        self.curLine = n.Line
+        let k = n.Kind
+        let line = n.Line
+
+        if k == ast.BLOCK {
+            self.lower_body(s, false)
+
+        } else if k == ast.LET {
+            self.lower_let(s)
+
+        } else if k == ast.VAR {
+            var rv = ""
+            let v = self.T.Kid(s, 0)
+            if v != 0 {
+                let before = self.nextReg
+                rv = self.lower_expr(v)
+                if not self.is_global_bind(n.Sval) {
+                    rv = self.freshen(rv, line, before)
+                }
+            } else {
+                rv = self.new_reg()
+                self.emit(line, "ZERO", [rv, self.short_type(n.Ival)])
+            }
+            self.bind_or_set_global(n.Sval, rv, line)
+
+        } else if k == ast.ASSIGN {
+            self.lower_assign(s)
+
+        } else if k == ast.EXPRSTMT {
+            let x = self.T.Kid(s, 0)
+            let xn = self.T.Get(x)
+            // `ch <- v` is a statement, not an expression: sending moves
+            // (§9.2), so it never leaves a value behind.
+            if xn.Kind == ast.BINARY and xn.Ival == tok.ARROW {
+                let rch = self.lower_expr(self.T.Kid(x, 0))
+                let rv = self.lower_expr(self.T.Kid(x, 1))
+                self.emit(line, "SEND", [rch, rv])
+                return
+            }
+            self.lower_expr(x)
+
+        } else if k == ast.IF {
+            self.lower_if(s)
+
+        } else if k == ast.FOR {
+            // Sval is "var|label"; either half may be empty.
+            let parts = str.split(n.Sval, "|")
+            var vName = ""
+            var label = ""
+            if len(parts) > 0 { vName = parts[0] }
+            if len(parts) > 1 { label = parts[1] }
+            let iter = self.T.Kid(s, 0)
+            if iter == 0 {
+                self.lower_infinite_for(s, label)
+            } else {
+                self.lower_iter_loop(label, line, iter, "", vName,
+                                     self.T.Kid(s, 1))
+            }
+
+        } else if k == ast.EACH {
+            // Sval is "a,b|label"; b is empty in the single-variable form,
+            // and then `a` is the VALUE, not the key.
+            let head = str.split(n.Sval, "|")
+            var names = ""
+            var label = ""
+            if len(head) > 0 { names = head[0] }
+            if len(head) > 1 { label = head[1] }
+            let ab = str.split(names, ",")
+            var a = ""
+            var b = ""
+            if len(ab) > 0 { a = ab[0] }
+            if len(ab) > 1 { b = ab[1] }
+            let iter = self.T.Kid(s, 0)
+            let body = self.T.Kid(s, 1)
+            if b != "" {
+                self.lower_iter_loop(label, line, iter, a, b, body)
+            } else {
+                self.lower_iter_loop(label, line, iter, "", a, body)
+            }
+
+        } else if k == ast.WHILE {
+            self.lower_while(s)
+
+        } else if k == ast.SWITCH {
+            self.lower_switch(s)
+
+        } else if k == ast.MATCH {
+            self.lower_match(s)
+
+        } else if k == ast.SELECTSTMT {
+            self.lower_select(s)
+
+        } else if k == ast.GROUP {
+            self.lower_group(s)
+
+        } else if k == ast.PARSESTMT {
+            self.lower_parse(s)
+
+        } else if k == ast.SAY {
+            // `say` renders each argument AS IT IS EVALUATED (§7.5), so a
+            // later argument that mutates an earlier one cannot change what
+            // was already printed: `say v, v.pop(), v` shows the pre-pop
+            // slice first.
+            var regs = []
+            each a in n.Kids {
+                let rv = self.lower_expr(a)
+                let rs = self.new_reg()
+                self.emit(line, "TOSTR", [rs, rv])
+                regs.append(rs)
+            }
+            self.emit(line, "SAY", ["(" || str.join(regs, ",") || ")"])
+
+        } else if k == ast.DEFERSTMT {
+            // Both forms are LATE-evaluated (callee and args at unwind time),
+            // so both lower to a synthetic closure (frozen decision 6). The
+            // call form is wrapped in a synthetic block so the two forms share
+            // one path.
+            var body = self.T.Kid(s, 0)
+            if n.Ival2 != 1 {
+                let es = self.T.Add(ast.EXPRSTMT, n.Line, n.Col, 0, 0, "",
+                                    [body])
+                body = self.T.Add(ast.BLOCK, n.Line, n.Col, 0, 0, "", [es])
+            }
+            let name = self.lower_closure([], body,
+                                          "defer body (late-evaluated)",
+                                          n.Line)
+            let rc = self.new_reg()
+            self.emit(line, "MKCLOS", [rc, name])
+            self.emit(line, "DEFER", [rc])
+
+        } else if k == ast.DROP {
+            self.emit(line, "DROP", [n.Sval])
+
+        } else if k == ast.RETURN {
+            var rv = ""
+            let vals = n.Kids
+            if len(vals) == 1 {
+                rv = self.lower_expr(vals[0])
+            } else if len(vals) > 1 {
+                var regs = []
+                each v in vals {
+                    regs.append(self.lower_expr(v))
+                }
+                rv = self.new_reg()
+                self.emit(line, "TUPLE",
+                          [rv, "(" || str.join(regs, ",") || ")"])
+            }
+            self.unwind_finallies(0, "return")
+            if rv == "" {
+                self.emit(line, "RET", [])
+            } else {
+                self.emit(line, "RET", [rv])
+            }
+
+        } else if k == ast.BREAK {
+            let loop = self.find_loop(n.Sval, line)
+            self.unwind_finallies(loop.finDepth, "break")
+            self.emit(line, "JUMP", [loop.breakL])
+
+        } else if k == ast.CONTINUE {
+            let loop = self.find_loop(n.Sval, line)
+            self.unwind_finallies(loop.finDepth, "continue")
+            self.emit(line, "JUMP", [loop.contL])
+
+        } else if k == ast.FALLTHROUGH {
+            if len(self.switches) == 0 {
+                self.fail(s, "fallthrough outside switch")
+            }
+            let sw = self.switches[len(self.switches) - 1]
+            if sw.current + 1 >= len(sw.bodyLabels) {
+                self.fail(s, "fallthrough in final switch case")
+            }
+            self.emit(line, "JUMP", [sw.bodyLabels[sw.current + 1]])
+
+        } else if k == ast.NUMERIC {
+            self.emit(line, "NUMDIG", [str(n.Ival)])
+
+        } else if k == ast.THROW {
+            let v = self.T.Kid(s, 0)
+            if v == 0 {
+                // A bare `throw` rethrows the exception the enclosing catch
+                // clause materialized.
+                if len(self.catchRegs) == 0 {
+                    self.fail(s, "bare `throw` outside a catch clause")
+                }
+                self.emit(line, "RETHROW",
+                          [self.catchRegs[len(self.catchRegs) - 1]])
+                return
+            }
+            let rv = self.lower_expr(v)
+            let from = self.T.Kid(s, 1)
+            if from != 0 {
+                let rc = self.lower_expr(from)
+                self.emit(line, "THROW", [rv, rc])
+            } else {
+                self.emit(line, "THROW", [rv])
+            }
+
+        } else if k == ast.TRYCATCH {
+            self.lower_try_catch(s)
+
+        } else {
+            self.fail(s, "cannot lower statement " || ast.KindName(k))
+        }
+    }
+
+    // bind_or_set_global declares a local binding, or stores a global when
+    // lowering $INIT/$SCRIPT top-level statements.
+    func bind_or_set_global(mut self, name str, rv str, line int) {
+        if self.inGlobal and name in self.globals and self.scope_depth_top() {
+            self.emit(line, "SETGLB", [name, rv])
+            return
+        }
+        if name == "_" { return }
+        // Bind the name directly to the value's register. Registers are
+        // allocated monotonically, so an expression's result register is
+        // normally fresh and owned by nobody else — but see freshen: a bare
+        // identifier hands back the register of an EXISTING binding.
+        self.scopes[len(self.scopes) - 1].vars[name] = rv
+    }
+
+    // is_global_bind reports whether this declaration writes a module global
+    // rather than a frame slot; a global is stored by SETGLB and needs no
+    // freshening.
+    func is_global_bind(self, name str) bool {
+        return self.inGlobal and name in self.globals and
+               self.scope_depth_top()
+    }
+
+    // freshen guarantees that the register about to be bound to a NEW name is
+    // one no other name already owns. Lowering a bare identifier returns that
+    // identifier's own register (or `^name` for an upvalue), so
+    //
+    //     var a = b
+    //     a = 1        // would write b's register, and b would change too
+    //
+    // aliases the two. A MOVE into a fresh register costs one instruction and
+    // restores the interpreter's semantics, where `var a = b` binds a copy.
+    func freshen(mut self, rv str, line int, before int) str {
+        if len(rv) > 1 and rv[0] == 'r' {
+            let n = to_int(rv[1..len(rv)])
+            if n != nil and n >= before { return rv }
+        }
+        let r = self.new_reg()
+        self.emit(line, "MOVE", [r, rv])
+        return r
+    }
+
+    // scope_depth_top reports whether we are at the top-level scope of a
+    // synthetic global function (one boundary scope + one body scope at most).
+    func scope_depth_top(self) bool {
+        return len(self.scopes) <= 2
+    }
+
+    // ------------------------------------------------------------ let/assign
+
+    func lower_let(mut self, s int) throws LowerError {
+        let n = self.T.Get(s)
+        let line = n.Line
+        let names = str.split(n.Sval, ",")
+        let v = self.T.Kid(s, 0)
+
+        // A comma-ok receive: exactly the interpreter's syntactic test (§9.2)
+        // — two names and a `<-ch` value, decided on the shape alone.
+        if len(names) == 2 {
+            let vn = self.T.Get(v)
+            if vn.Kind == ast.UNARY and vn.Ival == tok.ARROW {
+                let rch = self.lower_expr(self.T.Kid(v, 0))
+                let rv = self.new_reg()
+                let rok = self.new_reg()
+                self.emit(line, "RECVOK", [rv, rok, rch])
+                self.bind_or_set_global(names[0], rv, line)
+                self.bind_or_set_global(names[1], rok, line)
+                return
+            }
+        }
+        let before = self.nextReg
+        var rv = self.lower_expr(v)
+        if len(names) == 1 {
+            if not self.is_global_bind(names[0]) {
+                rv = self.freshen(rv, line, before)
+            }
+            self.bind_or_set_global(names[0], rv, line)
+            return
+        }
+        // A destructuring let: one register per name, `_` for the discards.
+        var regs = []
+        each nm in names {
+            if nm == "_" {
+                regs.append("_")
+            } else {
+                regs.append(self.new_reg())
+            }
+        }
+        self.emit(line, "UNTUPLE",
+                  ["(" || str.join(regs, ",") || ")", rv])
+        each i, nm in names {
+            if nm != "_" {
+                self.bind_or_set_global(nm, regs[i], line)
+            }
+        }
+    }
+
+    func lower_assign(mut self, s int) throws LowerError {
+        let n = self.T.Get(s)
+        let line = n.Line
+        let op = n.Ival              // the assignment operator's token kind
+        let rv = self.lower_expr(self.T.Kid(s, 1))
+        let target = self.T.Kid(s, 0)
+        let tn = self.T.Get(target)
+
+        if tn.Kind == ast.IDENT {
+            // lookup also RECORDS the upvalue when the name crosses a frame
+            // boundary, so it must run before the is_local test (the Go
+            // lowerer's single lookup call returns both facts).
+            let cur = self.lookup(tn.Sval)
+            let fnd = cur != ""
+            let loc = self.is_local(tn.Sval)
+            if fnd and loc {
+                if op == tok.ASSIGN {
+                    self.emit(line, "MOVE", [cur, rv])
+                } else {
+                    self.emit(line, compound_op(op), [cur, cur, rv])
+                }
+            } else if fnd {
+                // An upvalue: read through ^name, write back with UPSET.
+                if op == tok.ASSIGN {
+                    self.emit(line, "UPSET", [tn.Sval, rv])
+                } else {
+                    let rt = self.new_reg()
+                    self.emit(line, compound_op(op),
+                              [rt, "^" || tn.Sval, rv])
+                    self.emit(line, "UPSET", [tn.Sval, rt])
+                }
+            } else if tn.Sval in self.globals {
+                if op == tok.ASSIGN {
+                    self.emit(line, "SETGLB", [tn.Sval, rv])
+                } else {
+                    let rc = self.new_reg()
+                    self.emit(line, "GETGLB", [rc, tn.Sval])
+                    let rt = self.new_reg()
+                    self.emit(line, compound_op(op), [rt, rc, rv])
+                    self.emit(line, "SETGLB", [tn.Sval, rt])
+                }
+            } else {
+                self.fail(target, "assignment to undeclared variable `" ||
+                                  tn.Sval || "`")
+            }
+
+        } else if tn.Kind == ast.FIELD {
+            // Single receiver evaluation (documented divergence: the
+            // interpreter evaluates the receiver twice for compound ops).
+            let ro = self.lower_expr(self.T.Kid(target, 0))
+            if op == tok.ASSIGN {
+                self.emit(line, "SETFLD", [ro, tn.Sval, rv])
+            } else {
+                let rc = self.new_reg()
+                self.emit(line, "FIELD", [rc, ro, tn.Sval])
+                let rt = self.new_reg()
+                self.emit(line, compound_op(op), [rt, rc, rv])
+                self.emit(line, "SETFLD", [ro, tn.Sval, rt])
+            }
+
+        } else if tn.Kind == ast.INDEX {
+            let rc = self.lower_expr(self.T.Kid(target, 0))
+            let ri = self.lower_expr(self.T.Kid(target, 1))
+            if op == tok.ASSIGN {
+                self.emit(line, "SETIDX", [rc, ri, rv])
+            } else {
+                let rcur = self.new_reg()
+                self.emit(line, "INDEX", [rcur, rc, ri])
+                let rt = self.new_reg()
+                self.emit(line, compound_op(op), [rt, rcur, rv])
+                self.emit(line, "SETIDX", [rc, ri, rt])
+            }
+
+        } else {
+            self.fail(target, "invalid assignment target")
+        }
+    }
+
+    // ------------------------------------------------------------ if
+
+    func lower_if(mut self, s int) throws LowerError {
+        let n = self.T.Get(s)
+        let line = n.Line
+        let elseL = self.new_label()
+        let endL = self.new_label()
+        let pat0 = n.Ival            // the `if let` pattern (0 = a plain if)
+        let then = self.T.Kid(s, 1)
+        let els = self.T.Kid(s, 2)
+
+        if pat0 != 0 {
+            let rs = self.lower_expr(self.T.Kid(s, 0))
+            self.push_scope(false)
+            let pat = self.build_pattern(pat0)
+            let binds = self.pat_binds(pat)
+            let rf = self.new_reg()
+            self.emit_pat(line, "PMATCH",
+                          [rf, rs, self.pat_str(pat),
+                           "(" || str.join(binds, ",") || ")"], pat)
+            self.emit(line, "JMPF", [rf, elseL])
+            self.lower_body(then, false)
+            self.pop_scope()   // the pattern binds are visible to Then only
+        } else {
+            let rc = self.lower_expr(self.T.Kid(s, 0))
+            self.emit(line, "JMPF", [rc, elseL])
+            self.lower_body(then, false)
+        }
+
+        if els != 0 {
+            self.emit(0, "JUMP", [endL])
+            self.mark(elseL)
+            self.lower_stmt(els)
+            self.mark(endL)
+        } else {
+            // A dangling endL with no else: both labels mark the next instr.
+            self.mark(elseL)
+            self.mark(endL)
+        }
+    }
+
+    // ------------------------------------------------------------ loops
+
+    func lower_infinite_for(mut self, s int, label str) throws LowerError {
+        let n = self.T.Get(s)
+        let head = self.new_label()
+        let end = self.new_label()
+        self.push_loop(label, end, head)
+        self.mark(head)
+        // A cancellation poll, mirroring the interpreter.
+        self.emit(n.Line, "CKCANC", [])
+        self.lower_body(self.T.Kid(s, 1), false)
+        self.emit(0, "JUMP", [head])
+        self.mark(end)
+        self.pop_loop()
+    }
+
+    func lower_while(mut self, s int) throws LowerError {
+        let n = self.T.Get(s)
+        let head = self.new_label()
+        let end = self.new_label()
+        self.push_loop(n.Sval, end, head)
+        self.mark(head)
+        self.emit(n.Line, "CKCANC", [])
+        let rc = self.lower_expr(self.T.Kid(s, 0))
+        self.emit(n.Line, "JMPF", [rc, end])
+        self.lower_body(self.T.Kid(s, 1), false)
+        self.emit(0, "JUMP", [head])
+        self.mark(end)
+        self.pop_loop()
+    }
+
+    // lower_iter_loop lowers `for v in X` / `each [k,] v in X` through
+    // ITER/ITNEXT. kName is "" for the single-variable form.
+    func lower_iter_loop(mut self, label str, line int, iter int, kName str,
+                         vName str, body int) throws LowerError {
+        let rsrc = self.lower_expr(iter)
+        let rit = self.new_reg()
+        self.emit(line, "ITER", [rit, rsrc])
+        let head = self.new_label()
+        let end = self.new_label()
+        self.push_loop(label, end, head)
+        self.mark(head)
+        self.push_scope(false)
+        let rk = self.new_reg()
+        let rv = self.new_reg()
+        self.emit(line, "ITNEXT", [rk, rv, rit, end])
+        // The loop variables are bound to the ITNEXT registers directly; `_`
+        // and the absent key are simply never named.
+        if kName != "" and kName != "_" {
+            self.scopes[len(self.scopes) - 1].vars[kName] = rk
+        }
+        if vName != "" and vName != "_" {
+            self.scopes[len(self.scopes) - 1].vars[vName] = rv
+        }
+        self.lower_body(body, false)
+        self.pop_scope()
+        self.emit(0, "JUMP", [head])
+        self.mark(end)
+        self.pop_loop()
+    }
+
+    func push_loop(mut self, name str, breakL str, contL str) {
+        self.loops.append(LoopCtx{
+            name: name, breakL: breakL, contL: contL,
+            finDepth: len(self.fins), scopeDepth: len(self.scopes),
+        })
+    }
+
+    func pop_loop(mut self) {
+        self.loops = self.loops[0..len(self.loops) - 1]
+    }
+
+    // find_loop resolves a break/continue target: the innermost loop, or the
+    // named one. The Go lowerer reports on the line only (posOnLine), so the
+    // column is 0 here too.
+    func find_loop(self, label str, line int) LoopCtx throws LowerError {
+        if len(self.loops) == 0 {
+            throw LowerError{Msg: "break/continue outside a loop",
+                             Line: line, Col: 0}
+        }
+        if label == "" {
+            return self.loops[len(self.loops) - 1]
+        }
+        var i = len(self.loops) - 1
+        while i >= 0 {
+            if self.loops[i].name == label {
+                return self.loops[i]
+            }
+            i -= 1
+        }
+        throw LowerError{Msg: "unknown loop label `" || label || "`",
+                         Line: line, Col: 0}
+    }
+
+    // ------------------------------------------------------------ switch
+
+    func lower_switch(mut self, s int) throws LowerError {
+        let n = self.T.Get(s)
+        let line = n.Line
+        let rs = self.lower_expr(self.T.Kid(s, 0))
+        let end = self.new_label()
+        let cases = self.T.Get(self.T.Kid(s, 1)).Kids
+
+        // Bodies are labelled in source order; fallthrough jumps to the next
+        // body, including default (mirrors execSwitch).
+        var labels = []
+        each c in cases {
+            labels.append(self.new_label())
+        }
+
+        var defaultL = end
+        // The dispatch chain: case values are evaluated lazily, in source
+        // order. A case with no values is the default.
+        each i, c in cases {
+            let vals = self.T.Get(self.T.Kid(c, 0)).Kids
+            if len(vals) == 0 {
+                defaultL = labels[i]
+                continue
+            }
+            each ve in vals {
+                let rv = self.lower_expr(ve)
+                let rt = self.new_reg()
+                self.emit(line, "CMPEQ", [rt, rs, rv])
+                self.emit(line, "JMPT", [rt, labels[i]])
+            }
+        }
+        self.emit(line, "JUMP", [defaultL])
+
+        // `labels` MOVES into the context; from here on the labels are read
+        // back out of it.
+        self.switches.append(SwitchCtx{bodyLabels: labels, current: 0})
+        let si = len(self.switches) - 1
+        each i, c in cases {
+            // `current` travels with the switch so a nested fallthrough knows
+            // which body follows this one.
+            self.switches[si].current = i
+            self.mark(self.switches[si].bodyLabels[i])
+            self.push_scope(false)
+            each st in self.T.Get(self.T.Kid(c, 1)).Kids {
+                self.lower_stmt(st)
+            }
+            self.pop_scope()
+            self.emit(0, "JUMP", [end])
+        }
+        self.switches = self.switches[0..len(self.switches) - 1]
+        self.mark(end)
+    }
+
+    // ------------------------------------------------------------ match
+
+    func lower_match(mut self, s int) throws LowerError {
+        let n = self.T.Get(s)
+        let line = n.Line
+        let rs = self.lower_expr(self.T.Kid(s, 0))
+        let end = self.new_label()
+
+        each arm in self.T.Get(self.T.Kid(s, 1)).Kids {
+            let an = self.T.Get(arm)
+            let next = self.new_label()
+            self.push_scope(false)
+            let pat = self.build_pattern(an.Ival)
+            let binds = self.pat_binds(pat)
+            let rf = self.new_reg()
+            self.emit_pat(an.Line, "PMATCH",
+                          [rf, rs, self.pat_str(pat),
+                           "(" || str.join(binds, ",") || ")"], pat)
+            self.emit(an.Line, "JMPF", [rf, next])
+            let guard = self.T.Kid(arm, 0)
+            if guard != 0 {
+                // The guard runs in the arm's scope, after the binds.
+                let rg = self.lower_expr(guard)
+                self.emit(an.Line, "JMPF", [rg, next])
+            }
+            each st in self.T.Get(self.T.Kid(arm, 1)).Kids {
+                self.lower_stmt(st)
+            }
+            self.pop_scope()
+            self.emit(0, "JUMP", [end])
+            self.mark(next)
+        }
+        // Exhaustion is a bug: an uncatchable abort (§8.6).
+        self.emit(line, "ABORT", ["'no match arm matched'"])
+        self.mark(end)
+    }
+
+    // build_pattern converts an AST pattern to the structured IR pattern,
+    // allocating a register for each binding IN PATTERN ORDER (the register
+    // numbering is part of the listing).
+    func build_pattern(mut self, p int) int throws LowerError {
+        let n = self.T.Get(p)
+        if n.Kind == ast.PWILD {
+            return self.M.AddPat(ir.Pat{
+                Kind: ir.PAT_WILD, Name: "", Text: "", Reg: "", Elems: [],
+                LitKind: 0, LitText: "", CName: "",
+            })
+        }
+        if n.Kind == ast.PNIL {
+            return self.M.AddPat(ir.Pat{
+                Kind: ir.PAT_NIL, Name: "", Text: "", Reg: "", Elems: [],
+                LitKind: 0, LitText: "", CName: "",
+            })
+        }
+        if n.Kind == ast.PLIT {
+            let v = self.T.Kid(p, 0)
+            // The pool holds the DECODED value; Text keeps the source form for
+            // the listing (`0xd` is not `13` once it has been printed).
+            let lk, lt = self.literal_value(v)
+            return self.M.AddPat(ir.Pat{
+                Kind: ir.PAT_LIT, Name: "", Text: self.expr_text(v), Reg: "",
+                Elems: [], LitKind: lk, LitText: lt, CName: "",
+            })
+        }
+        if n.Kind == ast.PBIND {
+            let r = self.declare(n.Sval)
+            return self.M.AddPat(ir.Pat{
+                Kind: ir.PAT_BIND, Name: n.Sval, Text: "", Reg: r, Elems: [],
+                LitKind: 0, LitText: "", CName: "",
+            })
+        }
+        if n.Kind == ast.PVARIANT {
+            var elems = []
+            each e in n.Kids {
+                elems.append(self.build_pattern(e))
+            }
+            return self.M.AddPat(ir.Pat{
+                Kind: ir.PAT_VARIANT, Name: n.Sval, Text: "", Reg: "",
+                Elems: elems, LitKind: 0, LitText: "", CName: "",
+            })
+        }
+        self.fail(p, "cannot lower pattern " || ast.KindName(n.Kind))
+        return 0
+    }
+
+    // pat_binds lists a pattern's binding registers in pattern order.
+    func pat_binds(self, p int) []str {
+        var regs = []
+        let pn = self.M.Pats[p]
+        if pn.Kind == ir.PAT_BIND {
+            regs.append(pn.Reg)
+            return regs
+        }
+        each e in pn.Elems {
+            each r in self.pat_binds(e) {
+                regs.append(r)
+            }
+        }
+        return regs
+    }
+
+    // ------------------------------------------------------------ select
+
+    func lower_select(mut self, s int) throws LowerError {
+        let n = self.T.Get(s)
+        let line = n.Line
+        let end = self.new_label()
+        let cases = self.T.Get(self.T.Kid(s, 0)).Kids
+
+        // All channel operands and send values evaluate BEFORE blocking
+        // (§9.3), so a first pass lowers them and allocates the bind
+        // registers; the arm bodies follow the SELBEG/SELEND block.
+        var labels = []
+        var rchs = []
+        var rsends = []
+        var bindVs = []
+        var bindOks = []
+        var binds = []
+        var bindoks = []
+        each c in cases {
+            let cn = self.T.Get(c)
+            // Sval is "bind,bindok"; either side may be empty.
+            let nm = str.split(cn.Sval, ",")
+            var bind = ""
+            var bindok = ""
+            if len(nm) > 0 { bind = nm[0] }
+            if len(nm) > 1 { bindok = nm[1] }
+            binds.append(bind)
+            bindoks.append(bindok)
+
+            labels.append(self.new_label())
+            var rch = ""
+            var rsend = ""
+            var bv = ""
+            var bo = ""
+            if cn.Ival == 0 {                    // a receive
+                rch = self.lower_expr(self.T.Kid(c, 0))
+                if bind != ""   { bv = self.new_reg() }
+                if bindok != "" { bo = self.new_reg() }
+            } else if cn.Ival == 1 {             // a send
+                rch = self.lower_expr(self.T.Kid(c, 0))
+                rsend = self.lower_expr(self.T.Kid(c, 1))
+            }
+            rchs.append(rch)
+            rsends.append(rsend)
+            bindVs.append(bv)
+            bindOks.append(bo)
+        }
+
+        self.emit(line, "SELBEG", [])
+        each i, c in cases {
+            let cn = self.T.Get(c)
+            if cn.Ival == 0 {
+                var args = [labels[i], rchs[i]]
+                if bindVs[i] != "" {
+                    args.append(binds[i] || "=" || bindVs[i])
+                }
+                if bindOks[i] != "" {
+                    args.append(bindoks[i] || "=" || bindOks[i])
+                }
+                self.emit(cn.Line, "SELRECV", args)
+            } else if cn.Ival == 1 {
+                self.emit(cn.Line, "SELSEND",
+                          [labels[i], rchs[i], rsends[i]])
+            } else {
+                self.emit(cn.Line, "SELDEF", [labels[i]])
+            }
+        }
+        self.emit(line, "SELEND", [])
+
+        each i, c in cases {
+            self.mark(labels[i])
+            self.push_scope(false)
+            if binds[i] != "" and bindVs[i] != "" {
+                self.scopes[len(self.scopes) - 1].vars[binds[i]] = bindVs[i]
+            }
+            if bindoks[i] != "" and bindOks[i] != "" {
+                self.scopes[len(self.scopes) - 1].vars[bindoks[i]] =
+                    bindOks[i]
+            }
+            each st in self.T.Get(self.T.Kid(c, 2)).Kids {
+                self.lower_stmt(st)
+            }
+            self.pop_scope()
+            self.emit(0, "JUMP", [end])
+        }
+        self.mark(end)
+    }
+
+    // ------------------------------------------------------------ group
+
+    func lower_group(mut self, s int) throws LowerError {
+        let n = self.T.Get(s)
+        let line = n.Line
+        let timeout = self.T.Kid(s, 0)
+        if timeout != 0 {
+            let rt = self.lower_expr(timeout)
+            self.emit(line, "GRPBEG", [rt])
+        } else {
+            self.emit(line, "GRPBEG", [])
+        }
+        let isTry = n.Ival2 == 1
+        // The region makes an early exit (return/break/continue) join the
+        // group first — no task may outlive the block that spawned it (§9.1).
+        self.fins.append(FinRegion{fin: 0, ehActive: false, loopSeen: 0,
+                                isGroup: true, tryGroup: isTry})
+        self.lower_body(self.T.Kid(s, 1), false)
+        self.fins = self.fins[0..len(self.fins) - 1]
+        if isTry {
+            self.emit(0, "GRPENDT", [])   // try group: failure propagates
+        } else {
+            self.emit(0, "GRPEND", [])    // plain group: failure rethrows here
+        }
+    }
+
+    // ------------------------------------------------------------ parse
+
+    func lower_parse(mut self, s int) throws LowerError {
+        let n = self.T.Get(s)
+        let line = n.Line
+        let rsrc = self.lower_expr(self.T.Kid(s, 0))
+        var fold = "NONE"
+        if n.Sval != "" { fold = str.upper(n.Sval) }
+
+        // A PARSE term can only name a register, so a target that is NOT a
+        // plain local — a package-level global, or a variable captured from an
+        // enclosing frame — is parsed into a scratch register and written back
+        // afterwards. The three parallel slices are one writeback record.
+        var backName = []
+        var backReg = []
+        var backGlobal = []
+
+        var terms = []
+        var structured = []
+        each t in self.T.Get(self.T.Kid(s, 1)).Kids {
+            let tn = self.T.Get(t)
+            if tn.Ival == 0 {                       // a variable term
+                var op = self.lookup(tn.Sval)
+                let fnd = op != ""
+                let loc = self.is_local(tn.Sval)
+                if fnd and loc {
+                    // Re-target the existing local: PARSE writes into it.
+                } else if fnd {
+                    op = self.new_reg()             // an upvalue
+                    backName.append(tn.Sval)
+                    backReg.append(op)
+                    backGlobal.append(false)
+                } else if tn.Sval in self.globals {
+                    op = self.new_reg()
+                    backName.append(tn.Sval)
+                    backReg.append(op)
+                    backGlobal.append(true)
+                } else {
+                    // Not previously bound: implicitly a mutable str local
+                    // (§7.4).
+                    op = self.declare(tn.Sval)
+                }
+                terms.append(tn.Sval || "=" || op)
+                structured.append(ir.Term{Kind: ir.TERM_VAR, Name: tn.Sval,
+                                          Reg: op, Lit: "", Col: 0})
+            } else if tn.Ival == 1 {                // a discard
+                terms.append(".")
+                structured.append(ir.Term{Kind: ir.TERM_DISCARD, Name: "",
+                                          Reg: "", Lit: "", Col: 0})
+            } else if tn.Ival == 2 {                // a literal
+                terms.append("'" || tn.Sval || "'")
+                structured.append(ir.Term{Kind: ir.TERM_LIT, Name: "",
+                                          Reg: "", Lit: tn.Sval, Col: 0})
+            } else if tn.Ival == 3 {                // a column
+                terms.append(str(tn.Ival2))
+                structured.append(ir.Term{Kind: ir.TERM_COL, Name: "",
+                                          Reg: "", Lit: "", Col: tn.Ival2})
+            }
+        }
+        self.emit_terms(line, "PARSE",
+                        [rsrc, fold, "(" || str.join(terms, " ") || ")"],
+                        structured)
+
+        each i, nm in backName {
+            if backGlobal[i] {
+                self.emit(line, "SETGLB", [nm, backReg[i]])
+            } else {
+                self.emit(line, "UPSET", [nm, backReg[i]])
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ try/catch
+
+    func lower_try_catch(mut self, s int) throws LowerError {
+        let n = self.T.Get(s)
+        let line = n.Line
+        let catchL = self.new_label()
+        let endL = self.new_label()
+        let fin = self.T.Kid(s, 2)
+
+        self.fins.append(FinRegion{fin: fin, ehActive: true,
+                                loopSeen: len(self.loops), isGroup: false,
+                                tryGroup: false})
+        let fidx = len(self.fins) - 1
+
+        self.emit(line, "EHPUSH", [catchL])
+        self.lower_body(self.T.Kid(s, 0), false)
+        self.emit(0, "EHPOP", [])
+        // The protected body is over: an exit edge from here on must not EHPOP
+        // again (the region stays on the stack for the finally copies).
+        self.fins[fidx].ehActive = false
+        self.run_finally(fin, "normal")
+        self.emit(0, "JUMP", [endL])
+
+        // The handler: the unwinder pops the region and materializes the
+        // exception.
+        self.mark(catchL)
+        let re = self.new_reg()
+        self.emit(line, "CATCH", [re])
+        self.catchRegs.append(re)
+
+        var matched = false
+        each c in self.T.Get(self.T.Kid(s, 1)).Kids {
+            let cn = self.T.Get(c)
+            let nextC = self.new_label()
+            let types = self.T.Get(self.T.Kid(c, 1)).Kids
+            if len(types) > 0 {
+                var names = []
+                each te in types {
+                    names.append(self.short_type(te))
+                }
+                let rt = self.new_reg()
+                self.emit(cn.Line, "ISTYPE",
+                          [rt, re, "'" || str.join(names, ",") || "'"])
+                self.emit(cn.Line, "JMPF", [rt, nextC])
+            } else {
+                matched = true                  // a catch-all
+            }
+            self.push_scope(false)
+            if cn.Sval != "" {
+                self.scopes[len(self.scopes) - 1].vars[cn.Sval] = re
+            }
+            self.lower_body(self.T.Kid(c, 0), false)
+            self.pop_scope()
+            self.run_finally(fin, "catch")
+            self.emit(0, "JUMP", [endL])
+            self.mark(nextC)
+            if len(types) == 0 { break }
+        }
+        if not matched {
+            // No clause matched: finally still runs, then the exception
+            // continues unwinding.
+            self.run_finally(fin, "unwind")
+            self.emit(0, "THROW", [re])
+        }
+        self.catchRegs = self.catchRegs[0..len(self.catchRegs) - 1]
+        self.fins = self.fins[0..len(self.fins) - 1]
+        self.mark(endL)
+    }
+
+    // run_finally lowers one duplicated copy of a finally block (frozen
+    // decision: duplication per exit edge, each copy commented).
+    func run_finally(mut self, fin int, edge str) throws LowerError {
+        if fin == 0 { return }
+        self.note("finally (dup: " || edge || ")")
+        self.lower_body(fin, false)
+    }
+
+    // unwind_finallies emits the EHPOP + finally copies required for a
+    // return/break/continue leaving try regions. downTo is the fins depth of
+    // the jump target (0 for return).
+    func unwind_finallies(mut self, downTo int, edge str) throws LowerError {
+        var i = len(self.fins) - 1
+        while i >= downTo {
+            let region = self.fins[i]
+            if region.isGroup {
+                // A group must be joined before control leaves it (§9.1): no
+                // task may outlive the block that spawned it, whatever the
+                // exit edge.
+                self.note("group joined on " || edge)
+                if region.tryGroup {
+                    self.emit(0, "GRPENDT", [])
+                } else {
+                    self.emit(0, "GRPEND", [])
+                }
+                i -= 1
+                continue
+            }
+            if region.ehActive {
+                self.emit(0, "EHPOP", [])
+            }
+            self.run_finally(region.fin, edge)
+            i -= 1
+        }
+    }
+}

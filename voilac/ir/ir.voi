@@ -1,0 +1,170 @@
+// Package ir — Voilà's register-based linear IR (§12), and its HLASM-style
+// listing.
+//
+// The IR is an assembly language: simple operands are text ("r3", "K7", "L2",
+// a name). The two genuinely structured operands — match patterns and parse
+// templates — are carried as data, because a code generator must not re-parse
+// rendered text (`0xd` is not `13` once it has been printed).
+//
+// Patterns are recursive, so they live in an arena (`Module.Pats`) exactly as
+// AST nodes do; index 0 is the nil pattern.
+package ir
+
+use "std/str"
+use "std/fmt"
+
+// ---------------------------------------------------------------- constants
+
+const CINT   = 0
+const CFLOAT = 1
+const CDEC   = 2
+const CSTR   = 3
+const CRUNE  = 4
+const CBOOL  = 5
+const CNIL   = 6
+const CUNIT  = 7
+
+func ConstKindName(k int) str {
+    if k == CINT   { return "INT" }
+    if k == CFLOAT { return "FLOAT" }
+    if k == CDEC   { return "DEC" }
+    if k == CSTR   { return "STR" }
+    if k == CRUNE  { return "RUNE" }
+    if k == CBOOL  { return "BOOL" }
+    if k == CNIL   { return "NIL" }
+    return "UNIT"
+}
+
+struct Const {
+    Kind int
+    Text str
+}
+
+// ---------------------------------------------------------------- patterns
+
+const PAT_WILD    = 0
+const PAT_NIL     = 1
+const PAT_LIT     = 2
+const PAT_BIND    = 3
+const PAT_VARIANT = 4
+
+struct Pat {
+    Kind    int
+    Name    str
+    Text    str    // the literal's source form, for the listing
+    Reg     str    // PAT_BIND: the register bound
+    Elems   []int  // sub-patterns, as arena indices
+    LitKind int
+    LitText str
+    CName   str    // set by the C backend: the static VlPat symbol
+}
+
+// ---------------------------------------------------------------- templates
+
+const TERM_VAR     = 0
+const TERM_DISCARD = 1
+const TERM_LIT     = 2
+const TERM_COL     = 3
+
+struct Term {
+    Kind int
+    Name str
+    Reg  str
+    Lit  str
+    Col  int
+}
+
+// UpRef locates an upvalue in the lexical parent chain: Depth frames up
+// (1 = the immediately enclosing frame), slot Slot. Scope is the lexical scope
+// index the name was found in — the lowerer uses it to tell a loop-local
+// capture from an outer one.
+struct UpRef {
+    Name  str
+    Depth int
+    Slot  int
+    Scope int
+}
+
+// ---------------------------------------------------------------- code
+
+struct Instr {
+    Labels []str
+    Op     str
+    Args   []str
+    Pat    int    // an index into Module.Pats; 0 = none
+    Terms  []Term
+    Src    int    // 1-based source line; 0 = none
+}
+
+struct Func {
+    Name        str
+    Sig         str
+    NRegs       int
+    Instrs      []Instr
+    SrcLine     int
+    Ups         []UpRef   // insertion-ordered, so the IR is deterministic
+    LoopCapture str
+}
+
+impl Func {
+    // Up finds an upvalue by name; Depth 0 means "not an upvalue".
+    func Up(self, name str) UpRef {
+        each u in self.Ups {
+            if u.Name == name { return u }
+        }
+        return UpRef{Name: "", Depth: 0, Slot: 0, Scope: 0}
+    }
+
+    func HasUp(self, name str) bool {
+        each u in self.Ups {
+            if u.Name == name { return true }
+        }
+        return false
+    }
+}
+
+struct TypeDecl {
+    Kind  str    // STRUCT, ENUM, EXCEPTION
+    Name  str
+    Lines []str  // pre-rendered member descriptions
+}
+
+struct Module {
+    Source   str
+    Consts   []Const
+    Types    []TypeDecl
+    Funcs    []Func
+    Pats     []Pat
+    constIdx map[str]int
+}
+
+func NewModule(source str) Module {
+    var m = Module{Source: source, Consts: [], Types: [], Funcs: [],
+                   Pats: [], constIdx: make(map[str]int)}
+    // Index 0 of the pattern arena is the nil pattern.
+    m.Pats.append(Pat{Kind: PAT_WILD, Name: "", Text: "", Reg: "", Elems: [],
+                      LitKind: 0, LitText: "", CName: ""})
+    return m
+}
+
+impl Module {
+    // Constant interns a constant and returns its pool name ("K3"). The pool
+    // is insertion-ordered and the dedup key is (kind, canonical text).
+    func Constant(mut self, kind int, text str) str {
+        let key = "{kind}:{text}"
+        if key in self.constIdx {
+            return "K" || str(self.constIdx[key])
+        }
+        let i = len(self.Consts)
+        self.Consts.append(Const{Kind: kind, Text: text})
+        self.constIdx[key] = i
+        return "K" || str(i)
+    }
+
+    // AddPat appends a pattern to the arena and returns its index.
+    func AddPat(mut self, p Pat) int {
+        let i = len(self.Pats)
+        self.Pats.append(p)
+        return i
+    }
+}

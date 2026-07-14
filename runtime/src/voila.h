@@ -1,0 +1,354 @@
+/* voila.h — the Voilà native runtime (libvoila).
+ *
+ * The C backend compiles a Voilà program to C that calls into this API.
+ * Memory is reference-counted, never garbage-collected: the Acyclicity Rule
+ * (spec §6.3) guarantees the owning type graph is a DAG, so refcounts always
+ * reach zero.
+ *
+ * Ownership convention, obeyed by every function here and by generated code:
+ *
+ *     - helpers BORROW their arguments and return an OWNED value
+ *     - frame slots OWN their contents
+ *     - vl_set(&slot, owned) releases the old value and takes the new one
+ *
+ * Generated code therefore reads:  vl_set(&F->r[3], vl_add(F->r[1], F->r[2]));
+ */
+#ifndef VOILA_H
+#define VOILA_H
+
+#include <setjmp.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+
+/* ---------------------------------------------------------------- values */
+
+typedef enum {
+  VL_NIL,
+  VL_UNIT,
+  VL_BOOL,
+  VL_INT,
+  VL_FLOAT,
+  VL_RUNE,
+  VL_DUR,     /* duration, nanoseconds */
+  VL_INSTANT, /* instant, nanoseconds since the epoch */
+  VL_OBJ
+} VlTag;
+
+typedef struct VlObj VlObj;
+
+typedef struct {
+  VlTag t;
+  union {
+    int64_t i;
+    double f;
+    uint32_t r;
+    bool b;
+    VlObj *o;
+  } u;
+} Value;
+
+typedef enum {
+  O_STR,
+  O_DEC,
+  O_SLICE,
+  O_MAP,
+  O_SET,
+  O_TUPLE,
+  O_STRUCT,
+  O_ENUM,
+  O_ERR,
+  O_CLOSURE,
+  O_NATIVE,
+  O_CHAN,
+  O_TASK,
+  O_SHARED,
+  O_CELL,
+  O_WEAK,
+  O_RANGE,
+  O_FILE,
+  O_BUILDER,
+  O_TYPE,
+  O_FRAME,
+  O_ITER
+} VlKind;
+
+struct VlObj {
+  int32_t rc;
+  uint8_t kind;
+};
+
+/* ---------------------------------------------------------------- frames */
+
+typedef struct VlFrame VlFrame;
+
+/* A compiled function's registers live in a heap frame so closures can
+ * capture them by reference (the interpreter's environments, made explicit).
+ * `up` is the lexically enclosing frame — an upvalue is (depth, slot). */
+struct VlFrame {
+  VlObj hdr;
+  VlFrame *up;
+  int nregs;
+  Value *defers; /* closures, run LIFO on exit and on unwind */
+  int ndefers, capdefers;
+  Value r[1]; /* flexible */
+};
+
+VlFrame *vl_frame_new(int nregs, VlFrame *up);
+void vl_frame_release(VlFrame *f);
+void vl_frame_clear(VlFrame *f); /* breaks frame<->closure reference cycles */
+void vl_frame_push(VlFrame *f);           /* onto the task's frame stack */
+void vl_frame_pop_run_defers(VlFrame *f); /* normal exit: defers, then pop */
+void vl_defer(VlFrame *f, Value closure);
+
+Value vl_up(VlFrame *f, int depth, int slot);            /* borrowed */
+void vl_upset(VlFrame *f, int depth, int slot, Value v); /* takes ownership */
+
+/* ---------------------------------------------------------------- memory */
+
+Value vl_retain(Value v);
+void vl_release(Value v);
+void vl_set(Value *slot, Value owned);
+
+/* ---------------------------------------------------------------- ctors */
+
+Value vl_nil(void);
+Value vl_unit(void);
+Value vl_bool(bool b);
+Value vl_int(int64_t n);
+Value vl_float(double f);
+Value vl_rune(uint32_t r);
+Value vl_dur(int64_t ns);
+Value vl_instant(int64_t ns);
+
+Value vl_str(const char *s);              /* NUL-terminated */
+Value vl_str_n(const char *s, int64_t n); /* explicit length */
+const char *vl_cstr(Value v);             /* borrowed bytes, NUL-terminated */
+int64_t vl_strlen(Value v);
+
+Value vl_dec_parse(const char *s); /* throws ConvError on garbage */
+Value vl_dec_from_int(int64_t n);
+
+Value vl_slice_new(int64_t n); /* n nil elements */
+Value vl_map_new(void);
+Value vl_set_new(void);
+Value vl_tuple_new(Value *elems, int n);
+Value vl_range_new(int64_t lo, int64_t hi, int64_t by, bool inclusive);
+Value vl_builder_new(void);
+
+/* ---------------------------------------------------------------- types */
+
+/* Type descriptors are emitted by the code generator. */
+typedef struct {
+  const char *name;
+  int nfields;
+  const char *const *fields;
+  const char *const *ftypes; /* declared type of each field, for zero values */
+} VlType;
+
+typedef struct {
+  const char *type;    /* owning enum */
+  const char *variant; /* variant name */
+  int nfields;
+  const char *const *fields;
+} VlVariant;
+
+/* The generated program registers its metadata before main runs. */
+typedef Value (*VlFn)(Value *argv, int argc, VlFrame *up);
+
+typedef struct {
+  const char *type;
+  const char *method;
+  VlFn fn;
+  bool has_self;
+} VlMethod;
+
+void vl_register_types(const VlType *types, int ntypes, const VlVariant *vars,
+                       int nvars, const VlMethod *methods, int nmethods);
+
+Value vl_struct_new(const char *type, Value *positional, int npos,
+                    const char **names, Value *named, int nnamed);
+Value vl_enum_new(const char *type, const char *variant, Value *argv, int argc);
+Value vl_exc_new(const char *type, Value *positional, int npos,
+                 const char **names, Value *named, int nnamed);
+Value vl_zero(const char *type_text); /* zero value of a declared type */
+
+/* ---------------------------------------------------------------- calls */
+
+Value vl_closure(VlFn fn, VlFrame *up);
+Value vl_native(const char *name, VlFn fn);
+Value vl_call(Value callee, Value *argv, int argc); /* borrowed argv */
+Value vl_call_named(Value callee, Value *argv, int argc, const char **names,
+                    int nnamed);
+Value vl_callm(Value recv, const char *method, Value *argv, int argc);
+Value vl_spawn_fn(VlFn fn, Value *argv, int argc);
+Value vl_spawn_closure(Value closure);
+Value vl_await(Value task);
+
+/* ---------------------------------------------------------------- ops */
+
+Value vl_add(Value a, Value b);
+Value vl_sub(Value a, Value b);
+Value vl_mul(Value a, Value b);
+Value vl_div(Value a, Value b);  /* exact division → float (§5.1) */
+Value vl_idiv(Value a, Value b); /* floor division */
+Value vl_mod(Value a, Value b);  /* floor remainder */
+Value vl_pow(Value a, Value b);
+Value vl_cat(Value a, Value b); /* || string concatenation */
+Value vl_shl(Value a, Value b);
+Value vl_shr(Value a, Value b);
+Value vl_band(Value a, Value b);
+Value vl_bor(Value a, Value b);
+Value vl_bxor(Value a, Value b);
+Value vl_neg(Value a);
+Value vl_not(Value a);
+Value vl_bnot(Value a);
+
+bool vl_truthy(Value v); /* bool only; anything else aborts */
+bool vl_equal(Value a, Value b);
+int vl_compare(Value a, Value b); /* -1, 0, 1; throws on incomparable */
+Value vl_cmpeq(Value a, Value b);
+Value vl_cmpne(Value a, Value b);
+Value vl_cmplt(Value a, Value b);
+Value vl_cmple(Value a, Value b);
+Value vl_cmpgt(Value a, Value b);
+Value vl_cmpge(Value a, Value b);
+Value vl_cmpin(Value a, Value b); /* x in coll */
+
+Value vl_index(Value coll, Value idx);            /* out of bounds ABORTS */
+Value vl_slice_range(Value coll, Value range);    /* out of range THROWS */
+void vl_setidx(Value coll, Value idx, Value v);   /* takes ownership of v */
+Value vl_field(Value obj, const char *name);      /* borrowed → owned */
+void vl_setfld(Value obj, const char *name, Value v);
+Value vl_conv(const char *type, Value v, Value *base); /* checked (§3.2) */
+Value vl_interp(Value *parts, int n);                  /* string interpolation */
+
+/* Iteration protocol: ranges, slices, maps, sets, strings, channels. */
+Value vl_iter(Value src);
+bool vl_iter_next(Value it, Value *key, Value *val); /* owned outputs */
+
+/* Helpers emitted by the C backend. */
+int64_t vl_int_of(Value v);
+Value *vl_slice_data(Value s);
+void vl_spread(Value dst, Value src);
+void vl_slice_append(Value s, Value owned);
+Value vl_map_new(void);
+Value vl_set_new(void);
+int64_t vl_len(Value v);
+
+/* ---------------------------------------------------------------- errors */
+
+typedef struct VlHandler {
+  jmp_buf buf;
+  struct VlHandler *prev;
+  int frame_depth;
+} VlHandler;
+
+void vl_eh_prepare(VlHandler *h);
+void vl_eh_pop(void);
+Value vl_eh_current(void); /* owned copy of the in-flight exception */
+bool vl_istype(Value exc, const char *types); /* comma-separated names */
+
+#define VL_TRY(h) (vl_eh_prepare(&(h)), setjmp((h).buf))
+
+Value vl_err(Value msg);       /* error VALUE (§8.1) */
+Value vl_errf(Value *argv, int argc);
+bool vl_isfail(Value v);       /* err or nil — the `else` operator's test */
+Value vl_tryp(Value v);        /* `try expr`: propagate failure (see below) */
+Value vl_must(Value v);        /* error value → exception */
+void vl_throw(Value exc);      /* raise; unwinds, running defers */
+void vl_rethrow(Value exc);
+void vl_throw_from(Value exc, Value cause);
+void vl_throwf(const char *type, const char *fmt, ...);
+void vl_abort(const char *fmt, ...); /* §8.6: uncatchable, no defers */
+
+/* `try expr` inside a function that returns T!: the generated code checks
+ * vl_isfail and jumps to the function's exit with the failure as its result.
+ * vl_tryp exists for the interpreter-shaped path and simply returns v. */
+
+/* ---------------------------------------------------------------- tasks */
+
+void vl_group_begin(Value timeout); /* nil = no timeout */
+/* Plain `group` rethrows a task failure; `try group` yields it as an error
+ * value (nil when the group succeeded). */
+Value vl_group_end(bool as_error_value);
+Value vl_time_after(int64_t ns);
+void vl_sleep_ns(int64_t ns);
+int64_t vl_now_ns(void);
+
+Value vl_chan_new(int64_t cap);
+void vl_chan_send(Value ch, Value v); /* takes ownership: sending moves */
+Value vl_chan_recv(Value ch);
+Value vl_chan_recv_ok(Value ch, Value *ok);
+void vl_chan_close(Value ch);
+void vl_check_cancelled(void);
+
+/* select: the generated code describes its cases, the runtime picks one. */
+typedef enum { VL_SEL_RECV, VL_SEL_SEND, VL_SEL_DEFAULT } VlSelKind;
+typedef struct {
+  VlSelKind kind;
+  Value ch;
+  Value send; /* VL_SEL_SEND */
+} VlSelCase;
+int vl_select(VlSelCase *cases, int n, Value *recv_val, bool *recv_ok);
+
+Value vl_shared(Value v);
+Value vl_cell(Value v);
+Value vl_weak(Value shared);
+
+/* ---------------------------------------------------------------- numeric */
+
+void vl_numeric_digits(int n);
+int vl_get_digits(void);
+void vl_digits_save(void);
+void vl_digits_restore(void);
+
+/* ---------------------------------------------------------------- text */
+
+Value vl_tostr(Value v); /* the form `say` prints (Show honored) */
+char *vl_fmt_float(double f); /* Go-compatible shortest form; caller frees */
+
+/* ---------------------------------------------------------------- parse */
+
+typedef enum { VL_T_VAR, VL_T_DISCARD, VL_T_LIT, VL_T_COL } VlTermKind;
+typedef struct {
+  VlTermKind kind;
+  int slot;        /* VL_T_VAR: frame register */
+  const char *lit; /* VL_T_LIT */
+  int col;         /* VL_T_COL */
+} VlTerm;
+void vl_parse(VlFrame *f, Value src, const char *fold, const VlTerm *terms,
+              int nterms);
+
+/* ---------------------------------------------------------------- match */
+
+/* Patterns are emitted as a flat postfix program; see cgen. */
+typedef enum {
+  VL_P_WILD,
+  VL_P_NIL,
+  VL_P_LIT,
+  VL_P_BIND,
+  VL_P_VARIANT
+} VlPatKind;
+typedef struct VlPat {
+  VlPatKind kind;
+  const char *name; /* variant name */
+  int slot;         /* VL_P_BIND: frame register */
+  int lit;          /* VL_P_LIT: index into the program's constant pool */
+  int nelems;
+  const struct VlPat *elems;
+} VlPat;
+bool vl_match(VlFrame *f, Value subject, const VlPat *p, const Value *consts);
+
+/* ---------------------------------------------------------------- entry */
+
+void vl_init(int argc, char **argv);
+int vl_finish(void); /* joins the root group; returns the exit code */
+void vl_say(Value *argv, int argc);
+
+/* Builtin (prelude) and package functions used by generated code are
+ * declared in voila_std.h, which the generator includes. */
+#include "voila_std.h"
+
+#endif /* VOILA_H */

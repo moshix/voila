@@ -1,0 +1,111 @@
+// chk/acyclic.voi — the Acyclicity Rule (§6.3).
+//
+// A port of internal/check/acyclic.go. Following SCALAR OWNING edges — a
+// direct field of a named type, and shared[T]/cell[T] — the type graph must
+// be a DAG. Collection and optional edges are tree-shaped by construction and
+// are excluded; weak[T] never owns.
+package chk
+
+use "voilac/ast"
+
+// Edge is one scalar owning edge in the type graph.
+struct Edge {
+    from  str
+    to    str
+    field str
+    node  int   // the field's TYPE node: where the diagnostic points
+}
+
+impl Checker {
+    // check_acyclicity reports, for every type that reaches itself, the edge
+    // that closes the cycle — once per edge.
+    func check_acyclicity(mut self) {
+        each name in self.sNames {
+            let fields = self.T.Kid(self.structs[name], 0)
+            each f in self.T.Get(fields).Kids {
+                self.own_edge(name, f)
+            }
+        }
+        each name in self.eNames {
+            let vs = self.T.Kid(self.enums[name], 0)
+            each v in self.T.Get(vs).Kids {
+                each f in self.T.Get(self.T.Kid(v, 0)).Kids {
+                    self.own_edge(name, f)
+                }
+            }
+        }
+
+        // One DFS per type. A type with no outgoing edge visits nothing, so
+        // sweeping every name is the same walk the Go checker makes over the
+        // edge map's keys.
+        each name in self.sNames {
+            self.acyc_visit(name, name, [name])
+        }
+        each name in self.eNames {
+            self.acyc_visit(name, name, [name])
+        }
+    }
+
+    // own_edge records the owning edge a field carries, if any.
+    func own_edge(mut self, from str, f int) {
+        let fd = self.T.Get(f)
+        let te = fd.Ival
+        if te == 0 { return }
+        let tn = self.T.Get(te)
+        var to = ""
+        if tn.Kind == ast.TNAMED {
+            to = tn.Sval
+        } else if tn.Kind == ast.TBOX {
+            // The box kind is in Ival2: 0 shared, 1 cell, 2 weak. A weak box
+            // is a non-owning back-edge and cannot close an ownership cycle.
+            if tn.Ival2 == 2 { return }
+            let el = self.T.Kid(te, 0)
+            if el != 0 and self.T.Kind(el) == ast.TNAMED {
+                to = self.T.Get(el).Sval
+            }
+        } else {
+            return
+        }
+        // Only edges to types this program declares can form a cycle.
+        if not (to in self.structs) and not (to in self.enums) { return }
+        self.edges.append(Edge{from: from, to: to, field: fd.Sval, node: te})
+    }
+
+    // acyc_visit walks the owning edges out of `cur`, looking for a way back
+    // to `start`. `path` is the set of types already on the DFS stack, carried
+    // as a slice: a cycle is short, and copying it keeps the recursion free of
+    // aliasing.
+    func acyc_visit(mut self, start str, cur str, path []str) {
+        each e in self.edges {
+            if e.from != cur { continue }
+            if e.to == start {
+                // The cycle closes here. Report the closing edge once, keyed
+                // by the field it lives in.
+                let key = e.from || "." || e.field
+                if key in self.reported { continue }
+                self.reported.add(key)
+                self.report_at(e.node,
+                               "type `{start}` forms an ownership cycle " ||
+                               "through field `{e.field}`")
+                continue
+            }
+            if not on_path(path, e.to) {
+                self.acyc_visit(start, e.to, extend(path, e.to))
+            }
+        }
+    }
+}
+
+func on_path(path []str, name str) bool {
+    each p in path {
+        if p == name { return true }
+    }
+    return false
+}
+
+func extend(path []str, name str) []str {
+    var out = []
+    each p in path { out.append(p) }
+    out.append(name)
+    return out
+}

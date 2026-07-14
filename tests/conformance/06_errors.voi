@@ -1,0 +1,58 @@
+exception NotFound { path str }
+exception ParseError {
+    line int
+    col  int
+    func message(self) str { return "parse error at {self.line}:{self.col}" }
+}
+func port(s str) int! {
+    let n = try to_int(s) else return err("not a number: {s}")
+    if n < 1 or n > 65535 { return err("out of range: {n}") }
+    return n
+}
+func load(p str) str { throw NotFound{path: p} }
+func boom() int { throw ParseError{line: 3, col: 9} }
+func defers() {
+    defer say "defer 1"
+    defer say "defer 2"
+    say "body"
+}
+func defer_unwind() {
+    defer say "cleanup ran"
+    throw NotFound{path: "/x"}
+}
+func main() {
+    say try port("80")
+    say port("bad") else 8080
+    match port("99999") {
+        Ok(v)  => say "ok", v
+        Err(e) => say "err:", e.message()
+    }
+    try {
+        say load("/etc/x")
+    } catch e: NotFound {
+        say "caught NotFound", e.path
+    } finally {
+        say "finally"
+    }
+    match attempt boom() {
+        Ok(v)  => say "ok"
+        Err(e) => say "attempt:", e.message()
+    }
+    try {
+        let n = must port("bad")
+        say n
+    } catch e {
+        say "must:", e.message()
+    }
+    defers()
+    try { defer_unwind() } catch e { say "unwound" }
+    try {
+        try { throw NotFound{path: "a"} }
+        catch e: NotFound { throw ParseError{line: 1, col: 1} from e }
+    } catch e: ParseError {
+        say e.message(), "caused by", e.cause().message()
+    }
+    try { say [1,2,3][0..9] } catch e: RangeError { say "slice throws" }
+    try { let x = u8(300) } catch e: ConvError { say "conv", e.value, e.to }
+    say to_int("banana"), to_u8(300), int("ff", 16)
+}

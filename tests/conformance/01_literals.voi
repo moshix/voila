@@ -1,0 +1,13 @@
+// Literals, radices, underscores, escapes, interpolation.
+func main() {
+    say 42, 0x1F, 0o755, 0b1010, 1_000_000
+    say 3.14, 6.02e23, 1.5e-8
+    say 19.99d, 3d, 0.1d
+    say 'A', '\n' == "\n", '\u{48}'
+    say "tab\there", "quote\"q", "brace \{x}"
+    say `raw
+multi`
+    say true, false, nil
+    let x = 7
+    say "x={x} sq={x * x} nest={str(len("abc"))}"
+}

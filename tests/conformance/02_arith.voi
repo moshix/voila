@@ -1,0 +1,27 @@
+// Numeric tower: exact division, floor div/mod, power, overflow traps.
+func main() {
+    say 7 / 2, 1 / 4
+    say 17//5, -17//5, 17 % 5, -17 % 5
+    say 2 ** 10, 2 ** 0
+    say 1 + 2.5, 2.0 * 3
+    say 19.99d * 3d, 0.1d + 0.2d, 1d / 3d
+    numeric digits 5
+    say 1d / 3d
+    numeric digits 28
+    say min(3, 1, 2), max([5, 9, 2]), abs(-7), abs(-2.5)
+    say sum([1, 2, 3]), avg([2.0, 4.0])
+    say round(2.5), round(3.5), floor(-1.2), ceil(1.2), trunc(-1.9)
+    say round_to(3.14159, 2)
+    try {
+        let x = 9_223_372_036_854_775_807 + 1
+        say x
+    } catch e: OverflowError {
+        say "overflow trapped"
+    }
+    say wrap_add(9_223_372_036_854_775_807, 1)
+    try {
+        say 1 / 0
+    } catch e: RangeError {
+        say "div by zero trapped"
+    }
+}

@@ -1,0 +1,6 @@
+package main
+use "probemod/p"
+func main() {
+    let bad i8 = 300
+    say bad
+}

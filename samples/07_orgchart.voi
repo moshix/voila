@@ -1,0 +1,80 @@
+// 07_orgchart.voi — shared ownership without leaks (§6.3): children are
+// owned through []shared[Employee] (tree-shaped, fine); the back-edge to
+// the manager MUST be weak[Employee] — write `shared` there and the
+// compiler rejects the program with an ownership-cycle error. Try it.
+package main
+
+use "std/fmt"
+use "std/str"
+
+struct Employee {
+    name    str
+    title   str
+    reports []shared[Employee]
+    boss    weak[Employee]     // back-edge: weak or it will not compile
+}
+
+func hire(name str, title str, boss ?shared[Employee]) shared[Employee] {
+    let e = shared(Employee{name: name, title: title, reports: []})
+    if let Some(b) = boss {
+        // Construction-time wiring: stage 0 permits it; the deep-freeze of
+        // shared values after construction is a stage-1 tightening.
+        b.reports.append(e)
+        e.boss = weak(b)
+    }
+    return e
+}
+
+// depth walks the weak back-edges up to the root (§14.3's shape).
+func depth(e shared[Employee]) int {
+    match e.boss.upgrade() {
+        Some(b) => return 1 + depth(b)
+        nil     => return 0
+    }
+}
+
+// headcount rolls up the tree through the owning edges.
+func headcount(e shared[Employee]) int {
+    var n = 1
+    each r in e.reports {
+        n += headcount(r)
+    }
+    return n
+}
+
+func print_tree(e shared[Employee]) {
+    let indent = str.repeat("    ", depth(e))
+    fmt.printf("%s%-22s %s\n", indent, e.name, "(" || e.title || ")")
+    each r in e.reports {
+        print_tree(r)
+    }
+}
+
+func chain_of_command(e shared[Employee]) str {
+    match e.boss.upgrade() {
+        Some(b) => return e.name || " -> " || chain_of_command(b)
+        nil     => return e.name
+    }
+}
+
+func main() {
+    let ceo = hire("Ada Lovelace", "CEO", nil)
+    let eng = hire("Grace Hopper", "VP Engineering", ceo)
+    let ops = hire("Margaret Hamilton", "VP Operations", ceo)
+    let be  = hire("Dennis Ritchie", "Backend Lead", eng)
+    let fe  = hire("Alan Kay", "Frontend Lead", eng)
+    hire("Ken Thompson", "Engineer", be)
+    hire("Barbara Liskov", "Engineer", be)
+    hire("Donald Knuth", "Engineer", fe)
+    hire("Edsger Dijkstra", "SRE", ops)
+
+    say "ORG CHART"
+    say str.repeat("=", 46)
+    print_tree(ceo)
+
+    say
+    fmt.printf("headcount under %s: %d\n", ceo.name, headcount(ceo))
+    fmt.printf("headcount under %s: %d\n", eng.name, headcount(eng))
+    fmt.printf("depth of a backend engineer: %d\n", depth(be.reports[0]))
+    say "chain of command:", chain_of_command(be.reports[1])
+}

@@ -1,0 +1,26 @@
+package geom
+
+// A second file in the same package: names are visible without qualification,
+// and both files merge into one package.
+use "std/fmt"
+
+exception BadShape { why str }
+
+trait Named { func Name(self) str }
+
+impl Named for Box {
+    func Name(self) str { return "box" }
+}
+
+func Describe(b Box) str {
+    return fmt.sprintf("%s %.1fx%.1f", b.Name(), b.w, b.h)
+}
+
+func Validate(b Box) Box {
+    if b.w <= 0.0 { throw BadShape{why: "width must be positive"} }
+    return b
+}
+
+struct Pair[T] { a T, b T }
+
+func MakePair(x float, y float) Pair[float] { return Pair[float]{a: x, b: y} }

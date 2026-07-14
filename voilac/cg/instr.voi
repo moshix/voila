@@ -1,0 +1,786 @@
+// cg/instr.voi — one IR instruction, one C statement.
+//
+// The name tables below decide what a native build can express: a program
+// using anything the C runtime does not provide fails at BUILD time with a
+// clear message rather than at run time.
+package cg
+
+use "voilac/ir"
+use "std/str"
+use "std/fmt"
+
+// prelude_natives are the built-in functions the C runtime provides.
+func prelude_natives() []str {
+    return ["len", "append", "close", "err", "errf", "assert", "min", "max",
+            "abs", "sum", "avg", "round", "floor", "ceil", "trunc",
+            "round_to", "range", "zip", "enumerate", "keys", "values",
+            "shared", "cell", "weak", "set", "printf", "sprintf",
+            "to_int", "to_i8", "to_i16", "to_i32", "to_i64", "to_u8",
+            "to_u16", "to_u32", "to_u64", "to_byte", "to_float", "to_dec",
+            "to_rune",
+            "wrap_i8", "wrap_i16", "wrap_i32", "wrap_i64", "wrap_u8",
+            "wrap_u16", "wrap_u32", "wrap_u64", "sat_i8", "sat_i16",
+            "sat_i32", "sat_i64", "sat_u8", "sat_u16", "sat_u32", "sat_u64",
+            "wrap_add", "wrap_mul"]
+}
+
+// str_natives are std/str's functions, reachable bare (the method-call
+// duality s.upper() == str.upper(s)) and as `str.NAME`.
+func str_natives() []str {
+    return ["upper", "lower", "title", "trim", "trim_left", "trim_right",
+            "strip", "pad", "pad_left", "center", "contains", "index",
+            "last_index", "starts_with", "ends_with", "count", "equal_fold",
+            "substr", "left", "right", "split", "split_n", "lines", "fields",
+            "word", "words", "subword", "delword", "join", "replace",
+            "replace_n", "repeat", "reverse", "translate", "overlay",
+            "insert", "delstr", "bytes", "from_bytes", "runes", "from_runes",
+            "rune_len", "is_digit", "is_alpha", "is_space", "is_upper", "hex",
+            "unhex", "b64", "unb64"]
+}
+
+// pkg_natives are the package-qualified names the C runtime provides.
+func pkg_natives() []str {
+    return ["fmt.printf", "fmt.sprintf", "fmt.eprintf", "fmt.fprintf",
+            "fmt.print", "fmt.println", "fmt.comma", "fmt.bytes", "fmt.pad",
+            "fmt.pad_left", "fmt.center",
+            "os.read", "os.write", "os.open", "os.create", "os.exists",
+            "os.remove", "os.args", "os.env", "os.exit", "os.on_abort",
+            "os.isdir", "os.listdir", "os.run", "os.cwd", "os.pid",
+            "os.stderr", "os.stdout",
+            "math.sqrt", "math.sin", "math.cos", "math.tan", "math.asin",
+            "math.acos", "math.atan", "math.ln", "math.log2", "math.log10",
+            "math.exp", "math.pow", "math.hypot", "math.mod", "math.pi",
+            "math.e",
+            "time.now", "time.since", "time.sleep", "time.after",
+            "time.millis", "time.seconds", "time.Nanosecond",
+            "time.Microsecond", "time.Millisecond", "time.Second",
+            "time.Minute", "time.Hour",
+            "log.info", "log.warn", "log.error", "log.debug", "log.flush",
+            "sort.sort", "sort.sort_by", "sort.reversed",
+            "json.encode", "json.pretty", "json.decode",
+            "rand.int", "rand.float", "rand.seed", "uuid.new",
+            "conv.to_int", "conv.to_float", "conv.to_dec"]
+}
+
+// known_native_names is the full set: prelude, std/str (bare and qualified),
+// and the packages.
+func known_native_names() []str {
+    var out = []
+    each n in prelude_natives() {
+        out.append(n)
+    }
+    each n in str_natives() {
+        out.append(n)
+        out.append("str." || n)
+    }
+    each n in pkg_natives() {
+        out.append(n)
+    }
+    return out
+}
+
+// pkg_constant_names are package CONSTANTS rather than functions: LOADFN of
+// one of these yields a value, not a callable, so it must NOT be registered in
+// the natives table (which the runtime resolves as function pointers).
+func pkg_constant_names() []str {
+    return ["time.Nanosecond", "time.Microsecond", "time.Millisecond",
+            "time.Second", "time.Minute", "time.Hour",
+            "math.pi", "math.e", "os.stderr", "os.stdout"]
+}
+
+func bin_op_fns() map[str]str {
+    var m = make(map[str]str)
+    m["ADD"]   = "vl_add"
+    m["SUB"]   = "vl_sub"
+    m["MUL"]   = "vl_mul"
+    m["DIV"]   = "vl_div"
+    m["IDIV"]  = "vl_idiv"
+    m["MOD"]   = "vl_mod"
+    m["POW"]   = "vl_pow"
+    m["CAT"]   = "vl_cat"
+    m["SHL"]   = "vl_shl"
+    m["SHR"]   = "vl_shr"
+    m["BAND"]  = "vl_band"
+    m["BOR"]   = "vl_bor"
+    m["BXOR"]  = "vl_bxor"
+    m["CMPEQ"] = "vl_cmpeq"
+    m["CMPNE"] = "vl_cmpne"
+    m["CMPLT"] = "vl_cmplt"
+    m["CMPLE"] = "vl_cmple"
+    m["CMPGT"] = "vl_cmpgt"
+    m["CMPGE"] = "vl_cmpge"
+    m["CMPIN"] = "vl_cmpin"
+    return m
+}
+
+func un_op_fns() map[str]str {
+    var m = make(map[str]str)
+    m["NEG"]  = "vl_neg"
+    m["NOT"]  = "vl_not"
+    m["BNOT"] = "vl_bnot"
+    return m
+}
+
+// split_variant divides `pkg.Enum.Variant` into its type and variant halves at
+// the LAST dot — the type name itself may be package-qualified.
+func split_variant(name str) (str, str) {
+    let i = str.last_index(name, ".")
+    if i < 0 { return name, name }
+    return name[0..i], name[i + 1..len(name)]
+}
+
+impl Gen {
+    // is_variant reports whether type.variant names an enum variant. The Go
+    // backend has no way to tell yet, and neither has this one.
+    func is_variant(self, typ str, variant str) bool {
+        return false
+    }
+
+    // variant_call recognizes a CALL whose name is Enum.Variant; it returns
+    // [type, variant], or an empty slice when the name is not one.
+    func variant_call(self, name str) []str {
+        if not str.contains(name, ".") { return [] }
+        let typ, variant = split_variant(name)
+        each t in self.mod.Types {
+            if t.Kind == "ENUM" and t.Name == typ {
+                return [typ, variant]
+            }
+        }
+        return []
+    }
+
+    // ------------------------------------------------------------ dispatch
+
+    // emit_instr writes one instruction as C.
+    func emit_instr(mut self, f ir.Func, ins ir.Instr, seq int) {
+        let a = ins.Args
+
+        if ins.Op in self.binOp {
+            let fn = self.binOp[ins.Op]
+            self.p(fmt.sprintf("  vl_set(&%s, %s(%s, %s));",
+                               self.dst(f, a[0]), fn, self.operand(f, a[1]),
+                               self.operand(f, a[2])))
+            return
+        }
+        if ins.Op in self.unOp {
+            let fn = self.unOp[ins.Op]
+            self.p(fmt.sprintf("  vl_set(&%s, %s(%s));", self.dst(f, a[0]),
+                               fn, self.operand(f, a[1])))
+            return
+        }
+
+        switch ins.Op {
+        case "*":   // listing-only comment
+            return
+
+        case "LOADK", "MOVE":
+            self.p(fmt.sprintf("  vl_set(&%s, vl_retain(%s));",
+                               self.dst(f, a[0]), self.operand(f, a[1])))
+
+        case "ZERO":
+            self.p(fmt.sprintf("  vl_set(&%s, vl_zero(%s));",
+                               self.dst(f, a[0]), c_quote(a[1])))
+
+        case "GETGLB":
+            self.p(fmt.sprintf("  vl_set(&%s, vl_retain(G[%d]));",
+                               self.dst(f, a[0]), self.globals[a[1]]))
+        case "SETGLB":
+            self.p(fmt.sprintf("  vl_set(&G[%d], vl_retain(%s));",
+                               self.globals[a[0]], self.operand(f, a[1])))
+
+        case "UPSET":
+            if not f.HasUp(a[0]) {
+                self.failf(fmt.sprintf("cgen: unresolved upvalue `%s` in %s",
+                                       a[0], f.Name))
+                return
+            }
+            let up = f.Up(a[0])
+            self.p(fmt.sprintf("  vl_upset(F->up, %d, %d, vl_retain(%s));",
+                               up.Depth - 1, up.Slot, self.operand(f, a[1])))
+
+        case "LOADFN":
+            self.emit_loadfn(f, a)
+
+        case "GETCTX":
+            self.failf("cgen: `ctx` is not available in native builds yet")
+
+        case "JUMP":
+            self.p(fmt.sprintf("  goto %s;", a[0]))
+        case "JMPF":
+            self.p(fmt.sprintf("  if (!vl_truthy(%s)) goto %s;",
+                               self.operand(f, a[0]), a[1]))
+        case "JMPT":
+            self.p(fmt.sprintf("  if (vl_truthy(%s)) goto %s;",
+                               self.operand(f, a[0]), a[1]))
+
+        case "RET":
+            if len(a) == 0 {
+                self.p("  __ret = vl_unit(); goto __exit;")
+            } else {
+                self.p(fmt.sprintf("  __ret = vl_retain(%s); goto __exit;",
+                                   self.operand(f, a[0])))
+            }
+
+        case "ABORT":
+            self.p(fmt.sprintf("  vl_abort(\"%%s\", %s);",
+                               c_quote(str.strip(a[0], "'"))))
+
+        case "CKCANC":
+            self.p("  vl_check_cancelled();")
+
+        case "CALL":
+            self.emit_call(f, a, seq)
+
+        case "CALLR":
+            let argv, n = self.emit_argv(f, seq, a[2])
+            self.p(fmt.sprintf("  vl_set(&%s, vl_call(%s, %s, %s));",
+                               self.dst(f, a[0]), self.operand(f, a[1]),
+                               argv, n))
+            self.release_argv(seq, a[2])
+
+        case "CALLM":
+            let argv, n = self.emit_argv(f, seq, a[3])
+            self.p(fmt.sprintf("  vl_set(&%s, vl_callm(%s, %s, %s, %s));",
+                               self.dst(f, a[0]), self.operand(f, a[1]),
+                               c_quote(a[2]), argv, n))
+            self.release_argv(seq, a[3])
+
+        case "CONV":
+            if len(a) > 3 {
+                self.p(fmt.sprintf("  Value cb%d = %s;", seq,
+                                   self.operand(f, a[3])))
+                self.p(fmt.sprintf("  vl_set(&%s, vl_conv(%s, %s, &cb%d));",
+                                   self.dst(f, a[0]), c_quote(a[1]),
+                                   self.operand(f, a[2]), seq))
+            } else {
+                self.p(fmt.sprintf("  vl_set(&%s, vl_conv(%s, %s, NULL));",
+                                   self.dst(f, a[0]), c_quote(a[1]),
+                                   self.operand(f, a[2])))
+            }
+
+        case "NEWCHAN":
+            if len(a) > 1 {
+                self.p(fmt.sprintf("  vl_set(&%s, " ||
+                                   "vl_chan_new(vl_int_of(%s)));",
+                                   self.dst(f, a[0]), self.operand(f, a[1])))
+            } else {
+                self.p(fmt.sprintf("  vl_set(&%s, vl_chan_new(0));",
+                                   self.dst(f, a[0])))
+            }
+
+        case "NEWSLICE":
+            let spec = a[1]
+            if str.starts_with(spec, "[") {
+                // make([]T, n) — sized, zero-filled.
+                let reg = str.strip(spec, "[]")
+                self.p(fmt.sprintf("  vl_set(&%s, " ||
+                                   "vl_slice_new(vl_int_of(%s)));",
+                                   self.dst(f, a[0]), self.operand(f, reg)))
+                return
+            }
+            self.p(fmt.sprintf("  vl_set(&%s, vl_slice_new(0));",
+                               self.dst(f, a[0])))
+            each arg in parse_args(spec) {
+                self.p(fmt.sprintf("  vl_slice_append(%s, vl_retain(%s));",
+                                   self.dst(f, a[0]),
+                                   self.operand(f, arg.Reg)))
+            }
+
+        case "NEWMAP":
+            self.p(fmt.sprintf("  vl_set(&%s, vl_map_new());",
+                               self.dst(f, a[0])))
+        case "NEWSET":
+            self.p(fmt.sprintf("  vl_set(&%s, vl_set_new());",
+                               self.dst(f, a[0])))
+
+        case "NEWRANGE":
+            var by = "1"
+            if a[3] != "1" {
+                by = "vl_int_of(" || self.operand(f, a[3]) || ")"
+            }
+            self.p(fmt.sprintf("  vl_set(&%s, vl_range_new(vl_int_of(%s), " ||
+                               "vl_int_of(%s), %s, %s));",
+                               self.dst(f, a[0]), self.operand(f, a[1]),
+                               self.operand(f, a[2]), by,
+                               bool_c(a[4] == "incl")))
+
+        case "NEWSTRUCT", "NEWEXC":
+            self.emit_composite(f, ins, seq, ins.Op == "NEWEXC")
+
+        case "NEWENUM":
+            let typ, variant = split_variant(a[1])
+            let argv, n = self.emit_argv(f, seq, a[2])
+            self.p(fmt.sprintf("  vl_set(&%s, vl_enum_new(%s, %s, %s, %s));",
+                               self.dst(f, a[0]), c_quote(typ),
+                               c_quote(variant), argv, n))
+            self.release_argv(seq, a[2])
+
+        case "TUPLE":
+            let argv, n = self.emit_argv(f, seq, a[1])
+            self.p(fmt.sprintf("  vl_set(&%s, vl_tuple_new(%s, %s));",
+                               self.dst(f, a[0]), argv, n))
+            self.release_argv(seq, a[1])
+
+        case "UNTUPLE":
+            each i, r in parse_args(a[0]) {
+                if r.Reg == "_" { continue }
+                self.p(fmt.sprintf("  vl_set(&%s, vl_index(%s, vl_int(%d)));",
+                                   self.dst(f, r.Reg), self.operand(f, a[1]),
+                                   i))
+            }
+
+        case "INDEX":
+            self.p(fmt.sprintf("  vl_set(&%s, vl_index(%s, %s));",
+                               self.dst(f, a[0]), self.operand(f, a[1]),
+                               self.operand(f, a[2])))
+        case "SETIDX":
+            self.p(fmt.sprintf("  vl_setidx(%s, %s, vl_retain(%s));",
+                               self.operand(f, a[0]), self.operand(f, a[1]),
+                               self.operand(f, a[2])))
+        case "SLICE":
+            self.p(fmt.sprintf("  vl_set(&%s, vl_slice_range(%s, %s));",
+                               self.dst(f, a[0]), self.operand(f, a[1]),
+                               self.operand(f, a[2])))
+        case "FIELD":
+            self.p(fmt.sprintf("  vl_set(&%s, vl_field(%s, %s));",
+                               self.dst(f, a[0]), self.operand(f, a[1]),
+                               c_quote(a[2])))
+        case "SETFLD":
+            self.p(fmt.sprintf("  vl_setfld(%s, %s, vl_retain(%s));",
+                               self.operand(f, a[0]), c_quote(a[1]),
+                               self.operand(f, a[2])))
+
+        case "INTERP":
+            let argv, n = self.emit_argv(f, seq, a[1])
+            self.p(fmt.sprintf("  vl_set(&%s, vl_interp(%s, %s));",
+                               self.dst(f, a[0]), argv, n))
+            self.release_argv(seq, a[1])
+
+        case "SAY":
+            let argv, n = self.emit_argv(f, seq, a[0])
+            self.p(fmt.sprintf("  vl_say(%s, %s);", argv, n))
+            self.release_argv(seq, a[0])
+
+        case "TOSTR":
+            self.p(fmt.sprintf("  vl_set(&%s, vl_tostr(%s));",
+                               self.dst(f, a[0]), self.operand(f, a[1])))
+
+        case "ISFAIL":
+            self.p(fmt.sprintf("  vl_set(&%s, vl_bool(vl_isfail(%s)));",
+                               self.dst(f, a[0]), self.operand(f, a[1])))
+
+        case "TRYP":
+            // `try expr`: a failure becomes this function's result (§8.1).
+            self.p(fmt.sprintf("  if (vl_isfail(%s)) \{ __ret = " ||
+                               "vl_retain(%s); goto __exit; \}",
+                               self.operand(f, a[1]),
+                               self.operand(f, a[1])))
+            self.p(fmt.sprintf("  vl_set(&%s, vl_retain(%s));",
+                               self.dst(f, a[0]), self.operand(f, a[1])))
+
+        case "MUST":
+            self.p(fmt.sprintf("  vl_set(&%s, vl_must(%s));",
+                               self.dst(f, a[0]), self.operand(f, a[1])))
+
+        case "THROW":
+            if len(a) > 1 {
+                self.p(fmt.sprintf("  vl_throw_from(%s, %s);",
+                                   self.operand(f, a[0]),
+                                   self.operand(f, a[1])))
+            } else {
+                self.p(fmt.sprintf("  vl_throw(%s);",
+                                   self.operand(f, a[0])))
+            }
+        case "RETHROW":
+            self.p(fmt.sprintf("  vl_rethrow(%s);", self.operand(f, a[0])))
+
+        case "EHPUSH":
+            self.p(fmt.sprintf("  VlHandler h%d;", seq))
+            self.p(fmt.sprintf("  if (VL_TRY(h%d)) goto %s;", seq, a[0]))
+        case "EHPOP":
+            self.p("  vl_eh_pop();")
+        case "CATCH":
+            self.p(fmt.sprintf("  vl_set(&%s, vl_eh_current());",
+                               self.dst(f, a[0])))
+        case "ISTYPE":
+            self.p(fmt.sprintf("  vl_set(&%s, vl_bool(vl_istype(%s, %s)));",
+                               self.dst(f, a[0]), self.operand(f, a[1]),
+                               c_quote(str.strip(a[2], "'"))))
+
+        case "NUMDIG":
+            self.p(fmt.sprintf("  vl_numeric_digits(%s);", a[0]))
+        case "NDSAVE":
+            self.p("  vl_digits_save();")
+        case "NDREST":
+            self.p("  vl_digits_restore();")
+
+        case "DROP":
+            // The static checker already rejects use-after-move; nothing to
+            // do.
+            return
+
+        case "DEFER":
+            self.p(fmt.sprintf("  vl_defer(F, %s);", self.operand(f, a[0])))
+
+        case "MKCLOS":
+            if not (a[1] in self.fnIdx) {
+                self.failf(fmt.sprintf("cgen: unknown closure %s", a[1]))
+                return
+            }
+            self.p(fmt.sprintf("  vl_set(&%s, vl_closure(%s, F));",
+                               self.dst(f, a[0]),
+                               c_func_name(self.fnIdx[a[1]])))
+
+        case "GRPBEG":
+            if len(a) > 0 {
+                self.p(fmt.sprintf("  vl_group_begin(%s);",
+                                   self.operand(f, a[0])))
+            } else {
+                self.p("  vl_group_begin(vl_nil());")
+            }
+        case "GRPEND":
+            self.p("  vl_release(vl_group_end(false));")
+        case "GRPENDT":
+            self.p(fmt.sprintf("  \{ Value ge%d = vl_group_end(true);", seq))
+            self.p(fmt.sprintf("    if (ge%d.t != VL_NIL) \{ __ret = ge%d; " ||
+                               "goto __exit; \}", seq, seq))
+            self.p(fmt.sprintf("    vl_release(ge%d); \}", seq))
+
+        case "SPAWN":
+            let name = a[1]
+            let argv, n = self.emit_argv(f, seq, a[2])
+            if name in self.fnIdx {
+                self.p(fmt.sprintf("  vl_set(&%s, vl_spawn_fn(%s, %s, %s));",
+                                   self.dst(f, a[0]),
+                                   c_func_name(self.fnIdx[name]), argv, n))
+                self.release_argv(seq, a[2])
+                return
+            }
+            let idx = self.native(name)
+            self.p(fmt.sprintf("  vl_set(&%s, vl_spawn_fn(NAT[%d], %s, %s));",
+                               self.dst(f, a[0]), idx, argv, n))
+            self.release_argv(seq, a[2])
+
+        case "SPAWNR":
+            self.p(fmt.sprintf("  vl_set(&%s, vl_spawn_closure(%s));",
+                               self.dst(f, a[0]), self.operand(f, a[1])))
+
+        case "SEND":
+            self.p(fmt.sprintf("  vl_chan_send(%s, vl_retain(%s));",
+                               self.operand(f, a[0]), self.operand(f, a[1])))
+        case "RECV":
+            self.p(fmt.sprintf("  vl_set(&%s, vl_chan_recv(%s));",
+                               self.dst(f, a[0]), self.operand(f, a[1])))
+        case "RECVOK":
+            self.p(fmt.sprintf("  \{ Value ok%d; vl_set(&%s, " ||
+                               "vl_chan_recv_ok(%s, &ok%d));", seq,
+                               self.dst(f, a[0]), self.operand(f, a[2]),
+                               seq))
+            self.p(fmt.sprintf("    vl_set(&%s, ok%d); \}",
+                               self.dst(f, a[1]), seq))
+
+        case "ITER":
+            self.p(fmt.sprintf("  vl_set(&%s, vl_iter(%s));",
+                               self.dst(f, a[0]), self.operand(f, a[1])))
+        case "ITNEXT":
+            self.p(fmt.sprintf("  \{ Value ik%d, iv%d;", seq, seq))
+            self.p(fmt.sprintf("    if (!vl_iter_next(%s, &ik%d, &iv%d)) " ||
+                               "goto %s;", self.operand(f, a[2]), seq, seq,
+                               a[3]))
+            self.p(fmt.sprintf("    vl_set(&%s, ik%d); vl_set(&%s, iv%d); \}",
+                               self.dst(f, a[0]), seq, self.dst(f, a[1]),
+                               seq))
+
+        case "PMATCH":
+            if ins.Pat == 0 {
+                self.failf("cgen: PMATCH without a structured pattern")
+                return
+            }
+            self.p(fmt.sprintf("  vl_set(&%s, vl_bool(vl_match(F, %s, &%s, " ||
+                               "K)));", self.dst(f, a[0]),
+                               self.operand(f, a[1]),
+                               self.mod.Pats[ins.Pat].CName))
+
+        case "PARSE":
+            self.emit_parse(f, ins, seq)
+
+        case "ARGDEF":
+            self.p(fmt.sprintf("  if (argc > %d) goto %s;", reg_slot(a[0]),
+                               a[1]))
+        case "VARARG":
+            let slot = reg_slot(a[0])
+            self.p(fmt.sprintf("  \{ Value va%d = vl_slice_new(0);", seq))
+            self.p(fmt.sprintf("    for (int i = %d; i < argc; i++) " ||
+                               "vl_slice_append(va%d, vl_retain(argv[i]));",
+                               slot, seq))
+            self.p(fmt.sprintf("    vl_set(&F->r[%d], va%d); \}", slot, seq))
+
+        case "SELBEG":
+            self.selCases = []
+        case "SELRECV", "SELSEND", "SELDEF":
+            self.selCases.append(ins)
+        case "SELEND":
+            self.emit_select(f, seq)
+
+        default:
+            self.failf(fmt.sprintf("cgen: no C lowering for %s", ins.Op))
+        }
+    }
+
+    // ------------------------------------------------------------ calls
+
+    // emit_loadfn takes a function's address: a module function becomes a
+    // closure, anything else a runtime lookup.
+    func emit_loadfn(mut self, f ir.Func, a []str) {
+        let name = a[1]
+        if name in self.fnIdx {
+            self.p(fmt.sprintf("  vl_set(&%s, vl_closure(%s, NULL));",
+                               self.dst(f, a[0]),
+                               c_func_name(self.fnIdx[name])))
+            return
+        }
+        if str.contains(name, ".") and not (name in self.pkgConst) {
+            // A variant constructor used as a value, or a package function.
+            let typ, variant = split_variant(name)
+            if self.is_variant(typ, variant) {
+                self.failf(fmt.sprintf("cgen: enum constructors as " ||
+                                       "first-class values are not " ||
+                                       "supported in native builds yet (%s)",
+                                       name))
+                return
+            }
+        }
+        if not (name in self.pkgConst) {
+            self.native(name)   // a function reference: resolve it in NAT too
+        } else if not (name in self.known) {
+            self.failf(fmt.sprintf("cgen: `%s` is not available in native " ||
+                                   "builds", name))
+        }
+        self.p(fmt.sprintf("  vl_set(&%s, vl_lookup_value(%s));",
+                           self.dst(f, a[0]), c_quote(name)))
+    }
+
+    func emit_call(mut self, f ir.Func, a []str, seq int) {
+        let name = a[1]
+        let argv, n = self.emit_argv(f, seq, a[2])
+        if name in self.fnIdx {
+            self.p(fmt.sprintf("  vl_set(&%s, %s(%s, %s, NULL));",
+                               self.dst(f, a[0]),
+                               c_func_name(self.fnIdx[name]), argv, n))
+            self.release_argv(seq, a[2])
+            return
+        }
+        let v = self.variant_call(name)
+        if len(v) > 0 {
+            self.p(fmt.sprintf("  vl_set(&%s, vl_enum_new(%s, %s, %s, %s));",
+                               self.dst(f, a[0]), c_quote(v[0]),
+                               c_quote(v[1]), argv, n))
+            self.release_argv(seq, a[2])
+            return
+        }
+        if str.ends_with(name, "]") {
+            let br = str.index(name, "[")
+            let base = name[0..br]
+            var typ = name[br + 1..len(name)]
+            if str.ends_with(typ, "]") { typ = typ[0..len(typ) - 1] }
+            if base != "json.decode" {
+                // Generics are type-erased everywhere else (§3.7):
+                // cell[int](0) is simply cell(0).
+                if base in self.fnIdx {
+                    self.p(fmt.sprintf("  vl_set(&%s, %s(%s, %s, NULL));",
+                                       self.dst(f, a[0]),
+                                       c_func_name(self.fnIdx[base]), argv,
+                                       n))
+                    return
+                }
+                let bidx = self.native(base)
+                self.p(fmt.sprintf("  vl_set(&%s, NAT[%d](%s, %s, NULL));",
+                                   self.dst(f, a[0]), bidx, argv, n))
+                return
+            }
+            // json.decode[T] is the one call that keeps its type argument:
+            // the runtime needs T to shape the decoded value.
+            let jidx = self.native(base)
+            self.p(fmt.sprintf("  Value ty%d = vl_str(%s);", seq,
+                               c_quote(typ)))
+            self.p(fmt.sprintf("  Value ja%d[8]; ja%d[0] = ty%d;", seq, seq,
+                               seq))
+            self.p(fmt.sprintf("  for (int i = 0; i < %s && i < 7; i++) " ||
+                               "ja%d[i+1] = %s[i];", n, seq, argv))
+            self.p(fmt.sprintf("  vl_set(&%s, NAT[%d](ja%d, %s + 1, NULL));",
+                               self.dst(f, a[0]), jidx, seq, n))
+            self.p(fmt.sprintf("  vl_release(ty%d);", seq))
+            return
+        }
+        let idx = self.native(name)
+        self.p(fmt.sprintf("  vl_set(&%s, NAT[%d](%s, %s, NULL));",
+                           self.dst(f, a[0]), idx, argv, n))
+        self.release_argv(seq, a[2])
+    }
+
+    // ------------------------------------------------------------ composites
+
+    // emit_composite builds a struct or exception value.
+    func emit_composite(mut self, f ir.Func, ins ir.Instr, seq int,
+                        isExc bool) {
+        let a = ins.Args
+        var typ = a[1]
+        // Generics are type-erased: Stack[str] is the Stack descriptor (§3.7).
+        let br = str.index(typ, "[")
+        if br > 0 { typ = typ[0..br] }
+
+        var pos = []
+        var named = []
+        each x in parse_args(a[2]) {
+            if x.Name != "" {
+                named.append(x)
+            } else {
+                pos.append(x)
+            }
+        }
+        var posName = "NULL"
+        var posN = "0"
+        if len(pos) > 0 {
+            var vals = []
+            each x in pos {
+                vals.append(self.operand(f, x.Reg))
+            }
+            self.p(fmt.sprintf("  Value cp%d[] = \{%s\};", seq,
+                               str.join(vals, ", ")))
+            posName = fmt.sprintf("cp%d", seq)
+            posN = str(len(pos))
+        }
+        var nmName = "NULL"
+        var nvName = "NULL"
+        var nN = "0"
+        if len(named) > 0 {
+            var ks = []
+            var vs = []
+            each x in named {
+                ks.append(c_quote(x.Name))
+                vs.append(self.operand(f, x.Reg))
+            }
+            self.p(fmt.sprintf("  const char *cn%d[] = \{%s\};", seq,
+                               str.join(ks, ", ")))
+            self.p(fmt.sprintf("  Value cv%d[] = \{%s\};", seq,
+                               str.join(vs, ", ")))
+            nmName = fmt.sprintf("cn%d", seq)
+            nvName = fmt.sprintf("cv%d", seq)
+            nN = str(len(named))
+        }
+        var ctor = "vl_struct_new"
+        if isExc { ctor = "vl_exc_new" }
+        let dst = fmt.sprintf("F->r[%d]", reg_slot(a[0]))
+        self.p(fmt.sprintf("  vl_set(&%s, %s(%s, %s, %s, %s, %s, %s));", dst,
+                           ctor, c_quote(typ), posName, posN, nmName, nvName,
+                           nN))
+
+        // Field defaults for fields the literal omitted (§3.4).
+        self.emit_field_defaults(typ, dst, seq, named, len(pos))
+    }
+
+    // emit_field_defaults fills declared defaults the composite literal
+    // omitted.
+    func emit_field_defaults(mut self, typ str, dst str, seq int,
+                             named []CallArg, npos int) {
+        if not (typ in self.defaults) { return }
+        var given = set()
+        each n in named {
+            given.add(n.Name)
+        }
+        each i, fd in self.defaults[typ] {
+            if fd.Name in given or i < npos or fd.ConstIdx < 0 { continue }
+            self.p(fmt.sprintf("  vl_setfld(%s, %s, vl_retain(K[%d]));", dst,
+                               c_quote(fd.Name), fd.ConstIdx))
+        }
+    }
+
+    // ------------------------------------------------------------ parse
+
+    // emit_parse renders the PARSE template.
+    func emit_parse(mut self, f ir.Func, ins ir.Instr, seq int) {
+        let a = ins.Args
+        self.p(fmt.sprintf("  \{ static const VlTerm t%d[] = \{", seq))
+        each t in ins.Terms {
+            if t.Kind == ir.TERM_VAR {
+                var slot = reg_slot(t.Reg)
+                if slot < 0 {
+                    self.failf(fmt.sprintf("cgen: `parse` into the " ||
+                                           "captured variable `%s` is not " ||
+                                           "supported in native builds",
+                                           t.Name))
+                    slot = 0
+                }
+                self.p(fmt.sprintf("    \{VL_T_VAR, %d, NULL, 0\},", slot))
+            } else if t.Kind == ir.TERM_DISCARD {
+                self.p("    \{VL_T_DISCARD, 0, NULL, 0\},")
+            } else if t.Kind == ir.TERM_LIT {
+                self.p(fmt.sprintf("    \{VL_T_LIT, 0, %s, 0\},",
+                                   c_quote(t.Lit)))
+            } else if t.Kind == ir.TERM_COL {
+                self.p(fmt.sprintf("    \{VL_T_COL, 0, NULL, %d\},", t.Col))
+            }
+        }
+        self.p("    \{VL_T_DISCARD, 0, NULL, 0\}\};")
+        self.p(fmt.sprintf("    vl_parse(F, %s, %s, t%d, %d); \}",
+                           self.operand(f, a[0]), c_quote(a[1]), seq,
+                           len(ins.Terms)))
+    }
+
+    // ------------------------------------------------------------ select
+
+    // emit_select renders a select statement from the buffered case
+    // instructions.
+    func emit_select(mut self, f ir.Func, seq int) {
+        let cases = self.selCases
+        self.selCases = []
+        self.p(fmt.sprintf("  \{ VlSelCase sc%d[%d];", seq,
+                           max(1, len(cases))))
+        each i, c in cases {
+            if c.Op == "SELRECV" {
+                self.p(fmt.sprintf("    sc%d[%d].kind = VL_SEL_RECV; " ||
+                                   "sc%d[%d].ch = %s;", seq, i, seq, i,
+                                   self.operand(f, c.Args[1])))
+            } else if c.Op == "SELSEND" {
+                self.p(fmt.sprintf("    sc%d[%d].kind = VL_SEL_SEND; " ||
+                                   "sc%d[%d].ch = %s; sc%d[%d].send = %s;",
+                                   seq, i, seq, i,
+                                   self.operand(f, c.Args[1]), seq, i,
+                                   self.operand(f, c.Args[2])))
+            } else if c.Op == "SELDEF" {
+                self.p(fmt.sprintf("    sc%d[%d].kind = VL_SEL_DEFAULT;", seq,
+                                   i))
+            }
+        }
+        self.p(fmt.sprintf("    Value rv%d; bool ro%d;", seq, seq))
+        self.p(fmt.sprintf("    int ch%d = vl_select(sc%d, %d, &rv%d, " ||
+                           "&ro%d);", seq, seq, len(cases), seq, seq))
+        each i, c in cases {
+            self.p(fmt.sprintf("    if (ch%d == %d) \{", seq, i))
+            if c.Op == "SELRECV" {
+                // Args: label, chan, [value-bind], [ok-bind] — by POSITION.
+                let binds = c.Args[2..len(c.Args)]
+                if len(binds) > 0 {
+                    let parts = str.split_n(binds[0], "=", 2)
+                    if len(parts) == 2 {
+                        self.p(fmt.sprintf("      vl_set(&F->r[%d], " ||
+                                           "vl_retain(rv%d));",
+                                           reg_slot(parts[1]), seq))
+                    }
+                }
+                if len(binds) > 1 {
+                    let parts = str.split_n(binds[1], "=", 2)
+                    if len(parts) == 2 {
+                        self.p(fmt.sprintf("      vl_set(&F->r[%d], " ||
+                                           "vl_bool(ro%d));",
+                                           reg_slot(parts[1]), seq))
+                    }
+                }
+                self.p(fmt.sprintf("      vl_release(rv%d);", seq))
+            }
+            self.p(fmt.sprintf("      goto %s;", c.Args[0]))
+            self.p("    \}")
+        }
+        self.p("  \}")
+    }
+}

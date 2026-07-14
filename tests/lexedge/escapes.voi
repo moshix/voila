@@ -1,0 +1,6 @@
+// An empty \u{} is U+0000; a rune literal must hold exactly one codepoint.
+let z = "\u{}"
+let r = '\u{41}'
+let t = "tab\there\nnl"
+let brace = "\{not interp\}"
+say len(z), r, t, brace

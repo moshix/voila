@@ -1,0 +1,3 @@
+package b
+use "bad/a"
+func B() int { return a.A() }

@@ -1,0 +1,509 @@
+// chk/checks.voi — the lattice, exhaustiveness, move and format checks.
+//
+// A port of internal/check/checks.go, message for message.
+package chk
+
+use "voilac/ast"
+use "std/str"
+
+// ---------------------------------------------------------------- lattice
+
+// The integer types and their ranges (§3.2). u64 is clamped to the signed
+// maximum, exactly as the Go table is: the checker compares against an i64.
+func is_int_type(t str) bool {
+    return t == "i8" or t == "i16" or t == "i32" or t == "i64" or
+           t == "int" or t == "u8" or t == "u16" or t == "u32" or
+           t == "u64" or t == "byte"
+}
+
+func int_lo(t str) int {
+    if t == "i8"  { return 0 - 128 }
+    if t == "i16" { return 0 - 32768 }
+    if t == "i32" { return 0 - 2147483648 }
+    // The i64 minimum cannot be written as a literal: its magnitude is one
+    // past the maximum.
+    if t == "i64" or t == "int" { return 0 - 9223372036854775807 - 1 }
+    return 0
+}
+
+func int_hi(t str) int {
+    if t == "i8"  { return 127 }
+    if t == "i16" { return 32767 }
+    if t == "i32" { return 2147483647 }
+    if t == "i64" or t == "int" { return 9223372036854775807 }
+    if t == "u8" or t == "byte" { return 255 }
+    if t == "u16" { return 65535 }
+    if t == "u32" { return 4294967295 }
+    if t == "u64" { return 9223372036854775807 }
+    return 0
+}
+
+// is_numeric reports whether a type participates in the widening lattice.
+func is_numeric(t str) bool {
+    return is_int_type(t) or t == "float" or t == "dec" or t == "f32"
+}
+
+// The signed and unsigned rungs of the lattice; 0 means "not on this ladder".
+func iorder(t str) int {
+    if t == "i8"  { return 1 }
+    if t == "i16" { return 2 }
+    if t == "i32" { return 3 }
+    if t == "i64" or t == "int" { return 4 }
+    return 0
+}
+
+func uorder(t str) int {
+    if t == "u8" or t == "byte" { return 1 }
+    if t == "u16" { return 2 }
+    if t == "u32" { return 3 }
+    if t == "u64" { return 4 }
+    return 0
+}
+
+// widens_to reports whether `from` implicitly converts to `dst` (§3.2): the
+// conversion must be exact for every value of the source type.
+func widens_to(from str, dst str) bool {
+    if from == dst { return true }
+    let fo = iorder(from)
+    if fo > 0 {
+        let d = iorder(dst)
+        if d > 0 { return fo <= d }
+        if dst == "dec" { return true }
+        // i8..i32 fit float's 53-bit mantissa; i64 does NOT.
+        if dst == "float" { return fo <= 3 }
+        return false
+    }
+    let fu = uorder(from)
+    if fu > 0 {
+        let d = uorder(dst)
+        if d > 0 { return fu <= d }
+        let ds = iorder(dst)
+        if ds > 0 { return fu < ds }   // u8→i16, u16→i32, u32→i64
+        if dst == "dec" { return true }
+        if dst == "float" { return fu <= 3 }
+        return false
+    }
+    if from == "f32" { return dst == "float" }
+    // float→dec, float→int and dec→anything are explicit conversions.
+    return false
+}
+
+impl Checker {
+    // check_lattice walks let/var bindings with an explicit primitive type and
+    // judges literal and known-binding initialisers against §3.2. Only
+    // top-level functions, globals and the script body are walked — the Go
+    // checker does not enter impl methods here.
+    func check_lattice(mut self) {
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            let n = self.T.Get(d)
+            if n.Kind == ast.FUNC and self.T.Kid(d, 0) != 0 {
+                var scope = make(map[str]str)
+                self.lattice_block(self.T.Kid(d, 0), scope)
+            } else if n.Kind == ast.GLOBAL {
+                var scope = make(map[str]str)
+                self.lattice_stmt(self.T.Kid(d, 0), scope)
+            }
+        }
+        // Each script statement is judged in a scope of its own, as in Go.
+        each s in self.T.Get(self.T.Kid(self.file, 2)).Kids {
+            var scope = make(map[str]str)
+            self.lattice_stmt(s, scope)
+        }
+    }
+
+    func lattice_block(mut self, b int, scope map[str]str) {
+        if b == 0 { return }
+        // A block shadows: bindings made inside it do not leak out.
+        var inner = make(map[str]str)
+        each k in keys(scope) { inner[k] = scope[k] }
+        each s in self.T.Get(b).Kids {
+            self.lattice_stmt(s, inner)
+        }
+    }
+
+    func lattice_stmt(mut self, s int, scope mut map[str]str) {
+        if s == 0 { return }
+        let n = self.T.Get(s)
+        let k = n.Kind
+        if k == ast.LET {
+            let names = str.split(n.Sval, ",")
+            self.lattice_binding(n.Ival, self.T.Kid(s, 0), scope, names[0])
+        } else if k == ast.VAR {
+            let v = self.T.Kid(s, 0)
+            if v != 0 {
+                self.lattice_binding(n.Ival, v, scope, n.Sval)
+            } else if n.Ival != 0 and self.T.Kind(n.Ival) == ast.TNAMED {
+                // `var x u8` with no initialiser: remember the type anyway.
+                scope[n.Sval] = self.T.Get(n.Ival).Sval
+            }
+        } else if k == ast.BLOCK {
+            self.lattice_block(s, scope)
+        } else if k == ast.IF {
+            self.lattice_block(self.T.Kid(s, 1), scope)
+            let e = self.T.Kid(s, 2)
+            if e != 0 { self.lattice_stmt(e, scope) }
+        } else if k == ast.FOR or k == ast.EACH or k == ast.WHILE or
+                  k == ast.GROUP {
+            self.lattice_block(self.T.Kid(s, 1), scope)
+        } else if k == ast.TRYCATCH {
+            self.lattice_block(self.T.Kid(s, 0), scope)
+            each cc in self.T.Get(self.T.Kid(s, 1)).Kids {
+                self.lattice_block(self.T.Kid(cc, 0), scope)
+            }
+            self.lattice_block(self.T.Kid(s, 2), scope)
+        }
+    }
+
+    func lattice_binding(mut self, t int, value int, scope mut map[str]str,
+                         name str) {
+        if t == 0 or self.T.Kind(t) != ast.TNAMED {
+            if t == 0 and value != 0 {
+                // No declared type: remember the primitive a plain literal
+                // infers, so a later `let f float = x` can be judged.
+                let vk = self.T.Kind(value)
+                if vk == ast.INT   { scope[name] = "int" }
+                if vk == ast.FLOAT { scope[name] = "float" }
+                if vk == ast.DEC   { scope[name] = "dec" }
+            }
+            return
+        }
+        let target = self.T.Get(t).Sval
+        scope[name] = target
+        if value == 0 { return }
+        let v = self.T.Get(value)
+        if v.Kind == ast.INT or v.Kind == ast.FLOAT or v.Kind == ast.DEC or
+           v.Kind == ast.STR {
+            self.lattice_literal(target, value)
+        } else if v.Kind == ast.UNARY {
+            // The sign is handled by the range's symmetry: only the magnitude
+            // of a negated integer literal is judged.
+            let x = self.T.Kid(value, 0)
+            if x != 0 and self.T.Kind(x) == ast.INT {
+                self.lattice_literal(target, x)
+            }
+        } else if v.Kind == ast.IDENT {
+            if v.Sval in scope {
+                let from = scope[v.Sval]
+                if is_numeric(from) and is_numeric(target) {
+                    if not widens_to(from, target) {
+                        self.lattice_error(from, target, v.Line, v.Col)
+                    }
+                }
+            }
+        }
+    }
+
+    func lattice_literal(mut self, target str, lit int) {
+        let n = self.T.Get(lit)
+        if n.Kind == ast.INT {
+            if not is_int_type(target) { return }
+            // Base 0 reads 0x/0o/0b as the lexer wrote them; an unreadable or
+            // overflowing literal is left alone, exactly as ParseInt's error
+            // is in Go.
+            let v = to_int(n.Sval, 0)
+            if v == nil { return }
+            if v < int_lo(target) or v > int_hi(target) {
+                self.report(n.Line, n.Col,
+                            "literal {n.Sval} does not fit in {target}")
+            }
+        } else if n.Kind == ast.FLOAT {
+            if is_int_type(target) {
+                self.report(n.Line, n.Col, "float → {target} truncates")
+            } else if target == "dec" {
+                self.report(n.Line, n.Col, "binary float → dec is lossy")
+            }
+        } else if n.Kind == ast.DEC {
+            // Note: `byte` is absent from Go's list here, so a dec literal
+            // bound to a byte is not reported. Kept identical on purpose.
+            if target == "float" or target == "f32" or target == "int" or
+               target == "i8" or target == "i16" or target == "i32" or
+               target == "i64" or target == "u8" or target == "u16" or
+               target == "u32" or target == "u64" {
+                self.lattice_error("dec", target, n.Line, n.Col)
+            }
+        } else if n.Kind == ast.STR {
+            if is_int_type(target) or target == "float" or target == "dec" {
+                self.report(n.Line, n.Col,
+                            "str does not convert implicitly to {target}")
+            }
+        }
+    }
+
+    func lattice_error(mut self, from str, dst str, line int, col int) {
+        self.report(line, col,
+                    "{from} → {dst} may lose information; implicit " ||
+                    "conversion requires exact representability (§3.2)")
+    }
+
+    // ------------------------------------------------------------ match
+
+    // check_exhaustiveness verifies that a match covers its subject (§3.5).
+    func check_exhaustiveness(mut self) {
+        each s in self.all_stmts() {
+            if self.T.Kind(s) == ast.MATCH { self.check_match(s) }
+        }
+    }
+
+    func check_match(mut self, m int) {
+        let mn = self.T.Get(m)
+        var variants = []
+        var catchAll = false
+        var sawNil = false
+        var sawSome = false
+        var sawOk = false
+        var sawErr = false
+        each a in self.T.Get(self.T.Kid(m, 1)).Kids {
+            // A guarded arm may fall through, so it proves nothing about
+            // coverage.
+            if self.T.Kid(a, 0) != 0 { continue }
+            let p = self.T.Get(a).Ival
+            if p == 0 { continue }
+            let pk = self.T.Kind(p)
+            if pk == ast.PWILD or pk == ast.PBIND {
+                catchAll = true
+            } else if pk == ast.PNIL {
+                sawNil = true
+            } else if pk == ast.PVARIANT {
+                let nm = self.T.Get(p).Sval
+                if nm == "Some" {
+                    sawSome = true
+                } else if nm == "Ok" {
+                    sawOk = true
+                } else if nm == "Err" {
+                    sawErr = true
+                } else {
+                    variants.append(nm)
+                }
+            }
+        }
+        // A catch-all, or both halves of an option or a result, covers it.
+        if catchAll or (sawNil and sawSome) or (sawOk and sawErr) { return }
+
+        if len(variants) > 0 {
+            let en = self.enum_of(variants[0])
+            if en != 0 {
+                var covered = set([])
+                each v in variants { covered.add(v) }
+                var missing = []
+                each v in self.T.Get(self.T.Kid(en, 0)).Kids {
+                    let vn = self.T.Get(v).Sval
+                    if not (vn in covered) { missing.append(vn) }
+                }
+                // Matching a ?Enum: the Some/nil combination was judged above.
+                if sawNil or sawSome { return }
+                if len(missing) == 0 { return }
+                let ename = self.T.Get(en).Sval
+                self.report(mn.Line, mn.Col,
+                            "match on `{ename}` is not exhaustive")
+                return
+            }
+        }
+        self.report(mn.Line, mn.Col, "match is not exhaustive")
+    }
+
+    // enum_of finds the enum a variant name belongs to, or 0.
+    func enum_of(self, variant str) int {
+        each name in self.eNames {
+            let e = self.enums[name]
+            each v in self.T.Get(self.T.Kid(e, 0)).Kids {
+                if self.T.Get(v).Sval == variant { return e }
+            }
+        }
+        return 0
+    }
+
+    // ------------------------------------------------------------ moves
+
+    // check_moves is the straight-line use-after-move analysis (§6.1): within
+    // one block, sequentially, a binding passed to an `own` parameter — or
+    // dropped — must not be used again. Branch and loop bodies are skipped:
+    // the analysis is conservative, not a dataflow.
+    func check_moves(mut self) {
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            if self.T.Kind(d) == ast.FUNC and self.T.Kid(d, 0) != 0 {
+                var moved = make(map[str]int)
+                self.moves_block(self.T.Kid(d, 0), moved)
+            }
+        }
+        let script = self.T.Get(self.T.Kid(self.file, 2)).Kids
+        if len(script) > 0 {
+            var moved = make(map[str]int)
+            each s in script { self.moves_stmt(s, moved) }
+        }
+    }
+
+    func moves_block(mut self, b int, moved mut map[str]int) {
+        if b == 0 { return }
+        each s in self.T.Get(b).Kids { self.moves_stmt(s, moved) }
+    }
+
+    func moves_stmt(mut self, s int, moved mut map[str]int) {
+        if s == 0 { return }
+        let n = self.T.Get(s)
+        let k = n.Kind
+        if k == ast.EXPRSTMT or k == ast.LET {
+            let v = self.T.Kid(s, 0)
+            self.moved_use(v, moved)
+            self.record_moves(v, moved)
+        } else if k == ast.VAR {
+            let v = self.T.Kid(s, 0)
+            if v != 0 {
+                self.moved_use(v, moved)
+                self.record_moves(v, moved)
+            }
+        } else if k == ast.ASSIGN {
+            let v = self.T.Kid(s, 1)
+            self.moved_use(v, moved)
+            self.record_moves(v, moved)
+            // Re-assignment revives the binding. A move records the line it
+            // happened on, so line 0 is the "alive again" marker: the map
+            // has no delete the C backend is known to carry.
+            let lhs = self.T.Kid(s, 0)
+            if lhs != 0 and self.T.Kind(lhs) == ast.IDENT {
+                moved[self.T.Get(lhs).Sval] = 0
+            }
+        } else if k == ast.SAY or k == ast.RETURN {
+            each a in n.Kids { self.moved_use(a, moved) }
+        } else if k == ast.DROP {
+            moved[n.Sval] = n.Line
+        } else if k == ast.BLOCK {
+            self.moves_block(s, moved)
+        }
+    }
+
+    // moved_use reports every identifier used after a straight-line move.
+    func moved_use(mut self, e int, moved map[str]int) {
+        each x in self.walk_expr(e) {
+            if self.T.Kind(x) != ast.IDENT { continue }
+            let nm = self.T.Get(x).Sval
+            if nm in moved and moved[nm] != 0 {
+                self.report_at(x, "use of moved value `{nm}`")
+            }
+        }
+    }
+
+    // record_moves marks the bindings this expression hands to an `own`
+    // parameter.
+    func record_moves(mut self, e int, moved mut map[str]int) {
+        each x in self.walk_expr(e) {
+            if self.T.Kind(x) != ast.CALL { continue }
+            let callee = self.T.Kid(x, 0)
+            if callee == 0 or self.T.Kind(callee) != ast.IDENT { continue }
+            let fname = self.T.Get(callee).Sval
+            if not (fname in self.funcs) { continue }
+            let params = self.T.Get(self.T.Kid(self.funcs[fname], 1)).Kids
+            let args = self.T.Get(self.T.Kid(x, 1)).Kids
+            each i, p in params {
+                // The low two bits of a parameter's flags are its mode; bit 16
+                // is variadic and is not part of the mode.
+                if (self.T.Get(p).Ival2 & 3) != ast.MODE_OWN { continue }
+                if i >= len(args) { continue }
+                let av = self.T.Kid(args[i], 0)
+                if av != 0 and self.T.Kind(av) == ast.IDENT {
+                    let an = self.T.Get(av)
+                    moved[an.Sval] = an.Line
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ printf
+
+    // check_format_strings validates literal format strings at compile time
+    // (§13.1). A computed format is checked at run time instead.
+    func check_format_strings(mut self) {
+        each s in self.all_stmts() {
+            if self.T.Kind(s) != ast.EXPRSTMT { continue }
+            each x in self.walk_expr(self.T.Kid(s, 0)) {
+                if self.T.Kind(x) == ast.CALL { self.check_printf(x) }
+            }
+        }
+    }
+
+    func check_printf(mut self, call int) {
+        let name, off = printf_like(self.T, call)
+        if name == "" { return }
+        let args = self.T.Get(self.T.Kid(call, 1)).Kids
+        if len(args) <= off { return }
+        let fa = self.T.Kid(args[off], 0)
+        if fa == 0 or self.T.Kind(fa) != ast.STR { return }
+        let lit = self.T.Get(fa)
+        let want, bad = count_verbs(lit.Sval)
+        if bad != "" {
+            self.report(lit.Line, lit.Col,
+                        "unknown format verb %" || bad ||
+                        " in {name} format string")
+            return
+        }
+        let got = len(args) - off - 1
+        if want != got {
+            self.report(lit.Line, lit.Col,
+                        "{name} format needs {want} argument(s), " ||
+                        "call passes {got}")
+        }
+    }
+}
+
+// printf_like returns the printf-family name a call names, and the index of
+// its format argument. An empty name means the call is not printf-like.
+func printf_like(t ast.Tree, call int) (str, int) {
+    let f = t.Kid(call, 0)
+    if f == 0 { return "", 0 }
+    let n = t.Get(f)
+    if n.Kind == ast.IDENT {
+        if n.Sval == "printf" or n.Sval == "sprintf" { return n.Sval, 0 }
+        return "", 0
+    }
+    if n.Kind == ast.FIELD {
+        let b = t.Kid(f, 0)
+        if b == 0 or t.Kind(b) != ast.IDENT { return "", 0 }
+        if t.Get(b).Sval != "fmt" { return "", 0 }
+        if n.Sval == "printf" or n.Sval == "sprintf" or n.Sval == "eprintf" {
+            return "fmt." || n.Sval, 0
+        }
+        // fprintf takes the writer first: the format is the SECOND argument.
+        if n.Sval == "fprintf" { return "fmt.fprintf", 1 }
+    }
+    return "", 0
+}
+
+// count_verbs counts the arguments a format string consumes, and returns the
+// first unknown verb it finds — "<end>" for a `%` that runs off the end.
+func count_verbs(f str) (int, str) {
+    var n = 0
+    var i = 0
+    while i < len(f) {
+        if f[i] != 37 {          // '%'
+            i += 1
+            continue
+        }
+        i += 1
+        if i < len(f) and f[i] == 37 {   // "%%" is a literal percent
+            i += 1
+            continue
+        }
+        while i < len(f) and has_byte("-+0 #", f[i]) { i += 1 }
+        if i < len(f) and f[i] == 42 {   // '*': the width comes from an arg
+            n += 1
+            i += 1
+        } else {
+            while i < len(f) and f[i] >= 48 and f[i] <= 57 { i += 1 }
+        }
+        if i < len(f) and f[i] == 46 {   // '.': a precision
+            i += 1
+            if i < len(f) and f[i] == 42 {
+                n += 1
+                i += 1
+            } else {
+                while i < len(f) and f[i] >= 48 and f[i] <= 57 { i += 1 }
+            }
+        }
+        if i < len(f) and f[i] == 43 { i += 1 }   // a trailing '+'
+        if i >= len(f) { return n, "<end>" }
+        let verb = f[i]
+        i += 1
+        if not has_byte("diufFeEgGsqxXobctv", verb) { return n, chr(verb) }
+        n += 1
+    }
+    return n, ""
+}

@@ -1,0 +1,4 @@
+package main
+use "bad/one"
+use "bad/two"
+func main() { say one.Mk(), two.Zero() }

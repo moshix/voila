@@ -1,0 +1,97 @@
+// churn.voi — refcount stress. Every path here is one where reference
+// counting is easy to get wrong: closures capturing frames, exceptions
+// unwinding through defers, values moving across channels, collection churn,
+// deep recursion, and string building. Run under `leaks` / valgrind / ASan;
+// the correct result is zero leaked bytes.
+exception Boom { n int }
+
+struct Node { name str, kids []shared[Node], parent weak[Node] }
+
+func deep(n int) int {
+    if n == 0 { return 0 }
+    return 1 + deep(n - 1)
+}
+
+func thrower(n int) int {
+    defer say_nothing()
+    if n % 7 == 0 { throw Boom{n: n} }
+    return n
+}
+
+func say_nothing() { let x = 1 }
+
+func make_const(n int) fn() int { return fn() int { return n } }
+
+func main() {
+    // 1. collection churn
+    var total = 0
+    for i in 0..2000 {
+        var v = []
+        for j in 0..20 { v.append(j * i) }
+        v.sort()
+        let m = v.map(fn(x) { x + 1 }).filter(fn(x) { x % 2 == 0 })
+        total += len(m)
+    }
+    say "churn:", total
+
+    // 2. maps and strings
+    var counts = make(map[str]int)
+    for i in 0..2000 {
+        let k = "key" || str(i % 50)
+        counts[k] = counts.get(k, 0) + 1
+    }
+    say "keys:", len(counts)
+
+    var sb = str.Builder{}
+    for i in 0..2000 { sb.write("x") }
+    say "built:", len(sb.done())
+
+    // 3. exceptions unwinding through defers
+    var caught = 0
+    for i in 0..500 {
+        try { let _ = thrower(i) } catch e: Boom { caught += 1 }
+    }
+    say "caught:", caught
+
+    // 4. closures capturing frames
+    var fns = []
+    for i in 0..500 { fns.append(make_const(i)) }
+    var acc = 0
+    each f in fns { acc += f() }
+    say "closures:", len(fns), acc
+
+    // 5. shared/weak graphs
+    var roots = []
+    for i in 0..200 {
+        let r = shared(Node{name: "r", kids: []})
+        let k = shared(Node{name: "k", kids: [], parent: weak(r)})
+        r.kids.append(k)
+        roots.append(r)
+    }
+    say "graphs:", len(roots)
+
+    // 6. channels moving values between tasks
+    let ch = chan[str](8)
+    let done = chan[int](1)
+    group {
+        spawn {
+            var n = 0
+            each s in ch { n += len(s) }
+            done <- n
+        }
+        spawn {
+            for i in 0..500 { ch <- "payload" || str(i) }
+            close(ch)
+        }
+    }
+    say "channel bytes:", <-done
+
+    // 7. deep recursion
+    say "depth:", deep(2000)
+
+    // 8. decimals
+    numeric digits 31
+    var money = 0d
+    for i in 0..1000 { money += 0.01d }
+    say "money:", money
+}

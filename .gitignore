@@ -1,0 +1,47 @@
+# Toolchain binary built at the repo root
+/voila
+/voila.exe
+
+# Build output directories
+/dist/
+/bin/
+/build/
+
+# claude
+.claude
+
+
+# Executables produced by `voila build` from the samples
+/samples/*[0-9]
+/life
+/hello
+/txnreport
+
+# Assembly listings from `voila build -S` (the IR goldens under
+# internal/ir/testdata/ ARE tracked; these patterns don't touch them)
+/*.s
+/samples/*.s
+/selfhost/*.s
+
+# Go test and coverage artifacts
+*.test
+coverage.html
+
+# `*.out` is NOT ignored: tests/conformance/*.out and samples/golden/* are the
+# checked-in goldens — they are the interpreter's semantics, frozen in amber,
+# and the self-hosted toolchain is held to them.
+
+# Scratch C emitted next to a source by `voila build --emit=c`
+/voilac/main.c
+/samples/*.c
+/tests/**/*.c
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# CodeGraph index (machine-generated)
+.codegraph/

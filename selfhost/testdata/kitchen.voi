@@ -1,0 +1,70 @@
+// kitchen.voi — token kitchen sink for the differential lexer test.
+package main
+
+/* block comment /* nested */ still comment */
+
+use "std/fmt"
+
+const BIG = 1_000_000
+const HEX = 0x1F
+const OCT = 0o755
+const BIN = 0b1010
+const PI  = 3.14159
+const AVO = 6.02e23
+const NEG = 1.5e-8
+const PRICE = 19.99d
+const WHOLE = 3d
+
+func ops() int {
+    var a = 10
+    a += 1
+    a -= 2
+    a *= 3
+    a /= 2
+    a %= 7
+    let b = a//3
+    let c = a << 2 >> 1 & 3 | 4 ^ 5
+    let d = ~c
+    let e = 2 ** 10
+    let f = a < b and b <= c or not (c > d) and d >= e
+    let g = a != b
+    let h = "x" || "y"
+    let i = 0..10
+    let j = 0..=10
+    let k = 5 in i
+    say f, g, h, j, k
+    return e
+}
+
+func strings() {
+    let plain = "hello world"
+    let escaped = "tab\there\nnewline \"quoted\" backslash\\ done"
+    let uni = "\u{48}\u{69}"
+    let brace = "literal \{ brace"
+    let interp = "value is {1 + 2} here"
+    let raw = `raw
+string with "quotes" and {braces}`
+    let r1 = 'A'
+    let r2 = '\n'
+    let r3 = 'é'
+    say plain, escaped, uni, brace, interp, raw, r1, r2, r3
+}
+
+struct Point { x float, y float }
+
+enum Shape {
+    Circle(radius float)
+    Empty
+}
+
+func main() {
+    let p = Point{x: 1.0, y: 2.0}
+    match Circle(2.5) {
+        Circle(r) => say r
+        Empty     => say "none"
+    }
+    for i in 0..3 { continue }
+    while false { break }
+    say p, ops()
+    strings()
+}

@@ -1,0 +1,11 @@
+2 + 3 * 4        = 14
+(2 + 3) * 4      = 20
+2 ^ 10           = 1024
+2 ^ 3 ^ 2        = 512
+-(4 + 1) * 2     = -10
+100 / 8          = 12.5
+3.5 * 2 + 0.25   = 7.25
+((((7))))        = 7
+1 / 0            ! division by zero
+2 +              ! unexpected end of expression
+4 $ 2            ! unexpected character $ at column 3

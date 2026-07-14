@@ -1,0 +1,36 @@
+// low/names.voi — the prelude, std package and predeclared-exception name
+// tables. The lowerer classifies a bare identifier by consulting these, exactly
+// as the Go lowerer consults interp.PreludeNames()/PackageNames().
+//
+// Keep in step with internal/interp: a name missing here lowers as an unknown
+// identifier instead of a prelude call.
+package low
+
+func PreludeNames() []str {
+    return ["abs", "append", "assert", "avg", "b64", "bytes", "ceil", "cell",
+            "center", "close", "contains", "ends_with", "enumerate", "err",
+            "errf", "fields", "floor", "from_bytes", "from_runes", "hex",
+            "index", "is_alpha", "is_digit", "is_space", "is_upper", "join",
+            "keys", "left", "len", "lines", "lower", "max", "min", "pad",
+            "pad_left", "printf", "range", "repeat", "replace", "reverse",
+            "right", "round", "round_to", "rune_len", "runes", "sat_i16",
+            "sat_i32", "sat_i64", "sat_i8", "sat_u16", "sat_u32", "sat_u64",
+            "sat_u8", "set", "shared", "split", "sprintf", "starts_with",
+            "substr", "sum", "title", "to_byte", "to_dec", "to_float",
+            "to_i16", "to_i32", "to_i64", "to_i8", "to_int", "to_rune",
+            "to_u16", "to_u32", "to_u64", "to_u8", "translate", "trim",
+            "trunc", "unb64", "unhex", "upper", "values", "weak", "word",
+            "words", "wrap_add", "wrap_i16", "wrap_i32", "wrap_i64", "wrap_i8",
+            "wrap_mul", "wrap_u16", "wrap_u32", "wrap_u64", "wrap_u8", "zip"]
+}
+
+func PackageNames() []str {
+    return ["conv", "fmt", "http", "json", "log", "math", "os", "rand",
+            "regex", "sort", "str", "time", "uuid"]
+}
+
+func BuiltinExceptions() []str {
+    return ["ConvError", "RangeError", "OverflowError", "FormatError",
+            "ValueError", "RuntimeError", "IOError", "KeyError", "Timeout",
+            "Cancelled"]
+}

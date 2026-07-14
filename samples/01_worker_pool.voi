@@ -1,0 +1,80 @@
+// 01_worker_pool.voi — structured concurrency (§9): a pool of eight workers
+// pulls ranges off a jobs channel, counts primes in each range, and streams
+// results back. The group block guarantees every task has finished before
+// the summary prints — no goroutine can outlive it. Ever.
+package main
+
+use "std/fmt"
+
+struct Job    { id int, lo int, hi int }
+struct Result { id int, primes int }
+
+func is_prime(n int) bool {
+    if n < 2 { return false }
+    if n < 4 { return true }
+    if n % 2 == 0 { return false }
+    var d = 3
+    while d * d <= n {
+        if n % d == 0 { return false }
+        d += 2
+    }
+    return true
+}
+
+func count_primes(lo int, hi int) int {
+    var count = 0
+    for n in lo..hi {
+        if is_prime(n) { count += 1 }
+    }
+    return count
+}
+
+func main() {
+    let jobs    = chan[Job](16)
+    let results = chan[Result](16)
+    let done    = chan[[]Result](1)
+
+    group {
+        // Eight workers race for jobs; sending a Result moves it (§9.2),
+        // so no result is ever shared between two tasks.
+        for w in 0..8 {
+            spawn {
+                each job in jobs {
+                    results <- Result{id: job.id, primes: count_primes(job.lo, job.hi)}
+                }
+            }
+        }
+
+        // One producer slices 0..80_000 into ten ranges.
+        spawn {
+            for i in 0..10 {
+                jobs <- Job{id: i, lo: i * 8000, hi: (i + 1) * 8000}
+            }
+            close(jobs)
+        }
+
+        // One collector gathers everything, then hands the batch onward.
+        spawn {
+            var batch = []
+            for i in 0..10 {
+                let r = <-results
+                batch.append(r)
+            }
+            done <- batch
+        }
+    }
+    // <- here every worker, the producer and the collector have returned.
+
+    var batch = <-done
+    batch.sort_by(fn(a, b) { a.id < b.id })
+
+    var total = 0
+    fmt.printf("%-14s %10s\n", "range", "primes")
+    each r in batch {
+        fmt.printf("%6d-%-7d %10d\n", r.id * 8000, (r.id + 1) * 8000, r.primes)
+        total += r.primes
+    }
+    fmt.printf("%-14s %10d\n", "TOTAL", total)
+    assert(total == count_primes(0, 80000), "pool must agree with sequential count")
+    say "workers joined; nothing is still running. Ever."
+}

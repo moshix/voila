@@ -1,0 +1,637 @@
+// Package lex — the Voilà lexer, in Voilà.
+//
+// It is a faithful port of the stage-0 lexer: the same semicolon-insertion
+// rule (§2.4), the same `//` comment-vs-floor-division disambiguation
+// (Deviation D.1), nested block comments, radix literals, the `d` suffix, and
+// interpolated strings lexed into parts. A differential test diffs its token
+// stream against the Go lexer's over every source in the repository —
+// including this file.
+package lex
+
+use "voilac/tok"
+use "std/str"
+use "std/fmt"
+
+struct Lexer {
+    src   str
+    file  str
+    pos   int
+    line  int
+    col   int
+    last  int   // kind of the last emitted token (for semicolon insertion)
+    seen  bool  // has anything been emitted on this line?
+    Errs  []str
+    kw    map[str]int
+}
+
+func New(file str, src str) Lexer { return NewAt(file, src, 1, 1) }
+
+// NewAt starts the lexer at a given position. The parser uses it to lex an
+// interpolated string's embedded expression so that its tokens carry the
+// coordinates they have in the enclosing FILE, not in the snippet.
+func NewAt(file str, src str, line int, col int) Lexer {
+    var kw = make(map[str]int)
+    each i, w in tok.Keywords() {
+        kw[w] = tok.KW_FIRST + i
+    }
+    var lx = Lexer{src: src, file: file, pos: 0, line: line, col: col,
+                   last: tok.EOF, seen: false, Errs: [], kw: kw}
+    // A shebang line is skipped entirely (§1, script form).
+    if str.starts_with(src, "#!") {
+        while lx.pos < len(src) and lx.at(lx.pos) != 10 {
+            lx.pos += 1
+        }
+    }
+    return lx
+}
+
+impl Lexer {
+    func at(self, i int) int {
+        if i < 0 or i >= len(self.src) { return -1 }
+        return self.src[i]
+    }
+
+    func peek(self) int { return self.at(self.pos) }
+
+    func peek_at(self, n int) int { return self.at(self.pos + n) }
+
+    func advance(mut self) int {
+        let c = self.src[self.pos]
+        self.pos += 1
+        if c == 10 {
+            self.line += 1
+            self.col = 1
+        } else {
+            self.col += 1
+        }
+        return c
+    }
+
+    func error(mut self, line int, col int, msg str) {
+        self.Errs.append("{self.file}:{line}:{col}: {msg}")
+    }
+
+    // Tokens lexes the whole input.
+    func Tokens(mut self) []tok.Token {
+        var out = []
+        while true {
+            let t = self.next()
+            out.append(t)
+            if t.Kind == tok.EOF { return out }
+        }
+        return out
+    }
+
+    func next(mut self) tok.Token {
+        while true {
+            // Whitespace, with a virtual semicolon at a line end (§2.4).
+            while self.pos < len(self.src) {
+                let c = self.peek()
+                if c == 10 {
+                    if can_end_expr(self.last) and self.seen {
+                        let t = self.mk(tok.SEMI, "", self.line, self.col)
+                        self.advance()
+                        self.last = tok.SEMI
+                        self.seen = false
+                        return t
+                    }
+                    self.advance()
+                    self.seen = false
+                } else if c == 32 or c == 9 or c == 13 {
+                    self.advance()
+                } else {
+                    break
+                }
+            }
+            if self.pos >= len(self.src) {
+                if can_end_expr(self.last) and self.seen {
+                    self.last = tok.SEMI
+                    return self.mk(tok.SEMI, "", self.line, self.col)
+                }
+                return self.mk(tok.EOF, "", self.line, self.col)
+            }
+
+            let c = self.peek()
+            // `//` is floor division only in operator position, touching an
+            // operand; spaced on both sides it is a comment (Deviation D.1).
+            if c == 47 and self.peek_at(1) == 47 {
+                if self.is_floor_div() {
+                    let line = self.line
+                    let col = self.col
+                    self.advance()
+                    self.advance()
+                    return self.emit(tok.FLOORDIV, "//", line, col)
+                }
+                while self.pos < len(self.src) and self.peek() != 10 {
+                    self.advance()
+                }
+                continue
+            }
+            if c == 47 and self.peek_at(1) == 42 {
+                self.block_comment()
+                continue
+            }
+            return self.scan()
+        }
+        return self.mk(tok.EOF, "", self.line, self.col)
+    }
+
+    func is_floor_div(self) bool {
+        if not self.seen { return false }
+        if not can_end_expr(self.last) { return false }
+        if self.peek_at(2) == 47 { return false }        // /// doc comment
+        var tight_before = false
+        if self.pos > 0 {
+            let b = self.at(self.pos - 1)
+            if b != 32 and b != 9 and b != 13 and b != 10 { tight_before = true }
+        }
+        var tight_after = false
+        let a = self.peek_at(2)
+        if a != -1 and a != 32 and a != 9 and a != 13 and a != 10 {
+            tight_after = true
+        }
+        return tight_before or tight_after
+    }
+
+    func block_comment(mut self) {
+        let line = self.line
+        let col = self.col
+        self.advance()
+        self.advance()
+        var depth = 1
+        while self.pos < len(self.src) {
+            if self.peek() == 47 and self.peek_at(1) == 42 {
+                self.advance()
+                self.advance()
+                depth += 1
+            } else if self.peek() == 42 and self.peek_at(1) == 47 {
+                self.advance()
+                self.advance()
+                depth -= 1
+                if depth == 0 { return }
+            } else {
+                self.advance()
+            }
+        }
+        self.error(line, col, "unterminated block comment")
+    }
+
+    func mk(self, kind int, lit str, line int, col int) tok.Token {
+        return tok.Token{Kind: kind, Lit: lit, Line: line, Col: col,
+                         Parts: [], IsExpr: [], PartLine: [], PartCol: [],
+                         Virtual: false}
+    }
+
+    func emit(mut self, kind int, lit str, line int, col int) tok.Token {
+        self.last = kind
+        self.seen = true
+        return self.mk(kind, lit, line, col)
+    }
+
+    func scan(mut self) tok.Token {
+        let line = self.line
+        let col = self.col
+        let c = self.peek()
+
+        if is_digit(c) { return self.number(line, col) }
+        if c == 34 { return self.string_lit(line, col) }
+        if c == 96 { return self.raw_string(line, col) }
+        if c == 39 { return self.rune_lit(line, col) }
+
+        if is_letter(c) {
+            let start = self.pos
+            while self.pos < len(self.src) {
+                let ch = self.peek()
+                if is_letter(ch) or is_digit(ch) {
+                    self.advance()
+                } else {
+                    break
+                }
+            }
+            let word = self.src[start..self.pos]
+            if word in self.kw {
+                return self.emit(self.kw[word], word, line, col)
+            }
+            return self.emit(tok.IDENT, word, line, col)
+        }
+
+        // Operators, longest match first.
+        let o3 = tok.Ops3()
+        let c3 = tok.Ops3Code()
+        each i, op in o3 {
+            if self.match_op(op) { return self.emit(c3[i], op, line, col) }
+        }
+        let o2 = tok.Ops2()
+        let c2 = tok.Ops2Code()
+        each i, op in o2 {
+            if self.match_op(op) { return self.emit(c2[i], op, line, col) }
+        }
+        if c == 59 {
+            self.advance()
+            return self.emit(tok.SEMI, ";", line, col)
+        }
+        let o1 = tok.Ops1()
+        let c1 = tok.Ops1Code()
+        each i, op in o1 {
+            if self.match_op(op) { return self.emit(c1[i], op, line, col) }
+        }
+
+        let bad = self.advance()
+        self.error(line, col, "unexpected character")
+        return self.emit(tok.ILLEGAL, chr(bad), line, col)
+    }
+
+    func match_op(mut self, op str) bool {
+        if self.pos + len(op) > len(self.src) { return false }
+        if self.src[self.pos..self.pos + len(op)] != op { return false }
+        for i in 0..len(op) {
+            self.advance()
+        }
+        return true
+    }
+
+    func number(mut self, line int, col int) tok.Token {
+        let c0 = self.peek()
+        let c1 = self.peek_at(1)
+        // Radix prefixes: 0x, 0o, 0b (§2.6).
+        if c0 == 48 and (c1 == 120 or c1 == 88 or c1 == 111 or c1 == 79 or
+                         c1 == 98 or c1 == 66) {
+            var lit = ""
+            lit = lit || chr(self.advance())
+            let base = self.advance()
+            lit = lit || chr(base)
+            // Each base admits only its own digits: `0b12` is `0b1` then `2`.
+            var n = 0
+            while self.pos < len(self.src) {
+                let ch = self.peek()
+                if ch == 95 {
+                    self.advance()
+                    continue
+                }
+                if not in_base(ch, base) { break }
+                lit = lit || chr(self.advance())
+                n += 1
+            }
+            if n == 0 {
+                self.error(line, col, "malformed number literal")
+            }
+            return self.emit(tok.INT, lit, line, col)
+        }
+
+        var lit = self.digits()
+        var kind = tok.INT
+        // A fraction — but `0..10` must leave the range operator alone.
+        if self.peek() == 46 and is_digit(self.peek_at(1)) {
+            kind = tok.FLOAT
+            self.advance()
+            lit = lit || "." || self.digits()
+        }
+        let e = self.peek()
+        if e == 101 or e == 69 {
+            let n1 = self.peek_at(1)
+            let n2 = self.peek_at(2)
+            var expo = false
+            if is_digit(n1) { expo = true }
+            if (n1 == 43 or n1 == 45) and is_digit(n2) { expo = true }
+            if expo {
+                kind = tok.FLOAT
+                lit = lit || chr(self.advance())
+                let sg = self.peek()
+                if sg == 43 or sg == 45 { lit = lit || chr(self.advance()) }
+                lit = lit || self.digits()
+            }
+        }
+        // The `d` suffix makes an exact decimal (§2.6).
+        if self.peek() == 100 {
+            let after = self.peek_at(1)
+            if not (is_letter(after) or is_digit(after)) {
+                self.advance()
+                return self.emit(tok.DEC, lit, line, col)
+            }
+        }
+        return self.emit(kind, lit, line, col)
+    }
+
+    func digits(mut self) str {
+        var out = ""
+        while self.pos < len(self.src) {
+            let ch = self.peek()
+            if ch == 95 {
+                self.advance()
+            } else if is_digit(ch) {
+                out = out || chr(self.advance())
+            } else {
+                break
+            }
+        }
+        return out
+    }
+
+    func escape(mut self) str {
+        let line = self.line
+        let col = self.col
+        self.advance()
+        if self.pos >= len(self.src) {
+            self.error(line, col, "unterminated escape sequence")
+            return ""
+        }
+        let c = self.advance()
+        if c == 110 { return "\n" }
+        if c == 116 { return "\t" }
+        if c == 114 { return "\r" }
+        if c == 48  { return str.from_runes([rune(0)]) }
+        if c == 92  { return "\\" }
+        if c == 34  { return "\"" }
+        if c == 39  { return "'" }
+        if c == 123 { return "\{" }
+        if c == 125 { return "\}" }
+        if c == 117 {
+            if self.peek() != 123 {
+                self.error(line, col, "bad unicode escape")
+                return ""
+            }
+            self.advance()
+            var hex = ""
+            while self.pos < len(self.src) and self.peek() != 125 {
+                hex = hex || chr(self.advance())
+            }
+            if self.pos < len(self.src) { self.advance() }
+            // An empty \u{} is U+0000, exactly as an empty accumulate loop
+            // leaves it — only a BAD hex digit is an error.
+            var v = 0
+            each h in hex {
+                let d = hex_val(h)
+                if d < 0 {
+                    self.error(line, col, "bad hex in \\u\{...\} escape")
+                    return ""
+                }
+                v = v * 16 + d
+            }
+            return str.from_runes([rune(v)])
+        }
+        self.error(line, col, "unknown escape sequence")
+        return chr(c)
+    }
+
+    // string_lit lexes "…". An unescaped `{` makes it an interpolated string,
+    // whose pieces are carried on the token.
+    func string_lit(mut self, line int, col int) tok.Token {
+        self.advance()
+        var parts = []
+        var isexpr = []
+        var plines = []
+        var pcols = []
+        var lit = ""
+        var seg = self.pos
+        var interp = false
+        while true {
+            if self.pos >= len(self.src) or self.peek() == 10 {
+                // Flush the run scanned so far: an unterminated string still
+                // carries its text (the Go lexer accumulates byte by byte).
+                lit = lit || self.src[seg..self.pos]
+                self.error(line, col, "unterminated string literal")
+                break
+            }
+            let c = self.peek()
+            if c == 34 {
+                lit = lit || self.src[seg..self.pos]
+                self.advance()
+                break
+            }
+            if c == 92 {
+                lit = lit || self.src[seg..self.pos]
+                lit = lit || self.escape()
+                seg = self.pos
+            } else if c == 123 {
+                interp = true
+                // Flush the literal run that precedes this `{` — including one
+                // that sits between two interpolations ("a{x}, and {y}").
+                lit = lit || self.src[seg..self.pos]
+                if len(lit) > 0 {
+                    parts.append(lit)
+                    isexpr.append(false)
+                    plines.append(line)
+                    pcols.append(col)
+                    lit = ""
+                }
+                // The expression starts one column past the `{`.
+                let eline = self.line
+                let ecol = self.col + 1
+                let e = self.interp_expr()
+                parts.append(e)
+                isexpr.append(true)
+                plines.append(eline)
+                pcols.append(ecol)
+                seg = self.pos
+            } else {
+                self.advance()
+            }
+        }
+        if not interp {
+            return self.emit(tok.STR, lit, line, col)
+        }
+        if len(lit) > 0 {
+            parts.append(lit)
+            isexpr.append(false)
+            plines.append(line)
+            pcols.append(col)
+        }
+        self.last = tok.ISTR
+        self.seen = true
+        return tok.Token{Kind: tok.ISTR, Lit: "", Line: line, Col: col,
+                         Parts: parts, IsExpr: isexpr, PartLine: plines,
+                         PartCol: pcols, Virtual: false}
+    }
+
+    // interp_expr consumes a balanced {…}, skipping nested strings and runes.
+    func interp_expr(mut self) str {
+        let line = self.line
+        let col = self.col
+        self.advance()
+        let start = self.pos
+        var depth = 1
+        while self.pos < len(self.src) {
+            let c = self.peek()
+            if c == 123 {
+                depth += 1
+                self.advance()
+            } else if c == 125 {
+                depth -= 1
+                if depth == 0 {
+                    let out = self.src[start..self.pos]
+                    self.advance()
+                    return out
+                }
+                self.advance()
+            } else if c == 34 {
+                self.advance()
+                while self.pos < len(self.src) and self.peek() != 34 and
+                      self.peek() != 10 {
+                    if self.peek() == 92 {
+                        self.advance()
+                        if self.pos < len(self.src) { self.advance() }
+                    } else {
+                        self.advance()
+                    }
+                }
+                if self.pos < len(self.src) and self.peek() == 34 { self.advance() }
+            } else if c == 39 {
+                self.advance()
+                while self.pos < len(self.src) and self.peek() != 39 and
+                      self.peek() != 10 {
+                    if self.peek() == 92 {
+                        self.advance()
+                        if self.pos < len(self.src) { self.advance() }
+                    } else {
+                        self.advance()
+                    }
+                }
+                if self.pos < len(self.src) and self.peek() == 39 { self.advance() }
+            } else if c == 96 {
+                self.advance()
+                while self.pos < len(self.src) and self.peek() != 96 {
+                    self.advance()
+                }
+                if self.pos < len(self.src) { self.advance() }
+            } else {
+                self.advance()
+            }
+        }
+        self.error(line, col, "unterminated interpolation in string literal")
+        return self.src[start..self.pos]
+    }
+
+    func raw_string(mut self, line int, col int) tok.Token {
+        self.advance()
+        let start = self.pos
+        while self.pos < len(self.src) and self.peek() != 96 {
+            self.advance()
+        }
+        if self.pos >= len(self.src) {
+            self.error(line, col, "unterminated raw string literal")
+            return self.emit(tok.STR, self.src[start..self.pos], line, col)
+        }
+        let lit = self.src[start..self.pos]
+        self.advance()
+        return self.emit(tok.STR, lit, line, col)
+    }
+
+    func rune_lit(mut self, line int, col int) tok.Token {
+        self.advance()
+        var lit = ""
+        if self.peek() == 92 {
+            lit = self.escape()
+        } else if self.pos < len(self.src) {
+            let start = self.pos
+            self.advance()
+            while self.pos < len(self.src) and self.peek() >= 128 and
+                  self.peek() < 192 {
+                self.advance()
+            }
+            lit = self.src[start..self.pos]
+        }
+        if self.peek() != 39 {
+            self.error(line, col, "unterminated rune literal")
+        } else {
+            self.advance()
+        }
+        if len(runes(lit)) != 1 {
+            self.error(line, col,
+                       "rune literal must contain exactly one codepoint")
+            if lit == "" { lit = str.from_runes([rune(0)]) }
+        }
+        return self.emit(tok.RUNE, lit, line, col)
+    }
+}
+
+// can_end_expr is the semicolon-insertion predicate (§2.4): the kinds a
+// statement may legally end on.
+func can_end_expr(k int) bool {
+    if k == tok.IDENT or k == tok.INT or k == tok.FLOAT or k == tok.DEC or
+       k == tok.STR or k == tok.ISTR or k == tok.RUNE {
+        return true
+    }
+    if k == tok.TRUE or k == tok.FALSE or k == tok.NIL or k == tok.SELF or
+       k == tok.RETURN or k == tok.BREAK or k == tok.CONTINUE or k == tok.SAY {
+        return true
+    }
+    if k == tok.RPAREN or k == tok.RBRACKET or k == tok.RBRACE or k == tok.DOT {
+        return true
+    }
+    return false
+}
+
+func is_digit(c int) bool { return c >= 48 and c <= 57 }
+
+func is_letter(c int) bool {
+    if c == 95 { return true }
+    if c >= 65 and c <= 90 { return true }
+    if c >= 97 and c <= 122 { return true }
+    return c >= 128
+}
+
+// in_base reports whether c is a digit of the radix introduced by `base`
+// (the character after the leading 0): b/B binary, o/O octal, x/X hex.
+func in_base(c int, base int) bool {
+    if base == 98 or base == 66 { return c == 48 or c == 49 }
+    if base == 111 or base == 79 { return c >= 48 and c <= 55 }
+    return is_hex(c)
+}
+
+// hex_val is the value of one hex digit, or -1.
+func hex_val(c rune) int {
+    let b = int(c)
+    if b >= 48 and b <= 57  { return b - 48 }
+    if b >= 97 and b <= 102 { return b - 97 + 10 }
+    if b >= 65 and b <= 70  { return b - 65 + 10 }
+    return -1
+}
+
+func is_hex(c int) bool {
+    if is_digit(c) { return true }
+    if c >= 97 and c <= 102 { return true }
+    return c >= 65 and c <= 70
+}
+
+func chr(c int) str { return str.from_runes([rune(c)]) }
+
+func try_hex(s str) int {
+    if len(s) == 0 { return -1 }
+    let v = to_int(s, 16)
+    if v == nil { return -1 }
+    return v
+}
+
+// Dump renders the token stream in the format the differential test compares
+// against the Go lexer.
+func Dump(ts []tok.Token) []str {
+    var out = []
+    each t in ts {
+        let kind = tok.Name(t.Kind)
+        var lit = ""
+        if kind == "KW" or kind == "IDENT" or kind == "INT" or
+           kind == "FLOAT" or kind == "DEC" {
+            lit = t.Lit
+        } else if kind == "STR" or kind == "RUNE" {
+            lit = escape_dump(t.Lit)
+        } else if kind == "OP" {
+            lit = tok.Spelling(t.Kind)
+        }
+        if lit == "" {
+            out.append("{t.Line}:{t.Col} {kind}")
+        } else {
+            out.append("{t.Line}:{t.Col} {kind} {lit}")
+        }
+    }
+    return out
+}
+
+func escape_dump(s str) str {
+    var out = str.replace(s, "\\", "\\\\")
+    out = str.replace(out, "\n", "\\n")
+    out = str.replace(out, "\t", "\\t")
+    out = str.replace(out, "\r", "\\r")
+    return out
+}
+
+var _unused = fmt.sprintf

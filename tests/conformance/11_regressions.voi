@@ -1,0 +1,88 @@
+// Regressions. Every case here is a defect a senior review found, reproduced
+// as the smallest program that told the two engines apart. They must now be
+// indistinguishable.
+use "std/time"
+exception Fail { n int }
+
+func greet(name str, greeting str) str { return greeting || ", " || name }
+func work(n int) int { return n }
+
+// A `return` out of a group body must still join the group (§9.1).
+func early() int {
+    group {
+        spawn work(1)
+        spawn work(2)
+        return 99
+    }
+    return 0
+}
+
+func main() {
+    // Named arguments are bound by NAME, not by position.
+    say greet(greeting: "Hi", name: "Bo")
+
+    // Literal patterns: constants must be interned before the pool is sized,
+    // hex must not be read as a `d`-suffixed decimal, and escapes must survive.
+    let n = 13
+    match n {
+        0xd => say "thirteen"
+        _   => say "other"
+    }
+    let nothing = nil
+    match nothing {
+        2 => say "TWO (wrong)"
+        _ => say "nil falls through"
+    }
+    let quoted = "he said \"hi\""
+    match quoted {
+        "he said \"hi\"" => say "escaped literal matched"
+        _               => say "other"
+    }
+
+    // select comma-ok binds by POSITION: a value named `book` is not the flag.
+    let ch = chan[int](1)
+    ch <- 42
+    select {
+    case book, ok := <-ch:
+        say "book =", book, "ok =", ok
+    }
+
+    // A predeclared exception is constructible and catchable.
+    try { throw ValueError{msg: "bad input"} }
+    catch e: ValueError { say "caught:", e.msg }
+
+    // The group is joined even though the body returned early.
+    say "early:", early()
+
+    // A rune equals the one-character string it denotes.
+    say '\n' == "\n", 'A' == "A", 'A' == 65
+
+    // say renders each argument as it is evaluated.
+    var v = [1, 2, 3]
+    say v, v.pop(), v
+
+    // shared[T].get() reaches the handle, not the value inside it.
+    say shared(42).get()
+
+    // INT64_MIN floor-divided by -1 traps instead of killing the process.
+    // (Note the tight `//`: spaced, it would be a comment — rule D.1.)
+    var lo = -9_223_372_036_854_775_807 - 1
+    var neg = -1
+    try { say lo//neg } catch e: OverflowError { say "idiv overflow trapped" }
+
+    // dec.format rejects a negative width instead of corrupting the heap.
+    try { say 1.5d.format(-2) } catch e: ValueError { say "format guard" }
+
+    // Two rune arguments in one call must not alias a shared buffer.
+    say str.replace("cat", 'a', 'o'), str.translate("cat", 'a', 'o')
+
+    // A generic call is type-erased, not a type argument.
+    let c = cell[int](5)
+    say c.get()
+
+    // A group whose task finishes before the deadline is NOT a timeout.
+    group timeout 2 * time.Second {
+        spawn work(7)
+    }
+    say "beat the deadline"
+}

@@ -1,0 +1,578 @@
+// load/rewrite.voi — name qualification.
+//
+// Inside package P every reference to one of P's own declarations becomes
+// `P.name`; in every file, a reference `Q.name` into an imported user package
+// becomes the flat name `Q.name`. Local scopes are tracked, so a variable that
+// happens to be called `parser` shadows the package of that name — the same
+// rule the interpreter applies.
+package load
+
+use "voilac/ast"
+use "std/str"
+
+// The rewriter's state lives on the Loader: a Rewriter struct holding the
+// Loader would MOVE it (a collection is owned, never shared), and every lookup
+// needs the package table anyway.
+impl Loader {
+    func push(mut self) { self.rwScopes.append(set([])) }
+
+    func pop(mut self) {
+        self.rwScopes = self.rwScopes[0..len(self.rwScopes) - 1]
+    }
+
+    func bind(mut self, n str) {
+        if len(self.rwScopes) == 0 or n == "" or n == "_" { return }
+        self.rwScopes[len(self.rwScopes) - 1].add(n)
+    }
+
+    func bound(self, n str) bool {
+        var i = len(self.rwScopes) - 1
+        while i >= 0 {
+            if n in self.rwScopes[i] { return true }
+            i -= 1
+        }
+        return false
+    }
+
+    func rw_error(mut self, t ast.Tree, node int, msg str) {
+        let n = t.Get(node)
+        self.Errs.append("{self.rwFile}:{n.Line}:{n.Col}: {msg}")
+    }
+
+    // qualify returns the flat name for one of this package's declarations. A
+    // name that a local binding — or a generic parameter — shadows is left
+    // alone.
+    func qualify(self, n str) str {
+        if self.rwSelf < 0 { return "" }
+        if not (n in self.pkgs[self.rwSelf].decls) { return "" }
+        if self.bound(n) { return "" }
+        return self.pkgs[self.rwSelf].name || "." || n
+    }
+
+    // rw_import resolves a qualifier to a package index, honouring `as`. The
+    // entry file's imports live in mainImports; a package file's in its own.
+    func rw_import(self, q str) int {
+        if self.rwSelf < 0 {
+            if q in self.mainImports { return self.mainImports[q] }
+            return 0 - 1
+        }
+        if q in self.pkgs[self.rwSelf].imports {
+            return self.pkgs[self.rwSelf].imports[q]
+        }
+        return 0 - 1
+    }
+
+    // member resolves `Q.name` into an imported user package.
+    func member(mut self, t ast.Tree, node int, q str, name str) str {
+        let pi = self.rw_import(q)
+        if pi < 0 { return "" }
+        if self.bound(q) { return "" }
+        if not (name in self.pkgs[pi].decls) {
+            self.rw_error(t, node, "package `{q}` has no exported `{name}`")
+            return ""
+        }
+        if not exported(name) {
+            self.rw_error(t, node,
+                          "`{q}.{name}` is package-private (an exported name " ||
+                          "starts with a capital)")
+            return ""
+        }
+        return self.pkgs[pi].name || "." || name
+    }
+
+    // ------------------------------------------------------------ file
+
+    func rw_file(mut self, t mut ast.Tree, root int) {
+        let decls = t.Get(t.Kid(root, 1)).Kids
+        // Declaration names first, so bodies can be rewritten against them.
+        each d in decls {
+            self.decl_name(t, d)
+        }
+        each d in decls {
+            self.decl(t, d)
+        }
+        self.push()
+        each s in t.Get(t.Kid(root, 2)).Kids {
+            self.stmt(t, s)
+        }
+        self.pop()
+    }
+
+    func decl_name(mut self, t mut ast.Tree, d int) {
+        if self.rwSelf < 0 { return }
+        let n = t.Get(d)
+        if n.Kind == ast.FUNC or n.Kind == ast.STRUCTDEC or
+           n.Kind == ast.ENUMDEC or n.Kind == ast.EXCDEC {
+            let q = self.qualify(n.Sval)
+            if q != "" { t.Nodes[d].Sval = q }
+            return
+        }
+        if n.Kind == ast.TYPEDEC {
+            let q = self.qualify(n.Sval)
+            if q != "" {
+                t.Nodes[d].Sval = q
+                let sd = t.Kid(d, 0)
+                if sd != 0 { t.Nodes[sd].Sval = q }
+            }
+            return
+        }
+        if n.Kind == ast.GLOBAL {
+            let s = t.Kid(d, 0)
+            let sn = t.Get(s)
+            if sn.Kind == ast.LET {
+                var out = []
+                each nm in str.split(sn.Sval, ",") {
+                    let q = self.qualify(nm)
+                    if q != "" { out.append(q) } else { out.append(nm) }
+                }
+                t.Nodes[s].Sval = str.join(out, ",")
+            } else if sn.Kind == ast.VAR {
+                let q = self.qualify(sn.Sval)
+                if q != "" { t.Nodes[s].Sval = q }
+            }
+        }
+    }
+
+    func decl(mut self, t mut ast.Tree, d int) {
+        let n = t.Get(d)
+        if n.Kind == ast.FUNC {
+            self.fn(t, d)
+        } else if n.Kind == ast.STRUCTDEC {
+            self.push()
+            self.bind_generics(t, t.Kid(d, 1))
+            each f in t.Get(t.Kid(d, 0)).Kids {
+                self.typ(t, f, 0 - 1)          // the type hangs off Ival
+                self.expr(t, f, 0)
+            }
+            self.pop()
+        } else if n.Kind == ast.ENUMDEC {
+            self.push()
+            self.bind_generics(t, t.Kid(d, 1))
+            each v in t.Get(t.Kid(d, 0)).Kids {
+                each f in t.Get(t.Kid(v, 0)).Kids {
+                    self.typ(t, f, 0 - 1)
+                    self.expr(t, f, 0)
+                }
+            }
+            self.pop()
+        } else if n.Kind == ast.EXCDEC {
+            each f in t.Get(t.Kid(d, 0)).Kids {
+                self.typ(t, f, 0 - 1)
+                self.push()
+                self.expr(t, f, 0)
+                self.pop()
+            }
+            each m in t.Get(t.Kid(d, 1)).Kids {
+                self.fn(t, m)
+            }
+        } else if n.Kind == ast.TRAITDEC {
+            each m in t.Get(t.Kid(d, 0)).Kids {
+                self.fn(t, m)
+            }
+        } else if n.Kind == ast.IMPLDEC {
+            self.push()
+            self.bind_generics(t, t.Kid(d, 1))
+            self.typ(t, d, 0 - 1)
+            each m in t.Get(t.Kid(d, 0)).Kids {
+                self.fn(t, m)
+            }
+            self.pop()
+        } else if n.Kind == ast.TYPEDEC {
+            self.typ(t, d, 0 - 1)
+            let sd = t.Kid(d, 0)
+            if sd != 0 {
+                self.push()
+                self.bind_generics(t, t.Kid(sd, 1))
+                each f in t.Get(t.Kid(sd, 0)).Kids {
+                    self.typ(t, f, 0 - 1)
+                    self.expr(t, f, 0)
+                }
+                self.pop()
+            }
+        } else if n.Kind == ast.GLOBAL {
+            self.push()
+            self.stmt(t, t.Kid(d, 0))
+            self.pop()
+        }
+    }
+
+    // bind_generics makes a generic parameter shadow a package type of the same
+    // name: in `func F[T](x T)`, `T` is the parameter, not the package's `T`.
+    func bind_generics(mut self, t ast.Tree, list int) {
+        if list == 0 { return }
+        each g in t.Get(list).Kids {
+            let parts = str.split(t.Get(g).Sval, "|")
+            self.bind(parts[0])
+        }
+    }
+
+    func fn(mut self, t mut ast.Tree, d int) {
+        self.push()
+        self.bind_generics(t, t.Kid(d, 3))
+        let n = t.Get(d)
+        if (n.Ival2 & 1) != 0 { self.bind("self") }
+        each p in t.Get(t.Kid(d, 1)).Kids {
+            self.typ(t, p, 0 - 1)
+            self.expr(t, p, 0)     // before bind: a default cannot see its param
+            self.bind(t.Get(p).Sval)
+        }
+        each r in t.Get(t.Kid(d, 2)).Kids {
+            self.typ_node(t, r)
+        }
+        each th in t.Get(t.Kid(d, 4)).Kids {
+            self.typ_node(t, th)
+        }
+        let body = t.Kid(d, 0)
+        if body != 0 { self.block(t, body) }
+        self.expr(t, d, 5)         // the trait default expression
+        self.pop()
+    }
+
+    // ------------------------------------------------------------ types
+
+    // typ rewrites the type reached from a node: kid index -1 means the node's
+    // Ival slot (the layout every ref-kind node uses).
+    func typ(mut self, t mut ast.Tree, node int, kid int) {
+        var id = 0
+        if kid < 0 {
+            id = t.Get(node).Ival
+        } else {
+            id = t.Kid(node, kid)
+        }
+        self.typ_node(t, id)
+    }
+
+    func typ_node(mut self, t mut ast.Tree, id int) {
+        if id == 0 { return }
+        let n = t.Get(id)
+        if n.Kind == ast.TNAMED {
+            let dot = index_of(n.Sval, '.')
+            if dot >= 0 {
+                let q = n.Sval[0..dot]
+                let name = n.Sval[dot + 1..len(n.Sval)]
+                let flat = self.member(t, id, q, name)
+                if flat != "" { t.Nodes[id].Sval = flat }
+            } else {
+                let q = self.qualify(n.Sval)
+                if q != "" { t.Nodes[id].Sval = q }
+            }
+            each a in t.Get(id).Kids {
+                self.typ_node(t, a)
+            }
+            return
+        }
+        if n.Kind == ast.TSLICE {
+            self.typ_node(t, t.Kid(id, 0))
+            self.expr_node(t, t.Kid(id, 1))
+            return
+        }
+        if n.Kind == ast.TMAP {
+            self.typ_node(t, t.Kid(id, 0))
+            self.typ_node(t, t.Kid(id, 1))
+            return
+        }
+        if n.Kind == ast.TFN {
+            each p in t.Get(t.Kid(id, 0)).Kids {
+                self.typ_node(t, p)
+            }
+            self.typ_node(t, n.Ival)
+            return
+        }
+        if n.Kind == ast.TTUPLE {
+            each e in t.Get(id).Kids {
+                self.typ_node(t, e)
+            }
+            return
+        }
+        if n.Kind == ast.TOPTION or n.Kind == ast.TRESULT or
+           n.Kind == ast.TSET or n.Kind == ast.TCHAN or
+           n.Kind == ast.TBOX or n.Kind == ast.TBORROW {
+            self.typ_node(t, t.Kid(id, 0))
+        }
+    }
+
+    // ------------------------------------------------------------ statements
+
+    func block(mut self, t mut ast.Tree, b int) {
+        if b == 0 { return }
+        self.push()
+        each s in t.Get(b).Kids {
+            self.stmt(t, s)
+        }
+        self.pop()
+    }
+
+    func stmt(mut self, t mut ast.Tree, s int) {
+        if s == 0 { return }
+        let n = t.Get(s)
+        let k = n.Kind
+
+        if k == ast.BLOCK {
+            self.block(t, s)
+        } else if k == ast.LET {
+            self.typ(t, s, 0 - 1)
+            self.expr(t, s, 0)
+            each nm in str.split(n.Sval, ",") {
+                self.bind(nm)
+            }
+        } else if k == ast.VAR {
+            self.typ(t, s, 0 - 1)
+            self.expr(t, s, 0)
+            self.bind(n.Sval)
+        } else if k == ast.ASSIGN {
+            self.expr(t, s, 0)
+            self.expr(t, s, 1)
+        } else if k == ast.EXPRSTMT {
+            self.expr(t, s, 0)
+        } else if k == ast.DROP {
+            if not self.bound(n.Sval) {
+                let q = self.qualify(n.Sval)
+                if q != "" { t.Nodes[s].Sval = q }
+            }
+        } else if k == ast.IF {
+            self.expr(t, s, 0)
+            self.push()
+            self.pattern(t, n.Ival)
+            self.block(t, t.Kid(s, 1))
+            self.pop()
+            self.stmt(t, t.Kid(s, 2))
+        } else if k == ast.FOR {
+            self.expr(t, s, 0)
+            self.push()
+            let parts = str.split(n.Sval, "|")
+            self.bind(parts[0])
+            self.block(t, t.Kid(s, 1))
+            self.pop()
+        } else if k == ast.EACH {
+            self.expr(t, s, 0)
+            self.push()
+            let head = str.split(n.Sval, "|")[0]
+            each nm in str.split(head, ",") {
+                self.bind(nm)
+            }
+            self.block(t, t.Kid(s, 1))
+            self.pop()
+        } else if k == ast.WHILE {
+            self.expr(t, s, 0)
+            self.block(t, t.Kid(s, 1))
+        } else if k == ast.SWITCH {
+            self.expr(t, s, 0)
+            each c in t.Get(t.Kid(s, 1)).Kids {
+                each i, v in t.Get(t.Kid(c, 0)).Kids {
+                    self.expr_node(t, v)
+                }
+                self.push()
+                each b in t.Get(t.Kid(c, 1)).Kids {
+                    self.stmt(t, b)
+                }
+                self.pop()
+            }
+        } else if k == ast.MATCH {
+            self.expr(t, s, 0)
+            each arm in t.Get(t.Kid(s, 1)).Kids {
+                self.push()
+                self.pattern(t, t.Get(arm).Ival)
+                self.expr(t, arm, 0)
+                each b in t.Get(t.Kid(arm, 1)).Kids {
+                    self.stmt(t, b)
+                }
+                self.pop()
+            }
+        } else if k == ast.SELECTSTMT {
+            each c in t.Get(t.Kid(s, 0)).Kids {
+                self.expr(t, c, 0)
+                self.expr(t, c, 1)
+                self.push()
+                each nm in str.split(t.Get(c).Sval, ",") {
+                    self.bind(nm)
+                }
+                each b in t.Get(t.Kid(c, 2)).Kids {
+                    self.stmt(t, b)
+                }
+                self.pop()
+            }
+        } else if k == ast.GROUP {
+            self.expr(t, s, 0)
+            self.block(t, t.Kid(s, 1))
+        } else if k == ast.PARSESTMT {
+            self.expr(t, s, 0)
+            each term in t.Get(t.Kid(s, 1)).Kids {
+                let tn = t.Get(term)
+                if tn.Ival != 0 { continue }        // not a capture term
+                // A target that names a package-level global must be QUALIFIED,
+                // or the parse would silently write a fresh local instead.
+                if not self.bound(tn.Sval) {
+                    let q = self.qualify(tn.Sval)
+                    if q != "" {
+                        t.Nodes[term].Sval = q
+                        continue
+                    }
+                }
+                self.bind(tn.Sval)
+            }
+        } else if k == ast.SAY or k == ast.RETURN {
+            each i, a in t.Get(s).Kids {
+                self.expr_node(t, a)
+            }
+        } else if k == ast.DEFERSTMT {
+            let x = t.Kid(s, 0)
+            if n.Ival2 == 1 {
+                self.block(t, x)
+            } else {
+                self.expr_node(t, x)
+            }
+        } else if k == ast.THROW {
+            self.expr(t, s, 0)
+            self.expr(t, s, 1)
+        } else if k == ast.TRYCATCH {
+            self.block(t, t.Kid(s, 0))
+            each c in t.Get(t.Kid(s, 1)).Kids {
+                each ty in t.Get(t.Kid(c, 1)).Kids {
+                    self.typ_node(t, ty)
+                }
+                self.push()
+                self.bind(t.Get(c).Sval)
+                self.block(t, t.Kid(c, 0))
+                self.pop()
+            }
+            self.block(t, t.Kid(s, 2))
+        }
+    }
+
+    // pattern binds a pattern's names; variant names stay global.
+    func pattern(mut self, t mut ast.Tree, p int) {
+        if p == 0 { return }
+        let n = t.Get(p)
+        if n.Kind == ast.PBIND {
+            self.bind(n.Sval)
+        } else if n.Kind == ast.PVARIANT {
+            each e in t.Get(p).Kids {
+                self.pattern(t, e)
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ expressions
+
+    func expr(mut self, t mut ast.Tree, node int, kid int) {
+        self.expr_node(t, t.Kid(node, kid))
+    }
+
+    func expr_node(mut self, t mut ast.Tree, e int) {
+        if e == 0 { return }
+        let n = t.Get(e)
+        let k = n.Kind
+
+        if k == ast.IDENT {
+            if self.bound(n.Sval) { return }
+            let q = self.qualify(n.Sval)
+            if q != "" { t.Nodes[e].Sval = q }
+            return
+        }
+        if k == ast.FIELD {
+            // `Q.name` into an imported user package flattens to ONE identifier:
+            // the FIELD node becomes an IDENT in place.
+            let base = t.Kid(e, 0)
+            let bn = t.Get(base)
+            if bn.Kind == ast.IDENT and not self.bound(bn.Sval) {
+                let flat = self.member(t, e, bn.Sval, n.Sval)
+                if flat != "" {
+                    t.Nodes[e].Kind = ast.IDENT
+                    t.Nodes[e].Sval = flat
+                    t.Nodes[e].Kids = []
+                    return
+                }
+            }
+            self.expr_node(t, base)
+            return
+        }
+        if k == ast.COMPOSITE {
+            let ty = n.Ival
+            if ty != 0 {
+                let tn = t.Get(ty)
+                let dot = index_of(tn.Sval, '.')
+                if dot >= 0 {
+                    let q = tn.Sval[0..dot]
+                    let name = tn.Sval[dot + 1..len(tn.Sval)]
+                    let flat = self.member(t, ty, q, name)
+                    if flat != "" {
+                        t.Nodes[ty].Sval = flat
+                        t.Nodes[e].Sval = flat
+                    }
+                } else {
+                    let q = self.qualify(tn.Sval)
+                    if q != "" {
+                        t.Nodes[ty].Sval = q
+                        t.Nodes[e].Sval = q
+                    }
+                }
+                each a in t.Get(ty).Kids {
+                    self.typ_node(t, a)
+                }
+            }
+            each f in t.Get(e).Kids {
+                self.expr(t, f, 0)
+            }
+            return
+        }
+        if k == ast.CALL {
+            self.expr(t, e, 0)
+            each a in t.Get(t.Kid(e, 1)).Kids {
+                self.expr(t, a, 0)
+            }
+            each ta in t.Get(t.Kid(e, 2)).Kids {
+                self.typ_node(t, ta)
+            }
+            return
+        }
+        if k == ast.CLOSURE {
+            self.push()
+            each p in t.Get(t.Kid(e, 1)).Kids {
+                self.typ(t, p, 0 - 1)
+                self.expr(t, p, 0)
+                self.bind(t.Get(p).Sval)
+            }
+            self.typ(t, e, 0 - 1)
+            self.block(t, t.Kid(e, 0))
+            self.pop()
+            return
+        }
+        if k == ast.ELSEEXPR {
+            self.expr(t, e, 0)
+            if n.Ival2 == 1 {
+                self.stmt(t, t.Kid(e, 1))
+            } else {
+                self.expr(t, e, 1)
+            }
+            return
+        }
+        if k == ast.SPAWNEXPR {
+            if n.Ival2 == 1 {
+                self.block(t, t.Kid(e, 0))
+            } else {
+                self.expr(t, e, 0)
+            }
+            return
+        }
+        // Everything else just recurses over its children: UNARY, BINARY,
+        // RANGE, INDEX, SLICELIT, TUPLE, INTERP, TRYEXPR, MUSTEXPR, ATTEMPT.
+        each c in t.Get(e).Kids {
+            self.expr_node(t, c)
+        }
+    }
+}
+
+func exported(n str) bool {
+    if n == "" { return false }
+    let c = n[0]
+    return c >= 65 and c <= 90
+}
+
+func index_of(s str, c rune) int {
+    var i = 0
+    while i < len(s) {
+        if s[i] == c { return i }
+        i += 1
+    }
+    return -1
+}

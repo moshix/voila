@@ -1,0 +1,2 @@
+package util
+func B() int { return 2 }

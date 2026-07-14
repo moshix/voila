@@ -1,0 +1,22 @@
+package p
+
+// Padding so the borrow-field error lands on a HIGH line number (line 20),
+// while main.voi's lattice error lands on a LOW one (line 5).
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+struct Holder {
+    r &str
+}
+
+func Use(h Holder) str { return "x" }

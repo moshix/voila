@@ -1,0 +1,7 @@
+// Each radix admits only its own digits: `0b12` is `0b1` followed by `2`.
+let a = 0b12
+let b = 0o19
+let c = 0x1f
+let d = 0b1010_0110
+let e = 0o777
+say a, b, c, d, e

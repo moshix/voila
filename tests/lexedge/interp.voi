@@ -1,0 +1,8 @@
+// A literal run between two interpolations must survive; positions inside an
+// embedded expression must name the enclosing file.
+let x = 1
+let y = 2
+say "expected {x}, found {y}"
+say "{x}{y}"
+say "a{x}b{y}c"
+say "nested {"inner {x}"} done"

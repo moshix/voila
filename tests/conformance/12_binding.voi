@@ -1,0 +1,54 @@
+// Binding a name to another name must COPY, never alias.
+//
+// The IR lowerer binds a new name straight to the register its initialiser
+// produced. That is right for every expression that allocates one — but a bare
+// identifier hands back the register of an EXISTING binding, so `var a = b`
+// once made `a` and `b` the same slot and `a = 1` silently changed `b` too.
+// The interpreter always copied, so the two engines disagreed. Both now MOVE
+// into a fresh register.
+
+func main() {
+    // The simple case.
+    let end = "END"
+    var alias = end
+    alias = "CHANGED"
+    say "1:", alias, end
+
+    // Through a `let`, in the other direction.
+    var src = 10
+    let snap = src
+    src = 99
+    say "2:", snap, src
+
+    // The register the loop reads must survive the loop's own writes.
+    var labels = ["A", "B", "C"]
+    let stop = "STOP"
+    var cur = stop
+    each i, l in labels {
+        cur = l
+        say "3:", i, cur, stop
+    }
+
+    // An upvalue must not be aliased either: `var local = captured` then
+    // writing `local` would have written the enclosing frame.
+    var outer = 1
+    let f = fn() int {
+        var inner = outer
+        inner = 42
+        return inner
+    }
+    say "4:", f(), outer
+
+    // Field and index initialisers already produce fresh registers.
+    var xs = [1, 2, 3]
+    var first = xs[0]
+    first = 100
+    say "5:", first, xs[0]
+
+    // int(s, base): base 0 auto-detects the prefix exactly as Go's ParseInt
+    // does. C's strtoll knows only 0x and a bare leading 0, so `0o755` and
+    // `0b1011` threw natively while the interpreter read them fine.
+    say "6:", int("0o755", 0), int("0x1f", 0), int("0b1011", 0), int("0755", 0)
+    say "7:", int("1_000_000", 0), int("-0x10", 0), int("42", 0)
+    say "8:", int("ff", 16), int("777", 8), to_int("zz")
+}

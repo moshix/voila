@@ -1,0 +1,33 @@
+use "std/fmt"
+use "std/str"
+func main() {
+    say str.upper("abc"), "abc".upper(), str.lower("ABC"), str.title("hello world")
+    say str.trim("  x  ") || "|", str.pad("ab", 5) || "|", str.pad_left("ab", 5) || "|"
+    say str.center("ab", 6) || "|"
+    say str.contains("abc", "b"), "b" in "abc", str.index("abcb", "b"), str.last_index("abcb", "b")
+    say str.starts_with("abc", "ab"), str.ends_with("abc", "bc"), str.count("aaa", "a")
+    say str.substr("abc", 10, 5) || "<>", str.left("voila", 2), str.right("voila", 2)
+    say str.split("a,b,c", ","), str.join(["a","b"], "-"), str.fields(" a  b ")
+    say str.lines("a\nb\n")
+    say str.word("the quick brown", 2), str.words("the quick brown")
+    say str.subword("a b c d", 2, 2), str.delword("a b c d", 2, 2)
+    say str.replace("aXbX", "X", "-"), str.replace_n("aXbX", "X", "-", 1)
+    say str.repeat("ab", 3), str.reverse("héllo")
+    say str.translate("hello", "el", "ip"), str.overlay("1234567890", "XX", 3)
+    say str.insert("ac", "b", 1), str.delstr("abcd", 1, 2)
+    say len("héllo"), str.rune_len("héllo")
+    say str.is_digit("123"), str.is_digit("12a"), str.is_alpha("ab"), str.is_space("  ")
+    say str.hex("AB"), str.unhex("4142"), str.b64("hi"), str.unb64("aGk=")
+    say str.bytes("AB"), str.runes("hé")
+    say str.equal_fold("ABC", "abc")
+    var sb = str.Builder{}
+    sb.write("a")
+    sb.write(1)
+    say sb.done(), sb.len()
+
+    // %0NX must zero-pad even when the hex begins with a letter: the native
+    // runtime's pad_into required a leading DIGIT, so `%06X` of 12 gave
+    // "     C" natively and "00000C" in the interpreter.
+    say fmt.sprintf("[%06X] [%06x] [%04X] [%#06x]", 12, 12, 255, 255)
+    say fmt.sprintf("[%06d] [%-8s] [%08.3f]", 12, "ab", 3.14159)
+}

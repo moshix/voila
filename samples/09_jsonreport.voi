@@ -1,0 +1,73 @@
+// 09_jsonreport.voi — encodings (§13.4): decode a typed config with
+// json.decode[T], walk a dynamic JSON document without declaring its shape,
+// aggregate with map/filter/reduce, and emit a machine-readable summary
+// with json.encode. Amounts decode as dec, so money survives the round trip.
+package main
+
+use "std/fmt"
+use "std/json"
+
+struct Config {
+    region    str
+    threshold int
+}
+
+struct Summary {
+    region   str
+    orders   int
+    accepted int
+    revenue  dec
+    top      str
+}
+
+const ORDERS = `[
+  {"id": "A-100", "customer": "rossi",    "amount": 220.50, "region": "eu"},
+  {"id": "A-101", "customer": "verdi",    "amount":  99.99, "region": "eu"},
+  {"id": "A-102", "customer": "bianchi",  "amount": 1450.00, "region": "us"},
+  {"id": "A-103", "customer": "esposito", "amount":  35.25, "region": "eu"},
+  {"id": "A-104", "customer": "russo",    "amount": 640.10, "region": "eu"},
+  {"id": "A-105", "customer": "ricci",    "amount":  12.00, "region": "apac"}
+]`
+
+func main() {
+    numeric digits 31
+
+    let cfg = json.decode[Config](`{"region": "eu", "threshold": 50}`)
+    say "config:", cfg
+
+    let orders = must json.decode(ORDERS)
+
+    // Dynamic navigation: each order is a map; keys index with [].
+    var eu = []
+    each o in orders {
+        if o["region"] == cfg.region {
+            eu.append(o)
+        }
+    }
+
+    let accepted = eu.filter(fn(o) { o["amount"] > cfg.threshold })
+    let revenue = accepted.reduce(fn(acc, o) { acc + o["amount"] }, 0d)
+
+    var top = accepted[0]
+    each o in accepted {
+        if o["amount"] > top["amount"] { top = o }
+    }
+
+    fmt.printf("%-10s %-10s %10s\n", "id", "customer", "amount")
+    each o in accepted {
+        fmt.printf("%-10s %-10s %10.2f\n", o["id"], o["customer"], o["amount"])
+    }
+    fmt.printf("%-21s %10.2f\n", "REVENUE", revenue)
+
+    let summary = Summary{
+        region:   cfg.region,
+        orders:   len(eu),
+        accepted: len(accepted),
+        revenue:  revenue,
+        top:      str(top["id"]),
+    }
+    say
+    say json.encode(summary)
+    say
+    say json.pretty(summary)
+}

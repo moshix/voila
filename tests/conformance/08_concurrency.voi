@@ -1,0 +1,75 @@
+use "std/time"
+exception Fail { who str }
+func work(n int) int { return n * 2 }
+func blocker() {
+    let never = chan[int](0)
+    let x = <-never
+}
+func failing(n int) {
+    if n == 2 { throw Fail{who: "task2"} }
+    blocker()
+}
+func main() {
+    group {
+        let a = spawn work(21)
+        let b = spawn work(100)
+        say a.await() + b.await()
+    }
+    say "joined"
+
+    let ch = chan[int](3)
+    ch <- 1
+    ch <- 2
+    close(ch)
+    var t = 0
+    each x in ch { t += x }
+    say t
+
+    let c2 = chan[int](1)
+    c2 <- 9
+    let v, ok = <-c2
+    say v, ok
+    close(c2)
+    let v2, ok2 = <-c2
+    say v2, ok2
+
+    let counter = cell[int](0)
+    group {
+        for i in 0..50 { spawn { counter.update(fn(n) { return n + 1 }) } }
+    }
+    say counter.get()
+
+    let e = chan[int](1)
+    select {
+    case x := <-e:
+        say "got", x
+    default:
+        say "empty"
+    }
+    e <- 7
+    select {
+    case x := <-e:
+        say "got", x
+    default:
+        say "empty"
+    }
+
+    try {
+        group {
+            spawn failing(1)
+            spawn failing(2)
+            spawn failing(3)
+        }
+    } catch ex: Fail {
+        say "caught", ex.who, "- siblings reaped"
+    }
+
+    try {
+        group timeout 40 * time.Millisecond {
+            spawn { blocker() }
+        }
+    } catch ex: Timeout {
+        say "timed out"
+    }
+    say "done"
+}

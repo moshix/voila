@@ -1,0 +1,4 @@
+package main
+use "bad/a/util"
+use "bad/b/util"
+func main() { say util.A() }

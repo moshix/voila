@@ -1,0 +1,49 @@
+// 02_accounts.voi — the REXX inheritance (§7.4, §3.1): fixed-width record
+// processing with column-mode `parse`, and exact decimal totals under
+// `numeric digits 31`. The balance arithmetic never touches a binary float,
+// so the total is exact to the penny — always, on every platform.
+package main
+
+use "std/fmt"
+use "std/os"
+use "std/str"
+
+func main() {
+    let f = must os.open("ACCOUNTS.DAT")
+    defer f.close()
+
+    numeric digits 31
+
+    var total    = 0d
+    var active   = 0
+    var skipped  = 0
+
+    say "ACCOUNT LEDGER — ACTIVE ACCOUNTS"
+    say str.repeat("-", 58)
+
+    each rec in f.records(60) {
+        // Columns: 1 code, 3 account number, 17 holder name, 49 balance.
+        parse rec 1 code 3 acct 17 name 49 amount .
+
+        if trim(code) != "AC" {
+            skipped += 1
+            continue
+        }
+
+        let bal = dec(trim(amount))
+        total += bal
+        active += 1
+        fmt.printf("%-14s %-32s %10.2f\n", trim(acct), trim(name), bal)
+    }
+
+    say str.repeat("-", 58)
+    fmt.printf("%-47s %10.2f\n", "TOTAL ({active} active, {skipped} skipped)", total)
+
+    // Exactness check: adding a penny 100 times equals exactly one unit.
+    var penny_sum = 0d
+    for i in 0..100 {
+        penny_sum += 0.01d
+    }
+    assert(penny_sum == 1d, "dec arithmetic must be exact")
+    say "penny check:", penny_sum, "== 1 exactly"
+}

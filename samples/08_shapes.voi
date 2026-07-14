@@ -1,0 +1,103 @@
+// 08_shapes.voi — traits and generics (§3.6, §3.7): a Shape enum with
+// exhaustive match (delete an arm and `voila check` names the missing case),
+// a trait implemented for two different types with dynamic dispatch, and a
+// generic Stack[T] driving an undo history.
+package main
+
+use "std/fmt"
+use "std/math"
+
+enum Shape {
+    Circle(radius float)
+    Rect(w float, h float)
+    Triangle(a float, b float, c float)
+}
+
+func area(s Shape) float {
+    match s {
+        Circle(r)         => return math.pi * r * r
+        Rect(w, h)        => return w * h
+        Triangle(a, b, c) => {
+            let s2 = (a + b + c) / 2
+            return math.sqrt(s2 * (s2 - a) * (s2 - b) * (s2 - c))
+        }
+    }
+}
+
+func perimeter(s Shape) float {
+    match s {
+        Circle(r)         => return 2.0 * math.pi * r
+        Rect(w, h)        => return 2.0 * (w + h)
+        Triangle(a, b, c) => return a + b + c
+    }
+}
+
+trait Describe {
+    func describe(self) str
+}
+
+struct Canvas  { name str, shapes []Shape }
+struct Palette { colors []str }
+
+impl Describe for Canvas {
+    func describe(self) str {
+        return "canvas '{self.name}' holding {len(self.shapes)} shapes"
+    }
+}
+
+impl Describe for Palette {
+    func describe(self) str {
+        return "palette of {len(self.colors)} colors"
+    }
+}
+
+// Dynamic dispatch: anything implementing Describe fits in this slice.
+func report(items []Describe) {
+    each it in items {
+        say " *", it.describe()
+    }
+}
+
+// A generic container (type-erased in the interpreter, §3.7).
+struct Stack[T] { items []T }
+
+impl[T] Stack[T] {
+    func push(mut self, own v T) { self.items.append(v) }
+    func pop(mut self) ?T        { return self.items.pop() }
+    func depth(self) int         { return len(self.items) }
+}
+
+func main() {
+    let shapes = [
+        Circle(1.0),
+        Rect(3.0, 4.0),
+        Triangle(3.0, 4.0, 5.0),
+        Circle(2.5),
+    ]
+
+    fmt.printf("%-22s %10s %10s\n", "shape", "area", "perim")
+    each s in shapes {
+        fmt.printf("%-22s %10.3f %10.3f\n", str(s), area(s), perimeter(s))
+    }
+
+    let total = shapes.reduce(fn(acc, s) { acc + area(s) }, 0.0)
+    fmt.printf("%-22s %10.3f\n", "TOTAL AREA", total)
+
+    say
+    let canvas = Canvas{name: "draft", shapes: shapes}
+    let palette = Palette{colors: ["teal", "ochre", "slate"]}
+    report([canvas, palette])
+
+    // Undo history on a generic stack.
+    var history = Stack[str]{items: []}
+    history.push("draw Circle(1)")
+    history.push("draw Rect(3x4)")
+    history.push("fill teal")
+    say
+    say "undo depth:", history.depth()
+    while history.depth() > 0 {
+        if let Some(action) = history.pop() {
+            say "undo:", action
+        }
+    }
+}

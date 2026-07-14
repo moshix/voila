@@ -1,0 +1,26 @@
+use "std/fmt"
+func main() {
+    let line = "moshix,55,Milan"
+    parse line "," name "," age "," city
+    say name, age, city
+    parse "one two three four" w1 w2 rest .
+    say w1 || "|" || w2 || "|" || rest
+    let rec = "AC12345678  0099"
+    parse rec 1 code 3 acct 13 amt .
+    say trim(code), trim(acct), int(trim(amt))
+    parse upper "hello world" a .
+    say a
+    parse lower "HELLO" b .
+    say b
+
+    fmt.printf("%d|%i|%5d|%-5d|%05d|\n", 42, 42, 42, 42, 42)
+    fmt.printf("%.2f|%8.2f|%-8.2f|\n", 3.14159, 3.14159, 3.14159)
+    fmt.printf("%.2f|%.2f|\n", 19.995d, 19.985d)
+    fmt.printf("%s|%10s|%-10s|%q|\n", "ab", "ab", "ab", "a\"b")
+    fmt.printf("%x|%X|%o|%b|%c|%t|%v|\n", 255, 255, 8, 5, 'Z', true, [1,2])
+    fmt.printf("%*d|%.*f|\n", 6, 42, 3, 3.14159)
+    say fmt.sprintf("%08.3f", 3.14159)
+    say fmt.comma(1234567), fmt.comma(-1234.5)
+    say fmt.bytes(1500000)
+    fmt.eprintf("to stderr\n")
+}

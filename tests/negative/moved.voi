@@ -1,0 +1,9 @@
+func consume(own v []int) { }
+
+func main() {
+    var data = [1, 2, 3]
+    consume(data)
+    say peek(data)
+}
+
+func peek(v []int) int { return v[0] }

@@ -1,0 +1,9 @@
+even square #1: 4
+even square #2: 16
+even square #3: 36
+even square #4: 64
+even square #5: 100
+even square #6: 144
+pipeline sum: 364
+stuck stage reaped by timeout; suppressed: 1
+done

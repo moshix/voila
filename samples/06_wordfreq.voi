@@ -1,0 +1,56 @@
+// 06_wordfreq.voi — text analytics with the std/str toolbox (§13.2): case
+// folding, punctuation stripping via translate, word splitting, an
+// insertion-ordered map as the counter, sort_by with a two-key comparator,
+// and a right-aligned report. Raw strings keep the corpus inline.
+package main
+
+use "std/fmt"
+use "std/str"
+
+const CORPUS = `The quick brown fox jumps over the lazy dog.
+The dog barks; the fox runs. The quick fox is quick —
+quicker than the lazy, lazy dog. A fox, a dog, a tale:
+the tale of the fox and the dog and the moon.
+The moon ignores them both, the way moons do.`
+
+struct Entry { word str, count int }
+
+func main() {
+    // Normalise: fold case, strip punctuation to spaces, split on whitespace.
+    let cleaned = str.translate(str.lower(CORPUS), ".,;:—?!\n", "        ")
+    let words = str.fields(cleaned)
+
+    var counts = make(map[str]int)
+    each w in words {
+        let seen = counts.get(w, 0)
+        counts[w] = seen + 1
+    }
+
+    // Into a sortable shape: count desc, then word asc for determinism.
+    var entries = []
+    each w, n in counts {
+        entries.append(Entry{word: w, count: n})
+    }
+    entries.sort_by(fn(a, b) {
+        if a.count != b.count { return a.count > b.count }
+        return a.word < b.word
+    })
+
+    say "WORD FREQUENCY — top 10 of", len(entries), "distinct words"
+    say str.repeat("=", 30)
+    each i, e in entries {
+        if i >= 10 { break }
+        let bar = str.repeat("#", e.count)
+        fmt.printf("%-10s %3d %s\n", e.word, e.count, bar)
+    }
+
+    // A few one-liners the REXX heritage makes trivial.
+    say
+    say "longest word:", entries.reduce(fn(best, e) {
+        if len(e.word) > len(best) { return e.word }
+        return best
+    }, "")
+    say "total words:", len(words)
+    say "words appearing once:", len(entries.filter(fn(e) { e.count == 1 }))
+    say "third word of corpus:", str.word(CORPUS, 3)
+}

@@ -1,0 +1,24 @@
+package report
+
+use "app/geom"
+use "std/fmt"
+
+// A package that imports another package: report -> geom.
+struct Line { name str, area float }
+
+func Describe(s geom.Shape) Line {
+    return Line{name: label(s), area: geom.Area(s)}
+}
+
+func label(s geom.Shape) str {
+    match s {
+        Circle(r)  => return "circle"
+        Rect(w, h) => return "rect"
+    }
+}
+
+func Render(lines []Line) {
+    each l in lines {
+        fmt.printf("%-8s %8.3f\n", l.name, l.area)
+    }
+}

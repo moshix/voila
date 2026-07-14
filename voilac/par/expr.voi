@@ -1,0 +1,444 @@
+// par/expr.voi — expressions, by precedence climbing (§5.1).
+package par
+
+use "voilac/tok"
+use "voilac/ast"
+
+// bin_prec returns the binding power of a binary operator, or 0 when the token
+// is not one. Only `**` is right-associative.
+func bin_prec(k int) int {
+    if k == tok.OR    { return P_OR }
+    if k == tok.AND   { return P_AND }
+    if k == tok.LT or k == tok.LE or k == tok.GT or k == tok.GE or
+       k == tok.EQ or k == tok.NE or k == tok.IN { return P_CMP }
+    if k == tok.CONCAT { return P_CONCAT }
+    if k == tok.SHL or k == tok.SHR or k == tok.AMP or k == tok.PIPE or
+       k == tok.CARET { return P_BITS }
+    if k == tok.PLUS or k == tok.MINUS { return P_ADD }
+    if k == tok.STAR or k == tok.SLASH or k == tok.FLOORDIV or
+       k == tok.PERCENT { return P_MUL }
+    if k == tok.POWER { return P_POW }
+    return 0
+}
+
+func is_right_assoc(k int) bool { return k == tok.POWER }
+
+impl Parser {
+    func expr(mut self) int { return self.binary(P_ELSE) }
+
+    func binary(mut self, min int) int {
+        var x = self.unary()
+        while true {
+            let t = self.cur()
+            let k = t.Kind
+
+            if (k == tok.RANGE or k == tok.RANGEEQ) and P_RANGE >= min {
+                self.next()
+                var inc = 0
+                if k == tok.RANGEEQ { inc = 1 }
+                let hi = self.binary(P_RANGE + 1)
+                var by = 0
+                if self.at(tok.IDENT) and self.cur().Lit == "by" {
+                    self.next()
+                    by = self.binary(P_RANGE + 1)
+                }
+                x = self.add(ast.RANGE, t, 0, inc, "", [x, hi, by])
+                continue
+            }
+
+            if k == tok.ELSE and P_ELSE >= min {
+                self.next()
+                let c = self.cur().Kind
+                var alt = 0
+                var isStmt = 0
+                if c == tok.RETURN or c == tok.THROW or c == tok.BREAK or
+                   c == tok.CONTINUE {
+                    alt = self.diverging_stmt()
+                    isStmt = 1
+                } else {
+                    alt = self.binary(P_ELSE)     // right-associative
+                }
+                x = self.add(ast.ELSEEXPR, t, 0, isStmt, "", [x, alt])
+                continue
+            }
+
+            let prec = bin_prec(k)
+            if prec == 0 or prec < min { return x }
+            self.next()
+            var nextMin = prec + 1
+            if is_right_assoc(k) { nextMin = prec }
+            let y = self.binary(nextMin)
+            x = self.add(ast.BINARY, t, k, 0, "", [x, y])
+        }
+        return x
+    }
+
+    // diverging_stmt parses the statement allowed on the right of the `else`
+    // operator (§8.1: `try to_int(s) else return err(…)`). It must not consume
+    // the terminator, so it does not call expect_semi.
+    func diverging_stmt(mut self) int {
+        let t = self.cur()
+        let k = t.Kind
+        if k == tok.RETURN {
+            self.next()
+            var vs = []
+            if not self.at(tok.SEMI) and not self.at(tok.RBRACE) and
+               not self.at(tok.EOF) and not self.at(tok.COMMA) and
+               not self.at(tok.RPAREN) {
+                vs.append(self.expr())
+                while self.accept(tok.COMMA) { vs.append(self.expr()) }
+            }
+            return self.add(ast.RETURN, t, 0, 0, "", vs)
+        }
+        if k == tok.THROW {
+            self.next()
+            var v = 0
+            var from = 0
+            if not self.at(tok.SEMI) and not self.at(tok.RBRACE) and
+               not self.at(tok.EOF) {
+                v = self.expr()
+                if self.at(tok.IDENT) and self.cur().Lit == "from" {
+                    self.next()
+                    from = self.expr()
+                }
+            }
+            return self.add(ast.THROW, t, 0, 0, "", [v, from])
+        }
+        if k == tok.BREAK or k == tok.CONTINUE {
+            self.next()
+            var label = ""
+            if self.at(tok.IDENT) { label = self.next().Lit }
+            var kind = ast.BREAK
+            if k == tok.CONTINUE { kind = ast.CONTINUE }
+            return self.add(kind, t, 0, 0, label, [])
+        }
+        self.error("expected diverging statement after `else`")
+        return self.add(ast.RETURN, t, 0, 0, "", [])
+    }
+
+    func unary(mut self) int {
+        let t = self.cur()
+        let k = t.Kind
+        if k == tok.MINUS or k == tok.NOT or k == tok.TILDE {
+            self.next()
+            return self.add(ast.UNARY, t, k, 0, "", [self.unary()])
+        }
+        if k == tok.ARROW {                       // a channel receive
+            self.next()
+            return self.add(ast.UNARY, t, k, 0, "", [self.unary()])
+        }
+        if k == tok.TRY {
+            self.next()
+            return self.add(ast.TRYEXPR, t, 0, 0, "", [self.unary()])
+        }
+        if k == tok.MUST {
+            self.next()
+            return self.add(ast.MUSTEXPR, t, 0, 0, "", [self.unary()])
+        }
+        if k == tok.ATTEMPT {
+            self.next()
+            return self.add(ast.ATTEMPT, t, 0, 0, "", [self.unary()])
+        }
+        return self.postfix(self.primary())
+    }
+
+    func postfix(mut self, x0 int) int {
+        var x = x0
+        while true {
+            let k = self.cur().Kind
+            if k == tok.LPAREN {
+                x = self.call_tail(x)
+            } else if k == tok.LBRACKET {
+                x = self.index_tail(x)
+            } else if k == tok.DOT {
+                let t = self.next()
+                let n = self.expect(tok.IDENT)
+                x = self.add(ast.FIELD, t, 0, 0, n.Lit, [x])
+            } else if k == tok.LBRACE {
+                // A composite literal — unless we are in a statement header,
+                // where the brace opens the body instead.
+                if self.noLit > 0 and self.lev == 0 { return x }
+                let nt = self.expr_to_named(x)
+                if nt == 0 { return x }
+                x = self.composite_tail(nt)
+            } else if k == tok.BANG or k == tok.QUESTION {
+                // §5.1 lists postfix `!`/`?`, but the spec gives them no
+                // expression semantics: they are type forms only.
+                self.error("postfix `{tok.Spelling(k)}` is a type form " ||
+                           "(`int{tok.Spelling(k)}`); it has no expression meaning")
+                self.next()
+            } else {
+                return x
+            }
+        }
+        return x
+    }
+
+    // expr_to_named turns an already-parsed expression back into the type of a
+    // composite literal: `Point{…}`, `pkg.Point{…}`, `Stack[int]{…}`. It
+    // returns a TNAMED node, or 0 when the expression is not a type name.
+    func expr_to_named(mut self, x int) int {
+        let n = self.T.Get(x)
+        if n.Kind == ast.IDENT {
+            return self.T.Add(ast.TNAMED, n.Line, n.Col, 0, 0, n.Sval, [])
+        }
+        if n.Kind == ast.FIELD {
+            let b = self.T.Get(n.Kids[0])
+            if b.Kind == ast.IDENT {
+                return self.T.Add(ast.TNAMED, n.Line, n.Col, 0, 0,
+                                  b.Sval || "." || n.Sval, [])
+            }
+            return 0
+        }
+        if n.Kind == ast.INDEX {
+            let b = self.T.Get(n.Kids[0])
+            if b.Kind != ast.IDENT { return 0 }
+            // The ARGUMENT may only be a plain or qualified name: `Stack[int]{}`
+            // and `Stack[pkg.T]{}` are composite literals, `Stack[Box[int]]{}`
+            // is not (the Go parser's exprToType accepts neither an index nor
+            // anything else nested).
+            let arg = self.expr_to_type(n.Kids[1])
+            if arg == 0 { return 0 }
+            return self.T.Add(ast.TNAMED, n.Line, n.Col, 0, 0, b.Sval, [arg])
+        }
+        return 0
+    }
+
+    // expr_to_type converts a generic ARGUMENT: a name, or a qualified name.
+    func expr_to_type(mut self, x int) int {
+        let n = self.T.Get(x)
+        if n.Kind == ast.IDENT {
+            return self.T.Add(ast.TNAMED, n.Line, n.Col, 0, 0, n.Sval, [])
+        }
+        if n.Kind == ast.FIELD {
+            let b = self.T.Get(n.Kids[0])
+            if b.Kind == ast.IDENT {
+                return self.T.Add(ast.TNAMED, n.Line, n.Col, 0, 0,
+                                  b.Sval || "." || n.Sval, [])
+            }
+        }
+        return 0
+    }
+
+    func composite_tail(mut self, nt int) int {
+        let t = self.expect(tok.LBRACE)
+        self.lev += 1
+        var fs = []
+        while true {
+            self.skip_semis()
+            if self.at(tok.RBRACE) or self.at(tok.EOF) { break }
+            let ft = self.cur()
+            var name = ""
+            if self.at(tok.IDENT) and self.peek(1).Kind == tok.COLON {
+                name = self.next().Lit
+                self.next()
+            }
+            let v = self.expr()
+            fs.append(self.add(ast.COMPFIELD, ft, 0, 0, name, [v]))
+            if not self.accept(tok.COMMA) {
+                self.skip_semis()
+                break
+            }
+        }
+        self.lev -= 1
+        self.expect(tok.RBRACE)
+        let n = self.T.Get(nt)
+        return self.T.Add(ast.COMPOSITE, n.Line, n.Col, nt, 0, n.Sval, fs)
+    }
+
+    func call_tail(mut self, fun int) int {
+        let t = self.expect(tok.LPAREN)
+        self.lev += 1
+        var targs = []
+        // `make([]str, n)` / `make(map[str]int)`: the first argument is a type.
+        let f = self.T.Get(fun)
+        if f.Kind == ast.IDENT and f.Sval == "make" and not self.at(tok.RPAREN) {
+            targs.append(self.type_expr())
+            if not self.at(tok.RPAREN) { self.expect(tok.COMMA) }
+        }
+        var args = []
+        while not self.at(tok.RPAREN) and not self.at(tok.EOF) {
+            let at2 = self.cur()
+            var name = ""
+            var spread = 0
+            var v = 0
+            if self.at(tok.IDENT) and self.peek(1).Kind == tok.COLON {
+                name = self.next().Lit
+                self.next()
+                v = self.expr()
+            } else {
+                v = self.expr()
+                if self.accept(tok.ELLIPSIS) { spread = 1 }
+            }
+            args.append(self.add(ast.ARG, at2, spread, 0, name, [v]))
+            if not self.accept(tok.COMMA) { break }
+        }
+        self.lev -= 1
+        self.expect(tok.RPAREN)
+        return self.add(ast.CALL, t, 0, 0, "",
+                        [fun, self.T.List(args), self.T.List(targs)])
+    }
+
+    func index_tail(mut self, x int) int {
+        let t = self.expect(tok.LBRACKET)
+        self.lev += 1
+        let idx = self.expr()
+        self.lev -= 1
+        self.expect(tok.RBRACKET)
+        return self.add(ast.INDEX, t, 0, 0, "", [x, idx])
+    }
+
+    func primary(mut self) int {
+        let t = self.cur()
+        let k = t.Kind
+
+        if k == tok.INT   { self.next() ; return self.add(ast.INT, t, 0, 0, t.Lit, []) }
+        if k == tok.FLOAT { self.next() ; return self.add(ast.FLOAT, t, 0, 0, t.Lit, []) }
+        if k == tok.DEC   { self.next() ; return self.add(ast.DEC, t, 0, 0, t.Lit, []) }
+        if k == tok.STR   { self.next() ; return self.add(ast.STR, t, 0, 0, t.Lit, []) }
+        if k == tok.RUNE  { self.next() ; return self.add(ast.RUNE, t, 0, 0, t.Lit, []) }
+        if k == tok.TRUE  { self.next() ; return self.add(ast.BOOL, t, 1, 0, "true", []) }
+        if k == tok.FALSE { self.next() ; return self.add(ast.BOOL, t, 0, 0, "false", []) }
+        if k == tok.NIL   { self.next() ; return self.add(ast.NILLIT, t, 0, 0, "nil", []) }
+        if k == tok.ISTR  { self.next() ; return self.interp_str(t) }
+        if k == tok.SELF  { self.next() ; return self.add(ast.SELF, t, 0, 0, "self", []) }
+
+        if k == tok.SPAWN {
+            self.next()
+            if self.at(tok.LBRACE) {
+                return self.add(ast.SPAWNEXPR, t, 0, 1, "", [self.block()])
+            }
+            return self.add(ast.SPAWNEXPR, t, 0, 0, "", [self.unary()])
+        }
+        if k == tok.CHAN {
+            // The `chan[T](cap)` constructor.
+            self.next()
+            self.expect(tok.LBRACKET)
+            let ty = self.type_expr()
+            self.expect(tok.RBRACKET)
+            let fun = self.add(ast.IDENT, t, 0, 0, "chan", [])
+            var args = []
+            if self.at(tok.LPAREN) {
+                self.next()
+                self.lev += 1
+                while not self.at(tok.RPAREN) and not self.at(tok.EOF) {
+                    let at2 = self.cur()
+                    let v = self.expr()
+                    args.append(self.add(ast.ARG, at2, 0, 0, "", [v]))
+                    if not self.accept(tok.COMMA) { break }
+                }
+                self.lev -= 1
+                self.expect(tok.RPAREN)
+            }
+            return self.add(ast.CALL, t, 0, 0, "",
+                            [fun, self.T.List(args), self.T.List([ty])])
+        }
+        if k == tok.SHARED {
+            self.next()
+            return self.add(ast.IDENT, t, 0, 0, "shared", [])
+        }
+        if k == tok.WEAK {
+            self.next()
+            return self.add(ast.IDENT, t, 0, 0, "weak", [])
+        }
+        if k == tok.IDENT {
+            if t.Lit == "fn" and (self.peek(1).Kind == tok.LPAREN or
+                                  self.peek(1).Kind == tok.OWN) {
+                return self.closure()
+            }
+            self.next()
+            return self.add(ast.IDENT, t, 0, 0, t.Lit, [])
+        }
+        if k == tok.LPAREN {
+            self.next()
+            self.lev += 1
+            if self.at(tok.RPAREN) {              // the unit value ()
+                self.lev -= 1
+                self.next()
+                return self.add(ast.TUPLE, t, 0, 0, "", [])
+            }
+            let x = self.expr()
+            if self.at(tok.COMMA) {
+                var es = [x]
+                while self.accept(tok.COMMA) {
+                    if self.at(tok.RPAREN) { break }
+                    es.append(self.expr())
+                }
+                self.lev -= 1
+                self.expect(tok.RPAREN)
+                return self.add(ast.TUPLE, t, 0, 0, "", es)
+            }
+            self.lev -= 1
+            self.expect(tok.RPAREN)
+            return x
+        }
+        if k == tok.LBRACKET {
+            self.next()
+            self.lev += 1
+            var es = []
+            while not self.at(tok.RBRACKET) and not self.at(tok.EOF) {
+                es.append(self.expr())
+                if not self.accept(tok.COMMA) { break }
+            }
+            self.lev -= 1
+            self.expect(tok.RBRACKET)
+            return self.add(ast.SLICELIT, t, 0, 0, "", es)
+        }
+
+        self.error("expected expression, found {self.show()}")
+        self.next()
+        return self.add(ast.NILLIT, t, 0, 0, "nil", [])
+    }
+
+    func closure(mut self) int {
+        let t = self.next()                       // `fn`
+        var ownc = 0
+        var caps = []
+        if self.accept(tok.OWN) {
+            ownc = 1
+            if self.accept(tok.LBRACKET) {
+                while not self.at(tok.RBRACKET) and not self.at(tok.EOF) {
+                    let c = self.expect(tok.IDENT)
+                    caps.append(self.add(ast.IDENT, c, 0, 0, c.Lit, []))
+                    if not self.accept(tok.COMMA) { break }
+                }
+                self.expect(tok.RBRACKET)
+            }
+        }
+        let saved = self.selfFlags
+        let ps = self.params()
+        self.selfFlags = saved                    // a closure has no receiver
+        var res = 0
+        if not self.at(tok.LBRACE) { res = self.type_expr() }
+        let body = self.block()
+        return self.add(ast.CLOSURE, t, res, ownc, "",
+                        [body, ps, self.T.List(caps)])
+    }
+
+    // interp_str sub-parses every embedded expression of an interpolated
+    // string. Each piece is parsed on its own, so an error inside one names the
+    // enclosing file but not the exact column — the diagnostic still points at
+    // the string.
+    func interp_str(mut self, t tok.Token) int {
+        var parts = []
+        var i = 0
+        while i < len(t.Parts) {
+            if t.IsExpr[i] {
+                var sub = NewAt(self.file, t.Parts[i], t.PartLine[i],
+                                t.PartCol[i])
+                let e = sub.expr()
+                if not sub.at(tok.EOF) and not sub.at(tok.SEMI) {
+                    sub.error("unexpected {sub.show()} after interpolated " ||
+                              "expression")
+                }
+                let id = self.T.Graft(sub.T, e)
+                each err in sub.Errs { self.Errs.append(err) }
+                parts.append(id)
+            } else {
+                parts.append(self.add(ast.STR, t, 0, 0, t.Parts[i], []))
+            }
+            i += 1
+        }
+        return self.add(ast.INTERP, t, 0, 0, "", parts)
+    }
+}

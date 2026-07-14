@@ -1,0 +1,85 @@
+// 03_txnreport.voi — the two-mechanism error story working together (§8):
+// expected failures travel as error VALUES (T!), exceptional records THROW.
+// The catch clauses sit exactly where recovery is possible — skip one
+// record, keep going — and `defer` guarantees the file closes on any path.
+package main
+
+use "std/fmt"
+use "std/os"
+use "std/str"
+
+exception BadRecord { line int, why str }
+
+struct Txn {
+    acct     int
+    holder   str
+    amount   dec
+    currency str
+}
+
+// parse_txn throws: a malformed record is not something IT can fix, and the
+// caller (the loop) is the frame that knows how to recover (§8.2).
+func parse_txn(line_no int, line str) Txn {
+    parse line "|" acct "|" holder "|" amount "|" currency
+
+    if str.trim(acct) == "" {
+        throw BadRecord{line: line_no, why: "empty account number"}
+    }
+    let amt = dec(str.trim(amount))       // throws ConvError on garbage
+    if amt <= 0d {
+        throw BadRecord{line: line_no, why: "non-positive amount {amt}"}
+    }
+    return Txn{
+        acct:     int(str.trim(acct)),
+        holder:   str.title(str.trim(holder)),
+        amount:   amt,
+        currency: str.trim(currency),
+    }
+}
+
+// rate returns an error VALUE: a missing rate is an expected, local failure
+// the caller obviously handles (§8.1).
+func rate(currency str) dec! {
+    switch currency {
+    case "EUR":
+        return 1d
+    case "USD":
+        return 0.92d
+    default:
+        return err("no rate for {currency}")
+    }
+}
+
+func main() {
+    numeric digits 31
+
+    let f = must os.open("TXN.DAT")       // T! → exception at the boundary
+    defer f.close()                       // runs even if we unwind out
+
+    var total_eur = 0d
+    var accepted  = 0
+    var rejected  = 0
+
+    each i, line in f.lines() {
+        try {
+            let t = parse_txn(i + 1, line)
+            let r = rate(t.currency) else 1d
+            let eur = t.amount * r
+            total_eur += eur
+            accepted += 1
+            fmt.printf("%6d  %-22s %10.2f %s %10.2f EUR\n",
+                t.acct, t.holder, t.amount, t.currency, eur)
+        } catch e: BadRecord {
+            fmt.eprintf("line %d rejected: %s\n", e.line, e.why)
+            rejected += 1
+        } catch e: ConvError {
+            fmt.eprintf("line %d rejected: cannot read %q as %s\n", i + 1, e.value, e.to)
+            rejected += 1
+        }
+    }
+
+    say
+    fmt.printf("%-24s %12.2f EUR\n", "TOTAL", total_eur)
+    fmt.printf("%-24s %12d\n", "ACCEPTED", accepted)
+    fmt.printf("%-24s %12d\n", "REJECTED", rejected)
+}

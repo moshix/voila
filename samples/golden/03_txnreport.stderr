@@ -1,0 +1,3 @@
+line 3 rejected: empty account number
+line 4 rejected: cannot read "banana" as dec
+line 7 rejected: non-positive amount -45.99

@@ -1,0 +1,5 @@
+func main() {
+    var fs = []
+    for i in 1..4 { fs.append(fn() int { return i }) }
+    each f in fs { say f() }
+}

@@ -1,0 +1,17 @@
+WORD FREQUENCY — top 10 of 24 distinct words
+==============================
+the         12 ############
+dog          5 #####
+fox          5 #####
+a            3 ###
+lazy         3 ###
+quick        3 ###
+and          2 ##
+moon         2 ##
+tale         2 ##
+barks        1 #
+
+longest word: ignores
+total words: 52
+words appearing once: 15
+third word of corpus: brown

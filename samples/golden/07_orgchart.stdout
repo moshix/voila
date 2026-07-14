@@ -1,0 +1,16 @@
+ORG CHART
+==============================================
+Ada Lovelace           (CEO)
+    Grace Hopper           (VP Engineering)
+        Dennis Ritchie         (Backend Lead)
+            Ken Thompson           (Engineer)
+            Barbara Liskov         (Engineer)
+        Alan Kay               (Frontend Lead)
+            Donald Knuth           (Engineer)
+    Margaret Hamilton      (VP Operations)
+        Edsger Dijkstra        (SRE)
+
+headcount under Ada Lovelace: 9
+headcount under Grace Hopper: 6
+depth of a backend engineer: 3
+chain of command: Barbara Liskov -> Dennis Ritchie -> Grace Hopper -> Ada Lovelace

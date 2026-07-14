@@ -1,0 +1,8 @@
+func main() {
+    let big i64 = 9_007_199_254_740_993
+    let f float = big
+    let n int   = 3.7
+    let d dec   = 0.1
+    let b u8    = 300
+    say f, n, d, b
+}

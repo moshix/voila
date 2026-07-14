@@ -1,0 +1,35 @@
+func main() {
+    var v = [3, 1, 2]
+    v.sort()
+    say v, v.len(), v.first(), v.last()
+    say v.map(fn(x) { x * 10 }), v.filter(fn(x) { x > 1 })
+    say v.reduce(fn(a, x) { a + x }, 100)
+    say v.contains(2), v.index_of(3), v.index_of(9)
+    v.append(4)
+    say v, v.pop(), v
+    v.reverse()
+    say v, v.sorted(), v.join("-")
+    say v.any(fn(x) { x > 2 }), v.all(fn(x) { x > 0 })
+
+    let m = make(map[str]int)
+    m["b"] = 2
+    m["a"] = 1
+    m["b"] = 20
+    say m, len(m), m.has("a"), m["zz"], m.get("zz", -1)
+    each k, val in m { say k, val }
+    say keys(m), values(m)
+    m.delete("a")
+    say m
+
+    let s = set()
+    s.add(1)
+    s.add(1)
+    s.add(2)
+    say len(s), 1 in s, 9 in s, s.items()
+
+    say zip([1,2], ["a","b"])
+    say enumerate(["x","y"])
+    let t = (1, "two", 3.0)
+    say t, t[1]
+    say [1,2,3,4][1..3]
+}

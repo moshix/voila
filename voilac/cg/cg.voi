@@ -1,0 +1,922 @@
+// Package cg compiles the Voilà IR to C — the stage-1 port of
+// internal/cgen. Generated code calls libvoila (runtime/), so the produced
+// executable contains no Go whatsoever.
+//
+// The oracle is the C itself: `voila build --emit=c x.voi` and
+// `voilac -c x.voi` must be byte-identical, so every format string here is a
+// transcription of the Go original.
+//
+// Model: every function's registers live in a heap frame (VlFrame) so that
+// closures can capture them by reference, exactly as the interpreter's
+// environments do. Helpers borrow their arguments and return owned values;
+// frame slots own their contents. One instruction is one C statement.
+package cg
+
+use "voilac/ast"
+use "voilac/ir"
+use "std/str"
+use "std/fmt"
+
+// CGenError carries every refusal the backend collected, joined by "\n".
+// The backend refuses to build what it cannot express (loop-variable capture,
+// `ctx`) rather than emit code that would behave differently.
+exception CGenError {
+    Msg str
+}
+
+// FieldDefault is a struct field whose declaration carries a literal default.
+// ConstIdx is -1 when the field has no usable default.
+struct FieldDefault {
+    Name     str
+    ConstIdx int
+}
+
+// TypeInfo is one struct/exception descriptor: field names and their rendered
+// declared types (the runtime's zero-value constructor reads the latter).
+struct TypeInfo {
+    Name   str
+    Fields []str
+    FTypes []str
+}
+
+// VarInfo is one enum variant descriptor.
+struct VarInfo {
+    Typ     str
+    Variant str
+    Fields  []str
+}
+
+// Method is one entry of the runtime method table.
+struct Method {
+    Typ     str
+    Name    str
+    Fn      int
+    HasSelf bool
+}
+
+// CallArg is one rendered call operand: "name:r3" or "r3..." or "r3".
+struct CallArg {
+    Reg    str
+    Name   str
+    Spread bool
+}
+
+struct Gen {
+    mod  ir.Module
+    T    ast.Tree
+    file int          // the FILE node
+    b    str.Builder
+
+    fnIdx    map[str]int            // Voilà function name → C index
+    natIdx   map[str]int            // builtin/package name → natives index
+    nats     []str                  // in index order
+    globals  map[str]int            // global name → G[] slot
+    gnames   []str
+    defaults map[str][]FieldDefault
+    selCases []ir.Instr
+    patSeq   int
+    errs     []str
+
+    // Name tables (see instr.voi).
+    known    set[str]      // names the C runtime provides
+    pkgConst set[str]      // package constants: values, not callables
+    binOp    map[str]str
+    unOp     map[str]str
+}
+
+func new_gen(t ast.Tree, file int, m ir.Module) Gen {
+    var g = Gen{
+        mod: m, T: t, file: file, b: str.Builder{},
+        fnIdx: make(map[str]int), natIdx: make(map[str]int), nats: [],
+        globals: make(map[str]int), gnames: [],
+        defaults: make(map[str][]FieldDefault),
+        selCases: [], patSeq: 0, errs: [],
+        known: set(), pkgConst: set(),
+        binOp: bin_op_fns(), unOp: un_op_fns(),
+    }
+    each n in known_native_names() { g.known.add(n) }
+    each n in pkg_constant_names() { g.pkgConst.add(n) }
+    return g
+}
+
+// Compile lowers a checked file to a self-contained C translation unit.
+func Compile(t ast.Tree, file int, m ir.Module) str throws CGenError {
+    var g = new_gen(t, file, m)
+    each i, f in m.Funcs {
+        g.fnIdx[f.Name] = i
+    }
+    g.collect_globals()
+    g.collect_defaults()
+
+    // Patterns and function bodies intern constants, so they are generated
+    // into buffers FIRST and the constant pool is emitted once it is final.
+    // (Sizing K[] before the last intern is an out-of-bounds read.)
+    let saved = g.b
+    g.b = str.Builder{}
+    g.emit_patterns()
+    let patterns = g.b.done()
+
+    g.b = str.Builder{}
+    each i, f in m.Funcs {
+        g.emit_func(i, f)
+    }
+    let bodies = g.b.done()
+    g.b = saved
+
+    g.emit_header()
+    g.emit_consts()
+    g.emit_types()
+    g.emit_protos()
+    g.b.write(patterns)
+    g.b.write(bodies)
+    g.emit_method_table()
+    g.emit_main()
+
+    if len(g.errs) > 0 {
+        throw CGenError{Msg: str.join(g.errs, "\n")}
+    }
+    return g.b.done()
+}
+
+impl Gen {
+    // failf records a refusal once — the same message is never repeated.
+    func failf(mut self, msg str) {
+        each e in self.errs {
+            if e == msg { return }
+        }
+        self.errs.append(msg)
+    }
+
+    // p writes one line of C.
+    func p(mut self, s str) {
+        self.b.write(s)
+        self.b.write("\n")
+    }
+
+    // ------------------------------------------------------------ collect
+
+    // collect_globals scans SETGLB/GETGLB for the module's global slots.
+    func collect_globals(mut self) {
+        each f in self.mod.Funcs {
+            each ins in f.Instrs {
+                var name = ""
+                if ins.Op == "SETGLB" {
+                    name = ins.Args[0]
+                } else if ins.Op == "GETGLB" {
+                    name = ins.Args[1]
+                } else {
+                    continue
+                }
+                if not (name in self.globals) {
+                    self.globals[name] = len(self.gnames)
+                    self.gnames.append(name)
+                }
+            }
+        }
+    }
+
+    // collect_defaults records struct/exception field defaults. A default must
+    // be a literal in native builds; anything else needs an initializer
+    // function, which the stage-0 backend does not emit.
+    func collect_defaults(mut self) {
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            let n = self.T.Get(d)
+            if n.Kind == ast.STRUCTDEC {
+                self.record_defaults(n.Sval, self.T.Kid(d, 0))
+            } else if n.Kind == ast.TYPEDEC {
+                let sd = self.T.Kid(d, 0)
+                if sd != 0 {
+                    self.record_defaults(n.Sval, self.T.Kid(sd, 0))
+                }
+            } else if n.Kind == ast.EXCDEC {
+                self.record_defaults(n.Sval, self.T.Kid(d, 0))
+            }
+        }
+    }
+
+    func record_defaults(mut self, name str, fields int) {
+        var ds = []
+        each f in self.T.Get(fields).Kids {
+            let fd = self.T.Get(f)
+            let dflt = self.T.Kid(f, 0)
+            if dflt == 0 {
+                ds.append(FieldDefault{Name: fd.Sval, ConstIdx: 0 - 1})
+                continue
+            }
+            if not is_literal(self.T.Kind(dflt)) {
+                self.failf(fmt.sprintf("cgen: field default for `%s.%s` " ||
+                                       "must be a literal in native builds",
+                                       name, fd.Sval))
+                ds.append(FieldDefault{Name: fd.Sval, ConstIdx: 0 - 1})
+                continue
+            }
+            let kind, norm = self.lit_const(dflt)
+            ds.append(FieldDefault{Name: fd.Sval,
+                                   ConstIdx: self.intern_const(kind, norm)})
+        }
+        self.defaults[name] = ds
+    }
+
+    // lit_const maps a literal expression to its (constant kind, pool text).
+    func lit_const(self, id int) (int, str) {
+        let n = self.T.Get(id)
+        if n.Kind == ast.INT {
+            return ir.CINT, str(parse_int_text(n.Sval))
+        }
+        if n.Kind == ast.FLOAT {
+            return ir.CFLOAT, fmt.sprintf("%g", float(n.Sval))
+        }
+        if n.Kind == ast.DEC   { return ir.CDEC, n.Sval }
+        if n.Kind == ast.STR   { return ir.CSTR, n.Sval }
+        if n.Kind == ast.RUNE  { return ir.CRUNE, n.Sval }
+        if n.Kind == ast.BOOL  { return ir.CBOOL, n.Sval }
+        return ir.CNIL, "nil"
+    }
+
+    // intern_const adds a constant to the pool, reusing an equal entry. The
+    // scan is linear because the pool is short and the dedup key is the pair
+    // (kind, canonical text) — exactly the lowerer's key.
+    func intern_const(mut self, kind int, text str) int {
+        each i, c in self.mod.Consts {
+            if c.Kind == kind and c.Text == text { return i }
+        }
+        self.mod.Consts.append(ir.Const{Kind: kind, Text: text})
+        return len(self.mod.Consts) - 1
+    }
+
+    // native registers a runtime function and returns its NAT[] index.
+    func native(mut self, name str) int {
+        if name in self.natIdx { return self.natIdx[name] }
+        if not (name in self.known) {
+            self.failf(fmt.sprintf("cgen: `%s` is not available in native " ||
+                                   "builds (no C implementation yet)", name))
+        }
+        let i = len(self.nats)
+        self.natIdx[name] = i
+        self.nats.append(name)
+        return i
+    }
+
+    // ------------------------------------------------------------ preamble
+
+    func emit_header(mut self) {
+        self.p("/* Generated by voila build. Do not edit.")
+        self.p(fmt.sprintf(" * source: %s", self.mod.Source))
+        self.p(" */")
+        self.p("#include \"voila.h\"")
+        self.p("#include <stdlib.h>")
+        self.p("")
+    }
+
+    func emit_consts(mut self) {
+        self.p(fmt.sprintf("static Value K[%d];",
+                           max(1, len(self.mod.Consts))))
+        self.p("static void init_consts(void) \{")
+        each i, c in self.mod.Consts {
+            if c.Kind == ir.CINT {
+                self.p(fmt.sprintf("  K[%d] = vl_int(%sLL);", i, c.Text))
+            } else if c.Kind == ir.CFLOAT {
+                self.p(fmt.sprintf("  K[%d] = vl_float(%s);", i,
+                                   c_float(c.Text)))
+            } else if c.Kind == ir.CDEC {
+                self.p(fmt.sprintf("  K[%d] = vl_dec_parse(%s);", i,
+                                   c_quote(c.Text)))
+            } else if c.Kind == ir.CSTR {
+                self.p(fmt.sprintf("  K[%d] = vl_str_n(%s, %d);", i,
+                                   c_quote(c.Text), len(c.Text)))
+            } else if c.Kind == ir.CRUNE {
+                self.p(fmt.sprintf("  K[%d] = vl_rune(%d);", i,
+                                   first_rune(c.Text)))
+            } else if c.Kind == ir.CBOOL {
+                self.p(fmt.sprintf("  K[%d] = vl_bool(%s);", i, c.Text))
+            } else if c.Kind == ir.CNIL {
+                self.p(fmt.sprintf("  K[%d] = vl_nil();", i))
+            } else if c.Kind == ir.CUNIT {
+                self.p(fmt.sprintf("  K[%d] = vl_unit();", i))
+            }
+        }
+        self.p("\}")
+        self.p("")
+        self.p(fmt.sprintf("static Value G[%d];", max(1, len(self.gnames))))
+        self.p("")
+    }
+
+    // ------------------------------------------------------------ types
+
+    // type_info gathers one struct/exception's field names and declared types.
+    func type_info(self, name str, fields int) TypeInfo {
+        var t = TypeInfo{Name: name, Fields: [], FTypes: []}
+        each f in self.T.Get(fields).Kids {
+            let fd = self.T.Get(f)
+            t.Fields.append(fd.Sval)
+            t.FTypes.append(self.type_text(fd.Ival))
+        }
+        return t
+    }
+
+    // emit_types writes the struct/enum/exception descriptors the runtime
+    // needs.
+    func emit_types(mut self) {
+        var types = []
+        var variants = []
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            let n = self.T.Get(d)
+            if n.Kind == ast.STRUCTDEC {
+                types.append(self.type_info(n.Sval, self.T.Kid(d, 0)))
+            } else if n.Kind == ast.TYPEDEC {
+                let sd = self.T.Kid(d, 0)
+                if sd != 0 {
+                    types.append(self.type_info(n.Sval, self.T.Kid(sd, 0)))
+                }
+            } else if n.Kind == ast.EXCDEC {
+                types.append(self.type_info(n.Sval, self.T.Kid(d, 0)))
+            } else if n.Kind == ast.ENUMDEC {
+                each v in self.T.Get(self.T.Kid(d, 0)).Kids {
+                    let vn = self.T.Get(v)
+                    var vd = VarInfo{Typ: n.Sval, Variant: vn.Sval, Fields: []}
+                    each f in self.T.Get(self.T.Kid(v, 0)).Kids {
+                        vd.Fields.append(self.T.Get(f).Sval)
+                    }
+                    variants.append(vd)
+                }
+            }
+        }
+
+        each i, t in types {
+            if len(t.Fields) == 0 { continue }
+            var qs = []
+            var ts = []
+            each k, fname in t.Fields {
+                qs.append(c_quote(fname))
+                ts.append(c_quote(t.FTypes[k]))
+            }
+            self.p(fmt.sprintf("static const char *const tf%d[] = \{%s\};",
+                               i, str.join(qs, ", ")))
+            self.p(fmt.sprintf("static const char *const tt%d[] = \{%s\};",
+                               i, str.join(ts, ", ")))
+        }
+        self.p("static const VlType g_types[] = \{")
+        each i, t in types {
+            var fp = "NULL"
+            var tp = "NULL"
+            if len(t.Fields) > 0 {
+                fp = fmt.sprintf("tf%d", i)
+                tp = fmt.sprintf("tt%d", i)
+            }
+            self.p(fmt.sprintf("  \{%s, %d, %s, %s\},", c_quote(t.Name),
+                               len(t.Fields), fp, tp))
+        }
+        self.p("  \{NULL, 0, NULL, NULL\}")
+        self.p("\};")
+
+        each i, v in variants {
+            if len(v.Fields) == 0 { continue }
+            var qs = []
+            each fname in v.Fields {
+                qs.append(c_quote(fname))
+            }
+            self.p(fmt.sprintf("static const char *const vf%d[] = \{%s\};",
+                               i, str.join(qs, ", ")))
+        }
+        self.p("static const VlVariant g_variants[] = \{")
+        each i, v in variants {
+            var fp = "NULL"
+            if len(v.Fields) > 0 {
+                fp = fmt.sprintf("vf%d", i)
+            }
+            self.p(fmt.sprintf("  \{%s, %s, %d, %s\},", c_quote(v.Typ),
+                               c_quote(v.Variant), len(v.Fields), fp))
+        }
+        self.p("  \{NULL, NULL, 0, NULL\}")
+        self.p("\};")
+        self.p(fmt.sprintf("static const int g_ntypes = %d;", len(types)))
+        self.p(fmt.sprintf("static const int g_nvariants = %d;",
+                           len(variants)))
+        self.p("")
+    }
+
+    // ------------------------------------------------------------ patterns
+
+    // emit_patterns writes a static VlPat tree for every PMATCH in the module.
+    func emit_patterns(mut self) {
+        each f in self.mod.Funcs {
+            each ins in f.Instrs {
+                if ins.Op == "PMATCH" and ins.Pat != 0 {
+                    self.emit_pattern(ins.Pat)
+                }
+            }
+        }
+    }
+
+    // emit_pattern assigns each pattern node a stable C symbol, children
+    // first (a node's initializer names its children).
+    func emit_pattern(mut self, pi int) str {
+        each e in self.mod.Pats[pi].Elems {
+            self.emit_pattern(e)
+        }
+        self.patSeq += 1
+        let name = fmt.sprintf("p%d", self.patSeq)
+        self.mod.Pats[pi].CName = name
+
+        var elems = "NULL"
+        if len(self.mod.Pats[pi].Elems) > 0 {
+            var refs = []
+            each e in self.mod.Pats[pi].Elems {
+                refs.append(self.mod.Pats[e].CName)
+            }
+            self.p(fmt.sprintf("static const VlPat %s_e[] = \{%s\};", name,
+                               str.join(refs, ", ")))
+            elems = name || "_e"
+        }
+
+        let kind = pat_kind_name(self.mod.Pats[pi].Kind)
+        var slot = 0
+        if self.mod.Pats[pi].Kind == ir.PAT_BIND {
+            slot = reg_slot(self.mod.Pats[pi].Reg)
+        }
+        var lit = 0
+        if self.mod.Pats[pi].Kind == ir.PAT_LIT {
+            lit = self.intern_const(self.mod.Pats[pi].LitKind,
+                                    self.mod.Pats[pi].LitText)
+        }
+        let pname = c_quote(self.mod.Pats[pi].Name)
+        self.p(fmt.sprintf("static const VlPat %s = \{%s, %s, %d, %d, %d, " ||
+                           "%s\};", name, kind, pname, slot, lit,
+                           len(self.mod.Pats[pi].Elems), elems))
+        return name
+    }
+
+    // ------------------------------------------------------------ functions
+
+    func emit_protos(mut self) {
+        each i, f in self.mod.Funcs {
+            self.p(fmt.sprintf("static Value %s(Value *argv, int argc, " ||
+                               "VlFrame *up); /* %s */", c_func_name(i),
+                               f.Name))
+        }
+        self.p("")
+        self.p(fmt.sprintf("static VlFn NAT[%d]; /* sized exactly; the " ||
+                           "bodies are generated first */",
+                           max(1, len(self.nats))))
+        self.p("")
+    }
+
+    // operand renders an IR operand as a borrowed C expression.
+    func operand(mut self, f ir.Func, s str) str {
+        if str.starts_with(s, "r") and reg_slot(s) >= 0 {
+            return fmt.sprintf("F->r[%d]", reg_slot(s))
+        }
+        if str.starts_with(s, "K") {
+            let n = atoi(s[1..len(s)])
+            if n >= 0 {
+                return fmt.sprintf("K[%d]", n)
+            }
+        }
+        if str.starts_with(s, "^") {
+            let name = s[1..len(s)]
+            if not f.HasUp(name) {
+                self.failf(fmt.sprintf("cgen: unresolved upvalue `%s` in %s",
+                                       name, f.Name))
+                return "vl_nil()"
+            }
+            let up = f.Up(name)
+            return fmt.sprintf("vl_up(F->up, %d, %d)", up.Depth - 1, up.Slot)
+        }
+        self.failf(fmt.sprintf("cgen: bad operand %q in %s", s, f.Name))
+        return "vl_nil()"
+    }
+
+    // dst renders a destination register.
+    func dst(mut self, f ir.Func, s str) str {
+        let n = reg_slot(s)
+        if n < 0 {
+            self.failf(fmt.sprintf("cgen: bad destination %q in %s", s,
+                                   f.Name))
+            return "F->r[0]"
+        }
+        return fmt.sprintf("F->r[%d]", n)
+    }
+
+    // emit_argv writes an argv array for a call, returning its C name and
+    // length expression.
+    func emit_argv(mut self, f ir.Func, id int, spec str) (str, str) {
+        let args = parse_args(spec)
+        let name = fmt.sprintf("a%d", id)
+        if len(args) == 0 {
+            return "NULL", "0"
+        }
+        var hasSpread = false
+        each a in args {
+            if a.Spread { hasSpread = true }
+        }
+        if not hasSpread {
+            var vals = []
+            each a in args {
+                vals.append(self.operand(f, a.Reg))
+            }
+            self.p(fmt.sprintf("  Value %s[] = \{%s\};", name,
+                               str.join(vals, ", ")))
+            return name, str(len(vals))
+        }
+        // Spread: build the argv dynamically.
+        self.p(fmt.sprintf("  Value %s_s = vl_slice_new(0);", name))
+        each a in args {
+            if a.Spread {
+                self.p(fmt.sprintf("  vl_spread(%s_s, %s);", name,
+                                   self.operand(f, a.Reg)))
+            } else {
+                self.p(fmt.sprintf("  vl_slice_append(%s_s, vl_retain(%s));",
+                                   name, self.operand(f, a.Reg)))
+            }
+        }
+        self.p(fmt.sprintf("  Value *%s = vl_slice_data(%s_s);", name, name))
+        return name, fmt.sprintf("(int)vl_len(%s_s)", name)
+    }
+
+    // release_argv frees the temporary slice a spread call built (it is an
+    // owned value; leaving it unreleased leaked one slice per call).
+    func release_argv(mut self, id int, spec str) {
+        each a in parse_args(spec) {
+            if a.Spread {
+                self.p(fmt.sprintf("  vl_release(a%d_s);", id))
+                return
+            }
+        }
+    }
+
+    func emit_func(mut self, idx int, f ir.Func) {
+        if f.LoopCapture != "" {
+            self.failf(fmt.sprintf(
+                "cgen: %s captures `%s`, which is declared inside a loop.\n" ||
+                "  Each iteration is a separate binding, and native builds " ||
+                "cannot yet\n" ||
+                "  give each one its own frame — the interpreter and the " ||
+                "binary would\n" ||
+                "  disagree, so the build is refused rather than silently " ||
+                "differ.\n" ||
+                "  Workaround: build the closure in a helper function that " ||
+                "takes the\n" ||
+                "  value as a parameter.", f.Name, f.LoopCapture))
+        }
+        self.p(fmt.sprintf("/* %s — %s */", f.Name, f.Sig))
+        self.p(fmt.sprintf("static Value %s(Value *argv, int argc, " ||
+                           "VlFrame *up) \{", c_func_name(idx)))
+        var nregs = f.NRegs
+        if nregs < 1 { nregs = 1 }
+        self.p(fmt.sprintf("  VlFrame *F = vl_frame_new(%d, up);", nregs))
+        self.p("  vl_frame_push(F);")
+        self.p("  Value __ret = vl_unit();")
+        self.p("  (void)argc;")
+        // Parameters land in the lowest registers.
+        self.p(fmt.sprintf("  for (int i = 0; i < argc && i < %d; i++) " ||
+                           "vl_set(&F->r[i], vl_retain(argv[i]));", nregs))
+
+        var seq = 0
+        each ins in f.Instrs {
+            each l in ins.Labels {
+                self.p(fmt.sprintf(" %s: ;", l))
+            }
+            seq += 1
+            self.emit_instr(f, ins, seq)
+        }
+
+        self.p(" __exit: ;")
+        self.p("  vl_frame_pop_run_defers(F);")
+        self.p("  vl_frame_clear(F); /* break frame<->closure cycles " ||
+               "before releasing */")
+        self.p("  vl_frame_release(F);")
+        self.p("  return __ret;")
+        self.p("\}")
+        self.p("")
+    }
+
+    // ------------------------------------------------------------ table
+
+    func emit_method_table(mut self) {
+        var ms = []
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            let n = self.T.Get(d)
+            if n.Kind == ast.IMPLDEC {
+                // The impl target: only a named type carries methods.
+                var tn = ""
+                if n.Ival != 0 and self.T.Kind(n.Ival) == ast.TNAMED {
+                    tn = self.T.Get(n.Ival).Sval
+                }
+                each m in self.T.Get(self.T.Kid(d, 0)).Kids {
+                    let mn = self.T.Get(m)
+                    let full = tn || "." || mn.Sval
+                    if full in self.fnIdx {
+                        ms.append(Method{Typ: tn, Name: mn.Sval,
+                                         Fn: self.fnIdx[full],
+                                         HasSelf: (mn.Ival2 & 1) != 0})
+                    }
+                }
+            } else if n.Kind == ast.EXCDEC {
+                each m in self.T.Get(self.T.Kid(d, 1)).Kids {
+                    let mn = self.T.Get(m)
+                    let full = n.Sval || "." || mn.Sval
+                    if full in self.fnIdx {
+                        ms.append(Method{Typ: n.Sval, Name: mn.Sval,
+                                         Fn: self.fnIdx[full],
+                                         HasSelf: (mn.Ival2 & 1) != 0})
+                    }
+                }
+            }
+        }
+        let sorted = sort_methods(ms)
+        self.p("static const VlMethod g_methods[] = \{")
+        each x in sorted {
+            self.p(fmt.sprintf("  \{%s, %s, %s, %s\},", c_quote(x.Typ),
+                               c_quote(x.Name), c_func_name(x.Fn),
+                               bool_c(x.HasSelf)))
+        }
+        self.p("  \{NULL, NULL, NULL, false\}")
+        self.p("\};")
+        self.p(fmt.sprintf("static const int g_nmethods = %d;", len(sorted)))
+        self.p("")
+    }
+
+    func emit_main(mut self) {
+        self.p("int main(int argc, char **argv) \{")
+        self.p("  vl_init(argc, argv);")
+        self.p("  vl_register_types(g_types, g_ntypes, g_variants, " ||
+               "g_nvariants, g_methods, g_nmethods);")
+        self.p("  init_consts();")
+        each i, name in self.nats {
+            self.p(fmt.sprintf("  NAT[%d] = vl_lookup_fn(%s);", i,
+                               c_quote(name)))
+        }
+        self.p(fmt.sprintf("  for (int i = 0; i < %d; i++) if (!NAT[i]) " ||
+                           "\{ fprintf(stderr, \"voila: missing runtime " ||
+                           "function\\n\"); return 1; \}", len(self.nats)))
+        if "$INIT" in self.fnIdx {
+            self.p(fmt.sprintf("  vl_release(%s(NULL, 0, NULL));",
+                               c_func_name(self.fnIdx["$INIT"])))
+        }
+        if "$SCRIPT" in self.fnIdx {
+            self.p(fmt.sprintf("  vl_release(%s(NULL, 0, NULL));",
+                               c_func_name(self.fnIdx["$SCRIPT"])))
+        }
+        if "main" in self.fnIdx {
+            self.p(fmt.sprintf("  Value r = %s(NULL, 0, NULL);",
+                               c_func_name(self.fnIdx["main"])))
+            self.p("  if (vl_isfail(r) && r.t != VL_NIL) \{")
+            self.p("    Value m = vl_callm(r, \"message\", NULL, 0);")
+            self.p("    fprintf(stderr, \"error: %s\\n\", vl_cstr(m));")
+            self.p("    return 1;")
+            self.p("  \}")
+            self.p("  vl_release(r);")
+        }
+        self.p("  int code = vl_finish();")
+        self.p(fmt.sprintf("  for (int i = 0; i < %d; i++) vl_release(G[i]);",
+                           max(1, len(self.gnames))))
+        self.p(fmt.sprintf("  for (int i = 0; i < %d; i++) vl_release(K[i]);",
+                           max(1, len(self.mod.Consts))))
+        self.p("  return code;")
+        self.p("\}")
+    }
+
+    // ------------------------------------------------------------ types
+
+    // type_text renders a declared type for the runtime's zero-value
+    // constructor. An unhandled form (a borrow) renders as "", exactly as the
+    // Go original's default branch does.
+    func type_text(self, te int) str {
+        if te == 0 { return "" }
+        let n = self.T.Get(te)
+        if n.Kind == ast.TNAMED  { return n.Sval }
+        if n.Kind == ast.TOPTION {
+            return "?" || self.type_text(self.T.Kid(te, 0))
+        }
+        if n.Kind == ast.TRESULT {
+            return self.type_text(self.T.Kid(te, 0)) || "!"
+        }
+        if n.Kind == ast.TSLICE {
+            return "[]" || self.type_text(self.T.Kid(te, 0))
+        }
+        if n.Kind == ast.TMAP {
+            return "map[" || self.type_text(self.T.Kid(te, 0)) || "]" ||
+                   self.type_text(self.T.Kid(te, 1))
+        }
+        if n.Kind == ast.TSET {
+            return "set[" || self.type_text(self.T.Kid(te, 0)) || "]"
+        }
+        if n.Kind == ast.TCHAN {
+            return "chan[" || self.type_text(self.T.Kid(te, 0)) || "]"
+        }
+        if n.Kind == ast.TBOX {
+            var kind = "shared"
+            if n.Ival2 == 1 {
+                kind = "cell"
+            } else if n.Ival2 == 2 {
+                kind = "weak"
+            }
+            return kind || "[" || self.type_text(self.T.Kid(te, 0)) || "]"
+        }
+        if n.Kind == ast.TTUPLE { return "tuple" }
+        if n.Kind == ast.TFN    { return "fn" }
+        return ""
+    }
+}
+
+// ---------------------------------------------------------------- helpers
+
+func c_func_name(i int) str { return fmt.sprintf("vf_%d", i) }
+
+func bool_c(b bool) str {
+    if b { return "true" }
+    return "false"
+}
+
+// is_literal reports whether a node kind is a basic literal — the only field
+// default a native build can express.
+func is_literal(k int) bool {
+    return k == ast.INT or k == ast.FLOAT or k == ast.DEC or k == ast.STR or
+           k == ast.RUNE or k == ast.BOOL or k == ast.NILLIT
+}
+
+func pat_kind_name(k int) str {
+    if k == ir.PAT_WILD    { return "VL_P_WILD" }
+    if k == ir.PAT_NIL     { return "VL_P_NIL" }
+    if k == ir.PAT_LIT     { return "VL_P_LIT" }
+    if k == ir.PAT_BIND    { return "VL_P_BIND" }
+    if k == ir.PAT_VARIANT { return "VL_P_VARIANT" }
+    return ""
+}
+
+// c_quote renders a C string literal. Bytes above 0x1f pass through — a UTF-8
+// sequence is written raw, exactly as the Go original's byte loop does.
+func c_quote(s str) str {
+    var b = str.Builder{}
+    b.write("\"")
+    each c in s {
+        if c == '"' {
+            b.write("\\\"")
+        } else if c == '\\' {
+            b.write("\\\\")
+        } else if c == '\n' {
+            b.write("\\n")
+        } else if c == '\t' {
+            b.write("\\t")
+        } else if c == '\r' {
+            b.write("\\r")
+        } else if int(c) < 32 {
+            b.write(fmt.sprintf("\\%03o", c))
+        } else {
+            b.write(str(c))
+        }
+    }
+    b.write("\"")
+    return b.done()
+}
+
+// c_float renders a float constant as a C literal: an integral text needs a
+// `.0` so the C compiler reads it as a double.
+func c_float(s str) str {
+    if not is_float_text(s) { return "0" }
+    if not contains_any(s, ".eE") { return s || ".0" }
+    return s
+}
+
+func contains_any(s str, chars str) bool {
+    each c in s {
+        if str.contains(chars, str(c)) { return true }
+    }
+    return false
+}
+
+// is_float_text reports whether the text is a plain decimal float — the pool
+// only ever holds %g-normalized text.
+func is_float_text(s str) bool {
+    var digits = 0
+    each c in s {
+        if int(c) >= 48 and int(c) <= 57 {
+            digits += 1
+        } else if c != '.' and c != 'e' and c != 'E' and c != '+' and
+                  c != '-' {
+            return false
+        }
+    }
+    return digits > 0
+}
+
+func first_rune(s str) int {
+    let rs = runes(s)
+    if len(rs) == 0 { return 0 }
+    return int(rs[0])
+}
+
+// atoi parses a non-negative decimal, returning -1 when the text is not one
+// (the Go original treats strconv.Atoi's error the same way).
+func atoi(s str) int {
+    if len(s) == 0 { return 0 - 1 }
+    var n = 0
+    each c in s {
+        if int(c) < 48 or int(c) > 57 { return 0 - 1 }
+        n = n * 10 + (int(c) - 48)
+    }
+    return n
+}
+
+// reg_slot maps "r7" to 7, and anything else to -1.
+func reg_slot(r str) int {
+    var s = r
+    if str.starts_with(s, "r") { s = s[1..len(s)] }
+    return atoi(s)
+}
+
+// parse_int_text reads an integer literal the way Go's strconv.ParseInt(s, 0,
+// 64) does: 0x/0o/0b radix prefixes, and a bare leading 0 means octal. A
+// malformed literal yields 0, as the Go backend's ignored error does.
+func parse_int_text(s0 str) int {
+    var s = s0
+    var neg = false
+    if str.starts_with(s, "-") {
+        neg = true
+        s = s[1..len(s)]
+    } else if str.starts_with(s, "+") {
+        s = s[1..len(s)]
+    }
+    var base = 10
+    if str.starts_with(s, "0x") or str.starts_with(s, "0X") {
+        base = 16
+        s = s[2..len(s)]
+    } else if str.starts_with(s, "0o") or str.starts_with(s, "0O") {
+        base = 8
+        s = s[2..len(s)]
+    } else if str.starts_with(s, "0b") or str.starts_with(s, "0B") {
+        base = 2
+        s = s[2..len(s)]
+    } else if len(s) > 1 and str.starts_with(s, "0") {
+        base = 8
+        s = s[1..len(s)]
+    }
+    var n = 0
+    each c in s {
+        if c == '_' { continue }
+        let d = digit_val(c)
+        if d < 0 or d >= base { return 0 }
+        n = n * base + d
+    }
+    if neg { return 0 - n }
+    return n
+}
+
+func digit_val(c rune) int {
+    let v = int(c)
+    if v >= 48 and v <= 57  { return v - 48 }       // '0'..'9'
+    if v >= 97 and v <= 102 { return v - 97 + 10 }  // 'a'..'f'
+    if v >= 65 and v <= 70  { return v - 65 + 10 }  // 'A'..'F'
+    return 0 - 1
+}
+
+// parse_args splits a rendered "(r1,name:r2,r3...)" operand.
+func parse_args(spec str) []CallArg {
+    var s = spec
+    if str.ends_with(s, ")") { s = s[0..len(s) - 1] }
+    if str.starts_with(s, "(") { s = s[1..len(s)] }
+    if s == "" { return [] }
+    var out = []
+    each part0 in str.split(s, ",") {
+        var part = part0
+        var spread = false
+        if str.ends_with(part, "...") {
+            spread = true
+            part = part[0..len(part) - 3]
+        }
+        var name = ""
+        let i = str.index(part, ":")
+        if i >= 0 {
+            name = part[0..i]
+            part = part[i + 1..len(part)]
+        }
+        out.append(CallArg{Reg: part, Name: name, Spread: spread})
+    }
+    return out
+}
+
+// sort_methods orders the method table by (type, name), stably — the Go
+// original's sort.SliceStable. Insertion sort keeps equal keys in source
+// order, which is what "stable" buys us.
+func sort_methods(ms []Method) []Method {
+    var out = []
+    each m in ms {
+        var i = len(out)
+        while i > 0 and method_less(m, out[i - 1]) {
+            i -= 1
+        }
+        out.append(m)
+        var j = len(out) - 1
+        while j > i {
+            out[j] = out[j - 1]
+            j -= 1
+        }
+        out[i] = m
+    }
+    return out
+}
+
+func method_less(a Method, b Method) bool {
+    if a.Typ != b.Typ { return a.Typ < b.Typ }
+    return a.Name < b.Name
+}

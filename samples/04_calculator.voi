@@ -1,0 +1,202 @@
+// 04_calculator.voi — a complete recursive-descent expression evaluator in
+// under 200 lines: a tokenizer built on enums with payloads (§3.5), an
+// exhaustive-match parser, and error values (T!) threaded with `try` (§8.1).
+// This is a scale model of the self-hosted compiler in selfhost/.
+package main
+
+use "std/fmt"
+use "std/str"
+
+enum Token {
+    Num(value float)
+    Op(sym rune)
+    LParen
+    RParen
+    End
+}
+
+struct Lexer {
+    src str
+    pos int
+}
+
+impl Lexer {
+    func peek_byte(self) int {
+        if self.pos >= len(self.src) { return -1 }
+        return self.src[self.pos]
+    }
+
+    func next(mut self) Token! {
+        // Skip blanks.
+        while self.peek_byte() == 32 {
+            self.pos += 1
+        }
+        let c = self.peek_byte()
+        if c == -1 { return End }
+
+        // Numbers (integer and decimal notation).
+        if c >= 48 and c <= 57 {
+            let start = self.pos
+            while self.is_digit_or_dot() {
+                self.pos += 1
+            }
+            let text = self.src[start..self.pos]
+            let v = try to_float(text) else return err("bad number {text}")
+            return Num(v)
+        }
+
+        self.pos += 1
+        switch c {
+        case 43:
+            return Op('+')
+        case 45:
+            return Op('-')
+        case 42:
+            return Op('*')
+        case 47:
+            return Op('/')
+        case 94:
+            return Op('^')
+        case 40:
+            return LParen
+        case 41:
+            return RParen
+        default:
+            return err("unexpected character {str.from_runes([rune(c)])} at column {self.pos}")
+        }
+    }
+
+    func is_digit_or_dot(self) bool {
+        let c = self.peek_byte()
+        if c == 46 { return true }
+        return c >= 48 and c <= 57
+    }
+}
+
+struct Parser {
+    lx  Lexer
+    cur Token
+}
+
+impl Parser {
+    func advance(mut self) unit! {
+        self.cur = try self.lx.next()
+        return ()
+    }
+
+    // expr := term (('+' | '-') term)*
+    func expr(mut self) float! {
+        var left = try self.term()
+        for {
+            match self.cur {
+                Op(sym) if sym == '+' => {
+                    try self.advance()
+                    left = left + try self.term()
+                }
+                Op(sym) if sym == '-' => {
+                    try self.advance()
+                    left = left - try self.term()
+                }
+                _ => return left
+            }
+        }
+    }
+
+    // term := power (('*' | '/') power)*
+    func term(mut self) float! {
+        var left = try self.power()
+        for {
+            match self.cur {
+                Op(sym) if sym == '*' => {
+                    try self.advance()
+                    left = left * try self.power()
+                }
+                Op(sym) if sym == '/' => {
+                    try self.advance()
+                    let r = try self.power()
+                    if r == 0.0 { return err("division by zero") }
+                    left = left / r
+                }
+                _ => return left
+            }
+        }
+    }
+
+    // power := unary ('^' power)?   — right-associative
+    func power(mut self) float! {
+        let base = try self.unary()
+        match self.cur {
+            Op(sym) if sym == '^' => {
+                try self.advance()
+                let e = try self.power()
+                return base ** e
+            }
+            _ => return base
+        }
+    }
+
+    // unary := '-' unary | primary
+    func unary(mut self) float! {
+        match self.cur {
+            Op(sym) if sym == '-' => {
+                try self.advance()
+                let v = try self.unary()
+                return -v
+            }
+            _ => return try self.primary()
+        }
+    }
+
+    // primary := Num | '(' expr ')'
+    func primary(mut self) float! {
+        match self.cur {
+            Num(v) => {
+                try self.advance()
+                return v
+            }
+            LParen => {
+                try self.advance()
+                let v = try self.expr()
+                match self.cur {
+                    RParen => try self.advance()
+                    _      => return err("missing closing parenthesis")
+                }
+                return v
+            }
+            End    => return err("unexpected end of expression")
+            _      => return err("unexpected token")
+        }
+    }
+}
+
+func evaluate(src str) float! {
+    var p = Parser{lx: Lexer{src: src, pos: 0}, cur: End}
+    try p.advance()
+    let v = try p.expr()
+    match p.cur {
+        End => return v
+        _   => return err("trailing garbage after expression")
+    }
+}
+
+func main() {
+    let cases = [
+        "2 + 3 * 4",
+        "(2 + 3) * 4",
+        "2 ^ 10",
+        "2 ^ 3 ^ 2",
+        "-(4 + 1) * 2",
+        "100 / 8",
+        "3.5 * 2 + 0.25",
+        "((((7))))",
+        "1 / 0",
+        "2 +",
+        "4 $ 2",
+    ]
+    each src in cases {
+        match evaluate(src) {
+            Ok(v)  => fmt.printf("%-16s = %v\n", src, v)
+            Err(e) => fmt.printf("%-16s ! %s\n", src, e.message())
+        }
+    }
+}

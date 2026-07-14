@@ -1,0 +1,226 @@
+// tools/build.voi — the Voilà toolchain's build, written in Voilà.
+//
+// The bootstrap has an irreducible first step: something that is not Voilà must
+// turn the checked-in C seed into a binary, because until that binary exists
+// there is nothing to run a Voilà program with. That step is one `cc` command,
+// and `build.sh` is the four lines that issue it.
+//
+// EVERYTHING ELSE IS THIS PROGRAM. The seed binary runs it, and it drives the
+// rest of the build: compile the compiler, compile the compiler with the
+// compiler, and assert that the two agree.
+//
+//     voila run tools/build.voi              build and verify the fixpoint
+//     voila run tools/build.voi reseed       …and rewrite bootstrap/voilac.c
+//     voila run tools/build.voi seed         stop after the seed
+//     voila run tools/build.voi blob         only regenerate the embedded runtime
+package main
+
+use "std/os"
+use "std/fmt"
+use "std/str"
+
+const BUILD = "build"
+const OUT   = "bin/voila"
+const BLOB  = "voilac/rt/blob.voi"
+const RTDIR = "runtime/src"
+
+func main() {
+    let args = os.args()
+    var mode = "all"
+    if len(args) > 0 { mode = args[0] }
+
+    // The compiler that is running this program IS the seed: whoever invoked us
+    // already has a working toolchain. `voila` on PATH, or the one that ran us.
+    let voila = tool()
+
+    sh("mkdir", ["-p", BUILD, "bin"])
+
+    // ---- 0. the runtime the compiler carries
+    //
+    // voilac/rt/blob.voi is libvoila's source, embedded in the compiler (the
+    // Voilà equivalent of Go's //go:embed). If runtime/src has moved on, a
+    // compiled program would be linked against a stale runtime — so regenerate
+    // it and say so when it had drifted.
+    head("0. the embedded runtime")
+    let before = read_or(BLOB, "")
+    let after = make_blob()
+    if before != after {
+        write_or_die(BLOB, after)
+        warn("voilac/rt/blob.voi was stale; regenerated from runtime/src")
+    } else {
+        ok("voilac/rt/blob.voi is current")
+    }
+    if mode == "blob" { return }
+
+    if mode == "seed" {
+        sh("cp", [voila, OUT])
+        ok(OUT || " (the seed itself)")
+        return
+    }
+
+    // ---- 1. the compiler compiles the compiler
+    head("1. the compiler compiles itself  →  voilac-1")
+    let one = BUILD || "/voilac-1"
+    must_run(voila, ["build", "voilac/main.voi", "-o", one])
+    ok(one)
+
+    // ---- 2. …and the result compiles it again
+    head("2. voilac-1 compiles itself  →  voilac-2, and the C must match")
+    let c1 = BUILD || "/gen1.c"
+    let c2 = BUILD || "/gen2.c"
+    let two = BUILD || "/voilac-2"
+    emit_c(one, c1)
+    must_run(one, ["build", "voilac/main.voi", "-o", two])
+    emit_c(two, c2)
+
+    let g1 = read_or(c1, "")
+    let g2 = read_or(c2, "")
+    if g1 != g2 {
+        fail("NO FIXPOINT — generation 1 and 2 emit different C")
+    }
+    ok("fixpoint: C(voilac-1) == C(voilac-2)")
+
+    // The seed must be what the compiler actually emits for itself. When it has
+    // drifted, the checked-in C is stale — which is not an error (the seed is
+    // still a valid bootstrap), but it must be said out loud.
+    let seed = read_or("bootstrap/voilac.c", "")
+    if seed == g1 {
+        ok("the checked-in seed is current")
+    } else if mode == "reseed" {
+        write_or_die("bootstrap/voilac.c", g1)
+        ok("reseeded bootstrap/voilac.c")
+    } else {
+        warn("bootstrap/voilac.c is stale — run: voila run tools/build.voi reseed")
+    }
+
+    sh("cp", [two, OUT])
+    ok(OUT)
+    // The toolchain is `voila`, and the manual says so. `voilac/` is the
+    // compiler's SOURCE directory, so the binary cannot be called that.
+    sh("cp", [two, "voila"])
+    ok("./voila")
+    sh("rm", ["-rf", BUILD])
+    head("done — ./voila is ready")
+}
+
+// tool finds the compiler to build with: $VOILA, else bin/voila, else the
+// `voila` on PATH.
+func tool() str {
+    let env = os.env("VOILA")
+    if env != nil {
+        let s = str(env)
+        if s != "" { return s }
+    }
+    if os.exists(OUT) { return OUT }
+    return "voila"
+}
+
+// make_blob renders libvoila's source as a Voilà source file — the compiler
+// carries the runtime inside itself, so a produced binary needs nothing on disk.
+//
+// The payload is base64, not escaped C: a C file is full of backslashes,
+// quotes, braces and backticks, every one of which means something inside a
+// Voilà string literal. Base64 is plain ASCII, the lexer scans each file as one
+// flat token, and `unb64` gives the bytes back untouched.
+func make_blob() str {
+    var names = []
+    // Headers first: the .c files include them.
+    each n in listing(RTDIR) {
+        if str.ends_with(n, ".h") { names.append(n) }
+    }
+    each n in listing(RTDIR) {
+        if str.ends_with(n, ".c") { names.append(n) }
+    }
+
+    var b = str.Builder{}
+    b.write("// Package rt — libvoila's source, carried inside the compiler.\n")
+    b.write("//\n")
+    b.write("// GENERATED by tools/build.voi. Do not edit: change runtime/src/\n")
+    b.write("// and rebuild.\n")
+    b.write("//\n")
+    b.write("// `voila build` writes these files next to the C it emits and\n")
+    b.write("// compiles the whole set with the system cc, so a produced binary\n")
+    b.write("// depends on nothing but libc. The payload is base64 because C\n")
+    b.write("// source is not a legal Voilà string literal.\n")
+    b.write("package rt\n\n")
+    b.write("use \"std/os\"\n")
+    b.write("use \"std/str\"\n\n")
+    b.write("// Names lists the runtime's files, headers first.\n")
+    b.write("func Names() []str \{\n    return [\n")
+    each n in names {
+        b.write("        \"" || n || "\",\n")
+    }
+    b.write("    ]\n\}\n\n")
+    b.write("// Data returns each file's contents, in the order Names gives.\n")
+    b.write("func Data() []str \{\n    var out = []\n")
+    each n in names {
+        let text = read_or(RTDIR || "/" || n, "")
+        b.write("    out.append(unb64(\"" || b64(text) || "\"))\n")
+    }
+    b.write("    return out\n\}\n\n")
+    b.write("// WriteTo writes libvoila's source into a directory and returns\n")
+    b.write("// the paths of the .c files, which are what `cc` must be handed.\n")
+    b.write("func WriteTo(dir str) []str throws IOError \{\n")
+    b.write("    var cfiles = []\n")
+    b.write("    let names = Names()\n")
+    b.write("    let data = Data()\n")
+    b.write("    each i, n in names \{\n")
+    b.write("        let p = dir || \"/\" || n\n")
+    b.write("        try os.write(p, data[i])\n")
+    b.write("        if str.ends_with(n, \".c\") \{ cfiles.append(p) \}\n")
+    b.write("    \}\n")
+    b.write("    return cfiles\n\}\n")
+    return b.done()
+}
+
+func listing(dir str) []str {
+    match os.listdir(dir) {
+        Ok(fs)  => return fs
+        Err(e)  => fail("cannot read " || dir)
+    }
+    return []
+}
+
+// emit_c captures a compiler's C output for the compiler's own source. os.run
+// inherits stdout, so the redirection goes through the shell.
+func emit_c(compiler str, out str) {
+    let rc = os.run("bash", ["-c", compiler || " --emit=c voilac/main.voi > " || out])
+    if rc != 0 {
+        fail("could not emit C with " || compiler)
+    }
+}
+
+func must_run(prog str, args []str) {
+    let rc = os.run(prog, args)
+    if rc != 0 {
+        fail(prog || " failed (exit " || str(rc) || ")")
+    }
+}
+
+func sh(prog str, args []str) {
+    os.run(prog, args)
+}
+
+func read_or(p str, dflt str) str {
+    match os.read(p) {
+        Ok(s)  => return s
+        Err(e) => return dflt
+    }
+    return dflt
+}
+
+func write_or_die(p str, text str) {
+    match os.write(p, text) {
+        Ok(u)  => u
+        Err(e) => fail("cannot write " || p)
+    }
+}
+
+func head(s str) { fmt.printf("\u{1b}[1m==> %s\u{1b}[0m\n", s) }
+func ok(s str)   { fmt.printf("\u{1b}[32m  ✓ %s\u{1b}[0m\n", s) }
+func warn(s str) { fmt.printf("\u{1b}[33m  ! %s\u{1b}[0m\n", s) }
+
+func fail(s str) {
+    fmt.eprintf("\u{1b}[1;31m  ✗ %s\u{1b}[0m\n", s)
+    os.exit(1)
+}

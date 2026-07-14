@@ -1,0 +1,661 @@
+// Package par — the Voilà parser, in Voilà.
+//
+// A faithful port of the stage-0 parser: recursive descent for declarations
+// and statements (§15), precedence climbing for expressions (§5.1). It builds
+// into the node arena of package ast. A differential test diffs its tree dump
+// against the Go parser's over every source in the repository.
+package par
+
+use "voilac/tok"
+use "voilac/ast"
+use "voilac/lex"
+use "std/str"
+
+// Precedence levels (§5.1, scaled; `else` and ranges wedged in as the
+// stage-0 parser does).
+const P_ELSE   = 10
+const P_OR     = 20
+const P_AND    = 30
+const P_CMP    = 40
+const P_RANGE  = 45
+const P_CONCAT = 50
+const P_BITS   = 60
+const P_ADD    = 70
+const P_MUL    = 80
+const P_POW    = 90
+
+struct Parser {
+    ts    []tok.Token
+    i     int
+    file  str
+    T     ast.Tree
+    Errs  []str
+    noLit int   // >0 inside a statement header: a composite literal needs parens
+    lev   int   // >0 inside brackets, where a composite literal is fine again
+    selfFlags int // set by params() when the receiver is `self`
+}
+
+func New(file str, src str) Parser { return NewAt(file, src, 1, 1) }
+
+// NewAt parses a fragment that begins at a known position — an interpolated
+// string's embedded expression, whose diagnostics must name the real column.
+func NewAt(file str, src str, line int, col int) Parser {
+    var lx = lex.NewAt(file, src, line, col)
+    let ts = lx.Tokens()
+    var p = Parser{ts: ts, i: 0, file: file, T: ast.NewTree(), Errs: lx.Errs,
+                   noLit: 0, lev: 0, selfFlags: 0}
+    return p
+}
+
+impl Parser {
+    // ------------------------------------------------------------ plumbing
+
+    func cur(self) tok.Token { return self.ts[self.i] }
+
+    func peek(self, n int) tok.Token {
+        if self.i + n >= len(self.ts) { return self.ts[len(self.ts) - 1] }
+        return self.ts[self.i + n]
+    }
+
+    func at(self, k int) bool { return self.cur().Kind == k }
+
+    func next(mut self) tok.Token {
+        let t = self.ts[self.i]
+        if self.i < len(self.ts) - 1 { self.i += 1 }
+        return t
+    }
+
+    func accept(mut self, k int) bool {
+        if self.at(k) {
+            self.next()
+            return true
+        }
+        return false
+    }
+
+    func error(mut self, msg str) {
+        let t = self.cur()
+        self.Errs.append("{self.file}:{t.Line}:{t.Col}: {msg}")
+    }
+
+    func expect(mut self, k int) tok.Token {
+        if self.at(k) { return self.next() }
+        self.error("expected {tok.Spelling(k)}, found {self.show()}")
+        return tok.Token{Kind: k, Lit: "", Line: self.cur().Line,
+                         Col: self.cur().Col, Parts: [], IsExpr: [],
+                         PartLine: [], PartCol: [], Virtual: false}
+    }
+
+    func show(self) str {
+        let t = self.cur()
+        let n = tok.Name(t.Kind)
+        if n == "IDENT" or n == "KW" or n == "INT" { return "{n}({t.Lit})" }
+        if n == "OP" { return tok.Spelling(t.Kind) }
+        return n
+    }
+
+    func skip_semis(mut self) {
+        while self.at(tok.SEMI) { self.next() }
+    }
+
+    // skip_semis_before consumes virtual semicolons when the given keyword
+    // follows — `else`, `catch` and `finally` on the next line (§2.3).
+    func skip_semis_before(mut self, k int) bool {
+        var j = self.i
+        while self.ts[j].Kind == tok.SEMI { j += 1 }
+        if self.ts[j].Kind == k {
+            self.i = j
+            return true
+        }
+        return false
+    }
+
+    func expect_semi(mut self) {
+        if self.at(tok.SEMI) {
+            self.skip_semis()
+            return
+        }
+        if self.at(tok.RBRACE) or self.at(tok.EOF) { return }
+        self.error("expected end of statement, found {self.show()}")
+        while not self.at(tok.SEMI) and not self.at(tok.RBRACE) and
+              not self.at(tok.EOF) {
+            self.next()
+        }
+        self.skip_semis()
+    }
+
+    func add(mut self, kind int, t tok.Token, ival int, ival2 int, sval str,
+             kids []int) int {
+        return self.T.Add(kind, t.Line, t.Col, ival, ival2, sval, kids)
+    }
+
+    // ------------------------------------------------------------ file
+
+    func File(mut self) int {
+        let start = self.cur()
+        var uses = []
+        var decls = []
+        var script = []
+
+        var pkg = ""
+        self.skip_semis()
+        if self.at(tok.PACKAGE) {
+            self.next()
+            pkg = self.expect(tok.IDENT).Lit
+            self.expect_semi()
+        }
+        self.skip_semis()
+        while not self.at(tok.EOF) {
+            self.skip_semis()
+            if self.at(tok.EOF) { break }
+            if self.at(tok.USE) {
+                uses.append(self.use_decl())
+            } else if self.decl_start() {
+                decls.append(self.decl())
+            } else if self.at(tok.CONST) or self.at(tok.LET) or self.at(tok.VAR) {
+                let here = self.cur()
+                let s = self.stmt()
+                decls.append(self.add(ast.GLOBAL, here, 0, 0, "", [s]))
+            } else {
+                script.append(self.stmt())
+            }
+            self.skip_semis()
+        }
+        let lu = self.T.List(uses)
+        let ld = self.T.List(decls)
+        let ls = self.T.List(script)
+        return self.add(ast.FILE, start, 0, 0, pkg, [lu, ld, ls])
+    }
+
+    func decl_start(self) bool {
+        let k = self.cur().Kind
+        return k == tok.FUNC or k == tok.STRUCT or k == tok.ENUM or
+               k == tok.TRAIT or k == tok.IMPL or k == tok.EXCEPTION or
+               k == tok.TYPE
+    }
+
+    func use_decl(mut self) int {
+        let t = self.expect(tok.USE)
+        let path = self.expect(tok.STR)
+        var alias = ""
+        var flags = 0
+        var names = []
+        if self.accept(tok.AS) {
+            alias = self.expect(tok.IDENT).Lit
+        } else if self.at(tok.LBRACE) {
+            self.next()
+            while not self.at(tok.RBRACE) and not self.at(tok.EOF) {
+                let n = self.expect(tok.IDENT)
+                names.append(self.add(ast.IDENT, n, 0, 0, n.Lit, []))
+                if not self.accept(tok.COMMA) { break }
+            }
+            self.expect(tok.RBRACE)
+            if len(names) > 0 { flags = 1 }
+        } else if self.at(tok.STAR) {
+            self.next()
+            flags = 2
+        }
+        self.expect_semi()
+        return self.add(ast.USE, t, 0, flags, path.Lit || "|" || alias, names)
+    }
+
+    // ------------------------------------------------------------ declarations
+
+    func decl(mut self) int {
+        let k = self.cur().Kind
+        if k == tok.FUNC      { return self.func_decl() }
+        if k == tok.STRUCT    { return self.struct_decl() }
+        if k == tok.ENUM      { return self.enum_decl() }
+        if k == tok.TRAIT     { return self.trait_decl() }
+        if k == tok.IMPL      { return self.impl_decl() }
+        if k == tok.EXCEPTION { return self.exception_decl() }
+        if k == tok.TYPE      { return self.type_decl() }
+        self.error("expected declaration, found {self.show()}")
+        self.next()
+        return 0
+    }
+
+    func generics(mut self) int {
+        var gs = []
+        if not self.at(tok.LBRACKET) { return self.T.List(gs) }
+        self.next()
+        while not self.at(tok.RBRACKET) and not self.at(tok.EOF) {
+            let n = self.expect(tok.IDENT)
+            var bound = ""
+            if self.accept(tok.COLON) {
+                bound = self.expect(tok.IDENT).Lit
+            }
+            gs.append(self.add(ast.GENERIC, n, 0, 0, n.Lit || "|" || bound, []))
+            if not self.accept(tok.COMMA) { break }
+        }
+        self.expect(tok.RBRACKET)
+        return self.T.List(gs)
+    }
+
+    // FLAG bits on a FUNC node's Ival2.
+    // 1 = has self, 2 = self is mut, 4 = self is own, 8 = nothrow
+    func func_decl(mut self) int {
+        let t = self.expect(tok.FUNC)
+        let name = self.expect(tok.IDENT)
+        let gens = self.generics()
+        var flags = 0
+        let params = self.params()
+        flags = flags | self.selfFlags
+        self.selfFlags = 0
+
+        var results = []
+        if not self.at(tok.LBRACE) and not self.at(tok.SEMI) and
+           not self.at(tok.THROWS) and not self.at(tok.NOTHROW) and
+           not self.at(tok.ASSIGN) and not self.at(tok.EOF) {
+            if self.at(tok.LPAREN) {
+                self.next()
+                while not self.at(tok.RPAREN) and not self.at(tok.EOF) {
+                    results.append(self.type_expr())
+                    if not self.accept(tok.COMMA) { break }
+                }
+                self.expect(tok.RPAREN)
+            } else {
+                results.append(self.type_expr())
+            }
+        }
+        var thr = []
+        if self.accept(tok.THROWS) {
+            while true {
+                thr.append(self.type_expr())
+                if not self.accept(tok.COMMA) { break }
+            }
+        } else if self.accept(tok.NOTHROW) {
+            flags = flags | 8
+        }
+        var body = 0
+        var dflt = 0
+        if self.at(tok.LBRACE) {
+            body = self.block()
+        } else if self.accept(tok.ASSIGN) {
+            dflt = self.expr()          // a trait default impl, e.g. `= nil`
+        }
+        let lr = self.T.List(results)
+        let lt = self.T.List(thr)
+        return self.add(ast.FUNC, t, 0, flags, name.Lit,
+                        [body, params, lr, gens, lt, dflt])
+    }
+
+    // params returns a LIST of PARAM; self's flags land in self.selfFlags.
+    func params(mut self) int {
+        self.expect(tok.LPAREN)
+        self.lev += 1
+        var ps = []
+        var untyped = []
+        while not self.at(tok.RPAREN) and not self.at(tok.EOF) {
+            var mode = ast.MODE_BORROW
+            if self.accept(tok.OWN) {
+                mode = ast.MODE_OWN
+            } else if self.accept(tok.MUT) {
+                mode = ast.MODE_MUT
+            }
+            if self.at(tok.SELF) {
+                self.next()
+                var f = 1
+                if mode == ast.MODE_MUT { f = f | 2 }
+                if mode == ast.MODE_OWN { f = f | 4 }
+                self.selfFlags = self.selfFlags | f
+                if not self.accept(tok.COMMA) { break }
+                continue
+            }
+            if self.at(tok.ELLIPSIS) {
+                let e = self.next()
+                ps.append(self.add(ast.PARAM, e, 0, 16, "args", [0]))
+                break
+            }
+            let nt = self.expect(tok.IDENT)
+            // The spec also writes the mode AFTER the name: `buf mut []byte`.
+            if self.accept(tok.MUT) {
+                mode = ast.MODE_MUT
+            } else if self.accept(tok.OWN) {
+                mode = ast.MODE_OWN
+            }
+            var ty = 0
+            var dflt = 0
+            var variadic = 0
+            if self.accept(tok.ELLIPSIS) {
+                variadic = 16
+                ty = self.type_expr()
+            } else if self.at(tok.COMMA) or self.at(tok.RPAREN) {
+                untyped.append(len(ps))       // type comes from a later member
+            } else if self.at(tok.ASSIGN) {
+                self.next()
+                dflt = self.expr()
+                untyped.append(len(ps))
+            } else {
+                ty = self.type_expr()
+                if self.accept(tok.ASSIGN) { dflt = self.expr() }
+            }
+            ps.append(self.add(ast.PARAM, nt, ty, mode | variadic, nt.Lit, [dflt]))
+            if not self.accept(tok.COMMA) { break }
+        }
+        self.lev -= 1
+        self.expect(tok.RPAREN)
+
+        // `a, b int` gives both the type of the last member of the group.
+        var lastType = 0
+        var k = len(ps) - 1
+        while k >= 0 {
+            let id = ps[k]
+            if self.T.Get(id).Ival != 0 {
+                lastType = self.T.Get(id).Ival
+            } else {
+                self.T.Nodes[id].Ival = lastType
+            }
+            k -= 1
+        }
+        return self.T.List(ps)
+    }
+
+    func field_list(mut self, term int) []int {
+        var fs = []
+        while not self.at(term) and not self.at(tok.EOF) {
+            self.skip_semis()
+            if self.at(term) { break }
+            let n = self.expect(tok.IDENT)
+            let ty = self.type_expr()
+            var dflt = 0
+            if self.accept(tok.ASSIGN) { dflt = self.expr() }
+            fs.append(self.add(ast.FIELDDECL, n, ty, 0, n.Lit, [dflt]))
+            // Separators: a newline, a `;`, or a `,` — the spec uses all three.
+            if not self.accept(tok.COMMA) {
+                if not self.at(term) { self.expect_semi() }
+            }
+            self.skip_semis()
+        }
+        return fs
+    }
+
+    func struct_decl(mut self) int {
+        let t = self.expect(tok.STRUCT)
+        let n = self.expect(tok.IDENT)
+        let gens = self.generics()
+        self.expect(tok.LBRACE)
+        let fs = self.field_list(tok.RBRACE)
+        self.expect(tok.RBRACE)
+        return self.add(ast.STRUCTDEC, t, 0, 0, n.Lit,
+                        [self.T.List(fs), gens])
+    }
+
+    func enum_decl(mut self) int {
+        let t = self.expect(tok.ENUM)
+        let n = self.expect(tok.IDENT)
+        let gens = self.generics()
+        self.expect(tok.LBRACE)
+        var vs = []
+        while true {
+            self.skip_semis()
+            if self.at(tok.RBRACE) or self.at(tok.EOF) { break }
+            let vn = self.expect(tok.IDENT)
+            var fs = []
+            if self.accept(tok.LPAREN) {
+                self.lev += 1
+                var idx = 0
+                while not self.at(tok.RPAREN) and not self.at(tok.EOF) {
+                    // `radius float` (named) or a bare type.
+                    if self.at(tok.IDENT) and (self.peek(1).Kind == tok.IDENT or
+                                               type_start(self.peek(1).Kind)) {
+                        let fn2 = self.next()
+                        let ty = self.type_expr()
+                        fs.append(self.add(ast.FIELDDECL, fn2, ty, 0, fn2.Lit, [0]))
+                    } else {
+                        let here = self.cur()
+                        let ty = self.type_expr()
+                        fs.append(self.add(ast.FIELDDECL, here, ty, 0,
+                                           "_" || str(idx), [0]))
+                    }
+                    idx += 1
+                    if not self.accept(tok.COMMA) { break }
+                }
+                self.lev -= 1
+                self.expect(tok.RPAREN)
+            }
+            vs.append(self.add(ast.VARIANTDEC, vn, 0, 0, vn.Lit,
+                               [self.T.List(fs)]))
+            if not self.accept(tok.COMMA) {
+                if not self.at(tok.RBRACE) { self.expect_semi() }
+            }
+        }
+        self.expect(tok.RBRACE)
+        return self.add(ast.ENUMDEC, t, 0, 0, n.Lit, [self.T.List(vs), gens])
+    }
+
+    func trait_decl(mut self) int {
+        let t = self.expect(tok.TRAIT)
+        let n = self.expect(tok.IDENT)
+        self.expect(tok.LBRACE)
+        var ms = []
+        while true {
+            self.skip_semis()
+            if self.at(tok.RBRACE) or self.at(tok.EOF) { break }
+            ms.append(self.func_decl())
+            self.skip_semis()
+        }
+        self.expect(tok.RBRACE)
+        return self.add(ast.TRAITDEC, t, 0, 0, n.Lit, [self.T.List(ms)])
+    }
+
+    func impl_decl(mut self) int {
+        let t = self.expect(tok.IMPL)
+        let gens = self.generics()
+        let first = self.type_expr()
+        var trait_name = ""
+        var ty = first
+        if self.accept(tok.FOR) {
+            let fn2 = self.T.Get(first)
+            if fn2.Kind != ast.TNAMED {
+                self.error("trait name expected before `for`")
+            }
+            // A trait name has no qualified form (§11.5): `impl pkg.Show for T`
+            // names the trait `Show`, exactly as the Go parser records it.
+            trait_name = bare_name(fn2.Sval)
+            ty = self.type_expr()
+        }
+        self.expect(tok.LBRACE)
+        var ms = []
+        while true {
+            self.skip_semis()
+            if self.at(tok.RBRACE) or self.at(tok.EOF) { break }
+            ms.append(self.func_decl())
+            self.skip_semis()
+        }
+        self.expect(tok.RBRACE)
+        return self.add(ast.IMPLDEC, t, ty, 0, trait_name,
+                        [self.T.List(ms), gens])
+    }
+
+    func exception_decl(mut self) int {
+        let t = self.expect(tok.EXCEPTION)
+        let n = self.expect(tok.IDENT)
+        self.expect(tok.LBRACE)
+        var fs = []
+        var ms = []
+        while true {
+            self.skip_semis()
+            if self.at(tok.RBRACE) or self.at(tok.EOF) { break }
+            if self.at(tok.FUNC) {
+                ms.append(self.func_decl())
+            } else {
+                let fn2 = self.expect(tok.IDENT)
+                let ty = self.type_expr()
+                var dflt = 0
+                if self.accept(tok.ASSIGN) { dflt = self.expr() }
+                fs.append(self.add(ast.FIELDDECL, fn2, ty, 0, fn2.Lit, [dflt]))
+                self.accept(tok.COMMA)
+            }
+            self.skip_semis()
+        }
+        self.expect(tok.RBRACE)
+        return self.add(ast.EXCDEC, t, 0, 0, n.Lit,
+                        [self.T.List(fs), self.T.List(ms)])
+    }
+
+    func type_decl(mut self) int {
+        let t = self.expect(tok.TYPE)
+        let n = self.expect(tok.IDENT)
+        var target = 0
+        var strct = 0
+        var alias = 0
+        if self.accept(tok.ASSIGN) {
+            alias = 1
+            target = self.type_expr()
+        } else if self.at(tok.STRUCT) {
+            self.next()
+            self.expect(tok.LBRACE)
+            let fs = self.field_list(tok.RBRACE)
+            self.expect(tok.RBRACE)
+            strct = self.add(ast.STRUCTDEC, n, 0, 0, n.Lit,
+                             [self.T.List(fs), self.T.List([])])
+        } else {
+            target = self.type_expr()
+        }
+        self.expect_semi()
+        return self.add(ast.TYPEDEC, t, target, alias, n.Lit, [strct])
+    }
+
+    // ------------------------------------------------------------ types
+
+    func type_expr(mut self) int {
+        var t = self.type_inner()
+        while self.at(tok.BANG) {
+            let b = self.next()
+            t = self.add(ast.TRESULT, b, 0, 0, "", [t])
+        }
+        return t
+    }
+
+    func type_inner(mut self) int {
+        let t = self.cur()
+        let k = t.Kind
+        if k == tok.QUESTION {
+            self.next()
+            return self.add(ast.TOPTION, t, 0, 0, "", [self.type_expr()])
+        }
+        if k == tok.AMP {
+            self.next()
+            return self.add(ast.TBORROW, t, 0, 0, "", [self.type_expr()])
+        }
+        if k == tok.LBRACKET {
+            self.next()
+            if self.accept(tok.RBRACKET) {
+                return self.add(ast.TSLICE, t, 0, 0, "", [self.type_expr(), 0])
+            }
+            self.lev += 1
+            let n = self.expr()
+            self.lev -= 1
+            self.expect(tok.RBRACKET)
+            return self.add(ast.TSLICE, t, 0, 0, "", [self.type_expr(), n])
+        }
+        if k == tok.CHAN {
+            self.next()
+            self.expect(tok.LBRACKET)
+            let e = self.type_expr()
+            self.expect(tok.RBRACKET)
+            return self.add(ast.TCHAN, t, 0, 0, "", [e])
+        }
+        if k == tok.SHARED or k == tok.WEAK {
+            self.next()
+            self.expect(tok.LBRACKET)
+            let e = self.type_expr()
+            self.expect(tok.RBRACKET)
+            var bk = 0
+            if k == tok.WEAK { bk = 2 }
+            return self.add(ast.TBOX, t, 0, bk, "", [e])
+        }
+        if k == tok.LPAREN {
+            self.next()
+            var es = []
+            while not self.at(tok.RPAREN) and not self.at(tok.EOF) {
+                es.append(self.type_expr())
+                if not self.accept(tok.COMMA) { break }
+            }
+            self.expect(tok.RPAREN)
+            return self.add(ast.TTUPLE, t, 0, 0, "", es)
+        }
+        if k == tok.FUNC {
+            // `fn` is not a keyword, so a function TYPE should never begin with
+            // `func` — but the Go parser accepts it, so this one must too.
+            self.next()
+            return self.fn_type(t)
+        }
+        if k == tok.IDENT {
+            let name = self.next().Lit
+            if name == "map" {
+                self.expect(tok.LBRACKET)
+                let kk = self.type_expr()
+                self.expect(tok.RBRACKET)
+                let vv = self.type_expr()
+                return self.add(ast.TMAP, t, 0, 0, "", [kk, vv])
+            }
+            if name == "set" {
+                self.expect(tok.LBRACKET)
+                let e = self.type_expr()
+                self.expect(tok.RBRACKET)
+                return self.add(ast.TSET, t, 0, 0, "", [e])
+            }
+            if name == "cell" and self.at(tok.LBRACKET) {
+                self.next()
+                let e = self.type_expr()
+                self.expect(tok.RBRACKET)
+                return self.add(ast.TBOX, t, 0, 1, "", [e])
+            }
+            if name == "fn" {
+                return self.fn_type(t)
+            }
+            var full = name
+            if self.accept(tok.DOT) {
+                full = full || "." || self.expect(tok.IDENT).Lit
+            }
+            var args = []
+            if self.at(tok.LBRACKET) {
+                self.next()
+                while not self.at(tok.RBRACKET) and not self.at(tok.EOF) {
+                    args.append(self.type_expr())
+                    if not self.accept(tok.COMMA) { break }
+                }
+                self.expect(tok.RBRACKET)
+            }
+            return self.add(ast.TNAMED, t, 0, 0, full, args)
+        }
+        self.error("expected type, found {self.show()}")
+        self.next()
+        return self.add(ast.TNAMED, t, 0, 0, "unit", [])
+    }
+
+    func fn_type(mut self, t tok.Token) int {
+        self.expect(tok.LPAREN)
+        var ps = []
+        while not self.at(tok.RPAREN) and not self.at(tok.EOF) {
+            ps.append(self.type_expr())
+            if not self.accept(tok.COMMA) { break }
+        }
+        self.expect(tok.RPAREN)
+        var res = 0
+        if not self.at(tok.LBRACE) and not self.at(tok.RPAREN) and
+           not self.at(tok.RBRACKET) and not self.at(tok.COMMA) and
+           not self.at(tok.SEMI) and not self.at(tok.RBRACE) and
+           not self.at(tok.EOF) and not self.at(tok.ASSIGN) {
+            res = self.type_expr()
+        }
+        return self.add(ast.TFN, t, res, 0, "", [self.T.List(ps)])
+    }
+}
+
+// bare_name drops a package qualifier: "fmt.Show" → "Show".
+func bare_name(s str) str {
+    var i = len(s) - 1
+    while i >= 0 {
+        if s[i] == '.' { return s[i + 1..len(s)] }
+        i -= 1
+    }
+    return s
+}
+
+func type_start(k int) bool {
+    return k == tok.LBRACKET or k == tok.QUESTION or k == tok.CHAN or
+           k == tok.SHARED or k == tok.WEAK or k == tok.LPAREN or k == tok.AMP
+}

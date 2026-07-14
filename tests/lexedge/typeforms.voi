@@ -1,0 +1,6 @@
+// `func` in type position, and the trait name of a qualified impl.
+struct P { v int }
+trait Show { func show(self) str }
+impl Show for P { func show(self) str { return "P" } }
+func apply(cb func(int) int, n int) int { return cb(n) }
+say apply(fn(x int) int { return x + 1 }, 41)

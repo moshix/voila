@@ -1,0 +1,16 @@
+config: Config{region: "eu", threshold: 50}
+id         customer       amount
+A-100      rossi          220.50
+A-101      verdi           99.99
+A-104      russo          640.10
+REVENUE                   960.59
+
+{"region":"eu","orders":4,"accepted":3,"revenue":960.59,"top":"A-104"}
+
+{
+  "region": "eu",
+  "orders": 4,
+  "accepted": 3,
+  "revenue": 960.59,
+  "top": "A-104"
+}

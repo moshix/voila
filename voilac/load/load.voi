@@ -1,0 +1,460 @@
+// Package load resolves a program's user packages and flattens them into a
+// single AST.
+//
+// One directory is one package (§11.2). A `use "pkg/sub"` that resolves to a
+// directory under the module root is a USER package; anything else is a std
+// package and is left to the runtime.
+//
+// Flattening: a declaration `Parse` in package `parser` becomes the global name
+// `parser.Parse`, and every reference to it — qualified from outside, bare from
+// inside — is rewritten to that name. The lexer can never produce an identifier
+// containing a dot, so these names cannot collide with anything the user wrote,
+// and the checker, the lowerer and the C backend need no knowledge of packages
+// at all.
+package load
+
+use "voilac/ast"
+use "voilac/par"
+use "std/os"
+use "std/str"
+use "voilac/path"
+
+const KIND_STD  = 0   // a std package: left to the runtime
+const KIND_USER = 1   // a directory under the module root
+const KIND_BAD  = 2   // neither — a typo, or an escape attempt
+
+struct Pkg {
+    name    str          // the qualifier: the directory's base name
+    dir     str          // the resolved directory — the package's identity
+    trees   []ast.Tree   // one per file, in sorted file-name order
+    roots   []int        // each tree's FILE node
+    sources []str        // each file's display name
+    paths   []str        // each file's openable path
+    imports map[str]int  // qualifier (honouring `as`) → index into Loader.pkgs
+    decls   set[str]
+}
+
+// Program is a loaded, flattened program.
+struct Program {
+    T       ast.Tree
+    File    int
+    Entry   str        // the entry file's display name
+    Src     str        // the entry file's text, for the listing's source echo
+    Sources []str      // every file that took part, as displayed
+    Paths   []str      // the same files, as they can actually be RE-OPENED
+    Errs    []str
+}
+
+struct Loader {
+    root      str
+    mod       str            // the module name from voila.mod, read once
+    pkgs      []Pkg
+    byDir     map[str]int
+    qualifier map[str]str    // base name → the directory that claimed it
+    order     []int          // dependency-first
+    stack     []str          // directories, for cycle detection
+    Errs      []str
+    Sources   []str
+    Paths     []str
+
+    at        str            // the file a diagnostic is currently about
+
+    // Rewriter state (see rewrite.voi): the package being qualified, its file,
+    // the entry file's imports, and the local scopes.
+    rwSelf      int
+    rwFile      str
+    mainImports map[str]int
+    rwScopes    []set[str]
+}
+
+// Load parses the entry file, pulls in every user package it reaches and
+// returns one flattened AST.
+func Load(entry str) Program {
+    var abs = entry
+    try {
+        abs = path.Abs(entry)
+    } catch {
+        abs = entry
+    }
+    let root = module_root(path.Dir(abs))
+    var l = Loader{
+        root: root, mod: module_name(root), pkgs: [], byDir: make(map[str]int),
+        qualifier: make(map[str]str), order: [], stack: [], Errs: [],
+        Sources: [], Paths: [], at: entry, rwSelf: 0 - 1, rwFile: "",
+        mainImports: make(map[str]int), rwScopes: [],
+    }
+
+    var prog = Program{T: ast.NewTree(), File: 0, Entry: entry, Src: "",
+                       Sources: [], Paths: [], Errs: []}
+    match os.read(entry) {
+        Ok(t)  => prog.Src = t
+        Err(e) => {
+            prog.Errs.append("cannot read {entry}: {e.message()}")
+            return prog
+        }
+    }
+
+    var p = par.New(entry, prog.Src)
+    let mainRoot = p.File()
+    l.Sources.append(entry)
+    l.Paths.append(entry)
+    each e in p.Errs { l.Errs.append(e) }
+    if len(l.Errs) > 0 {
+        prog.Errs = l.Errs
+        return prog
+    }
+
+    // Pull in every user package the entry file reaches, and build main's
+    // qualifier map (honouring `as` aliases).
+    let mainImports = l.imports_of(p.T, mainRoot)
+    each q in keys(mainImports) {
+        l.mainImports[q] = mainImports[q]
+    }
+    if len(l.Errs) > 0 {
+        prog.Errs = l.Errs
+        return prog
+    }
+    l.check_global_names()
+
+    var mt = ast.NewTree()
+    var decls = []
+    each pi in l.order {
+        var fi = 0
+        while fi < len(l.pkgs[pi].trees) {
+            l.rwSelf = pi
+            l.rwFile = l.pkgs[pi].sources[fi]
+            l.rwScopes = []
+            l.rw_file(l.pkgs[pi].trees[fi], l.pkgs[pi].roots[fi])
+
+            let grafted = mt.Graft(l.pkgs[pi].trees[fi],
+                                   l.pkgs[pi].roots[fi])
+            each d in mt.Get(mt.Kid(grafted, 1)).Kids {
+                decls.append(d)
+            }
+            let scriptList = mt.Kid(grafted, 2)
+            if mt.NKids(scriptList) > 0 {
+                let s0 = mt.Get(mt.Kid(scriptList, 0))
+                l.Errs.append("{l.pkgs[pi].sources[fi]}:{s0.Line}:{s0.Col}: " ||
+                              "a package file may not contain loose " ||
+                              "statements; put them in a function")
+            }
+            fi += 1
+        }
+        each s in l.pkgs[pi].sources { l.Sources.append(s) }
+        each s in l.pkgs[pi].paths { l.Paths.append(s) }
+    }
+
+    // main is rewritten with no self package: its own names stay bare.
+    l.rwSelf = 0 - 1
+    l.rwFile = entry
+    l.rwScopes = []
+    l.rw_file(p.T, mainRoot)
+
+    let mroot = mt.Graft(p.T, mainRoot)
+    each d in mt.Get(mt.Kid(mroot, 1)).Kids {
+        decls.append(d)
+    }
+    let script = mt.Get(mt.Kid(mroot, 2)).Kids
+
+    // Only the std imports survive: the user packages are gone after
+    // flattening.
+    var uses = []
+    each u in mt.Get(mt.Kid(mroot, 0)).Kids {
+        let un = mt.Get(u)
+        let ipath = str.split(un.Sval, "|")[0]
+        let dir, k = l.resolve(ipath)
+        if k == KIND_STD { uses.append(u) }
+    }
+
+    let mn = mt.Get(mroot)
+    let lu = mt.List(uses)
+    let ld = mt.List(decls)
+    let ls = mt.List(script)
+    // The tree moves into the Program last: every use of `mt` must precede it.
+    prog.File = mt.Add(ast.FILE, mn.Line, mn.Col, 0, 0, mn.Sval, [lu, ld, ls])
+    prog.T = mt
+    prog.Sources = l.Sources
+    prog.Paths = l.Paths
+    prog.Errs = l.Errs
+    return prog
+}
+
+impl Loader {
+    // imports_of loads every user package a file uses and returns its qualifier
+    // map.
+    func imports_of(mut self, t ast.Tree, file int) map[str]int {
+        var imports = make(map[str]int)
+        let saved = self.at
+        each u in t.Get(t.Kid(file, 0)).Kids {
+            let un = t.Get(u)
+            let parts = str.split(un.Sval, "|")
+            let ipath = parts[0]
+            var alias = ""
+            if len(parts) > 1 { alias = parts[1] }
+
+            let dir, k = self.resolve(ipath)
+            if k == KIND_STD { continue }
+            if k == KIND_BAD {
+                self.err(un.Line, un.Col,
+                         "no package `{ipath}`: it is not a std package and no " ||
+                         "such directory exists under the module root " ||
+                         "({self.root})")
+                continue
+            }
+            if un.Ival2 != 0 {
+                self.err(un.Line, un.Col,
+                         "selective and wildcard imports are not supported for " ||
+                         "user packages; write `{path.Base(ipath)}.Name`")
+                continue
+            }
+            let pi = self.load_pkg(path.Base(ipath), dir, un.Line, un.Col)
+            self.at = saved              // load_pkg walked into other files
+            if pi < 0 { continue }
+            var q = alias
+            if q == "" { q = self.pkgs[pi].name }
+            imports[q] = pi
+        }
+        return imports
+    }
+
+    // err anchors a diagnostic to the file being processed. `self.root` is a
+    // DIRECTORY — a position inside one is meaningless, and no editor can jump
+    // to it — so the current file is threaded through `at`.
+    func err(mut self, line int, col int, msg str) {
+        var at = self.at
+        if at == "" { at = self.root }
+        self.Errs.append("{at}:{line}:{col}: {msg}")
+    }
+
+    // check_global_names rejects the collisions flattening cannot express: enum
+    // VARIANT names and TRAIT names stay global (patterns and trait bounds have
+    // no qualified form), so two packages may not both define one.
+    func check_global_names(mut self) {
+        var seenPkg = make(map[str]str)
+        var seenWhat = make(map[str]str)
+        each pi in self.order {
+            let pk = self.pkgs[pi]
+            each fi, t in pk.trees {
+                self.at = pk.sources[fi]
+                each d in t.Get(t.Kid(pk.roots[fi], 1)).Kids {
+                    let dn = t.Get(d)
+                    if dn.Kind == ast.ENUMDEC {
+                        each v in t.Get(t.Kid(d, 0)).Kids {
+                            let vn = t.Get(v)
+                            self.claim(seenPkg, seenWhat, vn.Sval, "variant",
+                                       pk.name, vn.Line, vn.Col)
+                        }
+                    } else if dn.Kind == ast.TRAITDEC {
+                        self.claim(seenPkg, seenWhat, dn.Sval, "trait",
+                                   pk.name, dn.Line, dn.Col)
+                    }
+                }
+            }
+        }
+    }
+
+    func claim(mut self, seenPkg mut map[str]str, seenWhat mut map[str]str,
+               name str, what str, pkg str, line int, col int) {
+        if name in seenPkg and seenPkg[name] != pkg {
+            self.err(line, col,
+                     "{what} `{name}` is declared in both `{seenPkg[name]}` " ||
+                     "and `{pkg}`; {what}s are global across a program because " ||
+                     "patterns and trait bounds have no qualified form")
+            return
+        }
+        seenPkg[name] = pkg
+        seenWhat[name] = what
+    }
+
+    // resolve classifies an import path. An unresolvable path is an ERROR: it
+    // must never be waved through as "probably std", which would let a broken
+    // program pass `check` and fail at run time.
+    func resolve(self, p str) (str, int) {
+        if str.starts_with(p, "std/") { return "", KIND_STD }
+        if not str.contains(p, "/") and is_std(p) { return "", KIND_STD }
+        if path.IsAbs(p) or str.contains(p, "\\") { return "", KIND_BAD }
+
+        var clean = p
+        if str.starts_with(clean, "./") { clean = clean[2..len(clean)] }
+        if self.mod != "" {
+            if clean == self.mod {
+                clean = ""
+            } else if str.starts_with(clean, self.mod || "/") {
+                clean = clean[len(self.mod) + 1..len(clean)]
+            }
+        }
+        let dir = path.Clean(path.Join(self.root, clean))
+
+        // The package must live UNDER the module root: `use "../../etc"` is not
+        // a package reference, it is an escape.
+        if not path.HasPrefixDir(self.root, dir) { return "", KIND_BAD }
+        if not os.isdir(dir) { return "", KIND_BAD }
+        return dir, KIND_USER
+    }
+
+    // load_pkg parses every .voi file in a package directory, recursing into its
+    // own imports first so that the merge order is dependency-first. It returns
+    // an index into self.pkgs, or -1 on failure.
+    func load_pkg(mut self, name str, dir str, line int, col int) int {
+        // The cycle check must come FIRST: a package already on the stack is
+        // also already in byDir (it is registered before recursing), so an
+        // "already loaded" early return would swallow the cycle.
+        each on in self.stack {
+            if on == dir {
+                var chain = []
+                each d in self.stack { chain.append(path.Base(d)) }
+                chain.append(path.Base(dir))
+                self.err(line, col,
+                         "package `{name}` imports itself (through " ||
+                         str.join(chain, " -> ") || ")")
+                return 0 - 1
+            }
+        }
+        if dir in self.byDir { return self.byDir[dir] }
+
+        // Two different directories may not claim the same qualifier: `a/util`
+        // and `b/util` would both flatten to `util.`, and one would silently
+        // win.
+        if name in self.qualifier and self.qualifier[name] != dir {
+            self.err(line, col,
+                     "two packages are both named `{name}` " ||
+                     "({self.qualifier[name]} and {dir}); a package's flat name " ||
+                     "must be unique in a program")
+            return 0 - 1
+        }
+        self.qualifier[name] = dir
+
+        self.stack.append(dir)
+
+        var entries = []
+        match os.listdir(dir) {
+            Ok(es) => entries = es
+            Err(e) => {
+                self.err(line, col, "cannot read package `{name}`")
+                self.stack = self.stack[0..len(self.stack) - 1]
+                return 0 - 1
+            }
+        }
+        var names = []
+        each e in entries {
+            if not str.ends_with(e, ".voi") { continue }
+            if str.ends_with(e, "_test.voi") { continue }
+            // A DIRECTORY named `x.voi` is not a source file. Reading one
+            // succeeds natively (yielding "") and fails under a stricter
+            // engine — the two would then disagree about the same program.
+            if os.isdir(path.Join(dir, e)) { continue }
+            names.append(e)
+        }
+        if len(names) == 0 {
+            self.err(line, col, "package `{name}` has no .voi files")
+            self.stack = self.stack[0..len(self.stack) - 1]
+            return 0 - 1
+        }
+
+        var pk = Pkg{name: name, dir: dir, trees: [], roots: [], sources: [],
+                     paths: [], imports: make(map[str]int), decls: set([])}
+        // Register BEFORE recursing, so a cycle is caught by the stack check.
+        self.pkgs.append(pk)
+        let pi = len(self.pkgs) - 1
+        self.byDir[dir] = pi
+
+        // Parse every file first, so a package's own declarations are all known
+        // before its imports are resolved.
+        each fn2 in names {
+            let full = path.Join(dir, fn2)
+            var text = ""
+            match os.read(full) {
+                Ok(tx) => text = tx
+                Err(e) => {
+                    self.err(line, col, "cannot read {full}")
+                    continue
+                }
+            }
+            let disp = path.Rel(self.root, full)
+            self.at = disp
+            var p = par.New(disp, text)
+            let root = p.File()
+            each e in p.Errs { self.Errs.append(e) }
+            self.pkgs[pi].trees.append(p.T)
+            self.pkgs[pi].roots.append(root)
+            self.pkgs[pi].sources.append(disp)
+            self.pkgs[pi].paths.append(full)
+            each d in p.T.Get(p.T.Kid(root, 1)).Kids {
+                each dn in decl_names(p.T, d) {
+                    self.pkgs[pi].decls.add(dn)
+                }
+            }
+        }
+
+        // Then its imports, honouring `as` aliases exactly as main's are.
+        var k = 0
+        while k < len(self.pkgs[pi].trees) {
+            let t = self.pkgs[pi].trees[k]
+            let r = self.pkgs[pi].roots[k]
+            let deps = self.imports_of(t, r)
+            each q in keys(deps) {
+                self.pkgs[pi].imports[q] = deps[q]
+            }
+            k += 1
+        }
+        self.order.append(pi)   // dependencies were appended first
+        self.stack = self.stack[0..len(self.stack) - 1]
+        return pi
+    }
+}
+
+// decl_names lists the package-level names a declaration introduces. Enum
+// VARIANTS and TRAIT names stay global (patterns and trait bounds have no
+// qualified syntax), so they are excluded here and checked for uniqueness
+// across the program instead.
+func decl_names(t ast.Tree, d int) []str {
+    let n = t.Get(d)
+    if n.Kind == ast.FUNC or n.Kind == ast.STRUCTDEC or n.Kind == ast.ENUMDEC or
+       n.Kind == ast.EXCDEC or n.Kind == ast.TYPEDEC {
+        return [n.Sval]
+    }
+    if n.Kind == ast.GLOBAL {
+        let s = t.Kid(d, 0)
+        let sn = t.Get(s)
+        if sn.Kind == ast.LET { return str.split(sn.Sval, ",") }
+        if sn.Kind == ast.VAR { return [sn.Sval] }
+    }
+    return []
+}
+
+// module_root walks up to the nearest directory holding voila.mod; failing
+// that, the entry file's own directory is the root.
+func module_root(dir str) str {
+    var d = dir
+    while true {
+        if os.exists(path.Join(d, "voila.mod")) { return d }
+        let parent = path.Dir(d)
+        if parent == d { return dir }
+        d = parent
+    }
+    return dir
+}
+
+// module_name reads voila.mod once; resolve() consults the cached value.
+func module_name(root str) str {
+    var data = ""
+    match os.read(path.Join(root, "voila.mod")) {
+        Ok(d)  => data = d
+        Err(e) => return ""
+    }
+    each line in str.lines(data) {
+        let f = fields(line)
+        if len(f) >= 2 and f[0] == "module" { return f[1] }
+    }
+    return ""
+}
+
+func is_std(name str) bool {
+    let stds = ["fmt", "str", "os", "math", "time", "json", "log", "regex",
+                "http", "conv", "sort", "rand", "uuid", "io", "sync", "chan",
+                "test", "vm", "ffi"]
+    each s in stds {
+        if s == name { return true }
+    }
+    return false
+}

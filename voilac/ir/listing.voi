@@ -1,0 +1,245 @@
+// ir/listing.voi — the HLASM-style assembly listing.
+//
+// Every output line is at most 79 columns, counted in RUNES (the 3270 rule).
+package ir
+
+use "std/str"
+use "std/fmt"
+
+const MAXCOLS = 79
+
+// Column layout (0-based):
+//
+//     0        8        17       26                 48
+//     LOC      label    opcode   operands           * line| source
+const COL_LABEL   = 8
+const COL_OPCODE  = 17
+const COL_OPERAND = 26
+const COL_COMMENT = 48
+
+func rune_len(s str) int { return len(runes(s)) }
+
+func spaces(n int) str {
+    var b = str.Builder{}
+    var i = 0
+    while i < n {
+        b.write(" ")
+        i += 1
+    }
+    return b.done()
+}
+
+func pad(s str, width int) str {
+    if rune_len(s) >= width { return s || " " }
+    return s || spaces(width - rune_len(s))
+}
+
+// fit_comment appends a comment at COL_COMMENT when it fits within MAXCOLS;
+// otherwise the comment is truncated with an ellipsis. Source echo is
+// decoration — operands are never truncated.
+func fit_comment(line0 str, comment0 str) str {
+    var line = line0
+    var comment = comment0
+    if rune_len(line) >= COL_COMMENT {
+        line = line || "  "
+    } else {
+        line = line || spaces(COL_COMMENT - rune_len(line))
+    }
+    let room = MAXCOLS - rune_len(line)
+    if room < 4 { return trim_right(line) }
+    if rune_len(comment) > room {
+        let rs = runes(comment)
+        comment = str.from_runes(rs[0..room - 1]) || "…"
+    }
+    return trim_right(line || comment)
+}
+
+func trim_right(s str) str {
+    var rs = runes(s)
+    var n = len(rs)
+    while n > 0 and rs[n - 1] == ' ' {
+        n -= 1
+    }
+    return str.from_runes(rs[0..n])
+}
+
+// clip_line hard-truncates a pathological line (comments only) at MAXCOLS.
+func clip_line(s str) str {
+    let rs = runes(s)
+    if len(rs) <= MAXCOLS { return s }
+    return str.from_runes(rs[0..MAXCOLS - 1]) || "…"
+}
+
+// write_wrapped emits a line, splitting overlong operand text at commas onto
+// continuation lines: the continued line ends with `+` and the continuation
+// resumes at the operand column.
+func write_wrapped(b mut str.Builder, line0 str, contCol int) {
+    var line = line0
+    while rune_len(line) > MAXCOLS {
+        let rs = runes(line)
+        // Find the last comma or blank that lets the `+` fit.
+        var cut = 0 - 1
+        var i = MAXCOLS - 2
+        while i > contCol {
+            if rs[i] == ',' or rs[i] == ' ' {
+                cut = i + 1
+                break
+            }
+            i -= 1
+        }
+        if cut <= contCol { cut = MAXCOLS - 2 }
+        b.write(str.from_runes(rs[0..cut]) || "+\n")
+        line = spaces(contCol) || trim_left(str.from_runes(rs[cut..len(rs)]))
+    }
+    b.write(line)
+    b.write("\n")
+}
+
+func trim_left(s str) str {
+    let rs = runes(s)
+    var i = 0
+    while i < len(rs) and rs[i] == ' ' {
+        i += 1
+    }
+    return str.from_runes(rs[i..len(rs)])
+}
+
+// escape_const renders string and rune constant text with Go-style escapes,
+// keeping the pool single-line.
+func escape_const(s str) str {
+    var b = str.Builder{}
+    each r in s {
+        if r == '\n' {
+            b.write("\\n")
+        } else if r == '\t' {
+            b.write("\\t")
+        } else if r == '\r' {
+            b.write("\\r")
+        } else if r == '\\' {
+            b.write("\\\\")
+        } else if r == '\'' {
+            b.write("\\'")
+        } else if int(r) == 0 {
+            b.write("\\0")
+        } else {
+            b.write(str(r))
+        }
+    }
+    return b.done()
+}
+
+func dsect_name(name str) str {
+    if len(name) >= COL_LABEL {
+        return str.from_runes(runes(name)[0..COL_LABEL - 1])
+    }
+    return name
+}
+
+func repeat_dash(n int) str {
+    var b = str.Builder{}
+    var i = 0
+    while i < n {
+        b.write("-")
+        i += 1
+    }
+    return b.done()
+}
+
+// Listing renders the module. srcLines echoes source text (empty is fine).
+func Listing(m Module, srcLines []str) str {
+    var b = str.Builder{}
+
+    // ---- header
+    var w = fn(line str) {
+        b.write(clip_line(line))
+        b.write("\n")
+    }
+    w("*" || repeat_dash(MAXCOLS - 1))
+    w("*        VOILA VM ASSEMBLY LISTING")
+    w("*        SOURCE: " || m.Source)
+    w("*")
+    w("*        REGISTER-BASED LINEAR IR (SPEC #12). THIS IS THE FORM")
+    w("*        THE C BACKEND CONSUMES; IT IS NOT EXECUTED DIRECTLY.")
+    w("*        ENTRY ORDER: $INIT, $SCRIPT, MAIN. ^NAME DENOTES AN")
+    w("*        UPVALUE OF THE ENCLOSING FRAME: A CLOSURE CAPTURES THAT")
+    w("*        FRAME BY REFERENCE, NOT ITS VALUES BY COPY.")
+    w("*" || repeat_dash(MAXCOLS - 1))
+
+    // ---- constant pool
+    if len(m.Consts) > 0 {
+        w("*")
+        w("*        CONSTANT POOL")
+        each i, c in m.Consts {
+            let name = "K" || str(i)
+            var text = c.Text
+            if c.Kind == CSTR or c.Kind == CRUNE {
+                text = "'" || escape_const(text) || "'"
+            }
+            let line = pad(name, COL_LABEL) || pad("DC", COL_OPCODE - COL_LABEL) ||
+                       pad(ConstKindName(c.Kind), 6) || " " || text
+            write_wrapped(b, line, COL_OPERAND)
+        }
+    }
+
+    // ---- type commentary (DSECT-flavoured)
+    each t in m.Types {
+        w("*")
+        w("*        " || t.Kind || " " || t.Name)
+        w(pad(dsect_name(t.Name), COL_LABEL) || "DSECT")
+        each l in t.Lines {
+            w(spaces(COL_LABEL) || pad("DS", COL_OPCODE - COL_LABEL) || l)
+        }
+    }
+
+    // ---- functions
+    each fnc in m.Funcs {
+        w("*")
+        var head = pad(fnc.Name, COL_LABEL)
+        if len(fnc.Name) >= COL_LABEL {
+            // A long name gets its own line; CSECT goes on the next.
+            w("*        " || fnc.Name)
+            head = pad("", COL_LABEL)
+        }
+        let csect = head || pad("CSECT", COL_OPCODE - COL_LABEL)
+        let note = "* " || fnc.Sig || "  regs=" || str(fnc.NRegs)
+        w(fit_comment(csect, note))
+
+        var lastSrc = 0
+        var loc = 0
+        each ins in fnc.Instrs {
+            if ins.Op == "*" {
+                w("*        " || str.join(ins.Args, " "))
+                continue
+            }
+            var label = ""
+            if len(ins.Labels) > 0 {
+                label = str.join(ins.Labels, ",")
+            }
+            var line = fmt.sprintf("%06X  ", loc)
+            line = line || pad(label, COL_OPCODE - COL_LABEL)
+            line = line || pad(ins.Op, COL_OPERAND - COL_OPCODE)
+            line = line || str.join(ins.Args, ",")
+
+            // Echo the source when the line number changes. The echo is keyed
+            // to the ENTRY file, so an instruction lowered from an imported
+            // package has no text to show — the line number still prints, and
+            // the echo is empty. (A per-instruction file id would fix this; the
+            // IR does not carry one.)
+            if ins.Src > 0 and ins.Src != lastSrc {
+                var text = ""
+                if ins.Src <= len(srcLines) {
+                    text = str.trim(srcLines[ins.Src - 1])
+                }
+                let echo = "* " || str(ins.Src) || "| " || text
+                line = fit_comment(line, echo)
+                lastSrc = ins.Src
+            }
+            write_wrapped(b, line, COL_OPERAND)
+            loc += 4
+        }
+    }
+
+    w("*")
+    w(spaces(COL_LABEL) || "END")
+    return b.done()
+}

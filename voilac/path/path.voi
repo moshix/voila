@@ -1,0 +1,121 @@
+// Package path — the slice of file-system path handling the compiler needs.
+//
+// Paths are slash-separated. The toolchain runs on POSIX systems; a Windows
+// port would localise the separator here and nowhere else.
+package path
+
+use "std/str"
+use "std/os"
+
+const SEP = "/"
+
+// Base is the last element of a path ("a/b/c.voi" → "c.voi").
+func Base(p str) str {
+    if p == "" { return "" }
+    let parts = str.split(clean_trailing(p), SEP)
+    return parts[len(parts) - 1]
+}
+
+// Dir is everything before the last element ("a/b/c.voi" → "a/b"). A path with
+// no separator has directory "."; the root's directory is itself.
+func Dir(p str) str {
+    let c = clean_trailing(p)
+    var i = len(c) - 1
+    while i >= 0 {
+        if c[i] == '/' {
+            if i == 0 { return SEP }
+            return c[0..i]
+        }
+        i -= 1
+    }
+    return "."
+}
+
+// Join glues two path pieces, collapsing the separators between them.
+func Join(a str, b str) str {
+    if a == "" { return b }
+    if b == "" { return a }
+    return clean_trailing(a) || SEP || trim_leading(b)
+}
+
+// Ext is the extension including the dot ("x.voi" → ".voi"), or "".
+func Ext(p str) str {
+    let b = Base(p)
+    var i = len(b) - 1
+    while i >= 0 {
+        if b[i] == '.' { return b[i..len(b)] }
+        i -= 1
+    }
+    return ""
+}
+
+func IsAbs(p str) bool {
+    return len(p) > 0 and p[0] == '/'
+}
+
+// Abs makes a path absolute against the working directory. It does not
+// canonicalise `..`; the compiler never produces one.
+func Abs(p str) str throws IOError {
+    if IsAbs(p) { return Clean(p) }
+    let cwd = try os.cwd()
+    return Clean(Join(cwd, p))
+}
+
+// Clean removes "." elements and empty elements, and resolves ".." lexically.
+func Clean(p str) str {
+    let abs = IsAbs(p)
+    var out = []
+    each part in str.split(p, SEP) {
+        if part == "" or part == "." { continue }
+        if part == ".." {
+            if len(out) > 0 and out[len(out) - 1] != ".." {
+                out = out[0..len(out) - 1]
+                continue
+            }
+            if abs { continue }     // ".." above "/" is still "/"
+        }
+        out.append(part)
+    }
+    var joined = str.join(out, SEP)
+    if abs { return SEP || joined }
+    if joined == "" { return "." }
+    return joined
+}
+
+// Rel expresses target relative to base, or returns target unchanged when it
+// does not sit under base.
+func Rel(base str, target str) str {
+    let b = Clean(base)
+    let t = Clean(target)
+    if b == t { return "." }
+    let prefix = b || SEP
+    if len(t) > len(prefix) and t[0..len(prefix)] == prefix {
+        return t[len(prefix)..len(t)]
+    }
+    return t
+}
+
+// HasPrefixDir reports whether target lies at or under base.
+func HasPrefixDir(base str, target str) bool {
+    let b = Clean(base)
+    let t = Clean(target)
+    if b == t { return true }
+    let prefix = b || SEP
+    return len(t) > len(prefix) and t[0..len(prefix)] == prefix
+}
+
+func clean_trailing(p str) str {
+    var e = len(p)
+    while e > 1 and p[e - 1] == '/' {
+        e -= 1
+    }
+    return p[0..e]
+}
+
+func trim_leading(p str) str {
+    var i = 0
+    while i < len(p) and p[i] == '/' {
+        i += 1
+    }
+    return p[i..len(p)]
+}

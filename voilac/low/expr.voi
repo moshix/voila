@@ -1,0 +1,1045 @@
+// low/expr.voi — expressions, AST → IR (§12).
+//
+// A faithful port of internal/ir/lower_expr.go. Registers and labels are
+// allocated in exactly the order the Go lowerer allocates them, because the
+// oracle diffs the two assembly listings byte for byte: an extra `new_reg`,
+// or one taken a line too early, renames every register after it.
+package low
+
+use "voilac/ast"
+use "voilac/ir"
+use "voilac/tok"
+use "std/str"
+
+// bin_op maps a binary operator token to its IR opcode; "" = not one.
+func bin_op(k int) str {
+    if k == tok.PLUS     { return "ADD" }
+    if k == tok.MINUS    { return "SUB" }
+    if k == tok.STAR     { return "MUL" }
+    if k == tok.SLASH    { return "DIV" }
+    if k == tok.FLOORDIV { return "IDIV" }
+    if k == tok.PERCENT  { return "MOD" }
+    if k == tok.POWER    { return "POW" }
+    if k == tok.CONCAT   { return "CAT" }
+    if k == tok.SHL      { return "SHL" }
+    if k == tok.SHR      { return "SHR" }
+    if k == tok.AMP      { return "BAND" }
+    if k == tok.PIPE     { return "BOR" }
+    if k == tok.CARET    { return "BXOR" }
+    if k == tok.EQ       { return "CMPEQ" }
+    if k == tok.NE       { return "CMPNE" }
+    if k == tok.LT       { return "CMPLT" }
+    if k == tok.LE       { return "CMPLE" }
+    if k == tok.GT       { return "CMPGT" }
+    if k == tok.GE       { return "CMPGE" }
+    if k == tok.IN       { return "CMPIN" }
+    return ""
+}
+
+// conv_type reports whether a name is callable as a checked conversion (§3.2).
+func conv_type(n str) bool {
+    return n == "int" or n == "i8" or n == "i16" or n == "i32" or
+           n == "i64" or n == "u8" or n == "u16" or n == "u32" or
+           n == "u64" or n == "byte" or n == "float" or n == "f32" or
+           n == "dec" or n == "str" or n == "rune" or n == "bool"
+}
+
+// is_basic_lit reports whether a node kind is a basic literal — the kinds Go's
+// *ast.BasicLit covers. Anything else is not a literal at all.
+func is_basic_lit(k int) bool {
+    return k == ast.INT or k == ast.FLOAT or k == ast.DEC or k == ast.STR or
+           k == ast.RUNE or k == ast.BOOL or k == ast.NILLIT
+}
+
+// parse_int_lit reads an integer literal exactly as Go's
+// strconv.ParseInt(text, 0, 64) does: base 0 takes the radix from the
+// literal's own prefix (0x, 0o, 0b, a leading 0 = octal). ok is false when the
+// text does not fit an int64 — the only way a lexed literal can fail.
+func parse_int_lit(s str) (int, bool) {
+    let n = attempt int(s, 0) else return 0, false
+    return n, true
+}
+
+// parse_float_lit reads a float literal as Go's strconv.ParseFloat(text, 64).
+// Rendering it back with str() is Go's FormatFloat(f, 'g', -1, 64), so the
+// constant pool holds the same text on both sides.
+func parse_float_lit(s str) (float, bool) {
+    let f = attempt float(s) else return 0.0, false
+    return f, true
+}
+
+impl Lowerer {
+    // ------------------------------------------------------------ dispatch
+
+    // lower_expr lowers an expression and returns the operand holding its
+    // value.
+    func lower_expr(mut self, e int) str throws LowerError {
+        if e == 0 {
+            throw LowerError{Msg: "internal: nil expression",
+                             Line: self.curLine, Col: 0}
+        }
+        let n = self.T.Get(e)
+        let k = n.Kind
+
+        if is_basic_lit(k) {
+            return self.lower_lit(e)
+        }
+
+        if k == ast.INTERP {
+            var parts = []
+            // A part is either literal text (a STR node) or an embedded
+            // expression; the literal parts go straight to the constant pool.
+            each p in n.Kids {
+                if self.T.Kind(p) == ast.STR {
+                    parts.append(self.M.Constant(ir.CSTR, self.T.Get(p).Sval))
+                } else {
+                    parts.append(self.lower_expr(p))
+                }
+            }
+            let rd = self.new_reg()
+            self.emit(n.Line, "INTERP",
+                      [rd, "(" || str.join(parts, ",") || ")"])
+            return rd
+        }
+
+        if k == ast.IDENT {
+            return self.lower_ident_value(e)
+        }
+
+        if k == ast.SELF {
+            let op = self.lookup("self")
+            if op == "" {
+                self.fail(e, "`self` used outside a method")
+            }
+            return op
+        }
+
+        if k == ast.UNARY {
+            if n.Ival == tok.ARROW {
+                let rch = self.lower_expr(self.T.Kid(e, 0))
+                let rd = self.new_reg()
+                self.emit(n.Line, "RECV", [rd, rch])
+                return rd
+            }
+            let ra = self.lower_expr(self.T.Kid(e, 0))
+            let rd = self.new_reg()
+            var op = ""
+            if n.Ival == tok.MINUS {
+                op = "NEG"
+            } else if n.Ival == tok.NOT {
+                op = "NOT"
+            } else if n.Ival == tok.TILDE {
+                op = "BNOT"
+            }
+            self.emit(n.Line, op, [rd, ra])
+            return rd
+        }
+
+        if k == ast.BINARY {
+            return self.lower_binary(e)
+        }
+
+        if k == ast.RANGE {
+            let rlo = self.lower_expr(self.T.Kid(e, 0))
+            let rhi = self.lower_expr(self.T.Kid(e, 1))
+            var rby = "1"
+            if self.T.Kid(e, 2) != 0 {
+                rby = self.lower_expr(self.T.Kid(e, 2))
+            }
+            var mode = "excl"
+            if n.Ival2 == 1 { mode = "incl" }
+            let rd = self.new_reg()
+            self.emit(n.Line, "NEWRANGE", [rd, rlo, rhi, rby, mode])
+            return rd
+        }
+
+        if k == ast.CALL      { return self.lower_call(e) }
+        if k == ast.INDEX     { return self.lower_index(e) }
+        if k == ast.FIELD     { return self.lower_field(e) }
+        if k == ast.COMPOSITE { return self.lower_composite(e) }
+
+        if k == ast.SLICELIT {
+            var regs = []
+            each el in n.Kids {
+                regs.append(self.lower_expr(el))
+            }
+            let rd = self.new_reg()
+            self.emit(n.Line, "NEWSLICE",
+                      [rd, "(" || str.join(regs, ",") || ")"])
+            return rd
+        }
+
+        if k == ast.TUPLE {
+            if len(n.Kids) == 0 {
+                let ru = self.new_reg()
+                self.emit(n.Line, "LOADK",
+                          [ru, self.M.Constant(ir.CUNIT, "()")])
+                return ru
+            }
+            var regs = []
+            each el in n.Kids {
+                regs.append(self.lower_expr(el))
+            }
+            let rd = self.new_reg()
+            self.emit(n.Line, "TUPLE",
+                      [rd, "(" || str.join(regs, ",") || ")"])
+            return rd
+        }
+
+        if k == ast.CLOSURE {
+            let cnote = "closure" || self.closure_sig_text(e)
+            let ps = self.T.Get(self.T.Kid(e, 1)).Kids
+            let name = self.lower_closure(ps, self.T.Kid(e, 0), cnote, n.Line)
+            let rd = self.new_reg()
+            let caps = self.T.Get(self.T.Kid(e, 2)).Kids
+            if n.Ival2 == 1 and len(caps) > 0 {
+                var cs = []
+                each c in caps {
+                    cs.append(self.T.Get(c).Sval)
+                }
+                self.emit(n.Line, "MKCLOS",
+                          [rd, name, "own(" || str.join(cs, ",") || ")"])
+            } else {
+                self.emit(n.Line, "MKCLOS", [rd, name])
+                self.note("closure captures enclosing frame by reference")
+            }
+            return rd
+        }
+
+        if k == ast.TRYEXPR {
+            let ra = self.lower_expr(self.T.Kid(e, 0))
+            let rd = self.new_reg()
+            // err/nil propagates as the function's result.
+            self.emit(n.Line, "TRYP", [rd, ra])
+            return rd
+        }
+
+        if k == ast.MUSTEXPR {
+            let ra = self.lower_expr(self.T.Kid(e, 0))
+            let rd = self.new_reg()
+            self.emit(n.Line, "MUST", [rd, ra])
+            return rd
+        }
+
+        if k == ast.ATTEMPT {
+            // exception → error value (§8.5): a one-expression protected
+            // region.
+            let catchL = self.new_label()
+            let endL = self.new_label()
+            let rd = self.new_reg()
+            self.emit(n.Line, "EHPUSH", [catchL])
+            let ra = self.lower_expr(self.T.Kid(e, 0))
+            self.emit(n.Line, "MOVE", [rd, ra])
+            self.emit(0, "EHPOP", [])
+            self.emit(0, "JUMP", [endL])
+            self.mark(catchL)
+            let re = self.new_reg()
+            self.emit(n.Line, "CATCH", [re])
+            self.emit(n.Line, "MOVE", [rd, re])
+            self.mark(endL)
+            return rd
+        }
+
+        if k == ast.ELSEEXPR  { return self.lower_else(e) }
+        if k == ast.SPAWNEXPR { return self.lower_spawn(e) }
+
+        self.fail(e, "cannot lower expression " || ast.KindName(k))
+        return ""
+    }
+
+    // ------------------------------------------------------------ literals
+
+    func lower_lit(mut self, e int) str throws LowerError {
+        let n = self.T.Get(e)
+        let k = n.Kind
+        var kname = ""
+        if k == ast.INT {
+            let v, ok = parse_int_lit(n.Sval)
+            if not ok {
+                self.fail(e, "bad integer literal \"" || n.Sval || "\"")
+            }
+            kname = self.M.Constant(ir.CINT, str(v))
+        } else if k == ast.FLOAT {
+            let f, ok = parse_float_lit(n.Sval)
+            if not ok {
+                self.fail(e, "bad float literal \"" || n.Sval || "\"")
+            }
+            kname = self.M.Constant(ir.CFLOAT, str(f))
+        } else if k == ast.DEC {
+            kname = self.M.Constant(ir.CDEC, n.Sval)
+        } else if k == ast.STR {
+            kname = self.M.Constant(ir.CSTR, n.Sval)
+        } else if k == ast.RUNE {
+            kname = self.M.Constant(ir.CRUNE, n.Sval)
+        } else if k == ast.BOOL {
+            kname = self.M.Constant(ir.CBOOL, n.Sval)
+        } else if k == ast.NILLIT {
+            kname = self.M.Constant(ir.CNIL, "nil")
+        }
+        let rd = self.new_reg()
+        self.emit(n.Line, "LOADK", [rd, kname])
+        return rd
+    }
+
+    // lower_ident_value mirrors the interpreter's evalIdent resolution order
+    // (frozen decision 2): locals, then globals, then variants, then the
+    // callable names, then `ctx`.
+    func lower_ident_value(mut self, e int) str throws LowerError {
+        let n = self.T.Get(e)
+        let name = n.Sval
+
+        let op = self.lookup(name)
+        if op != "" { return op }
+
+        if name in self.globals {
+            let rg = self.new_reg()
+            self.emit(n.Line, "GETGLB", [rg, name])
+            return rg
+        }
+
+        if name in self.variants {
+            let vi = self.variants[name]
+            let rv = self.new_reg()
+            if not vi.payload {
+                self.emit(n.Line, "NEWENUM",
+                          [rv, vi.owner || "." || name, "()"])
+            } else {
+                self.emit(n.Line, "LOADFN", [rv, vi.owner || "." || name])
+            }
+            return rv
+        }
+
+        if name in self.funcs or name in self.prelude or conv_type(name) or
+           name in self.structs or name in self.enums or
+           name in self.exceptions or name in self.aliases or
+           name in self.packages {
+            let rf = self.new_reg()
+            self.emit(n.Line, "LOADFN", [rf, name])
+            return rf
+        }
+
+        if name == "ctx" {
+            let rc = self.new_reg()
+            self.emit(n.Line, "GETCTX", [rc])
+            return rc
+        }
+
+        self.fail(e, "unknown identifier `" || name || "`")
+        return ""
+    }
+
+    // ------------------------------------------------------------ operators
+
+    func lower_binary(mut self, e int) str throws LowerError {
+        let n = self.T.Get(e)
+        let opk = n.Ival
+
+        if opk == tok.AND or opk == tok.OR {
+            // Short-circuit lowering: the short path loads the constant that
+            // the operator already knows the answer to be.
+            let rd = self.new_reg()
+            let shortL = self.new_label()
+            let endL = self.new_label()
+            let ra = self.lower_expr(self.T.Kid(e, 0))
+            if opk == tok.AND {
+                self.emit(n.Line, "JMPF", [ra, shortL])
+            } else {
+                self.emit(n.Line, "JMPT", [ra, shortL])
+            }
+            let rb = self.lower_expr(self.T.Kid(e, 1))
+            self.emit(n.Line, "MOVE", [rd, rb])
+            self.emit(0, "JUMP", [endL])
+            self.mark(shortL)
+            var val = "false"
+            if opk == tok.OR { val = "true" }
+            self.emit(n.Line, "LOADK",
+                      [rd, self.M.Constant(ir.CBOOL, val)])
+            self.mark(endL)
+            return rd
+        }
+
+        if opk == tok.ARROW {
+            // A send in expression position; the statement form is in
+            // lower_stmt. Its value is unit.
+            let rch = self.lower_expr(self.T.Kid(e, 0))
+            let rv = self.lower_expr(self.T.Kid(e, 1))
+            self.emit(n.Line, "SEND", [rch, rv])
+            let rd = self.new_reg()
+            self.emit(n.Line, "LOADK",
+                      [rd, self.M.Constant(ir.CUNIT, "()")])
+            return rd
+        }
+
+        let op = bin_op(opk)
+        if op == "" {
+            self.fail(e, "cannot lower operator " || tok.Spelling(opk))
+        }
+        let ra = self.lower_expr(self.T.Kid(e, 0))
+        let rb = self.lower_expr(self.T.Kid(e, 1))
+        let rd = self.new_reg()
+        self.emit(n.Line, op, [rd, ra, rb])
+        return rd
+    }
+
+    // lower_else implements `expr else alt` (§9.2): failure (err/nil) selects
+    // the alternative. A directly-guarded `try` is unwrapped — the failure is
+    // handled locally, not propagated (mirrors evalMaybe; frozen decision 4).
+    func lower_else(mut self, e int) str throws LowerError {
+        let n = self.T.Get(e)
+        var inner = self.T.Kid(e, 0)
+        if self.T.Kind(inner) == ast.TRYEXPR {
+            inner = self.T.Kid(inner, 0)
+        }
+        let ra = self.lower_expr(inner)
+        let rd = self.new_reg()
+        let rt = self.new_reg()
+        let altL = self.new_label()
+        let endL = self.new_label()
+        self.emit(n.Line, "ISFAIL", [rt, ra])
+        self.emit(n.Line, "JMPT", [rt, altL])
+        self.emit(n.Line, "MOVE", [rd, ra])
+        self.emit(0, "JUMP", [endL])
+        self.mark(altL)
+        if n.Ival2 == 1 {
+            // The alternative diverges: rd is defined on the success path
+            // only.
+            self.lower_stmt(self.T.Kid(e, 1))
+        } else {
+            let rv = self.lower_expr(self.T.Kid(e, 1))
+            self.emit(n.Line, "MOVE", [rd, rv])
+        }
+        self.mark(endL)
+        return rd
+    }
+
+    // ------------------------------------------------------------ calls
+
+    func lower_call(mut self, x int) str throws LowerError {
+        let n = self.T.Get(x)
+        let line = n.Line
+        let fun = self.T.Kid(x, 0)
+        let fk = self.T.Kind(fun)
+        let args0 = self.T.Get(self.T.Kid(x, 1)).Kids
+
+        // The two constructors the parser leaves as plain calls.
+        if fk == ast.IDENT {
+            let nm = self.T.Get(fun).Sval
+            if nm == "chan" {
+                let rd = self.new_reg()
+                if len(args0) > 0 {
+                    let rc = self.lower_expr(self.T.Kid(args0[0], 0))
+                    self.emit(line, "NEWCHAN", [rd, rc])
+                } else {
+                    self.emit(line, "NEWCHAN", [rd])
+                }
+                return rd
+            }
+            if nm == "make" {
+                return self.lower_make(x)
+            }
+        }
+
+        // Method-call path: recv.name(args).
+        if fk == ast.FIELD {
+            let mname = self.T.Get(fun).Sval
+            let base = self.T.Kid(fun, 0)
+            if self.T.Kind(base) == ast.IDENT {
+                let bn = self.T.Get(base).Sval
+                // A name bound in any enclosing scope shadows the package and
+                // type tables, so it is a receiver, not a qualifier.
+                let bound = self.lookup(bn)
+                if bound == "" and bn in self.packages {
+                    let pargs = self.lower_args(x)
+                    let rp = self.new_reg()
+                    self.emit(line, "CALL",
+                              [rp, bn || "." || mname, pargs])
+                    return rp
+                }
+                // An associated function on a type: `Point.origin()` (§10).
+                if bound == "" and (bn in self.structs or bn in self.enums or
+                                    bn in self.exceptions) {
+                    let targs2 = self.lower_args(x)
+                    let rt = self.new_reg()
+                    self.emit(line, "CALL",
+                              [rt, bn || "." || mname, targs2])
+                    return rt
+                }
+            }
+            let robj = self.lower_expr(base)
+            let margs = self.lower_args(x)
+            let rd = self.new_reg()
+            self.emit(line, "CALLM", [rd, robj, mname, margs])
+            return rd
+        }
+
+        // Named callees.
+        if fk == ast.IDENT {
+            let name = self.T.Get(fun).Sval
+
+            let op = self.lookup(name)
+            if op != "" {
+                let cargs = self.lower_args(x)
+                let rc = self.new_reg()
+                self.emit(line, "CALLR", [rc, op, cargs])
+                return rc
+            }
+
+            if conv_type(name) or name in self.aliases {
+                // A checked conversion (§3.2): int(x), int(s, 16), dec("…").
+                if len(args0) == 0 {
+                    self.fail(x, name || "() needs an argument")
+                }
+                let ra = self.lower_expr(self.T.Kid(args0[0], 0))
+                let rd = self.new_reg()
+                if len(args0) > 1 {
+                    let rb = self.lower_expr(self.T.Kid(args0[1], 0))
+                    self.emit(line, "CONV", [rd, name, ra, rb])
+                } else {
+                    self.emit(line, "CONV", [rd, name, ra])
+                }
+                return rd
+            }
+
+            if name in self.variants {
+                let vi = self.variants[name]
+                let vargs = self.lower_args(x)
+                let rv = self.new_reg()
+                self.emit(line, "NEWENUM",
+                          [rv, vi.owner || "." || name, vargs])
+                return rv
+            }
+
+            if name in self.structs or name in self.enums or
+               name in self.exceptions {
+                self.fail(x, "type `" || name ||
+                             "` cannot be called; use a composite literal")
+            }
+
+            if name in self.funcs or name in self.prelude {
+                let fargs = self.lower_args_for(x, name)
+                let rf = self.new_reg()
+                self.emit(line, "CALL", [rf, name, fargs])
+                return rf
+            }
+
+            self.fail(x, "unknown function `" || name || "`")
+            return ""
+        }
+
+        // A generic instantiation called directly: cell[int](0),
+        // json.decode[T](s).
+        if fk == ast.INDEX {
+            let fname, ok = self.generic_func_name(fun)
+            if ok {
+                let gargs = self.lower_args(x)
+                let rg = self.new_reg()
+                self.emit(line, "CALL", [rg, fname, gargs])
+                return rg
+            }
+        }
+
+        // Anything else: evaluate the callee, call indirectly.
+        let rfn = self.lower_expr(fun)
+        let args = self.lower_args(x)
+        let rd = self.new_reg()
+        self.emit(line, "CALLR", [rd, rfn, args])
+        return rd
+    }
+
+    // lower_args renders a call's argument list. Named arguments are resolved
+    // to their PARAMETER POSITION here, while the callee's signature is in
+    // scope — downstream consumers then only ever see positional arguments.
+    func lower_args(mut self, x int) str throws LowerError {
+        return self.lower_args_for(x, "")
+    }
+
+    func lower_args_for(mut self, x int, callee str) str throws LowerError {
+        var regs = []
+        var names = []
+        var spreads = []
+        var hasNamed = false
+        each a in self.T.Get(self.T.Kid(x, 1)).Kids {
+            let an = self.T.Get(a)
+            regs.append(self.lower_expr(self.T.Kid(a, 0)))
+            names.append(an.Sval)
+            spreads.append(an.Ival == 1)
+            if an.Sval != "" { hasNamed = true }
+        }
+
+        if hasNamed {
+            // A named argument to a callee we cannot see (a closure, a
+            // builtin) has no defined position: reject rather than guess.
+            if not (callee in self.funcParams) {
+                self.fail(x,
+                          "named arguments require a statically known callee")
+            }
+            let params = self.funcParams[callee]
+            var slots = []
+            each p in params { slots.append("") }
+            var next = 0
+            each i, r in regs {
+                if spreads[i] {
+                    self.fail(x, "cannot mix a spread with named arguments")
+                }
+                if names[i] == "" {
+                    if next >= len(slots) {
+                        self.fail(x, "too many positional arguments")
+                    }
+                    slots[next] = r
+                    next += 1
+                } else {
+                    var at = -1
+                    each j, p in params {
+                        if p == names[i] { at = j }
+                    }
+                    if at < 0 {
+                        self.fail(x, "no parameter named `" || names[i] || "`")
+                    }
+                    if slots[at] != "" {
+                        self.fail(x, "parameter `" || names[i] ||
+                                     "` supplied twice")
+                    }
+                    slots[at] = r
+                }
+            }
+            // Trim the trailing empties (defaulted params); a HOLE is not
+            // expressible, so a gap before a supplied one is an error.
+            var end = len(slots)
+            while end > 0 and slots[end - 1] == "" {
+                end -= 1
+            }
+            for i in 0..end {
+                if slots[i] == "" {
+                    self.fail(x, "parameter `" || params[i] ||
+                                 "` must be supplied when a later one is")
+                }
+            }
+            return "(" || str.join(slots[0..end], ",") || ")"
+        }
+
+        var parts = []
+        each i, r in regs {
+            if spreads[i] {
+                parts.append(r || "...")
+            } else {
+                parts.append(r)
+            }
+        }
+        return "(" || str.join(parts, ",") || ")"
+    }
+
+    func lower_make(mut self, x int) str throws LowerError {
+        let n = self.T.Get(x)
+        let targs = self.T.Get(self.T.Kid(x, 2)).Kids
+        if len(targs) == 0 {
+            self.fail(x, "make requires a type argument")
+        }
+        let rd = self.new_reg()
+        let line = n.Line
+        let args0 = self.T.Get(self.T.Kid(x, 1)).Kids
+        let ty = targs[0]
+        let tk = self.T.Kind(ty)
+        if tk == ast.TSLICE {
+            if len(args0) > 0 {
+                let rn = self.lower_expr(self.T.Kid(args0[0], 0))
+                // The size form: zero-filled.
+                self.emit(line, "NEWSLICE", [rd, "[" || rn || "]"])
+            } else {
+                self.emit(line, "NEWSLICE", [rd, "()"])
+            }
+        } else if tk == ast.TMAP {
+            self.emit(line, "NEWMAP", [rd])
+        } else if tk == ast.TSET {
+            self.emit(line, "NEWSET", [rd])
+        } else if tk == ast.TCHAN {
+            if len(args0) > 0 {
+                let rc = self.lower_expr(self.T.Kid(args0[0], 0))
+                self.emit(line, "NEWCHAN", [rd, rc])
+            } else {
+                self.emit(line, "NEWCHAN", [rd])
+            }
+        } else {
+            self.fail(x, "cannot make " || self.short_type(ty))
+        }
+        return rd
+    }
+
+    // generic_func_name recognizes an fn[T] instantiation (mirrors evalIndex):
+    // the base resolves to a function-ish name and the index is a type name.
+    func generic_func_name(mut self, ix int) (str, bool) {
+        let idx = self.T.Kid(ix, 1)
+        if self.T.Kind(idx) != ast.IDENT {
+            return "", false
+        }
+        let iname = self.T.Get(idx).Sval
+        if not (conv_type(iname) or iname in self.structs or
+                iname in self.enums or iname in self.aliases) {
+            return "", false
+        }
+
+        let base = self.T.Kid(ix, 0)
+        let bk = self.T.Kind(base)
+        if bk == ast.IDENT {
+            let bn = self.T.Get(base).Sval
+            if self.lookup(bn) != "" {
+                return "", false
+            }
+            if bn in self.funcs or bn in self.prelude {
+                return bn || "[" || iname || "]", true
+            }
+        } else if bk == ast.FIELD {
+            let pkg = self.T.Kid(base, 0)
+            if self.T.Kind(pkg) == ast.IDENT {
+                let pn = self.T.Get(pkg).Sval
+                if self.lookup(pn) == "" and pn in self.packages {
+                    return pn || "." || self.T.Get(base).Sval || "[" ||
+                           iname || "]", true
+                }
+            }
+        }
+        return "", false
+    }
+
+    func lower_index(mut self, x int) str throws LowerError {
+        let n = self.T.Get(x)
+        // A generic instantiation as a VALUE: `cell[int]`, not called here.
+        let fname, ok = self.generic_func_name(x)
+        if ok {
+            let rf = self.new_reg()
+            self.emit(n.Line, "LOADFN", [rf, fname])
+            return rf
+        }
+        let rc = self.lower_expr(self.T.Kid(x, 0))
+        let idx = self.T.Kid(x, 1)
+        if self.T.Kind(idx) == ast.RANGE {
+            let rr = self.lower_expr(idx)
+            let rs = self.new_reg()
+            // A range slice THROWS RangeError…
+            self.emit(n.Line, "SLICE", [rs, rc, rr])
+            return rs
+        }
+        let ri = self.lower_expr(idx)
+        let rd = self.new_reg()
+        // …while a scalar index out of bounds ABORTS.
+        self.emit(n.Line, "INDEX", [rd, rc, ri])
+        return rd
+    }
+
+    func lower_field(mut self, x int) str throws LowerError {
+        let n = self.T.Get(x)
+        let base = self.T.Kid(x, 0)
+        // A package member as a value: fmt.printf passed around.
+        if self.T.Kind(base) == ast.IDENT {
+            let bn = self.T.Get(base).Sval
+            if self.lookup(bn) == "" and bn in self.packages {
+                let rp = self.new_reg()
+                self.emit(n.Line, "LOADFN", [rp, bn || "." || n.Sval])
+                return rp
+            }
+        }
+        let ro = self.lower_expr(base)
+        let rd = self.new_reg()
+        self.emit(n.Line, "FIELD", [rd, ro, n.Sval])
+        return rd
+    }
+
+    func lower_composite(mut self, x int) str throws LowerError {
+        let n = self.T.Get(x)
+        let tn = self.T.Get(n.Ival)      // the TNAMED type node
+        var name = tn.Sval               // already "Pkg.Name" when qualified
+        if len(tn.Kids) > 0 {
+            var targs = []
+            each a in tn.Kids {
+                targs.append(self.short_type(a))
+            }
+            name = name || "[" || str.join(targs, ",") || "]"
+        }
+
+        var fields = []
+        each f in n.Kids {
+            let fn2 = self.T.Get(f)
+            let r = self.lower_expr(self.T.Kid(f, 0))
+            if fn2.Sval != "" {
+                fields.append(fn2.Sval || ":" || r)
+            } else {
+                fields.append(r)
+            }
+        }
+
+        let rd = self.new_reg()
+        // The exception table is keyed by the type's declared name — which, in
+        // a flattened program, is the QUALIFIED one (`low.LowerError`). Keying
+        // it by the bare name silently lowers every package-level exception as
+        // a plain struct, and `throw` then aborts.
+        var op = "NEWSTRUCT"
+        if tn.Sval in self.exceptions { op = "NEWEXC" }
+        self.emit(n.Line, op,
+                  [rd, name, "(" || str.join(fields, ",") || ")"])
+        return rd
+    }
+
+    // lower_spawn: three forms (frozen decision; mirrors evalSpawn).
+    func lower_spawn(mut self, x int) str throws LowerError {
+        let n = self.T.Get(x)
+        let line = n.Line
+        let payload = self.T.Kid(x, 0)
+        let isBlock = n.Ival2 == 1
+
+        // Form 1: spawn f(a, b) with a directly-named callee — the callee and
+        // the arguments evaluate NOW, in the parent task.
+        if not isBlock and self.T.Kind(payload) == ast.CALL {
+            let fun = self.T.Kid(payload, 0)
+            let fk = self.T.Kind(fun)
+            if fk == ast.IDENT {
+                let fname = self.T.Get(fun).Sval
+                if self.lookup(fname) == "" and
+                   (fname in self.funcs or fname in self.prelude) {
+                    let args = self.lower_args(payload)
+                    let rd = self.new_reg()
+                    self.emit(line, "SPAWN", [rd, fname, args])
+                    return rd
+                }
+            }
+            if fk == ast.FIELD {
+                let base = self.T.Kid(fun, 0)
+                if self.T.Kind(base) == ast.IDENT {
+                    let bn = self.T.Get(base).Sval
+                    if self.lookup(bn) == "" and bn in self.packages {
+                        let args = self.lower_args(payload)
+                        let rd = self.new_reg()
+                        self.emit(line, "SPAWN",
+                                  [rd, bn || "." || self.T.Get(fun).Sval,
+                                   args])
+                        return rd
+                    }
+                }
+            }
+        }
+
+        // Forms 2 and 3: a block body, or any other expression — a synthetic
+        // closure run by the task. (Stage-0 listing note: for non-simple calls
+        // the arguments evaluate at task start, inside the closure.)
+        var body = 0
+        if isBlock {
+            body = payload
+        } else {
+            // Wrap the call in `{ call }` so the closure's trailing expression
+            // becomes the task's value, exactly as the Go lowerer's synthetic
+            // Block{ExprStmt{Call}} does.
+            let es = self.T.Add(ast.EXPRSTMT, n.Line, n.Col, 0, 0, "",
+                                [payload])
+            body = self.T.Add(ast.BLOCK, n.Line, n.Col, 0, 0, "", [es])
+            self.note("spawn args evaluate at task start in this form")
+        }
+        let name = self.lower_closure([], body, "spawn body", line)
+        let rc = self.new_reg()
+        self.emit(line, "MKCLOS", [rc, name])
+        let rd = self.new_reg()
+        self.emit(line, "SPAWNR", [rd, rc])
+        return rd
+    }
+
+    // ------------------------------------------------------------ rendering
+
+    // short_type renders a type expression compactly for operands and DSECTs.
+    func short_type(self, te int) str {
+        if te == 0 { return "?" }
+        let n = self.T.Get(te)
+        let k = n.Kind
+
+        if k == ast.TNAMED {
+            var s = n.Sval
+            if len(n.Kids) > 0 {
+                var args = []
+                each a in n.Kids {
+                    args.append(self.short_type(a))
+                }
+                s = s || "[" || str.join(args, ",") || "]"
+            }
+            return s
+        }
+        if k == ast.TOPTION {
+            return "?" || self.short_type(self.T.Kid(te, 0))
+        }
+        if k == ast.TRESULT {
+            return self.short_type(self.T.Kid(te, 0)) || "!"
+        }
+        if k == ast.TSLICE {
+            return "[]" || self.short_type(self.T.Kid(te, 0))
+        }
+        if k == ast.TMAP {
+            return "map[" || self.short_type(self.T.Kid(te, 0)) || "]" ||
+                   self.short_type(self.T.Kid(te, 1))
+        }
+        if k == ast.TSET {
+            return "set[" || self.short_type(self.T.Kid(te, 0)) || "]"
+        }
+        if k == ast.TCHAN {
+            return "chan[" || self.short_type(self.T.Kid(te, 0)) || "]"
+        }
+        if k == ast.TBOX {
+            var kind = "shared"
+            if n.Ival2 == 1 {
+                kind = "cell"
+            } else if n.Ival2 == 2 {
+                kind = "weak"
+            }
+            return kind || "[" || self.short_type(self.T.Kid(te, 0)) || "]"
+        }
+        if k == ast.TFN {
+            return "fn(...)"
+        }
+        if k == ast.TTUPLE {
+            var es = []
+            each el in n.Kids {
+                es.append(self.short_type(el))
+            }
+            return "(" || str.join(es, ",") || ")"
+        }
+        if k == ast.TBORROW {
+            return "&" || self.short_type(self.T.Kid(te, 0))
+        }
+        return "?"
+    }
+
+    // expr_text renders small expressions (literals, negations) as text for
+    // pattern operands and DSECT default commentary.
+    func expr_text(self, e int) str {
+        if e == 0 { return "..." }
+        let n = self.T.Get(e)
+        let k = n.Kind
+        if k == ast.STR  { return "\"" || n.Sval || "\"" }
+        if k == ast.RUNE { return "'" || n.Sval || "'" }
+        if k == ast.DEC  { return n.Sval || "d" }
+        if is_basic_lit(k) { return n.Sval }
+        if k == ast.UNARY {
+            return "-" || self.expr_text(self.T.Kid(e, 0))
+        }
+        if k == ast.IDENT    { return n.Sval }
+        if k == ast.SLICELIT { return "[...]" }
+        if k == ast.CALL {
+            return self.expr_text(self.T.Kid(e, 0)) || "(...)"
+        }
+        if k == ast.FIELD {
+            return self.expr_text(self.T.Kid(e, 0)) || "." || n.Sval
+        }
+        return "..."
+    }
+
+    // func_sig renders a declaration signature for the CSECT header comment.
+    func func_sig(self, d int) str {
+        let n = self.T.Get(d)
+        var ps = []
+        if (n.Ival2 & 1) != 0 {
+            if (n.Ival2 & 2) != 0 {
+                ps.append("mut self")
+            } else if (n.Ival2 & 4) != 0 {
+                ps.append("own self")
+            } else {
+                ps.append("self")
+            }
+        }
+        each p in self.T.Get(self.T.Kid(d, 1)).Kids {
+            let pn = self.T.Get(p)
+            var s = pn.Sval
+            let mode = pn.Ival2 & 3
+            if mode == ast.MODE_MUT {
+                s = "mut " || s
+            } else if mode == ast.MODE_OWN {
+                s = "own " || s
+            }
+            if (pn.Ival2 & 16) != 0 { s = s || " ..." }
+            if pn.Ival != 0 {
+                s = s || " " || self.short_type(pn.Ival)
+            }
+            ps.append(s)
+        }
+        var sig = "func " || n.Sval || "(" || str.join(ps, ", ") || ")"
+
+        let res = self.T.Get(self.T.Kid(d, 2)).Kids
+        if len(res) == 1 {
+            sig = sig || " " || self.short_type(res[0])
+        } else if len(res) > 1 {
+            var rs = []
+            each r in res {
+                rs.append(self.short_type(r))
+            }
+            sig = sig || " (" || str.join(rs, ", ") || ")"
+        }
+        if (n.Ival2 & 8) != 0 { sig = sig || " nothrow" }
+        return sig
+    }
+
+    func closure_sig_text(self, x int) str {
+        var ps = []
+        each p in self.T.Get(self.T.Kid(x, 1)).Kids {
+            ps.append(self.T.Get(p).Sval)
+        }
+        return "(" || str.join(ps, ", ") || ")"
+    }
+
+    // ------------------------------------------------------------ patterns
+
+    // pat_str renders a structured pattern (an arena index) as a PMATCH
+    // operand.
+    func pat_str(self, p int) str {
+        return "'" || self.pat_inner(p) || "'"
+    }
+
+    func pat_inner(self, p int) str {
+        let pt = self.M.Pats[p]
+        if pt.Kind == ir.PAT_WILD { return "_" }
+        if pt.Kind == ir.PAT_NIL  { return "nil" }
+        if pt.Kind == ir.PAT_LIT  { return pt.Text }
+        if pt.Kind == ir.PAT_BIND { return pt.Name }
+        if pt.Kind == ir.PAT_VARIANT {
+            if len(pt.Elems) == 0 { return pt.Name }
+            var subs = []
+            each el in pt.Elems {
+                subs.append(self.pat_inner(el))
+            }
+            return pt.Name || "(" || str.join(subs, ",") || ")"
+        }
+        return "?"
+    }
+
+    // literal_value normalizes a literal pattern's value: the kind, and the
+    // exact text the constant pool should hold (decoded, never re-quoted, and
+    // never re-parsed from the rendered form — `0xd` is not `13` once it has
+    // been printed).
+    func literal_value(self, e int) (int, str) {
+        var lit = e
+        var neg = false
+        let n0 = self.T.Get(e)
+        if n0.Kind == ast.UNARY and n0.Ival == tok.MINUS {
+            neg = true
+            lit = self.T.Kid(e, 0)
+        }
+        let n = self.T.Get(lit)
+        let k = n.Kind
+        if not is_basic_lit(k) { return ir.CNIL, "nil" }
+
+        var sign = ""
+        if neg { sign = "-" }
+
+        if k == ast.INT {
+            let v, ok = parse_int_lit(n.Sval)
+            if not ok { return ir.CINT, "0" }
+            var m = v
+            if neg { m = -m }
+            return ir.CINT, str(m)
+        }
+        if k == ast.FLOAT {
+            let f, ok = parse_float_lit(n.Sval)
+            if not ok { return ir.CFLOAT, "0" }
+            var g = f
+            if neg { g = -g }
+            return ir.CFLOAT, str(g)
+        }
+        if k == ast.DEC  { return ir.CDEC, sign || n.Sval }
+        if k == ast.STR  { return ir.CSTR, n.Sval }
+        if k == ast.RUNE { return ir.CRUNE, n.Sval }
+        if k == ast.BOOL { return ir.CBOOL, n.Sval }
+        return ir.CNIL, "nil"
+    }
+}

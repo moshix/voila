@@ -1,0 +1,9 @@
+circle     12.000
+rect       12.000
+geom.Box{w: 2, h: 5} 10
+box 2.0x5.0
+caught: width must be positive
+geom.Pair{a: 1.5, b: 2.5} 4
+3
+hello 1
+42

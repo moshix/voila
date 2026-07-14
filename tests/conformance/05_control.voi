@@ -1,0 +1,59 @@
+func classify(n int) str {
+    match n {
+        x if x < 0 => return "neg"
+        0          => return "zero"
+        _          => return "pos"
+    }
+}
+enum Shape { Circle(r float), Rect(w float, h float), Empty }
+func area(s Shape) float {
+    match s {
+        Circle(r)  => return 3.0 * r * r
+        Rect(w, h) => return w * h
+        Empty      => return 0.0
+    }
+}
+func find(x int) ?int {
+    if x > 0 { return x * 10 }
+    return nil
+}
+func main() {
+    say classify(-1), classify(0), classify(5)
+    say area(Circle(2.0)), area(Rect(3.0, 4.0)), area(Empty)
+    let e = Empty
+    say e == Empty, e == Circle(1.0)
+
+    if let Some(v) = find(5) { say "found", v }
+    if let Some(v) = find(-1) { say "found", v } else { say "none" }
+
+    var n = 0
+    for i in 0..5 { n += i }
+    say n
+    for i in 0..10 by 3 { say i }
+    for i in 0..=2 { say i }
+    var w = 3
+    while w > 0 { w -= 1 }
+    say w
+    var c = 0
+    outer: for i in 0..3 {
+        for j in 0..3 {
+            if j == 2 { continue outer }
+            if i == 2 { break outer }
+            c += 1
+        }
+    }
+    say c
+    switch "b" {
+    case "a":
+        say "a"
+    case "b":
+        say "b"
+        fallthrough
+    case "c":
+        say "c"
+    default:
+        say "d"
+    }
+    each i, x in ["p", "q"] { say i, x }
+    each ch in "hé" { say ch }
+}
