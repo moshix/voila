@@ -1,0 +1,140 @@
+// Package opt — the IR optimizer.
+//
+// Runs between lowering and the C backend, only when the user asked
+// (`voila build -O1|-O2|-O3`); a build without the flag never calls this
+// package, and every optimization-only path in the backend is gated on the
+// fields this package sets — so the default output is byte-identical to an
+// unoptimized build BY CONSTRUCTION, not by testing luck.
+//
+// Determinism is load-bearing: the self-hosting fixpoint compares emitted C
+// byte-for-byte across compiler generations. Every pass here iterates
+// slices in index order; maps are for lookup only, never iterated.
+//
+// Levels:
+//   -O1  dead-code elimination (pure defs only — arithmetic can trap and is
+//        NEVER deleted), unreferenced-label pruning, frame shrinking, and
+//        the backend's retain-elision for immediate constants.
+//   -O2  + frame elision (stack frames; see elide.voi)          [pending]
+//   -O3  + typed unboxing (native arithmetic; see typing.voi)   [pending]
+package opt
+
+use "voilac/ir"
+use "std/str"
+
+// Run optimizes the module in place. level <= 0 is a no-op.
+func Run(m mut ir.Module, level int) {
+    if level < 1 { return }
+    m.OptLevel = level
+    var fi = 0
+    while fi < len(m.Funcs) {
+        dce_func(m, fi)
+        shrink_func(m, fi)
+        fi += 1
+    }
+}
+
+// ---------------------------------------------------------------- registers
+
+// reg_slot parses "rN" → N, or -1 (labels, names, K's, upvalues, argv lists).
+func reg_slot(a str) int {
+    if len(a) < 2 { return 0 - 1 }
+    if a[0] != 'r' { return 0 - 1 }
+    var v = 0
+    var i = 1
+    while i < len(a) {
+        let c = a[i]
+        if c < '0' or c > '9' { return 0 - 1 }
+        v = v * 10 + (c - 48)
+        i += 1
+    }
+    return v
+}
+
+// mark_regs_in marks every rN token embedded in an argument string — plain
+// register operands, and registers inside composite arguments like
+// "(r1,r2)" or "(name:r3)".
+func mark_regs_in(a str, used mut []bool) {
+    let n = len(a)
+    var i = 0
+    while i < n {
+        if a[i] == 'r' and (i == 0 or not is_word_byte(a[i - 1])) {
+            var j = i + 1
+            var v = 0
+            var any = false
+            while j < n and a[j] >= '0' and a[j] <= '9' {
+                v = v * 10 + (a[j] - 48)
+                any = true
+                j += 1
+            }
+            // A register token ends at a non-word byte ("r12," yes, "r12x" no).
+            if any and (j >= n or not is_word_byte(a[j])) {
+                if v < len(used) { used[v] = true }
+            }
+            i = j
+        } else {
+            i += 1
+        }
+    }
+}
+
+func is_word_byte(c int) bool {
+    if c >= '0' and c <= '9' { return true }
+    if c >= 'a' and c <= 'z' { return true }
+    if c >= 'A' and c <= 'Z' { return true }
+    return c == '_'
+}
+
+// used_regs computes, for function fi, which register slots are referenced
+// anywhere EXCEPT as the destination of the single instruction `skip`
+// (pass -1 to count everything). References include: every instruction
+// argument, PMATCH pattern binds, PARSE template targets, and the upvalue
+// slots of every descendant closure (they read this frame through vl_up).
+func used_regs(m ir.Module, fi int, skip int) []bool {
+    let f = m.Funcs[fi]
+    var used = make([]bool, f.NRegs)
+    var i = 0
+    while i < f.NRegs {
+        used[i] = false
+        i += 1
+    }
+
+    each ii, ins in f.Instrs {
+        each ai, a in ins.Args {
+            if ii == skip and ai == 0 {
+                continue        // the candidate's own destination
+            }
+            mark_regs_in(a, used)
+        }
+        if ins.Pat != 0 { mark_pat(m, ins.Pat, used) }
+        each t in ins.Terms {
+            if t.Reg != "" { mark_regs_in(t.Reg, used) }
+        }
+    }
+
+    // Descendant closures (`name$fnN...`) address this frame's slots through
+    // their Ups. Over-marking (a deeper ancestor's slot) is the safe
+    // direction, so every descendant's Ups pin slots here.
+    let prefix = f.Name || "$fn"
+    each g in m.Funcs {
+        if str.starts_with(g.Name, prefix) {
+            each u in g.Ups {
+                if u.Slot >= 0 and u.Slot < len(used) { used[u.Slot] = true }
+            }
+        }
+    }
+    // Parameters are the calling convention; never treat them as dead.
+    var pi = 0
+    while pi < f.NParams and pi < len(used) {
+        used[pi] = true
+        pi += 1
+    }
+    return used
+}
+
+func mark_pat(m ir.Module, p int, used mut []bool) {
+    let pat = m.Pats[p]
+    if pat.Reg != "" { mark_regs_in(pat.Reg, used) }
+    each e in pat.Elems {
+        mark_pat(m, e, used)
+    }
+}

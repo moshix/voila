@@ -104,6 +104,16 @@ struct Func {
     SrcLine     int
     Ups         []UpRef   // insertion-ordered, so the IR is deterministic
     LoopCapture str
+
+    // Set by the LOWERER: how many leading registers are parameters
+    // (self included). The backend ignores it unless the optimizer ran.
+    NParams int
+
+    // Set only by the OPTIMIZER (voilac/opt). The C backend's new code
+    // paths are gated on these, so a build without -O emits byte-identical
+    // C by construction.
+    Elide bool    // use the stack-frame prologue (no heap VlFrame)
+    RegT  []int   // per-slot type for unboxing; empty = all boxed
 }
 
 impl Func {
@@ -136,11 +146,15 @@ struct Module {
     Funcs    []Func
     Pats     []Pat
     constIdx map[str]int
+
+    // 0 until voilac/opt runs; the backend's optimization-only emission
+    // paths check it.
+    OptLevel int
 }
 
 func NewModule(source str) Module {
     var m = Module{Source: source, Consts: [], Types: [], Funcs: [],
-                   Pats: [], constIdx: make(map[str]int)}
+                   Pats: [], constIdx: make(map[str]int), OptLevel: 0}
     // Index 0 of the pattern arena is the nil pattern.
     m.Pats.append(Pat{Kind: PAT_WILD, Name: "", Text: "", Reg: "", Elems: [],
                       LitKind: 0, LitText: "", CName: ""})

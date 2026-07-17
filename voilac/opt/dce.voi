@@ -1,0 +1,104 @@
+// opt/dce.voi — dead-code elimination and frame shrinking (-O1).
+//
+// Only PURE defs are candidates: LOADK and MOVE, whose only effect is
+// writing their destination. Arithmetic is NOT pure in Voilà — an ADD can
+// trap with OverflowError, and traps are observable (their messages are in
+// the conformance goldens) — so no arithmetic instruction is ever deleted.
+package opt
+
+use "voilac/ir"
+
+// dce_func removes LOADK/MOVE instructions whose destination register is
+// referenced nowhere else, iterating until nothing changes (deleting a MOVE
+// can strand the LOADK that fed it). Labels on a deleted instruction migrate
+// to the next surviving one, preserving every jump target.
+func dce_func(m mut ir.Module, fi int) {
+    var changed = true
+    while changed {
+        changed = false
+        var victim = 0 - 1
+        var ii = 0
+        while ii < len(m.Funcs[fi].Instrs) {
+            let op = m.Funcs[fi].Instrs[ii].Op
+            if op == "LOADK" or op == "MOVE" {
+                let d = reg_slot(m.Funcs[fi].Instrs[ii].Args[0])
+                if d >= 0 {
+                    let used = used_regs(m, fi, ii)
+                    if d < len(used) and not used[d] {
+                        victim = ii
+                        break
+                    }
+                }
+            }
+            ii += 1
+        }
+        if victim >= 0 {
+            delete_instr(m, fi, victim)
+            changed = true
+        }
+    }
+    prune_labels(m, fi)
+}
+
+// delete_instr removes instruction `ii`, migrating its labels onto the next
+// instruction (there is always a next one: RET is never a candidate).
+func delete_instr(m mut ir.Module, fi int, ii int) {
+    let labels = m.Funcs[fi].Instrs[ii].Labels
+    var out = []
+    each k, ins in m.Funcs[fi].Instrs {
+        if k == ii { continue }
+        out.append(ins)
+    }
+    if len(labels) > 0 and ii < len(out) {
+        // Prepend, preserving order: the emitted label lines are observable
+        // text in the C, and their order must be deterministic.
+        var merged = []
+        each l in labels { merged.append(l) }
+        each l in out[ii].Labels { merged.append(l) }
+        out[ii].Labels = merged
+    }
+    m.Funcs[fi].Instrs = out
+}
+
+// prune_labels drops labels that no instruction in the function references.
+// Every branch target is an argument string (JUMP/JMPF/JMPT/ITNEXT/EHPUSH/
+// ARGDEF/SEL*), so a label is live iff its exact text appears as an arg.
+func prune_labels(m mut ir.Module, fi int) {
+    var live = make(map[str]int)
+    each ins in m.Funcs[fi].Instrs {
+        each a in ins.Args {
+            if len(a) >= 2 and a[0] == 'L' and a[1] >= '0' and a[1] <= '9' {
+                live[a] = 1
+            }
+        }
+    }
+    var ii = 0
+    while ii < len(m.Funcs[fi].Instrs) {
+        if len(m.Funcs[fi].Instrs[ii].Labels) > 0 {
+            var keep = []
+            each l in m.Funcs[fi].Instrs[ii].Labels {
+                if l in live { keep.append(l) }
+            }
+            if len(keep) != len(m.Funcs[fi].Instrs[ii].Labels) {
+                m.Funcs[fi].Instrs[ii].Labels = keep
+            }
+        }
+        ii += 1
+    }
+}
+
+// shrink_func lowers NRegs to 1 + the highest referenced slot (respecting
+// parameters), so an elided or heap frame allocates only what it uses.
+func shrink_func(m mut ir.Module, fi int) {
+    let used = used_regs(m, fi, 0 - 1)
+    var hi = m.Funcs[fi].NParams - 1
+    var i = 0
+    while i < len(used) {
+        if used[i] and i > hi { hi = i }
+        i += 1
+    }
+    let want = hi + 1
+    if want < m.Funcs[fi].NRegs {
+        m.Funcs[fi].NRegs = want
+    }
+}

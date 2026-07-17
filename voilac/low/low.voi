@@ -351,7 +351,7 @@ impl Lowerer {
     func begin_fn(mut self, name str, sig str, srcLine int) {
         self.M.Funcs.append(ir.Func{
             Name: name, Sig: sig, NRegs: 0, Instrs: [], SrcLine: srcLine,
-            Ups: [], LoopCapture: "",
+            Ups: [], LoopCapture: "", NParams: 0, Elide: false, RegT: [],
         })
         self.fi = len(self.M.Funcs) - 1
         self.nextReg = 0
@@ -379,6 +379,9 @@ impl Lowerer {
         each p in ps {
             self.declare(self.T.Get(p).Sval)
         }
+        // Parameters occupy the lowest registers; nothing else has been
+        // declared yet, so the counter IS the parameter count.
+        self.M.Funcs[self.fi].NParams = self.nextReg
         // Callee-side calling convention: defaults and variadic packing are
         // function prologue (this mirrors the interpreter's bindParams).
         each p in ps {
@@ -444,6 +447,7 @@ impl Lowerer {
         each p in params {
             self.declare(self.T.Get(p).Sval)
         }
+        self.M.Funcs[self.fi].NParams = self.nextReg
         each p in params {
             let pn = self.T.Get(p)
             if (pn.Ival2 & 16) != 0 {

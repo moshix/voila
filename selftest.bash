@@ -203,6 +203,52 @@ case "$got" in
         fail=$((fail + 1)) ;;
 esac
 
+# ---------------------------------------------------------------- optimizer
+# Every conformance golden must hold at every implemented -O level, and the
+# optimizer must be deterministic (the fixpoint depends on it). Levels are
+# added here as they land: -O1 (M3), -O2 (M4), -O3 (M5).
+OPT_LEVELS="-O1"
+for LV in $OPT_LEVELS; do
+    bold "==> optimizer: goldens at $LV"
+    opass=0
+    for f in tests/conformance/*.voi; do
+        n="$(basename "${f%.voi}")"
+        want="tests/conformance/$n.out"
+        [ -f "$want" ] || continue
+        exe="$TMP/opt_$n"
+        if ! "$VOILA" build $LV "$f" -o "$exe" >"$TMP/opt.log" 2>&1; then
+            bad "$n: build failed at $LV"
+            head -3 "$TMP/opt.log" | sed 's/^/      /'
+            fail=$((fail + 1))
+            continue
+        fi
+        "$exe" > "$TMP/opt.out" 2> "$TMP/opt.err"
+        if ! cmp -s "$TMP/opt.out" "$want"; then
+            bad "$n: stdout differs at $LV"
+            diff "$want" "$TMP/opt.out" | head -4 | sed 's/^/      /'
+            fail=$((fail + 1))
+            continue
+        fi
+        werr="tests/conformance/$n.err"
+        if [ -f "$werr" ] && ! cmp -s "$TMP/opt.err" "$werr"; then
+            bad "$n: stderr differs at $LV"
+            fail=$((fail + 1))
+            continue
+        fi
+        opass=$((opass + 1))
+    done
+    ok "optimizer $LV: $opass goldens hold"
+done
+bold "==> optimizer: determinism (--emit=c -O1 twice, byte-identical)"
+"$VOILA" build -O1 --emit=c tests/conformance/05_control.voi > "$TMP/det1.c" 2>&1
+"$VOILA" build -O1 --emit=c tests/conformance/05_control.voi > "$TMP/det2.c" 2>&1
+if cmp -s "$TMP/det1.c" "$TMP/det2.c"; then
+    ok "deterministic"
+else
+    bad "optimizer output is nondeterministic"
+    fail=$((fail + 1))
+fi
+
 # ---------------------------------------------------------------- run + cache
 bold "==> the run verb (compile, cache, execute)"
 if "$VOILA" run tests/conformance/01_literals.voi > "$TMP/r1.txt" 2>&1 &&

@@ -25,6 +25,7 @@ use "voilac/par"
 use "voilac/load"
 use "voilac/chk"
 use "voilac/low"
+use "voilac/opt"
 use "voilac/cg"
 use "voilac/ir"
 use "voilac/rt"
@@ -56,6 +57,7 @@ func main() {
     }
     var verb = args[0]
     var src = args[1]
+    var optLevel = 0
 
     // `voila build -S x.voi` and `voila build --emit=c x.voi` are the forms the
     // manual documents: -S and --emit=c are options of BUILD, not verbs of
@@ -67,6 +69,12 @@ func main() {
             let a = args[i]
             if a == "-S" or a == "--emit=c" or a == "-c" {
                 verb = a
+            } else if a == "-O1" {
+                optLevel = 1
+            } else if a == "-O2" {
+                optLevel = 2
+            } else if a == "-O3" {
+                optLevel = 3
             } else if a == "-o" or a == "--keep-c" {
                 i += 1                       // the option's value
             } else if not str.starts_with(a, "-") {
@@ -80,6 +88,18 @@ func main() {
                 os.exit(2)
             }
             i += 1
+        }
+    }
+    // `voila run -O2 x.voi args…`: the level sits between the verb and the
+    // file; everything after the file is forwarded to the program untouched.
+    var runShift = 0
+    if verb == "run" and len(args) >= 3 {
+        if src == "-O1" { optLevel = 1 }
+        if src == "-O2" { optLevel = 2 }
+        if src == "-O3" { optLevel = 3 }
+        if optLevel > 0 {
+            src = args[2]
+            runShift = 1
         }
     }
     if src == "" or str.starts_with(src, "-") {
@@ -126,6 +146,12 @@ func main() {
         os.exit(1)
     }
 
+    // The optimizer runs here — before -S, --emit=c and build alike — so
+    // every verb sees the same module and `-S -O2` is the review artifact.
+    if optLevel > 0 {
+        opt.Run(lo.M, optLevel)
+    }
+
     if verb == "-S" {
         fmt.printf("%s", ir.Listing(lo.M, str.lines(prog.Src)))
         return
@@ -148,7 +174,7 @@ func main() {
         return
     }
     if verb == "run" {
-        run(prog, csrc, args)
+        run(prog, csrc, args, optLevel, runShift)
         return
     }
 
@@ -160,8 +186,14 @@ func main() {
 // arguments. The binary is cached under ~/.cache/voila, keyed by a hash of
 // every source that took part — so editing any file in any package invalidates
 // it, and an unchanged script starts instantly.
-func run(prog load.Program, csrc str, args []str) {
-    let key = fmt.sprintf("%016x", source_key(prog))
+func run(prog load.Program, csrc str, args []str, optLevel int,
+         runShift int) {
+    // The level is part of the key: `run -O2 x` after `run x` must not
+    // execute the cached unoptimized binary.
+    var kh = source_key(prog)
+    kh = fnv_into(kh, "\u{0}")
+    kh = fnv_into(kh, str(optLevel))
+    let key = fmt.sprintf("%016x", kh)
     let dir = cache_dir()
     ensure_dir(dir)
     let exe = path.Join(dir, key)
@@ -181,7 +213,7 @@ func run(prog load.Program, csrc str, args []str) {
     }
 
     var rest = []
-    var i = 2
+    var i = 2 + runShift
     while i < len(args) {
         rest.append(args[i])
         i += 1
@@ -276,6 +308,7 @@ func usage() {
     fmt.eprintf("  voila build -S      <file.voi>    emit the assembly listing\n")
     fmt.eprintf("  voila build --emit=c <file.voi>   emit the C\n")
     fmt.eprintf("  voila check  <file.voi>           verify only\n")
+    fmt.eprintf("  voila build -O1|-O2|-O3 <file>    optimize (also for run)\n")
     fmt.eprintf("  voila version                     print the version\n")
     fmt.eprintf("\n  ast | tokens | load              dump a front-end stage\n")
 }
