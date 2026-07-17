@@ -40,6 +40,7 @@ struct Checker {
     structs map[str]int   // name → STRUCTDEC node
     enums   map[str]int   // name → ENUMDEC node
     funcs   map[str]int   // name → FUNC node
+    excs    map[str]int   // name → EXCDEC node
     sNames  []str
     eNames  []str
 
@@ -60,7 +61,8 @@ func Check(t ast.Tree, file int, srcName str) []str {
     var c = Checker{
         T: t, file: file,
         structs: make(map[str]int), enums: make(map[str]int),
-        funcs: make(map[str]int), sNames: [], eNames: [],
+        funcs: make(map[str]int), excs: make(map[str]int),
+        sNames: [], eNames: [],
         edges: [], adj: make(map[str][]int), path: set([]),
         reported: set([]), Diags: [],
     }
@@ -71,6 +73,8 @@ func Check(t ast.Tree, file int, srcName str) []str {
     c.check_exhaustiveness()
     c.check_moves()
     c.check_format_strings()
+    c.check_call_sites()
+    c.check_composites()
     return c.render(srcName)
 }
 
@@ -88,6 +92,8 @@ impl Checker {
                 self.enums[n.Sval] = d
             } else if n.Kind == ast.FUNC {
                 self.funcs[n.Sval] = d
+            } else if n.Kind == ast.EXCDEC {
+                self.excs[n.Sval] = d
             } else if n.Kind == ast.TYPEDEC {
                 let sd = self.T.Kid(d, 0)
                 if sd != 0 { self.add_struct(n.Sval, sd) }

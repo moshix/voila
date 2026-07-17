@@ -1,0 +1,3 @@
+`Point` has no field `z`
+`Point` has 2 fields, but 3 values are given
+`Boom` has no field `att`

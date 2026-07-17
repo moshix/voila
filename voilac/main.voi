@@ -173,17 +173,21 @@ func main() {
     // checks all run here (§6, §3.2, §3.5, §13.1).
     report(chk.Check(prog.T, prog.File, src))
 
-    if verb == "check" {
-        say "ok"
-        return
-    }
-
+    // `check` runs the LOWERER too, then stops: the lowerer catches its own
+    // class of errors (unknown identifiers, loop-variable capture,
+    // unresolved upvalues), and "check said ok, build refused" is exactly
+    // the inconsistency the verb exists to prevent.
     var lo = low.New(prog.T, prog.File, src)
     try {
         lo.LowerModule()
     } catch e: low.LowerError {
         fmt.eprintf("%s:%d:%d: %s\n", src, e.Line, e.Col, e.Msg)
         os.exit(1)
+    }
+
+    if verb == "check" {
+        say "ok"
+        return
     }
 
     // The optimizer runs here — before -S, --emit=c and build alike — so

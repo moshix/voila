@@ -1,0 +1,230 @@
+// chk/callsite.voi — call-site arity and composite-literal field checks.
+//
+// Two classes of error used to sail through every verb (a call with too few
+// arguments ran with nil parameters; a composite naming a nonexistent field
+// silently dropped the value):
+//
+//     build(src, csrc, args)          // build takes 4 parameters
+//     Point{x: 1, z: 2}               // Point has fields x, y
+//
+// Both are decidable from the declarations the checker already indexes, so
+// they are checked here — statically, for every verb including `check`.
+//
+// SHADOWING makes the arity check conservative: `let f = fn(a int) int
+// {...}` legally shadows a module function `f`, and a checker without scope
+// resolution cannot tell which `f` a call names. Each function's subtree is
+// therefore walked twice — first collecting every name bound locally
+// (params, let/var, loop variables, catch/parse/select/match binds), then
+// checking only calls to names that are provably NOT rebound. Skipping a
+// shadowed name can only lose a diagnostic, never invent a wrong one.
+//
+// Calls through spread arguments (`f(xs...)`) and named arguments are not
+// counted (their arity is not a plain length); method calls (`x.m(...)`)
+// and calls of expressions are not IDENT callees and fall outside the walk.
+package chk
+
+use "voilac/ast"
+use "std/str"
+
+impl Checker {
+    // ------------------------------------------------------------- arity
+
+    func check_call_sites(mut self) {
+        // Module-level globals can shadow nothing (a duplicate module name
+        // is rejected elsewhere), so only function-local binds matter.
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            let n = self.T.Get(d)
+            if n.Kind == ast.FUNC and self.T.Kid(d, 0) != 0 {
+                self.check_calls_in(d)
+            } else if n.Kind == ast.IMPLDEC {
+                each m in self.T.Get(self.T.Kid(d, 0)).Kids {
+                    if self.T.Kind(m) == ast.FUNC and self.T.Kid(m, 0) != 0 {
+                        self.check_calls_in(m)
+                    }
+                }
+            }
+        }
+        var sbound = set([])
+        each s in self.T.Get(self.T.Kid(self.file, 2)).Kids {
+            self.collect_bound(s, sbound)
+        }
+        each s in self.T.Get(self.T.Kid(self.file, 2)).Kids {
+            self.walk_calls(s, sbound)
+        }
+    }
+
+    func check_calls_in(mut self, fnode int) {
+        var bound = set([])
+        self.collect_bound(fnode, bound)
+        self.walk_calls(self.T.Kid(fnode, 0), bound)
+    }
+
+    // collect_bound gathers every name the subtree binds. Over-collection
+    // (a match pattern's variant names, a loop label) is harmless: it can
+    // only suppress a check.
+    func collect_bound(self, node int, bound mut set[str]) {
+        if node == 0 { return }
+        let n = self.T.Get(node)
+        let k = n.Kind
+        if k == ast.PARAM or k == ast.VAR or k == ast.CATCH or
+           k == ast.PARSETERM or k == ast.SELCASE {
+            if n.Sval != "" { bound.add(n.Sval) }
+        } else if k == ast.LET {
+            each part in str.split(n.Sval, ",") {
+                bound.add(part)
+            }
+        } else if k == ast.FOR or k == ast.EACH {
+            // Sval is "names|label"; both halves are cheap to add.
+            each half in str.split(n.Sval, "|") {
+                each part in str.split(half, ",") {
+                    if part != "" { bound.add(part) }
+                }
+            }
+        }
+        // Patterns live behind Ival on ARM and `if let`. Inside a PATTERN,
+        // a bare IDENT is a bind — but only there: an IDENT anywhere else
+        // is a USE, and treating uses as binds would suppress every check
+        // (the callee itself is an IDENT).
+        if (k == ast.ARM or k == ast.IF) and n.Ival != 0 {
+            self.collect_pattern_binds(n.Ival, bound)
+        }
+        each kid in n.Kids {
+            self.collect_bound(kid, bound)
+        }
+    }
+
+    func collect_pattern_binds(self, node int, bound mut set[str]) {
+        if node == 0 { return }
+        let n = self.T.Get(node)
+        if n.Kind == ast.IDENT and n.Sval != "" {
+            bound.add(n.Sval)      // may be a variant name: over-collection
+        }
+        each kid in n.Kids {
+            self.collect_pattern_binds(kid, bound)
+        }
+    }
+
+    func walk_calls(mut self, node int, bound set[str]) {
+        if node == 0 { return }
+        let n = self.T.Get(node)
+        if n.Kind == ast.CALL {
+            self.check_one_call(node, bound)
+        }
+        if (n.Kind == ast.ARM or n.Kind == ast.IF) and n.Ival != 0 {
+            self.walk_calls(n.Ival, bound)
+        }
+        each kid in n.Kids {
+            self.walk_calls(kid, bound)
+        }
+    }
+
+    func check_one_call(mut self, call int, bound set[str]) {
+        let callee = self.T.Kid(call, 0)
+        if callee == 0 { return }
+        if self.T.Kind(callee) != ast.IDENT { return }
+        let name = self.T.Get(callee).Sval
+        if name in bound { return }                 // possibly shadowed
+        if not (name in self.funcs) { return }      // natives, closures, …
+
+        var given = 0
+        each a in self.T.Get(self.T.Kid(call, 1)).Kids {
+            let an = self.T.Get(a)
+            if an.Ival == 1 { return }              // spread: uncountable
+            if an.Sval != "" { return }             // named args: not counted
+            given += 1
+        }
+
+        // The declared parameters: Kids[1] of FUNC is the LIST of PARAM.
+        var min = 0
+        var max = 0
+        var variadic = false
+        each p in self.T.Get(self.T.Kid(self.funcs[name], 1)).Kids {
+            let pn = self.T.Get(p)
+            max += 1
+            if pn.Ival2 & 16 != 0 {
+                variadic = true
+            } else if self.T.Kid(p, 0) == 0 {
+                min += 1
+            }
+        }
+        if variadic {
+            if given >= min { return }
+            self.report_at(callee, "`" || name || "` takes at least " ||
+                str(min) || plural(min, " argument", " arguments") ||
+                ", but " || str(given) || plural(given, " is", " are") ||
+                " given")
+            return
+        }
+        if given >= min and given <= max { return }
+        var wants = str(max)
+        if min != max { wants = str(min) || " to " || str(max) }
+        self.report_at(callee, "`" || name || "` takes " || wants ||
+            plural(max, " argument", " arguments") || ", but " ||
+            str(given) || plural(given, " is", " are") || " given")
+    }
+
+    // -------------------------------------------------- composite fields
+
+    func check_composites(mut self) {
+        self.walk_composites(self.T.Kid(self.file, 1))
+        self.walk_composites(self.T.Kid(self.file, 2))
+    }
+
+    func walk_composites(mut self, node int) {
+        if node == 0 { return }
+        let n = self.T.Get(node)
+        if n.Kind == ast.COMPOSITE {
+            self.check_one_composite(node)
+        }
+        if (n.Kind == ast.ARM or n.Kind == ast.IF) and n.Ival != 0 {
+            self.walk_composites(n.Ival)
+        }
+        each kid in n.Kids {
+            self.walk_composites(kid)
+        }
+    }
+
+    func check_one_composite(mut self, comp int) {
+        let n = self.T.Get(comp)
+        var decl = 0
+        if n.Sval in self.structs {
+            decl = self.structs[n.Sval]
+        } else if n.Sval in self.excs {
+            decl = self.excs[n.Sval]
+        } else {
+            return          // enums, generics-in-flight, foreign types
+        }
+
+        var fields = set([])
+        var nfields = 0
+        each fd in self.T.Get(self.T.Kid(decl, 0)).Kids {
+            if self.T.Kind(fd) == ast.FIELDDECL {
+                fields.add(self.T.Get(fd).Sval)
+                nfields += 1
+            }
+        }
+
+        var positional = 0
+        each kid in self.T.Get(comp).Kids {
+            if self.T.Kind(kid) != ast.COMPFIELD { continue }
+            let f = self.T.Get(kid)
+            if f.Sval == "" {
+                positional += 1
+            } else if not (f.Sval in fields) {
+                self.report_at(kid, "`" || n.Sval || "` has no field `" ||
+                               f.Sval || "`")
+            }
+        }
+        if positional > nfields {
+            self.report_at(comp, "`" || n.Sval || "` has " || str(nfields) ||
+                plural(nfields, " field", " fields") || ", but " ||
+                str(positional) || plural(positional, " value is",
+                                          " values are") || " given")
+        }
+    }
+}
+
+func plural(n int, one str, many str) str {
+    if n == 1 { return one }
+    return many
+}

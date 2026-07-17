@@ -1,0 +1,12 @@
+// Composite-literal field validation: a nonexistent named field and an
+// over-long positional list (both used to be silently mistranslated —
+// the unknown field's value was dropped at runtime).
+struct Point { x int, y int }
+exception Boom { at str }
+
+func main() {
+    let p = Point{x: 1, z: 2}
+    let q = Point{1, 2, 3}
+    say p.x + q.y
+    throw Boom{att: "here"}
+}

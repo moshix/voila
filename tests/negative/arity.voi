@@ -1,0 +1,10 @@
+// Call-site arity: too few, too many, and below a variadic minimum — all
+// must be rejected at check time (they used to run with nil parameters).
+func add(a int, b int) int { return a + b }
+func fold(seed int, xs ...int) int { return seed + len(xs) }
+
+func main() {
+    say add(1)
+    say add(1, 2, 3)
+    say fold()
+}

@@ -1,0 +1,3 @@
+`add` takes 2 arguments, but 1 is given
+`add` takes 2 arguments, but 3 are given
+`fold` takes at least 1 argument, but 0 are given

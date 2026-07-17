@@ -240,7 +240,7 @@ that builds is the machine that runs, `--native` tunes for its processor.
 ## 2.2 What CHECK Rejects
 
 The compiler refuses a program it cannot vouch for. It does not warn; it
-refuses. These are the six families of diagnostic:
+refuses. These are the principal families of diagnostic:
 
 | The compiler says | Because |
 |---|---|
@@ -250,8 +250,13 @@ refuses. These are the six families of diagnostic:
 | `i64 → float may lose information` | the conversion is lossy; say so explicitly |
 | `fmt.printf format needs 2 argument(s), call passes 1` | your format string lies |
 | `borrow stored in struct field` | a borrow would outlive what it borrowed |
+| `` `add` takes 2 arguments, but 1 is given`` | the call and the declaration disagree |
+| `` `Point` has no field `z` `` | the composite names a field that does not exist |
+| `unknown identifier `total`` | the name is declared nowhere in scope |
 
-Each is a defect that would otherwise have reached production.
+Each is a defect that would otherwise have reached production. `check`
+runs the same front end as `build` — a program that checks clean builds,
+and a program `build` would refuse, `check` refuses too.
 
 ## 2.3 The Assembly Listing
 
