@@ -61,3 +61,24 @@ temps, hot-loop overflow, dec at -O3) — byte-identical at all four levels,
 0 leaks. Cross-build identity: the compiler built at -O3 emits byte-equal
 C (default AND -O3) for conformance, bench, samples, and itself. selftest
 now runs goldens at -O1, -O2 and -O3.
+
+## After M6 (architecture layer) — 2026-07-17
+
+-O3 raises the program TU to `cc -O3` (landed with M5); new opt-in
+`voila build --native` tunes for the build machine (probes the toolchain
+for -march=native vs -mcpu=native; never default; runtime archive stays
+generic/portable).
+
+Per-arch verification:
+- macOS/arm64 (Apple clang): full selftest + all opt probes green
+  (throughout M4/M5).
+- Linux/amd64 (Ubuntu 24.04, gcc 13.3, ovh2): bootstrap fixpoint, full
+  selftest ALL GREEN, opt probes (traps/unwind/typing_adv) byte-identical,
+  --native builds and runs. ThreadSanitizer over tests/opt/shared_frames
+  at -O0/-O2/-O3: CLEAN — the biased frame-refcount scheme shows no data
+  race on real hardware (macOS TSan is broken; this was the queued gate).
+- Linux bench spot (interleaved best-of-3):
+  b1_queens -O0 6242ms → -O3 5367ms (-14%); b2_life 1856ms → 1059ms (-43%).
+- Windows/mingw, Linux/arm64: tarball cross-builds unchanged; not
+  re-verified this milestone (no toolchain at hand — "as available" per
+  plan).

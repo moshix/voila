@@ -40,6 +40,13 @@ const VERSION = "0.3.2"
 // cache key hashes it; the program compile and the archive build use it.
 // If these ever diverged, a cached archive built with old flags would be
 // linked into builds claiming new ones.
+// gNative: `voila build --native` tunes the PROGRAM translation unit for
+// the build machine's CPU (never the default — binaries stay portable, and
+// the shared runtime archive stays generic). The spelling differs between
+// toolchains (-march=native vs -mcpu=native on some arm64 compilers), so
+// compile_c_in probes which one the cc accepts.
+var gNative = false
+
 // NEVER add -flto here: the -O2 frame-elision macro (VL_FRAME_ON_STACK)
 // and setjmp-crossing stack frames are only conforming because the runtime
 // archive is a separate translation unit the C optimizer cannot see into.
@@ -90,6 +97,8 @@ func main() {
                 lv = 3
             } else if a == "-o" or a == "--keep-c" {
                 i += 1                       // the option's value
+            } else if a == "--native" {
+                gNative = true
             } else if not str.starts_with(a, "-") {
                 src = a
             } else {
@@ -393,6 +402,26 @@ func compile_c(csrc str, out str, level int) {
     compile_c_in(csrc, out, "", level)
 }
 
+// native_flag finds the spelling this cc accepts for "tune for this CPU",
+// by compiling an empty program in the scratch directory.
+func native_flag(cc str, dir str) str {
+    let probe = path.Join(dir, "native_probe.c")
+    match os.write(probe, "int main(void) \{ return 0; \}\n") {
+        Ok(u) => u
+        Err(e) => return ""
+    }
+    let out = path.Join(dir, "native_probe.bin")
+    each f in ["-march=native", "-mcpu=native"] {
+        let rc = os.run("bash", ["-c",
+            shq(cc) || " " || f || " -o " || shq(out) || " " || shq(probe) ||
+            " >/dev/null 2>&1"])
+        if rc == 0 {
+            return f
+        }
+    }
+    return ""
+}
+
 func compile_c_in(csrc str, out str, keep str, level int) {
     // The scratch directory is per PROCESS. A fixed name would let two
     // concurrent builds — `make -j`, or a test harness — write the runtime into
@@ -429,6 +458,15 @@ func compile_c_in(csrc str, out str, keep str, level int) {
     var pflags = CFLAGS
     if level >= 3 {
         pflags = str.replace(pflags, "-O2", "-O3")
+    }
+    if gNative {
+        let nf = native_flag(cc, dir)
+        if nf == "" {
+            fmt.eprintf("voila: %s accepts neither -march=native nor " ||
+                        "-mcpu=native\n", cc)
+            os.exit(1)
+        }
+        pflags = pflags || " " || nf
     }
     var cargs = []
     each f in fields(pflags) {
