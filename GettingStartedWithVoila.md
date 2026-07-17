@@ -6,7 +6,7 @@
 
 ### A Programming Guide for the New User
 
-**Program Number 0.3.0**
+**Program Number 0.3.2**
 
 *First Edition*
 
@@ -104,9 +104,9 @@ $ ./build.sh
 ==> 2. voilac-1 compiles itself  →  voilac-2, and the C must match
   ✓ fixpoint: C(voilac-1) == C(voilac-2)
   ✓ the checked-in seed is current
-  ✓ bin/voila-0.3.0
-  ✓ bin/voila  ->  voila-0.3.0
-  ✓ ./voila  ->  bin/voila-0.3.0
+  ✓ bin/voila-0.3.2
+  ✓ bin/voila  ->  voila-0.3.2
+  ✓ ./voila  ->  bin/voila-0.3.2
 ==> done — ./voila is ready
 ```
 
@@ -116,7 +116,7 @@ and *that* compiler compiled itself once more. The two generations emitted
 byte-identical C, which is the classical proof that a self-hosted compiler
 is not quietly mistranslating itself.
 
-The binary is named for its version — `bin/voila-0.3.0` — with `bin/voila`
+The binary is named for its version — `bin/voila-0.3.2` — with `bin/voila`
 and `./voila` as symlinks to it, so `voila` always means the version you
 last built. Run `voila version` to see it.
 
@@ -200,7 +200,7 @@ it.
 
 ```console
 $ voila build samples/guide/g01_hello.voi -o hello
-voilac: built hello
+voila: built hello
 $ ./hello
 Hello, world!
 $ otool -L hello                 # or: ldd hello

@@ -214,12 +214,25 @@ func Listing(m Module, srcLines []str) str {
                 w("*        " || str.join(ins.Args, " "))
                 continue
             }
-            var label = ""
+            // A location may carry several labels — two branch targets that
+            // resolve to the same instruction. HLASM permits ONE symbol in the
+            // name field, so the extra labels are emitted as their own `EQU *`
+            // statements just above, each equated to this instruction's
+            // address. A name field never contains a comma.
+            var name = ""
             if len(ins.Labels) > 0 {
-                label = str.join(ins.Labels, ",")
+                let nlab = len(ins.Labels)
+                var k = 0
+                while k < nlab - 1 {
+                    w(fmt.sprintf("%06X  ", loc) ||
+                      pad(ins.Labels[k], COL_OPCODE - COL_LABEL) ||
+                      pad("EQU", COL_OPERAND - COL_OPCODE) || "*")
+                    k += 1
+                }
+                name = ins.Labels[nlab - 1]
             }
             var line = fmt.sprintf("%06X  ", loc)
-            line = line || pad(label, COL_OPCODE - COL_LABEL)
+            line = line || pad(name, COL_OPCODE - COL_LABEL)
             line = line || pad(ins.Op, COL_OPERAND - COL_OPCODE)
             line = line || str.join(ins.Args, ",")
 

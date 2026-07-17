@@ -33,7 +33,7 @@ use "std/os"
 use "std/fmt"
 use "std/str"
 
-const VERSION = "0.3.0"
+const VERSION = "0.3.2"
 
 func main() {
     let args = os.args()
@@ -139,7 +139,7 @@ func main() {
         return
     }
 
-    fmt.eprintf("voilac: unknown verb %s\n", verb)
+    fmt.eprintf("voila: unknown verb %s\n", verb)
     os.exit(2)
 }
 
@@ -162,7 +162,7 @@ func run(prog load.Program, csrc str, args []str) {
         let tmp = exe || ".tmp" || str(os.pid())
         compile_c(csrc, tmp)
         if os.run("mv", ["-f", tmp, exe]) != 0 {
-            fmt.eprintf("voilac: cannot install %s\n", exe)
+            fmt.eprintf("voila: cannot install %s\n", exe)
             os.exit(1)
         }
     }
@@ -202,7 +202,7 @@ func source_key(prog load.Program) int {
         match os.read(p) {
             Ok(text) => h = fnv_into(h, text)
             Err(e)   => {
-                fmt.eprintf("voilac: cannot re-read %s for the run cache\n", p)
+                fmt.eprintf("voila: cannot re-read %s for the run cache\n", p)
                 os.exit(1)
             }
         }
@@ -275,7 +275,7 @@ func build(src str, csrc str, args []str) {
     }
 
     compile_c_in(csrc, out, keep)
-    fmt.printf("voilac: built %s\n", out)
+    fmt.printf("voila: built %s\n", out)
 }
 
 // compile_c writes the C and libvoila's source into a scratch directory and
@@ -297,7 +297,7 @@ func compile_c_in(csrc str, out str, keep str) {
     match os.write(cpath, csrc) {
         Ok(u) => u
         Err(e) => {
-            fmt.eprintf("voilac: cannot write %s\n", cpath)
+            fmt.eprintf("voila: cannot write %s\n", cpath)
             os.exit(1)
         }
     }
@@ -305,7 +305,7 @@ func compile_c_in(csrc str, out str, keep str) {
     match rt.WriteTo(dir) {
         Ok(fs) => cfiles = fs
         Err(e) => {
-            fmt.eprintf("voilac: cannot write the runtime into %s\n", dir)
+            fmt.eprintf("voila: cannot write the runtime into %s\n", dir)
             os.exit(1)
         }
     }
@@ -320,7 +320,7 @@ func compile_c_in(csrc str, out str, keep str) {
     let cc = find_cc()
     let rc = os.run(cc, cargs)
     if rc != 0 {
-        fmt.eprintf("voilac: %s failed (exit %d); the C is in %s\n", cc, rc, dir)
+        fmt.eprintf("voila: %s failed (exit %d); the C is in %s\n", cc, rc, dir)
         os.exit(1)
     }
     if keep == "" {
@@ -356,7 +356,7 @@ func read(p str) str {
     match os.read(p) {
         Ok(s) => return s
         Err(e) => {
-            fmt.eprintf("voilac: cannot read %s\n", p)
+            fmt.eprintf("voila: cannot read %s\n", p)
             os.exit(2)
         }
     }

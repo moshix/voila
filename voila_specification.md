@@ -1,6 +1,6 @@
 # Voilà — Language Specification
 
-**Version 0.3 (Draft)** — floor division is spelled `~/`; `//` is a comment only (§5.1). Version 0.2 added exceptions (§8), implicit numeric conversions (§3.2), and the core library (§13).
+**Version 0.3.2 (Draft)** — floor division is spelled `~/`; `//` is a comment only (§5.1). Version 0.2 added exceptions (§8), implicit numeric conversions (§3.2), and the core library (§13).
 File extension: `.voi` · Module file: `voila.mod` · Toolchain: `voila`
 
 ---
@@ -1360,4 +1360,4 @@ voila run f.voi | voila build   // same source, same semantics
 
 ---
 
-*Voilà 0.3 draft specification. Designed for review — the acyclicity rule (§6.3), the structured-concurrency guarantee (§9.1), and the two-mechanism error story (§8) are the three claims most worth attacking first.*
+*Voilà 0.3.2 draft specification. Designed for review — the acyclicity rule (§6.3), the structured-concurrency guarantee (§9.1), and the two-mechanism error story (§8) are the three claims most worth attacking first.*

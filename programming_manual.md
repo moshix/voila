@@ -2,13 +2,13 @@
 
 ## Language Reference and Programming Guide
 
-**Program Number 5799-VLA · Version 0, Release 3**
+**Program Number 5799-VLA · Version 0, Release 3, Modification 2**
 
 ---
 
 **Second Edition (July 2026)**
 
-This edition applies to Version 0 Release 3 of the Voilà Language
+This edition applies to Version 0 Release 3 Modification 2 of the Voilà Language
 Toolchain (self-hosted), and to all subsequent releases and modifications
 until otherwise indicated in new editions. Make sure you are using the
 correct edition for the level of the product.
@@ -20,7 +20,7 @@ diagrams, general rules, and usage notes. Read Chapter 1 first;
 thereafter the manual is designed for random access.
 
 **Note.** Where the behavior of the toolchain deliberately differs from
-the *Voilà Language Specification, Version 0.3 (Draft)*, the difference
+the *Voilà Language Specification, Version 0.3.2 (Draft)*, the difference
 is recorded in Appendix D. Programs should be written to this manual.
 
 ---
