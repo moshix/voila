@@ -635,6 +635,20 @@ BI(os_pid) {
   return vl_int((int64_t)getpid());
 }
 
+/* os.hostname -> str!  (IOError when the kernel cannot say). */
+BI(os_hostname) {
+  UNUSED;
+  char buf[256];
+  if (gethostname(buf, sizeof buf) != 0) {
+    Value m = vl_str("cannot determine the hostname");
+    Value e = vl_exc_new("IOError", &m, 1, NULL, NULL, 0);
+    vl_release(m);
+    return e;
+  }
+  buf[sizeof buf - 1] = 0;
+  return vl_str(buf);
+}
+
 BI(os_cwd) {
   UNUSED;
   char buf[4096];
@@ -1120,6 +1134,7 @@ static const Entry table[] = {
     {"os.isdir", os_isdir}, {"os.listdir", os_listdir},
     {"os.run", os_run}, {"os.cwd", os_cwd}, {"os.pid", os_pid},
     {"os.exe", os_exe}, {"os.mtime", os_mtime}, {"os.size", os_size},
+    {"os.hostname", os_hostname},
 
     /* math */
     {"math.sqrt", math_sqrt}, {"math.sin", math_sin}, {"math.cos", math_cos},

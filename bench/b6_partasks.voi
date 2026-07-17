@@ -1,0 +1,64 @@
+// b6_partasks — the parallel queens: tasks, channels and a group. Pins
+// that structured concurrency stays correct AND fast under optimization
+// (frames of spawned closures are never elided; the workers' inner
+// search functions are).
+use "std/fmt"
+
+struct Search {
+    n     int
+    board []int
+    count int
+}
+
+impl Search {
+    func safe(self, row int, col int) bool {
+        var c = 0
+        while c < col {
+            let r = self.board[c]
+            if r == row { return false }
+            if r - c == row - col { return false }
+            if r + c == row + col { return false }
+            c += 1
+        }
+        return true
+    }
+
+    func place(mut self, col int) {
+        if col == self.n {
+            self.count += 1
+            return
+        }
+        for row in 0..self.n {
+            if self.safe(row, col) {
+                self.board[col] = row
+                self.place(col + 1)
+                self.board[col] = 0 - 1
+            }
+        }
+    }
+}
+
+func branch(n int, row int, out chan[int]) {
+    var s = Search{n: n, board: make([]int, n), count: 0}
+    for c in 0..n {
+        s.board[c] = 0 - 1
+    }
+    s.board[0] = row
+    s.place(1)
+    out <- s.count
+}
+
+func main() {
+    let n = 12
+    let out = chan[int](n)
+    var total = 0
+    group {
+        for row in 0..n {
+            spawn branch(n, row, out)
+        }
+        for i in 0..n {
+            total += <-out
+        }
+    }
+    fmt.printf("b6_partasks N=%d solutions=%d\n", n, total)
+}

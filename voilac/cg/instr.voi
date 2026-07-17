@@ -46,6 +46,7 @@ func pkg_natives() []str {
             "os.read", "os.write", "os.open", "os.create", "os.exists",
             "os.remove", "os.args", "os.env", "os.exit", "os.on_abort",
             "os.isdir", "os.listdir", "os.run", "os.cwd", "os.pid",
+            "os.hostname",
             "os.exe", "os.mtime", "os.size",
             "os.stderr", "os.stdout",
             "math.sqrt", "math.sin", "math.cos", "math.tan", "math.asin",

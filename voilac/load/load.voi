@@ -156,7 +156,12 @@ func Load(entry str) Program {
     each d in mt.Get(mt.Kid(mroot, 1)).Kids {
         decls.append(d)
     }
-    let script = mt.Get(mt.Kid(mroot, 2)).Kids
+    // Copied, not aliased: the FILE node built below must own its own kids
+    // (see the arena invariant on ast.Graft).
+    var script = []
+    each s0 in mt.Get(mt.Kid(mroot, 2)).Kids {
+        script.append(s0)
+    }
 
     // Only the std imports survive: the user packages are gone after
     // flattening.

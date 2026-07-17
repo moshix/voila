@@ -104,29 +104,42 @@ impl Tree {
         return best
     }
 
-    // Graft copies every node of another tree into this arena and returns the
+    // Graft MOVES every node of another tree into this arena and returns the
     // new id of `root`. Child ids — and the Ival node-reference of a ref-kind
     // node — are relocated; the nil node (0) stays 0. This is how the loader
     // merges a program's packages into a single tree, and how the parser folds
     // an interpolated string's sub-expressions in.
+    //
+    // Grafting CONSUMES the source: the kid ids are relocated in place and the
+    // node is appended with its Kids slice SHARED, not copied. The old
+    // copy-per-node form allocated a fresh slice for every node of every
+    // package and was the single largest cost in `load` (profiled: the bulk
+    // of 2.26 s on the compiler's own build). The caller must not use the
+    // source tree afterwards — the loader and the parser both discard it.
+    //
+    // ARENA INVARIANT: every node OWNS its Kids slice — two nodes must never
+    // share one. In-place relocation walks each node's slice exactly once; a
+    // shared slice would be relocated once PER OWNER and its ids would point
+    // past the arena. (The parser once aliased a match arm's body to its
+    // block's kids; that latent sharing surfaced the moment this function
+    // stopped copying.)
     func Graft(mut self, src Tree, root int) int {
         let base = len(self.Nodes)
+        let n = len(src.Nodes)
         var j = 1
-        while j < len(src.Nodes) {
-            let n = src.Nodes[j]
-            var kids = []
-            each c in n.Kids {
-                if c == 0 {
-                    kids.append(0)
-                } else {
-                    kids.append(c + base - 1)
+        while j < n {
+            let nk = len(src.Nodes[j].Kids)
+            var k = 0
+            while k < nk {
+                if src.Nodes[j].Kids[k] != 0 {
+                    src.Nodes[j].Kids[k] += base - 1
                 }
+                k += 1
             }
-            var iv = n.Ival
-            if IsRefKind(n.Kind) and iv != 0 {
-                iv = iv + base - 1
+            if IsRefKind(src.Nodes[j].Kind) and src.Nodes[j].Ival != 0 {
+                src.Nodes[j].Ival += base - 1
             }
-            self.Add(n.Kind, n.Line, n.Col, iv, n.Ival2, n.Sval, kids)
+            self.Nodes.append(src.Nodes[j])
             j += 1
         }
         if root == 0 { return 0 }

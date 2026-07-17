@@ -1,0 +1,33 @@
+// b5_churn — allocation churn: structs, slices and short strings created
+// and dropped in a tight loop. This is the frame-elision + refcount
+// workload: every call allocates a frame today, every value a retain.
+use "std/fmt"
+
+struct Point { x int, y int }
+
+func mid(a Point, b Point) Point {
+    return Point{x: (a.x + b.x) ~/ 2, y: (a.y + b.y) ~/ 2}
+}
+
+func build(n int) []Point {
+    var ps = []
+    for i in 0..n {
+        ps.append(Point{x: i, y: n - i})
+    }
+    return ps
+}
+
+func main() {
+    var acc = 0
+    let rounds = 9000
+    for r in 0..rounds {
+        let ps = build(300)
+        var i = 0
+        while i + 1 < len(ps) {
+            let m = mid(ps[i], ps[i + 1])
+            acc = wrap_add(acc, m.x + m.y)
+            i += 1
+        }
+    }
+    fmt.printf("b5_churn rounds=%d acc=%d\n", rounds, acc)
+}

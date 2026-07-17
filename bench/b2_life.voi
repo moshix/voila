@@ -1,0 +1,73 @@
+// b2_life — Conway's Life on a torus. Two-dimensional slice indexing and
+// copying: the workload for bounds checks, vl_index retains, and (later)
+// frame elision of the small neighbor-counting helper.
+// Output: generation count and a population checksum.
+use "std/fmt"
+
+const W = 48
+const H = 48
+
+func idx(x int, y int) int {
+    return y * W + x
+}
+
+func neighbors(g []int, x int, y int) int {
+    var n = 0
+    var dy = 0 - 1
+    while dy <= 1 {
+        var dx = 0 - 1
+        while dx <= 1 {
+            if dx != 0 or dy != 0 {
+                let nx = (x + dx + W) % W
+                let ny = (y + dy + H) % H
+                n += g[idx(nx, ny)]
+            }
+            dx += 1
+        }
+        dy += 1
+    }
+    return n
+}
+
+func main() {
+    var grid = make([]int, W * H)
+    // A deterministic soup: an LCG decides the initial cells.
+    // make([]int, n) yields NIL elements: every cell must be written before
+    // it is read, so the seed loop assigns 0 or 1 explicitly.
+    var seed = 12345
+    for i in 0..W * H {
+        seed = wrap_add(wrap_mul(seed, 1103515245), 12345) % 2147483648
+        if seed % 5 == 0 {
+            grid[i] = 1
+        } else {
+            grid[i] = 0
+        }
+    }
+
+    let gens = 350
+    for gen in 0..gens {
+        var next = make([]int, W * H)
+        for y in 0..H {
+            for x in 0..W {
+                let n = neighbors(grid, x, y)
+                let alive = grid[idx(x, y)]
+                var cell = 0
+                if alive == 1 and (n == 2 or n == 3) {
+                    cell = 1
+                } else if alive == 0 and n == 3 {
+                    cell = 1
+                }
+                next[idx(x, y)] = cell
+            }
+        }
+        grid = next
+    }
+
+    var pop = 0
+    var check = 0
+    each i, c in grid {
+        pop += c
+        if c == 1 { check = wrap_add(wrap_mul(check, 31), i) }
+    }
+    fmt.printf("b2_life gens=%d pop=%d check=%d\n", gens, pop, check)
+}

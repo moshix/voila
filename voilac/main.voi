@@ -35,6 +35,12 @@ use "std/str"
 
 const VERSION = "0.3.2"
 
+// CFLAGS is the single home of the C compilation flags. The runtime-archive
+// cache key hashes it; the program compile and the archive build use it.
+// If these ever diverged, a cached archive built with old flags would be
+// linked into builds claiming new ones.
+const CFLAGS = "-std=c11 -O2"
+
 func main() {
     let args = os.args()
 
@@ -65,6 +71,13 @@ func main() {
                 i += 1                       // the option's value
             } else if not str.starts_with(a, "-") {
                 src = a
+            } else {
+                // An unknown flag must be an ERROR, not a shrug: a silently
+                // ignored `-O2` would let a benchmark (or a user) believe an
+                // optimization was applied when nothing happened.
+                fmt.eprintf("voila: unknown build option %s\n", a)
+                usage()
+                os.exit(2)
             }
             i += 1
         }
@@ -159,7 +172,7 @@ func run(prog load.Program, csrc str, args []str) {
         // and race to rename it, and a truncated binary would be cached
         // forever. The rename itself is atomic, so the loser simply replaces an
         // identical file.
-        let tmp = exe || ".tmp" || str(os.pid())
+        let tmp = exe || ".tmp" || host_tag() || "-" || str(os.pid())
         compile_c(csrc, tmp)
         if os.run("mv", ["-f", tmp, exe]) != 0 {
             fmt.eprintf("voila: cannot install %s\n", exe)
@@ -195,10 +208,23 @@ func source_key(prog load.Program) int {
     var h = -3750763034362895579          // the FNV-1a 64-bit offset basis
     let exe = os.exe()
     h = fnv_into(h, exe)
-    h = fnv_into(h, str(os.size(exe)))
+    h = fnv_into(h, "\u{0}")             // field separators: without them
+    h = fnv_into(h, str(os.size(exe)))    // adjacent fields could collide
+    h = fnv_into(h, "\u{0}")
     h = fnv_into(h, str(os.mtime(exe)))
+    // The C toolchain is part of the key too: a binary linked against a
+    // stale or different runtime archive must not outlive the archive fix.
+    let cc = find_cc()
+    h = fnv_into(h, "\u{0}")
+    h = fnv_into(h, cc)
+    h = fnv_into(h, "\u{0}")
+    h = fnv_into(h, cc_identity(cc))
+    h = fnv_into(h, "\u{0}")
+    h = fnv_into(h, CFLAGS)
     each i, p in prog.Paths {
+        h = fnv_into(h, "\u{0}")
         h = fnv_into(h, prog.Sources[i])
+        h = fnv_into(h, "\u{0}")
         match os.read(p) {
             Ok(text) => h = fnv_into(h, text)
             Err(e)   => {
@@ -221,8 +247,26 @@ func fnv_into(h0 int, s str) int {
 
 func cache_dir() str {
     let home = os.env("HOME")
-    if home == nil { return "/tmp/voila-cache" }
+    if home == nil {
+        // Per-user, never world-shared: a common /tmp cache would let any
+        // local user pre-plant an archive that gets linked into binaries.
+        return "/tmp/voila-cache-" || host_tag()
+    }
     return path.Join(str(home), ".cache/voila")
+}
+
+// host_tag is a short stable token distinguishing hosts (NFS homes share
+// pids across machines) and users (the HOME-less cache path).
+func host_tag() str {
+    match os.hostname() {
+        Ok(hn) => {
+            var t = 0
+            t = fnv_into(t, hn)
+            return fmt.sprintf("%08x", t & 0xffffffff)
+        }
+        Err(e) => return "h0"
+    }
+    return "h0"
 }
 
 func usage() {
@@ -301,24 +345,81 @@ func compile_c_in(csrc str, out str, keep str) {
             os.exit(1)
         }
     }
-    var cfiles = []
-    match rt.WriteTo(dir) {
-        Ok(fs) => cfiles = fs
-        Err(e) => {
-            fmt.eprintf("voila: cannot write the runtime into %s\n", dir)
-            os.exit(1)
-        }
-    }
 
-    var cargs = ["-std=c11", "-O2", "-I" || dir, "-o", out, cpath]
-    each f in cfiles {
+    let cc = find_cc()
+
+    // The runtime never changes between builds of the same compiler, yet it
+    // used to be recompiled from source EVERY time — a fixed ~0.9 s that was
+    // ~93 % of a small program's build. runtime_lib compiles it once into
+    // ~/.cache/voila/rt-<key>/libvoila.a and reuses it; on any failure it
+    // returns "" and this function falls back to compiling from source, so a
+    // missing `ar` or an unwritable cache can never break a build.
+    // `--keep-c` also takes the source path: its promise is a self-contained
+    // directory holding everything cc consumed.
+    var rtdir = ""
+    if keep == "" { rtdir = runtime_lib(cc) }
+
+    // Each whitespace-separated flag is its own argv element.
+    var cargs = []
+    each f in fields(CFLAGS) {
         cargs.append(f)
+    }
+    if rtdir != "" {
+        cargs.append("-I" || rtdir)
+        cargs.append("-o")
+        cargs.append(out)
+        cargs.append(cpath)
+        cargs.append(path.Join(rtdir, "libvoila.a"))
+    } else {
+        var cfiles = []
+        match rt.WriteTo(dir) {
+            Ok(fs) => cfiles = fs
+            Err(e) => {
+                fmt.eprintf("voila: cannot write the runtime into %s\n", dir)
+                os.exit(1)
+            }
+        }
+        cargs.append("-I" || dir)
+        cargs.append("-o")
+        cargs.append(out)
+        cargs.append(cpath)
+        each f in cfiles {
+            cargs.append(f)
+        }
     }
     cargs.append("-lm")
     cargs.append("-lpthread")
 
-    let cc = find_cc()
-    let rc = os.run(cc, cargs)
+    var rc = os.run(cc, cargs)
+    if rc != 0 and rtdir != "" {
+        // A corrupt or incompatible archive must not wedge every future
+        // build: discard it and retry the self-contained source path once.
+        fmt.eprintf("voila: link against cached runtime failed; " ||
+                    "rebuilding it from source\n")
+        os.run("rm", ["-rf", rtdir])
+        var cfiles = []
+        match rt.WriteTo(dir) {
+            Ok(fs) => cfiles = fs
+            Err(e) => {
+                fmt.eprintf("voila: cannot write the runtime into %s\n", dir)
+                os.exit(1)
+            }
+        }
+        var retry = []
+        each f in fields(CFLAGS) {
+            retry.append(f)
+        }
+        retry.append("-I" || dir)
+        retry.append("-o")
+        retry.append(out)
+        retry.append(cpath)
+        each f in cfiles {
+            retry.append(f)
+        }
+        retry.append("-lm")
+        retry.append("-lpthread")
+        rc = os.run(cc, retry)
+    }
     if rc != 0 {
         fmt.eprintf("voila: %s failed (exit %d); the C is in %s\n", cc, rc, dir)
         os.exit(1)
@@ -326,6 +427,114 @@ func compile_c_in(csrc str, out str, keep str) {
     if keep == "" {
         os.run("rm", ["-rf", dir])
     }
+}
+
+// runtime_lib returns the directory holding libvoila.a and the runtime
+// headers for this (runtime source, cc, flags) combination, building it on
+// first use. Returns "" on any failure — the caller falls back to source.
+//
+// The key hashes what actually determines the object code: the CONTENT of
+// every runtime file (straight from the embedded blob — never a proxy like a
+// version string), the cc identity (name + the binary's size and mtime, so an
+// in-place compiler upgrade misses), and the flags.
+func runtime_lib(cc str) str {
+    var h = -3750763034362895579           // FNV-1a offset basis
+    let names = rt.Names()
+    let data = rt.Data()
+    each i, n in names {
+        h = fnv_into(h, "\u{0}")
+        h = fnv_into(h, n)
+        h = fnv_into(h, "\u{0}")
+        h = fnv_into(h, data[i])
+    }
+    h = fnv_into(h, cc)
+    h = fnv_into(h, "\u{0}")
+    // The cc identity is its VERSION+TARGET output, not the binary's stat:
+    // on macOS `/usr/bin/cc` is a sealed xcrun shim whose size and mtime
+    // never change when the actual compiler behind it is upgraded, and a
+    // universal binary stats identically on two architectures sharing a
+    // home directory. No identity means NO cache — a key that silently
+    // omits the compiler would happily serve stale objects forever.
+    let ccid = cc_identity(cc)
+    if ccid == "" { return "" }
+    h = fnv_into(h, ccid)
+    h = fnv_into(h, "\u{0}")
+    h = fnv_into(h, CFLAGS)
+
+    let root = cache_dir()
+    ensure_dir(root)
+    let final = path.Join(root, "rt-" || fmt.sprintf("%016x", h))
+    if os.exists(path.Join(final, "libvoila.a")) { return final }
+
+    // Build in a per-pid directory, then rename into place. If a concurrent
+    // build won the race, use its result and discard ours.
+    let tmp = final || ".tmp" || host_tag() || "-" || str(os.pid())
+    ensure_dir(tmp)
+    match rt.WriteTo(tmp) {
+        Ok(fs) => fs
+        Err(e) => {
+            os.run("rm", ["-rf", tmp])
+            return ""
+        }
+    }
+    // cc -c f1.c f2.c … drops one .o per file in the cwd; ar bundles them.
+    let script = "cd " || shq(tmp) || " && " || shq(cc) ||
+                 " " || CFLAGS || " -I. -c *.c && ar rcs libvoila.a *.o" ||
+                 " && rm -f *.o *.c"
+    if os.run("bash", ["-c", script]) != 0 {
+        os.run("rm", ["-rf", tmp])
+        return ""
+    }
+    // Install. `mv tmp final` is NOT the primitive here: when final already
+    // exists (a concurrent build won), mv NESTS tmp inside it instead of
+    // failing, leaving junk in the winner's directory. The portable atomic
+    // claim is mkdir — it fails if the directory exists — and the .a moves
+    // LAST, so a reader that gates on libvoila.a never sees a half-installed
+    // cache entry. If the content move fails midway, the claim is torn down
+    // too; a headers-only final would block this key forever.
+    let install = "if mkdir " || shq(final) || " 2>/dev/null; then " ||
+                  "mv " || shq(tmp) || "/*.h " || shq(final) || "/ && " ||
+                  "mv " || shq(tmp) || "/libvoila.a " || shq(final) || "/ " ||
+                  "|| rm -rf " || shq(final) || "; fi; " ||
+                  "rm -rf " || shq(tmp)
+    os.run("bash", ["-c", install])
+    if os.exists(path.Join(final, "libvoila.a")) { return final }
+    return ""
+}
+
+// cc_identity captures what the compiler IS: its version banner and target
+// triple. This is what invalidates the archive when the compiler is
+// upgraded in place or the architecture differs. "" when it cannot be
+// determined.
+func cc_identity(cc str) str {
+    let tmp = path.Join(cache_dir(), "ccid-" || str(os.pid()))
+    let rc = os.run("bash", ["-c",
+        shq(cc) || " --version 2>&1 | head -3 > " || shq(tmp) || "; " ||
+        shq(cc) || " -dumpmachine >> " || shq(tmp) || " 2>/dev/null; true"])
+    var out = ""
+    if rc == 0 {
+        match os.read(tmp) {
+            Ok(s)  => out = str.trim(s)
+            Err(e) => out = ""
+        }
+    }
+    os.remove(tmp)
+    return out
+}
+
+// shq single-quotes a string for a shell command line.
+func shq(s str) str {
+    var b = str.Builder{}
+    b.write("'")
+    each c in s {
+        if c == '\'' {
+            b.write("'\\''")
+        } else {
+            b.write(str(c))
+        }
+    }
+    b.write("'")
+    return b.done()
 }
 
 // find_cc honours $CC, then falls back to the platform's `cc`.

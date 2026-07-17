@@ -1,0 +1,48 @@
+// b1_queens — serial N-queens backtracking. The unboxing showcase: tight
+// integer recursion, comparisons, and array indexing; no strings, no dec.
+// Output is the solution count, which pins correctness at every -O level.
+use "std/fmt"
+
+struct Search {
+    n     int
+    board []int
+    count int
+}
+
+impl Search {
+    func safe(self, row int, col int) bool {
+        var c = 0
+        while c < col {
+            let r = self.board[c]
+            if r == row { return false }
+            if r - c == row - col { return false }
+            if r + c == row + col { return false }
+            c += 1
+        }
+        return true
+    }
+
+    func place(mut self, col int) {
+        if col == self.n {
+            self.count += 1
+            return
+        }
+        for row in 0..self.n {
+            if self.safe(row, col) {
+                self.board[col] = row
+                self.place(col + 1)
+                self.board[col] = 0 - 1
+            }
+        }
+    }
+}
+
+func main() {
+    let n = 12
+    var s = Search{n: n, board: make([]int, n), count: 0}
+    for c in 0..n {
+        s.board[c] = 0 - 1
+    }
+    s.place(0)
+    fmt.printf("b1_queens N=%d solutions=%d\n", n, s.count)
+}

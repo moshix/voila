@@ -315,7 +315,13 @@ impl Parser {
             var body = []
             if self.at(tok.LBRACE) {
                 let b = self.block()
-                body = self.T.Get(b).Kids
+                // COPY the block's kids — never alias them. Two nodes sharing
+                // one Kids slice breaks the arena invariant Graft relies on
+                // (it relocates kids in place; a shared slice would be
+                // relocated once per owner).
+                each s in self.T.Get(b).Kids {
+                    body.append(s)
+                }
             } else {
                 body.append(self.stmt())
             }

@@ -1,0 +1,22 @@
+// b4_ledger — exact-decimal arithmetic under `numeric digits`. dec is
+// NEVER unboxed (dynamically-scoped precision), so this benchmark must
+// show ~no regression at any -O level — that is the point of it.
+use "std/fmt"
+
+func main() {
+    numeric digits 20
+    var balance = 0d
+    var seed = 7
+    let n = 1000000
+    for i in 0..n {
+        seed = wrap_add(wrap_mul(seed, 1103515245), 12345) % 2147483648
+        let cents = seed % 100000
+        let amount = dec(cents) / 100d
+        if seed % 3 == 0 {
+            balance -= amount * 0.25d
+        } else {
+            balance += amount
+        }
+    }
+    fmt.printf("b4_ledger txns=%d balance=%s\n", n, balance.format(2))
+}

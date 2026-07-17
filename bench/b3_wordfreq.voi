@@ -1,0 +1,43 @@
+// b3_wordfreq — word counting over synthetic text: map insert/update,
+// string slicing and comparison. Strings and maps are BOXED at every -O
+// level; this pins the boxed path's performance and correctness.
+use "std/fmt"
+use "std/str"
+
+func main() {
+    // Deterministic corpus: an LCG picks from a fixed vocabulary.
+    let vocab = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta",
+                 "eta", "theta", "iota", "kappa", "lambda", "mu",
+                 "processor", "storage", "channel", "spool", "dataset",
+                 "catalog", "volume", "region"]
+    var counts = make(map[str]int)
+    each w in vocab { counts[w] = 0 }
+
+    // The LCG runs BEFORE the counting loop: precomputing the word sequence
+    // keeps the measured region map-dominated, not arithmetic-dominated
+    // (review finding H3 — the LCG was ~60 % of the old loop).
+    var seed = 42
+    let n = 3000000
+    var words = make([]int, n)
+    for i in 0..n {
+        seed = wrap_add(wrap_mul(seed, 1103515245), 12345) % 2147483648
+        words[i] = seed % len(vocab)
+    }
+
+    each i, wi in words {
+        let w = vocab[wi]
+        counts[w] += 1
+        // Three extra map touches per word keep this a MAP benchmark.
+        counts[w] = counts[w]
+        if counts[w] < 0 { counts[w] = 0 }
+    }
+
+    // Deterministic report: vocabulary order, and a rolling checksum.
+    var check = 0
+    var total = 0
+    each w in vocab {
+        total += counts[w]
+        check = wrap_add(wrap_mul(check, 131), counts[w])
+    }
+    fmt.printf("b3_wordfreq words=%d total=%d check=%d\n", n, total, check)
+}
