@@ -218,6 +218,10 @@ func install_versioned(bin str) {
     ok(OUT || "  ->  voila-" || ver)
     symlink(versioned, "voila")            // ./voila    -> bin/voila-<ver>
     ok("./voila  ->  " || versioned)
+    // Warm the code signature. On macOS the FIRST exec of a freshly written
+    // Mach-O can be transiently SIGKILLed while the kernel validates it; force
+    // that here, in the build, rather than in whatever test runs it first.
+    os.run("bash", ["-c", versioned || " version >/dev/null 2>&1"])
 }
 
 // compiler_version asks the freshly built binary for its version. os.run

@@ -226,6 +226,18 @@ the reference — written in the house style of the IBM mainframe language
 references, syntax diagrams included — and the
 [Language Specification](voila_specification.md).
 
+## 📜 License
+
+Voilà is free software under the **GNU General Public License, version 2** —
+see [LICENSE](LICENSE).
+
+## 📦 Releasing
+
+`./release.bash` cuts a GitHub Release for the current version: it builds the
+toolchain, reads the version from `voila version`, tags `v<version>`, and
+publishes the source tarball and native binaries produced by
+`build_voila.bash`. Run `./release.bash --dry-run` to preview.
+
 ---
 
 <div align="center">

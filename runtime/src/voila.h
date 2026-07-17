@@ -16,6 +16,21 @@
 #ifndef VOILA_H
 #define VOILA_H
 
+/* On glibc, -std=c11 hides POSIX/BSD declarations — clock_gettime, nanosleep,
+ * readlink, random/srandom — unless a feature-test macro is defined before the
+ * first system header. voila.h is the first header every translation unit
+ * includes (directly, or via voila_int.h), so this is the one place to set it.
+ * It is scoped to Linux: macOS exposes those APIs already, and defining
+ * _POSIX_C_SOURCE there would instead HIDE the BSD ones. */
+#if defined(__linux__)
+#  ifndef _DEFAULT_SOURCE
+#    define _DEFAULT_SOURCE 1
+#  endif
+#  ifndef _POSIX_C_SOURCE
+#    define _POSIX_C_SOURCE 200809L
+#  endif
+#endif
+
 #include <setjmp.h>
 #include <stdbool.h>
 #include <stddef.h>

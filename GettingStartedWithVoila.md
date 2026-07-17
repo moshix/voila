@@ -104,8 +104,9 @@ $ ./build.sh
 ==> 2. voilac-1 compiles itself  →  voilac-2, and the C must match
   ✓ fixpoint: C(voilac-1) == C(voilac-2)
   ✓ the checked-in seed is current
-  ✓ bin/voila
-  ✓ ./voila
+  ✓ bin/voila-0.3.0
+  ✓ bin/voila  ->  voila-0.3.0
+  ✓ ./voila  ->  bin/voila-0.3.0
 ==> done — ./voila is ready
 ```
 
@@ -114,6 +115,10 @@ compiler; that compiler compiled the real compiler from its Voilà source;
 and *that* compiler compiled itself once more. The two generations emitted
 byte-identical C, which is the classical proof that a self-hosted compiler
 is not quietly mistranslating itself.
+
+The binary is named for its version — `bin/voila-0.3.0` — with `bin/voila`
+and `./voila` as symlinks to it, so `voila` always means the version you
+last built. Run `voila version` to see it.
 
 Put `voila` on your PATH, or call it as `./voila`.
 
