@@ -1,0 +1,49 @@
+// The unwind-through-elided-frame probe. `holder` owns boxed values (a
+// string built at runtime, a slice, a struct) in a function that throws
+// through them; the catcher is above. At -O2 holder's frame is on the C
+// stack — the unwinder must release those values (they are registered via
+// the frame stack) or this leaks; leaks are checked by the harness.
+use "std/str"
+use "std/fmt"
+
+struct Wrap { name str, vals []int }
+
+exception Boom { at str }
+
+func deep(n int) int {
+    if n == 0 { throw Boom{at: "bottom"} }
+    return deep(n - 1)
+}
+
+func holder(round int) int {
+    var b = str.Builder{}
+    b.write("round-")
+    b.write(str(round))
+    let name = b.done()
+    var xs = [round, round + 1, round + 2]
+    let w = Wrap{name: name, vals: xs}
+    // The throw below unwinds THROUGH this frame; name/xs/w must be freed.
+    return deep(3) + len(w.name)
+}
+
+func main() {
+    var caught = 0
+    for round in 0..200 {
+        try {
+            holder(round)
+        } catch e: Boom {
+            caught += 1
+        }
+    }
+    fmt.printf("unwind rounds=%d caught=%d\n", 200, caught)
+
+    // And a catch INSIDE the same (elidable) function: setjmp returns into
+    // a live stack frame.
+    var localCaught = 0
+    try {
+        throw Boom{at: "local"}
+    } catch e: Boom {
+        localCaught = 1
+    }
+    say "local catch:", localCaught
+}

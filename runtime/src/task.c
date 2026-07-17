@@ -220,7 +220,15 @@ static Value task_new(VlFn fn, Value closure, Value *argv, int argc) {
   pthread_mutex_unlock(&g_mu);
 
   t->hdr.rc++; /* the thread holds a reference */
-  if (pthread_create(&t->th, NULL, task_main, t) != 0)
+  /* An explicit 8 MB stack: macOS secondary threads default to 512 KB,
+   * and -O2's frame elision moves register files onto the C stack — deep
+   * recursion inside a task should have the same headroom as main. */
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);
+  int rc_create = pthread_create(&t->th, &attr, task_main, t);
+  pthread_attr_destroy(&attr);
+  if (rc_create != 0)
     vl_abort("cannot create task thread");
   pthread_detach(t->th);
 

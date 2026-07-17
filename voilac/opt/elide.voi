@@ -1,0 +1,43 @@
+// opt/elide.voi — frame elision (-O2).
+//
+// A function that creates no closures needs no HEAP frame: its registers can
+// live in the caller's C stack, killing the calloc + nil-init + free that
+// every call pays today. The stack frame is still a real VlFrame, still
+// pushed on the ctx frame stack — so the exception unwinder releases its
+// registers exactly as before, PMATCH/PARSE/VARARG still write through it,
+// and EHPUSH/setjmp is safe (registers are memory behind the never-modified
+// frame pointer, not C locals a longjmp could clobber).
+//
+// The predicate, and why each opcode disqualifies:
+//   MKCLOS  — vl_closure(vf, F) stores F in a heap object that can outlive
+//             the call; a stack frame would dangle. This also covers DEFER
+//             and spawn-blocks, which lower through MKCLOS.
+//   DEFER   — checked explicitly anyway: the predicate must not depend on a
+//             lowering accident staying true.
+//   GETCTX  — already refused in native builds; listed so the predicate is
+//             total over the opcode set.
+//   NRegs > 256 — caps the per-call C-stack growth at ~4 KB.
+//
+// Everything else — throwing ops, EHPUSH, PMATCH, PARSE, VARARG, upvalue
+// READS of enclosing frames — is layout-identical on a stack frame.
+package opt
+
+use "voilac/ir"
+
+func elide_func(m mut ir.Module, fi int) {
+    if m.Funcs[fi].NRegs > 256 { return }
+    each ins in m.Funcs[fi].Instrs {
+        let op = ins.Op
+        if op == "MKCLOS" or op == "DEFER" or op == "GETCTX" { return }
+    }
+    m.Funcs[fi].Elide = true
+    // The decision is visible in `-S -O2` listings: a note instruction,
+    // which the listing renders and the backend ignores.
+    var out = []
+    out.append(ir.Instr{Labels: [], Op: "*", Args: ["opt: frame=stack"],
+                        Pat: 0, Terms: [], Src: 0})
+    each ins in m.Funcs[fi].Instrs {
+        out.append(ins)
+    }
+    m.Funcs[fi].Instrs = out
+}

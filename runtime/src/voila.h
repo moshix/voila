@@ -105,12 +105,34 @@ struct VlFrame {
   VlObj hdr;
   VlFrame *up;
   int nregs;
+  /* 1: the storage is the caller's C stack (frame elision, -O2). Never
+   * free()d; still registered on the ctx frame stack so the exception
+   * unwinder releases its registers exactly as for a heap frame. Occupies
+   * what was struct padding: sizeof(VlFrame) is unchanged. */
+  uint8_t stackalloc;
+  /* 1: some closure captured this frame (or a descendant), so it can cross
+   * threads and its refcount needs atomic updates. A closure is the ONLY
+   * way a frame escapes its thread, and vl_closure sets the flag on the
+   * whole up-chain BEFORE the closure value can be published — so a plain
+   * read of this flag is race-free, and the overwhelmingly common unshared
+   * frame keeps the plain non-atomic ++/-- it always had. */
+  uint8_t shared;
   Value *defers; /* closures, run LIFO on exit and on unwind */
   int ndefers, capdefers;
   Value r[1]; /* flexible */
 };
 
 VlFrame *vl_frame_new(int nregs, VlFrame *up);
+VlFrame *vl_frame_stack_init(VlFrame *f, int nregs, VlFrame *up);
+
+/* The -O2 prologue: registers live in the caller's C stack frame. VL_NIL is
+ * all-zero bits, so the zeroed buffer needs no nil-init loop. */
+#define VL_FRAME_ON_STACK(Fv, N, UP)                                        \
+  struct {                                                                  \
+    VlFrame f;                                                              \
+    Value pad_[(N) > 1 ? (N) - 1 : 1];                                      \
+  } Fv##_buf;                                                               \
+  VlFrame *Fv = vl_frame_stack_init(&Fv##_buf.f, (N), (UP))
 void vl_frame_release(VlFrame *f);
 void vl_frame_clear(VlFrame *f); /* breaks frame<->closure reference cycles */
 void vl_frame_push(VlFrame *f);           /* onto the task's frame stack */

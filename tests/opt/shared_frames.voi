@@ -1,0 +1,36 @@
+// Shared-frame refcount stress. Closures over ONE enclosing frame cross into
+// many tasks; every closure call creates a child frame that retains/releases
+// the SHARED parent — the exact counter the biased-RC scheme must update
+// atomically (frame.shared == 1). A dropped or doubled count is a
+// use-after-free or a leak; the harness runs this repeatedly and under
+// `leaks`.
+use "std/fmt"
+
+func worker(bump fn(int) int, tid int, out chan[int]) {
+    var acc = 0
+    for i in 0..20000 {
+        acc = (acc + bump(i + tid)) % 1000000007
+    }
+    out <- acc
+}
+
+func main() {
+    let base = 1000
+    // `bump` captures main's frame (`base` lives there); each call builds a
+    // nested closure so the chain is retained again from the running task.
+    let bump = fn(x int) int {
+        let inner = fn(y int) int { return y + base }
+        return inner(x)
+    }
+    let out = chan[int](8)
+    group {
+        for t in 0..8 {
+            spawn worker(bump, t, out)
+        }
+        var total = 0
+        for i in 0..8 {
+            total = (total + <-out) % 1000000007
+        }
+        fmt.printf("shared_frames total=%d\n", total)
+    }
+}

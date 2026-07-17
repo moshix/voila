@@ -63,29 +63,44 @@ func main() {
     // manual documents: -S and --emit=c are options of BUILD, not verbs of
     // their own. They are accepted bare too, because that is what the compiler
     // itself has always been driven with.
-    if verb == "build" {
+    // `-O` levels are honored by every whole-program verb — build, run,
+    // check, -S, --emit=c — because they all see the same optimized module.
+    // A level on a verb that cannot apply it (tokens, ast, load) is an
+    // ERROR, not a shrug: a silently ignored flag lets a user believe an
+    // optimization was applied when nothing happened.
+    var seenO = false
+    if verb == "build" or verb == "check" or verb == "-S" or
+       verb == "--emit=c" or verb == "-c" {
         var i = 1
         while i < len(args) {
             let a = args[i]
+            var lv = 0 - 1
             if a == "-S" or a == "--emit=c" or a == "-c" {
                 verb = a
+            } else if a == "-O0" {
+                lv = 0                        // an explicit no-op
             } else if a == "-O1" {
-                optLevel = 1
+                lv = 1
             } else if a == "-O2" {
-                optLevel = 2
+                lv = 2
             } else if a == "-O3" {
-                optLevel = 3
+                lv = 3
             } else if a == "-o" or a == "--keep-c" {
                 i += 1                       // the option's value
             } else if not str.starts_with(a, "-") {
                 src = a
             } else {
-                // An unknown flag must be an ERROR, not a shrug: a silently
-                // ignored `-O2` would let a benchmark (or a user) believe an
-                // optimization was applied when nothing happened.
                 fmt.eprintf("voila: unknown build option %s\n", a)
                 usage()
                 os.exit(2)
+            }
+            if lv >= 0 {
+                if seenO {
+                    fmt.eprintf("voila: more than one -O level given\n")
+                    os.exit(2)
+                }
+                seenO = true
+                optLevel = lv
             }
             i += 1
         }
@@ -94,17 +109,30 @@ func main() {
     // file; everything after the file is forwarded to the program untouched.
     var runShift = 0
     if verb == "run" and len(args) >= 3 {
-        if src == "-O1" { optLevel = 1 }
-        if src == "-O2" { optLevel = 2 }
-        if src == "-O3" { optLevel = 3 }
-        if optLevel > 0 {
+        if src == "-O0" { runShift = 1 }
+        if src == "-O1" { optLevel = 1; runShift = 1 }
+        if src == "-O2" { optLevel = 2; runShift = 1 }
+        if src == "-O3" { optLevel = 3; runShift = 1 }
+        if runShift == 1 {
             src = args[2]
-            runShift = 1
         }
     }
     if src == "" or str.starts_with(src, "-") {
         usage()
         os.exit(2)
+    }
+
+    // The front-end-only verbs take no options; a stray flag (say, an -O
+    // level on `tokens`) is rejected rather than silently ignored.
+    if verb == "tokens" or verb == "ast" or verb == "load" {
+        var i = 2
+        while i < len(args) {
+            if str.starts_with(args[i], "-") {
+                fmt.eprintf("voila: %s takes no options: %s\n", verb, args[i])
+                os.exit(2)
+            }
+            i += 1
+        }
     }
 
     // The two front-end-only verbs work on ONE file: no packages, no loader.

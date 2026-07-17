@@ -1,6 +1,11 @@
 /* value.c — values, reference counting, frames, equality, printing. */
 #include "voila_int.h"
 
+static void frame_mark_shared(VlFrame *f);
+static void frame_retain(VlFrame *f);
+
+#include <assert.h>
+
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -142,7 +147,20 @@ Value vl_closure(VlFn fn, VlFrame *up) {
   VlClosure *c = (VlClosure *)vl_obj_new(O_CLOSURE, sizeof(VlClosure));
   c->fn = fn;
   c->up = up;
-  if (up) up->hdr.rc++;
+  if (up) {
+    /* The optimizer's elision predicate FORBIDS closures over stack
+     * frames (any MKCLOS disqualifies the function). This assert is the
+     * tripwire for a predicate bug: better an immediate abort in a debug
+     * build than a dangling frame pointer in production. */
+    assert(!up->stackalloc && "closure over a stack-allocated frame");
+    /* From here on this frame (and every ancestor it can reach) may cross
+     * threads inside the closure. Mark BEFORE the closure value escapes:
+     * publication (channel send, spawn) synchronizes, so consumers see the
+     * flag. The retain itself may already race with an earlier closure over
+     * the same frame running elsewhere, hence frame_retain's atomic path. */
+    frame_mark_shared(up);
+    frame_retain(up);
+  }
   return obj(&c->hdr);
 }
 
@@ -292,15 +310,52 @@ static void obj_free(VlObj *o) {
 
 /* ---------------------------------------------------------------- frames */
 
+/* frame_mark_shared flags a frame and its whole up-chain as thread-crossing.
+ * Runs on the frame's owning thread, before the capturing closure escapes;
+ * an already-shared ancestor means the rest of the chain is already marked. */
+static void frame_mark_shared(VlFrame *f) {
+  for (; f && !f->shared; f = f->up) f->shared = 1;
+}
+
+/* frame_retain bumps a frame's refcount: plain for thread-local frames,
+ * atomic once a closure made the frame shareable. */
+static void frame_retain(VlFrame *f) {
+  if (f->shared) __atomic_add_fetch(&f->hdr.rc, 1, __ATOMIC_RELAXED);
+  else f->hdr.rc++;
+}
+
 VlFrame *vl_frame_new(int nregs, VlFrame *up) {
   size_t size = sizeof(VlFrame) + sizeof(Value) * (size_t)(nregs > 0 ? nregs - 1 : 0);
   VlFrame *f = (VlFrame *)vl_alloc(size);
   f->hdr.rc = 1;
   f->hdr.kind = O_FRAME;
   f->nregs = nregs;
+  f->stackalloc = 0;
+  f->shared = 0;
   f->up = up;
-  if (up) up->hdr.rc++;
+  if (up) {
+    assert(!up->stackalloc && "a stack frame must never be captured as up");
+    frame_retain(up);
+  }
   for (int i = 0; i < nregs; i++) f->r[i] = vl_nil();
+  return f;
+}
+
+/* vl_frame_stack_init readies caller-provided (stack) storage as a frame.
+ * The buffer arrives zeroed by the C compiler? NO — it arrives as
+ * uninitialized automatic storage; memset here is the nil-init (VL_NIL is
+ * all-zero bits), and it is the only per-call cost that remains. */
+VlFrame *vl_frame_stack_init(VlFrame *f, int nregs, VlFrame *up) {
+  memset(f, 0, sizeof(VlFrame) + sizeof(Value) * (size_t)(nregs > 0 ? nregs - 1 : 0));
+  f->hdr.rc = 1;
+  f->hdr.kind = O_FRAME;
+  f->nregs = nregs;
+  f->stackalloc = 1;
+  f->up = up;
+  if (up) {
+    assert(!up->stackalloc && "a stack frame must never be captured as up");
+    frame_retain(up);
+  }
   return f;
 }
 
@@ -324,12 +379,19 @@ void vl_frame_clear(VlFrame *f) {
 
 void vl_frame_release(VlFrame *f) {
   if (!f) return;
-  if (--f->hdr.rc > 0) return;
+  if (f->shared) {
+    /* ACQ_REL: the zero-observing thread must see every register write the
+     * other thread made before its own release. */
+    if (__atomic_sub_fetch(&f->hdr.rc, 1, __ATOMIC_ACQ_REL) > 0) return;
+  } else {
+    /* Never captured by a closure => never left this thread. */
+    if (--f->hdr.rc > 0) return;
+  }
   for (int i = 0; i < f->nregs; i++) vl_release(f->r[i]);
   for (int i = 0; i < f->ndefers; i++) vl_release(f->defers[i]);
   free(f->defers);
   if (f->up) vl_frame_release(f->up);
-  free(f);
+  if (!f->stackalloc) free(f);
 }
 
 void vl_frame_push(VlFrame *f) {

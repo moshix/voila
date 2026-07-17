@@ -1,0 +1,22 @@
+// Trap identity under optimization: every trap message must be byte-equal
+// at -O0 and every -O level (the messages live in the goldens; at -O3 the
+// arithmetic becomes native and the messages must come from the SAME
+// runtime strings).
+use "std/fmt"
+
+func main() {
+    let big = 9223372036854775807
+    let lo = 0 - 9223372036854775807 - 1
+    try { say big + 1 } catch e { say "t1:", e.message() }
+    try { say lo - 1 } catch e { say "t2:", e.message() }
+    try { say big * 2 } catch e { say "t3:", e.message() }
+    try { say lo ~/ -1 } catch e { say "t4:", e.message() }
+    try { say 1 ~/ 0 } catch e { say "t5:", e.message() }
+    try { say 1 % 0 } catch e { say "t6:", e.message() }
+    try { say 1 / 0 } catch e { say "t7:", e.message() }
+    try { say 1.0 / 0.0 } catch e { say "t8:", e.message() }
+    try { say 0 - lo } catch e { say "t9:", e.message() }
+    try { say 2 ** 127 } catch e { say "t10:", e.message() }
+    try { say 1 << 64 } catch e { say "t11:", e.message() }
+    say "traps done"
+}

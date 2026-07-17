@@ -1,0 +1,12 @@
+t1: OverflowError{op: "integer overflow: 9223372036854775807 + 1"}
+t2: OverflowError{op: "integer overflow: -9223372036854775808 - 1"}
+t3: OverflowError{op: "integer overflow: 9223372036854775807 * 2"}
+t4: OverflowError{op: "integer overflow: -9223372036854775808 // -1"}
+t5: RangeError{msg: "division by zero"}
+t6: RangeError{msg: "division by zero"}
+t7: RangeError{msg: "division by zero"}
+t8: RangeError{msg: "division by zero"}
+t9: OverflowError{op: "integer overflow: 0 - -9223372036854775808"}
+t10: OverflowError{op: "integer overflow: 2 ** 127"}
+t11: RangeError{msg: "shift count 64 out of range"}
+traps done

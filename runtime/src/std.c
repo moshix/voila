@@ -1084,6 +1084,7 @@ STRFN(replace) STRFN(replace_n) STRFN(repeat) STRFN(reverse) STRFN(translate)
 STRFN(overlay) STRFN(insert) STRFN(delstr) STRFN(bytes) STRFN(from_bytes)
 STRFN(runes) STRFN(from_runes) STRFN(rune_len) STRFN(is_digit) STRFN(is_alpha)
 STRFN(is_space) STRFN(is_upper) STRFN(hex) STRFN(unhex) STRFN(b64) STRFN(unb64)
+STRFN(find_any) STRFN(skip_any)
 #undef STRFN
 
 /* ---------------------------------------------------------------- table */
@@ -1180,6 +1181,7 @@ static const Entry str_table[] = {
     E(reverse) E(translate) E(overlay) E(insert) E(delstr) E(bytes)
     E(from_bytes) E(runes) E(from_runes) E(rune_len) E(is_digit) E(is_alpha)
     E(is_space) E(is_upper) E(hex) E(unhex) E(b64) E(unb64)
+    E(find_any) E(skip_any)
 #undef E
 };
 

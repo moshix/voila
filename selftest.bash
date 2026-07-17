@@ -207,7 +207,7 @@ esac
 # Every conformance golden must hold at every implemented -O level, and the
 # optimizer must be deterministic (the fixpoint depends on it). Levels are
 # added here as they land: -O1 (M3), -O2 (M4), -O3 (M5).
-OPT_LEVELS="-O1"
+OPT_LEVELS="-O1 -O2"
 for LV in $OPT_LEVELS; do
     bold "==> optimizer: goldens at $LV"
     opass=0

@@ -217,6 +217,7 @@ Value vl_str_call(const char *name, Value *argv, int argc, bool *ok) {
      * after `from` that appears in `stops`, or -1. This is the LEXER's
      * scanning primitive: a token scan that visited every character through
      * boxed method calls becomes one C loop with a 256-entry table. */
+    if (argc < 2) vl_abort("find_any: missing stops argument");
     int64_t stn;
     const char *st = S(argv[1], &stn);
     int64_t from = argc > 2 ? I(argv[2]) : 0;
@@ -231,6 +232,7 @@ Value vl_str_call(const char *name, Value *argv, int argc, bool *ok) {
     /* skip_any(chars, from) -> index of the first byte of the subject at or
      * after `from` that is NOT in `chars`, or len. The complement of
      * find_any: identifiers, digit runs and whitespace skip in one C loop. */
+    if (argc < 2) vl_abort("skip_any: missing chars argument");
     int64_t stn;
     const char *st = S(argv[1], &stn);
     int64_t from = argc > 2 ? I(argv[2]) : 0;

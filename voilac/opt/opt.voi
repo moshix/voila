@@ -29,6 +29,9 @@ func Run(m mut ir.Module, level int) {
     while fi < len(m.Funcs) {
         dce_func(m, fi)
         shrink_func(m, fi)
+        if level >= 2 {
+            elide_func(m, fi)
+        }
         fi += 1
     }
 }

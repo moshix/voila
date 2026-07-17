@@ -571,7 +571,15 @@ impl Gen {
                            "VlFrame *up) \{", c_func_name(idx)))
         var nregs = f.NRegs
         if nregs < 1 { nregs = 1 }
-        self.p(fmt.sprintf("  VlFrame *F = vl_frame_new(%d, up);", nregs))
+        if f.Elide {
+            // Frame elision (-O2): the registers live in THIS call's C stack
+            // frame. Everything downstream — push, unwinding, PMATCH writes,
+            // the epilogue — is unchanged, because a stack frame is
+            // layout-identical to a heap one; only the allocator differs.
+            self.p(fmt.sprintf("  VL_FRAME_ON_STACK(F, %d, up);", nregs))
+        } else {
+            self.p(fmt.sprintf("  VlFrame *F = vl_frame_new(%d, up);", nregs))
+        }
         self.p("  vl_frame_push(F);")
         self.p("  Value __ret = vl_unit();")
         self.p("  (void)argc;")
