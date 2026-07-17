@@ -14,72 +14,89 @@ static Value derune(Value v) {
   return v;
 }
 
-/* int → float only when exactly representable (§3.2). */
-static double int_to_float(int64_t n) {
-  if (n > (1LL << 53) || n < -(1LL << 53))
-    vl_throwf("ConvError",
-              "int value %lld is not exactly representable as float; use float(x)",
-              (long long)n);
-  return (double)n;
+/* ------------------------------------------------------- cold traps (-O3)
+ * The SINGLE home of every numeric trap message. The boxed helpers below
+ * and the inline _ck wrappers in voila.h both land here, so an optimized
+ * build cannot emit a different message than an unoptimized one. */
+
+void vl_trap_iovf(const char *op, int64_t a, int64_t b) {
+  vl_throwf("OverflowError", "integer overflow: %lld %s %lld",
+            (long long)a, op, (long long)b);
+  __builtin_unreachable();
+}
+void vl_trap_div0(void) {
+  vl_throwf("RangeError", "division by zero");
+  __builtin_unreachable();
+}
+void vl_trap_itof(int64_t n) {
+  vl_throwf("ConvError",
+            "int value %lld is not exactly representable as float; use float(x)",
+            (long long)n);
+  __builtin_unreachable();
+}
+void vl_trap_shift(int64_t n) {
+  vl_throwf("RangeError", "shift count %lld out of range", (long long)n);
+  __builtin_unreachable();
+}
+void vl_trap_inegovf(void) {
+  vl_throwf("OverflowError", "integer overflow negating");
+  __builtin_unreachable();
 }
 
-/* ---------------------------------------------------------------- ints */
-
-static Value int_add(int64_t a, int64_t b) {
-  int64_t c;
-  if (__builtin_add_overflow(a, b, &c))
-    vl_throwf("OverflowError", "integer overflow: %lld + %lld", (long long)a, (long long)b);
-  return vl_int(c);
-}
-
-static Value int_sub(int64_t a, int64_t b) {
-  int64_t c;
-  if (__builtin_sub_overflow(a, b, &c))
-    vl_throwf("OverflowError", "integer overflow: %lld - %lld", (long long)a, (long long)b);
-  return vl_int(c);
-}
-
-static Value int_mul(int64_t a, int64_t b) {
-  int64_t c;
-  if (__builtin_mul_overflow(a, b, &c))
-    vl_throwf("OverflowError", "integer overflow: %lld * %lld", (long long)a, (long long)b);
-  return vl_int(c);
-}
-
-static int64_t floor_div(int64_t a, int64_t b) {
-  if (b == 0) vl_throwf("RangeError", "division by zero");
-  if (b == -1 && a == INT64_MIN)
-    vl_throwf("OverflowError", "integer overflow: %lld // -1", (long long)a);
+/* Shared out-of-line cores (declared in voila.h). */
+int64_t vl_ifloordiv(int64_t a, int64_t b) {
+  if (b == 0) vl_trap_div0();
+  if (b == -1 && a == INT64_MIN) vl_trap_iovf("//", a, -1);
   int64_t q = a / b;
   if ((a % b != 0) && ((a < 0) != (b < 0))) q--;
   return q;
 }
-
-static int64_t floor_mod(int64_t a, int64_t b) {
-  if (b == 0) vl_throwf("RangeError", "division by zero");
+int64_t vl_ifloormod(int64_t a, int64_t b) {
+  if (b == 0) vl_trap_div0();
   if (b == -1) return 0;
   int64_t m = a % b;
   if (m != 0 && ((a < 0) != (b < 0))) m += b;
   return m;
 }
-
-static Value int_pow(int64_t a, int64_t b) {
+int64_t vl_ipow_i(int64_t a, int64_t b) {
   if (b < 0)
     vl_throwf("RangeError", "negative integer exponent %lld (use float or dec base)",
               (long long)b);
   int64_t result = 1, base = a;
   for (int64_t e = b; e > 0; e >>= 1) {
     if (e & 1) {
-      if (__builtin_mul_overflow(result, base, &result))
-        vl_throwf("OverflowError", "integer overflow: %lld ** %lld", (long long)a, (long long)b);
+      if (__builtin_mul_overflow(result, base, &result)) vl_trap_iovf("**", a, b);
     }
     if (e > 1) {
-      if (__builtin_mul_overflow(base, base, &base))
-        vl_throwf("OverflowError", "integer overflow: %lld ** %lld", (long long)a, (long long)b);
+      if (__builtin_mul_overflow(base, base, &base)) vl_trap_iovf("**", a, b);
     }
   }
-  return vl_int(result);
+  return result;
 }
+double vl_ffloormod(double x, double y) {
+  if (y == 0) vl_trap_div0();
+  double m = fmod(x, y);
+  if (m != 0 && ((m < 0) != (y < 0))) m += y;
+  return m;
+}
+int64_t vl_ifloordiv_f(double x, double y) {
+  if (y == 0) vl_trap_div0();
+  double q = floor(x / y);
+  return (int64_t)q;
+}
+double vl_fpow(double x, double y) { return pow(x, y); }
+
+/* int → float only when exactly representable (§3.2): vl_itof_ck. */
+#define int_to_float vl_itof_ck
+
+/* ---------------------------------------------------------------- ints */
+
+static Value int_add(int64_t a, int64_t b) { return vl_int(vl_iadd_ck(a, b)); }
+static Value int_sub(int64_t a, int64_t b) { return vl_int(vl_isub_ck(a, b)); }
+static Value int_mul(int64_t a, int64_t b) { return vl_int(vl_imul_ck(a, b)); }
+static int64_t floor_div(int64_t a, int64_t b) { return vl_ifloordiv(a, b); }
+static int64_t floor_mod(int64_t a, int64_t b) { return vl_ifloormod(a, b); }
+static Value int_pow(int64_t a, int64_t b) { return vl_int(vl_ipow_i(a, b)); }
 
 /* ---------------------------------------------------------------- durations */
 
@@ -170,9 +187,7 @@ static Value arith(int op, Value a, Value b) {
     case OP_ADD: return int_add(a.u.i, b.u.i);
     case OP_SUB: return int_sub(a.u.i, b.u.i);
     case OP_MUL: return int_mul(a.u.i, b.u.i);
-    case OP_DIV:
-      if (b.u.i == 0) vl_throwf("RangeError", "division by zero");
-      return vl_float(int_to_float(a.u.i) / int_to_float(b.u.i));
+    case OP_DIV: return vl_float(vl_idivf_ck(a.u.i, b.u.i));
     case OP_IDIV: return vl_int(floor_div(a.u.i, b.u.i));
     case OP_MOD: return vl_int(floor_mod(a.u.i, b.u.i));
     case OP_POW: return int_pow(a.u.i, b.u.i);
@@ -190,21 +205,10 @@ static Value arith(int op, Value a, Value b) {
     case OP_ADD: return vl_float(x + y);
     case OP_SUB: return vl_float(x - y);
     case OP_MUL: return vl_float(x * y);
-    case OP_DIV:
-      if (y == 0) vl_throwf("RangeError", "division by zero");
-      return vl_float(x / y);
-    case OP_IDIV: {
-      if (y == 0) vl_throwf("RangeError", "division by zero");
-      double q = floor(x / y);
-      return vl_int((int64_t)q);
-    }
-    case OP_MOD: {
-      if (y == 0) vl_throwf("RangeError", "division by zero");
-      double m = fmod(x, y);
-      if (m != 0 && ((m < 0) != (y < 0))) m += y;
-      return vl_float(m);
-    }
-    case OP_POW: return vl_float(pow(x, y));
+    case OP_DIV: return vl_float(vl_fdiv_ck(x, y));
+    case OP_IDIV: return vl_int(vl_ifloordiv_f(x, y));
+    case OP_MOD: return vl_float(vl_ffloormod(x, y));
+    case OP_POW: return vl_float(vl_fpow(x, y));
     case OP_LT: return vl_bool(x < y);
     case OP_LE: return vl_bool(x <= y);
     case OP_GT: return vl_bool(x > y);
@@ -273,15 +277,17 @@ static int64_t want_i(Value v) {
   return v.u.i;
 }
 
+/* Original trap order preserved: the count is inspected (and range-checked)
+ * before the left operand is even looked at. */
 Value vl_shl(Value a, Value b) {
   int64_t n = want_i(b);
-  if (n < 0 || n > 63) vl_throwf("RangeError", "shift count %lld out of range", (long long)n);
+  if (n < 0 || n > 63) vl_trap_shift(n);
   return vl_int(want_i(a) << n);
 }
 
 Value vl_shr(Value a, Value b) {
   int64_t n = want_i(b);
-  if (n < 0 || n > 63) vl_throwf("RangeError", "shift count %lld out of range", (long long)n);
+  if (n < 0 || n > 63) vl_trap_shift(n);
   return vl_int(want_i(a) >> n);
 }
 
@@ -292,10 +298,7 @@ Value vl_bnot(Value a) { return vl_int(~want_i(a)); }
 
 Value vl_neg(Value a) {
   a = derune(a);
-  if (a.t == VL_INT) {
-    if (a.u.i == INT64_MIN) vl_throwf("OverflowError", "integer overflow negating");
-    return vl_int(-a.u.i);
-  }
+  if (a.t == VL_INT) return vl_int(vl_ineg_ck(a.u.i));
   if (a.t == VL_FLOAT) return vl_float(-a.u.f);
   if (is_dec(a)) return vl_dec_neg_v(a);
   if (a.t == VL_DUR) return vl_dur(-a.u.i);

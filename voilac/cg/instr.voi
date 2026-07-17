@@ -177,6 +177,15 @@ impl Gen {
     func emit_instr(mut self, f ir.Func, ins ir.Instr, seq int) {
         let a = ins.Args
 
+        // -O3: instructions whose destination is a typed register render as
+        // native C arithmetic. Everything not handled there falls through to
+        // the boxed paths below, where operand() boxes typed sources on
+        // demand and dst() rejects typed destinations (the transfer function
+        // guarantees they cannot occur).
+        if len(f.RegT) > 0 {
+            if self.emit_native(f, ins) { return }
+        }
+
         if ins.Op in self.binOp {
             let fn = self.binOp[ins.Op]
             self.p(fmt.sprintf("  vl_set(&%s, %s(%s, %s));",
@@ -562,6 +571,226 @@ impl Gen {
     }
 
     // ------------------------------------------------------------ calls
+
+    // ------------------------------------------------------------ -O3
+
+    // const_rt maps "Kn" to the RT_* type of the pool constant.
+    func const_rt(self, a str) int {
+        if len(a) < 2 { return ir.RT_BOX }
+        if a[0] != 'K' { return ir.RT_BOX }
+        var v = 0
+        var i = 1
+        while i < len(a) {
+            let c = a[i]
+            if c < '0' or c > '9' { return ir.RT_BOX }
+            v = v * 10 + (c - 48)
+            i += 1
+        }
+        if v >= len(self.mod.Consts) { return ir.RT_BOX }
+        let k = self.mod.Consts[v].Kind
+        if k == ir.CINT { return ir.RT_INT }
+        if k == ir.CFLOAT { return ir.RT_FLOAT }
+        if k == ir.CBOOL { return ir.RT_BOOL }
+        return ir.RT_BOX
+    }
+
+    // xty gives an operand's RT_* type: register slot or pool constant.
+    func xty(self, f ir.Func, a str) int {
+        let r = reg_slot(a)
+        if r >= 0 { return self.rt(f, r) }
+        return self.const_rt(a)
+    }
+
+    // nat renders an operand in native form. `want` is RT_INT or RT_FLOAT
+    // (or RT_BOOL for booleans); an int operand in a float position widens
+    // through vl_itof_ck — the same trap, in the same order, as the boxed
+    // path's int_to_float.
+    func nat(mut self, f ir.Func, a str, want int) str {
+        let t = self.xty(f, a)
+        let r = reg_slot(a)
+        var e = ""
+        if r >= 0 {
+            if t == ir.RT_INT { e = fmt.sprintf("r%d_i", r) }
+            if t == ir.RT_FLOAT { e = fmt.sprintf("r%d_f", r) }
+            if t == ir.RT_BOOL { e = fmt.sprintf("r%d_b", r) }
+        } else if str.starts_with(a, "K") {
+            let n = atoi(a[1..len(a)])
+            if n >= 0 and n < len(self.mod.Consts) {
+                let c = self.mod.Consts[n]
+                if c.Kind == ir.CINT { e = c.Text || "LL" }
+                if c.Kind == ir.CFLOAT { e = c.Text }
+                if c.Kind == ir.CBOOL { e = c.Text }
+            }
+        }
+        if e == "" {
+            self.failf(fmt.sprintf("cgen: operand %q is not native in %s",
+                                   a, f.Name))
+            return "0"
+        }
+        if want == ir.RT_FLOAT and t == ir.RT_INT {
+            return fmt.sprintf("vl_itof_ck(%s)", e)
+        }
+        return e
+    }
+
+    // emit_native renders the typed-register instruction forms; it returns
+    // false for anything the boxed paths should handle. A typed DESTINATION
+    // on an op outside this table is an inference bug — dst() aborts on it.
+    func emit_native(mut self, f ir.Func, ins ir.Instr) bool {
+        let op = ins.Op
+        let a = ins.Args
+
+        // Branches read a typed bool source.
+        if op == "JMPF" or op == "JMPT" {
+            let r = reg_slot(a[0])
+            if r >= 0 and self.rt(f, r) == ir.RT_BOOL {
+                var neg = "!"
+                if op == "JMPT" { neg = "" }
+                self.p(fmt.sprintf("  if (%sr%d_b) goto %s;", neg, r, a[1]))
+                return true
+            }
+            return false
+        }
+
+        if len(a) == 0 { return false }
+        let d = reg_slot(a[0])
+        if d < 0 { return false }
+        let dt = self.rt(f, d)
+        if dt == ir.RT_BOX { return false }
+
+        var lhs = ""
+        if dt == ir.RT_INT { lhs = fmt.sprintf("r%d_i", d) }
+        if dt == ir.RT_FLOAT { lhs = fmt.sprintf("r%d_f", d) }
+        if dt == ir.RT_BOOL { lhs = fmt.sprintf("r%d_b", d) }
+
+        if op == "LOADK" or op == "MOVE" {
+            self.p(fmt.sprintf("  %s = %s;", lhs, self.nat(f, a[1], dt)))
+            return true
+        }
+        if op == "ADD" or op == "SUB" or op == "MUL" {
+            if dt == ir.RT_INT {
+                var fn = "vl_iadd_ck"
+                if op == "SUB" { fn = "vl_isub_ck" }
+                if op == "MUL" { fn = "vl_imul_ck" }
+                self.p(fmt.sprintf("  %s = %s(%s, %s);", lhs, fn,
+                                   self.nat(f, a[1], ir.RT_INT),
+                                   self.nat(f, a[2], ir.RT_INT)))
+            } else {
+                var c = "+"
+                if op == "SUB" { c = "-" }
+                if op == "MUL" { c = "*" }
+                self.p(fmt.sprintf("  %s = %s %s %s;", lhs,
+                                   self.nat(f, a[1], ir.RT_FLOAT), c,
+                                   self.nat(f, a[2], ir.RT_FLOAT)))
+            }
+            return true
+        }
+        if op == "DIV" {
+            // `/` always yields float; two ints check div0 BEFORE widening,
+            // exactly as the boxed path does.
+            if self.xty(f, a[1]) == ir.RT_INT and
+               self.xty(f, a[2]) == ir.RT_INT {
+                self.p(fmt.sprintf("  %s = vl_idivf_ck(%s, %s);", lhs,
+                                   self.nat(f, a[1], ir.RT_INT),
+                                   self.nat(f, a[2], ir.RT_INT)))
+            } else {
+                self.p(fmt.sprintf("  %s = vl_fdiv_ck(%s, %s);", lhs,
+                                   self.nat(f, a[1], ir.RT_FLOAT),
+                                   self.nat(f, a[2], ir.RT_FLOAT)))
+            }
+            return true
+        }
+        if op == "IDIV" {
+            if self.xty(f, a[1]) == ir.RT_INT and
+               self.xty(f, a[2]) == ir.RT_INT {
+                self.p(fmt.sprintf("  %s = vl_ifloordiv(%s, %s);", lhs,
+                                   self.nat(f, a[1], ir.RT_INT),
+                                   self.nat(f, a[2], ir.RT_INT)))
+            } else {
+                self.p(fmt.sprintf("  %s = vl_ifloordiv_f(%s, %s);", lhs,
+                                   self.nat(f, a[1], ir.RT_FLOAT),
+                                   self.nat(f, a[2], ir.RT_FLOAT)))
+            }
+            return true
+        }
+        if op == "MOD" or op == "POW" {
+            if dt == ir.RT_INT {
+                var fn = "vl_ifloormod"
+                if op == "POW" { fn = "vl_ipow_i" }
+                self.p(fmt.sprintf("  %s = %s(%s, %s);", lhs, fn,
+                                   self.nat(f, a[1], ir.RT_INT),
+                                   self.nat(f, a[2], ir.RT_INT)))
+            } else {
+                var fn = "vl_ffloormod"
+                if op == "POW" { fn = "vl_fpow" }
+                self.p(fmt.sprintf("  %s = %s(%s, %s);", lhs, fn,
+                                   self.nat(f, a[1], ir.RT_FLOAT),
+                                   self.nat(f, a[2], ir.RT_FLOAT)))
+            }
+            return true
+        }
+        if op == "SHL" or op == "SHR" {
+            var fn = "vl_ishl_ck"
+            if op == "SHR" { fn = "vl_ishr_ck" }
+            self.p(fmt.sprintf("  %s = %s(%s, %s);", lhs, fn,
+                               self.nat(f, a[1], ir.RT_INT),
+                               self.nat(f, a[2], ir.RT_INT)))
+            return true
+        }
+        if op == "BAND" or op == "BOR" or op == "BXOR" {
+            var c = "&"
+            if op == "BOR" { c = "|" }
+            if op == "BXOR" { c = "^" }
+            self.p(fmt.sprintf("  %s = %s %s %s;", lhs,
+                               self.nat(f, a[1], ir.RT_INT), c,
+                               self.nat(f, a[2], ir.RT_INT)))
+            return true
+        }
+        if op == "BNOT" {
+            self.p(fmt.sprintf("  %s = ~%s;", lhs,
+                               self.nat(f, a[1], ir.RT_INT)))
+            return true
+        }
+        if op == "NEG" {
+            if dt == ir.RT_INT {
+                self.p(fmt.sprintf("  %s = vl_ineg_ck(%s);", lhs,
+                                   self.nat(f, a[1], ir.RT_INT)))
+            } else {
+                self.p(fmt.sprintf("  %s = -%s;", lhs,
+                                   self.nat(f, a[1], ir.RT_FLOAT)))
+            }
+            return true
+        }
+        if op == "NOT" {
+            self.p(fmt.sprintf("  %s = !%s;", lhs,
+                               self.nat(f, a[1], ir.RT_BOOL)))
+            return true
+        }
+        if op == "CMPLT" or op == "CMPLE" or op == "CMPGT" or
+           op == "CMPGE" or op == "CMPEQ" or op == "CMPNE" {
+            var c = "<"
+            if op == "CMPLE" { c = "<=" }
+            if op == "CMPGT" { c = ">" }
+            if op == "CMPGE" { c = ">=" }
+            if op == "CMPEQ" { c = "==" }
+            if op == "CMPNE" { c = "!=" }
+            let tx = self.xty(f, a[1])
+            let ty = self.xty(f, a[2])
+            // The inference typed this BOOL, so both operands are native;
+            // an int/float mix compares as floats, widening with the same
+            // trap as the boxed path.
+            var w = ir.RT_INT
+            if tx != ir.RT_INT or ty != ir.RT_INT { w = ir.RT_FLOAT }
+            if tx == ir.RT_BOOL { w = ir.RT_BOOL }
+            self.p(fmt.sprintf("  %s = %s %s %s;", lhs,
+                               self.nat(f, a[1], w), c,
+                               self.nat(f, a[2], w)))
+            return true
+        }
+        // A typed destination on any other op cannot happen; let the boxed
+        // path's dst() failf with the precise message.
+        return false
+    }
 
     // emit_loadfn takes a function's address: a module function becomes a
     // closure, anything else a runtime lookup.

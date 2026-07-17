@@ -35,6 +35,14 @@ func ConstKindName(k int) str {
     return "UNIT"
 }
 
+// Register types assigned by the -O3 unboxing pass (opt/typing.voi) and
+// consumed by the backend. Shared here so opt and cg agree on the values.
+const RT_UNSEEN = 0
+const RT_INT    = 1
+const RT_FLOAT  = 2
+const RT_BOOL   = 3
+const RT_BOX    = 4
+
 struct Const {
     Kind int
     Text str
@@ -113,7 +121,7 @@ struct Func {
     // paths are gated on these, so a build without -O emits byte-identical
     // C by construction.
     Elide bool    // use the stack-frame prologue (no heap VlFrame)
-    RegT  []int   // per-slot type for unboxing; empty = all boxed
+    RegT  []int   // per-slot RT_* type for unboxing; empty = all boxed
 }
 
 impl Func {

@@ -34,3 +34,30 @@ byte-identical at every level), tests/opt/shared_frames.voi (8 tasks × 20k
 cross-thread closure calls × 25 runs per level, deterministic, 0 leaks).
 TSan is broken on this macOS toolchain (a trivial pthread hello segfaults);
 a Linux TSan pass over shared_frames is queued for M6's per-arch gate.
+
+## After M5 (typed unboxing -O3; cc -O3 for flagged program TUs) — 2026-07-17
+
+== RUNTIME SUITE — suite best-of-3 (interleaved A/B in parens), ms ==
+program           -O0     -O3   delta
+b1_queens        4153    3589   -14%  (interleaved: 3982 vs 3784, -5%)
+b2_life          1181     710   -40%  (interleaved: 1116 vs 708, -37%)
+b3_wordfreq       416     382    -8%
+b4_ledger         987     971    -2%  (dec never unboxes — by design)
+b5_churn          810     742    -8%  (interleaved: 849 vs 748, -12%)
+b6_partasks       851     716   -16%
+b7_strings        523     496    -5%
+
+The unboxing pass types whole registers (flow-insensitive join over all
+defs): loop counters, LCG arithmetic, accumulator temps go native — hence
+b2_life's -37%. The known structural limit: PARAMETERS stay boxed (the
+calling convention passes Values), so recursion-through-params workloads
+(b1_queens' solver) gain far less. Candidates for a later milestone:
+call-site specialization, and rewriting `for i in range` iterators into
+native counters (today ITNEXT forces its loop variable to BOX).
+
+New: tests/opt/typing_adv.voi (match-bind counters, parse targets, UPSET
+closures, setjmp-clobber probe, int/float join demotion, loop-carried
+temps, hot-loop overflow, dec at -O3) — byte-identical at all four levels,
+0 leaks. Cross-build identity: the compiler built at -O3 emits byte-equal
+C (default AND -O3) for conformance, bench, samples, and itself. selftest
+now runs goldens at -O1, -O2 and -O3.

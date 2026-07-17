@@ -461,9 +461,22 @@ impl Gen {
         self.p("")
     }
 
-    // operand renders an IR operand as a borrowed C expression.
+    // rt gives a slot's RT_* type; RT_BOX when the pass did not run.
+    func rt(self, f ir.Func, slot int) int {
+        if slot < 0 or slot >= len(f.RegT) { return ir.RT_BOX }
+        return f.RegT[slot]
+    }
+
+    // operand renders an IR operand as a borrowed C expression. A typed
+    // register boxes on demand: vl_int/vl_float/vl_bool are immediates, so
+    // the wrap allocates nothing and needs no retain.
     func operand(mut self, f ir.Func, s str) str {
         if str.starts_with(s, "r") and reg_slot(s) >= 0 {
+            let n = reg_slot(s)
+            let t = self.rt(f, n)
+            if t == ir.RT_INT { return fmt.sprintf("vl_int(r%d_i)", n) }
+            if t == ir.RT_FLOAT { return fmt.sprintf("vl_float(r%d_f)", n) }
+            if t == ir.RT_BOOL { return fmt.sprintf("vl_bool(r%d_b)", n) }
             return fmt.sprintf("F->r[%d]", reg_slot(s))
         }
         if str.starts_with(s, "K") {
@@ -486,13 +499,19 @@ impl Gen {
         return "vl_nil()"
     }
 
-    // dst renders a destination register.
+    // dst renders a destination register. A typed slot here is an internal
+    // bug: the transfer function promised every non-native def forces BOX,
+    // so only native emission paths may write typed slots.
     func dst(mut self, f ir.Func, s str) str {
         let n = reg_slot(s)
         if n < 0 {
             self.failf(fmt.sprintf("cgen: bad destination %q in %s", s,
                                    f.Name))
             return "F->r[0]"
+        }
+        if self.rt(f, n) != ir.RT_BOX {
+            self.failf(fmt.sprintf("cgen: typed register r%d written by a " ||
+                                   "boxed path in %s", n, f.Name))
         }
         return fmt.sprintf("F->r[%d]", n)
     }
@@ -583,9 +602,28 @@ impl Gen {
         self.p("  vl_frame_push(F);")
         self.p("  Value __ret = vl_unit();")
         self.p("  (void)argc;")
-        // Parameters land in the lowest registers.
+        // Typed registers (-O3) are C locals beside the frame; their frame
+        // slots stay nil forever. The `= 0` default is unobservable: no
+        // accepted program reads a register before a def (see typing.voi).
+        each ri, rt in f.RegT {
+            if rt == ir.RT_INT {
+                self.p(fmt.sprintf("  int64_t r%d_i = 0;", ri))
+            } else if rt == ir.RT_FLOAT {
+                self.p(fmt.sprintf("  double r%d_f = 0;", ri))
+            } else if rt == ir.RT_BOOL {
+                self.p(fmt.sprintf("  bool r%d_b = false;", ri))
+            }
+        }
+        // Parameters land in the lowest registers. Under -O the spill stops
+        // at NParams: slots past the declared parameters are temporaries no
+        // instruction ever reads before writing, so spilling extra call
+        // arguments into them was always dead weight.
+        var spill = nregs
+        if self.mod.OptLevel >= 1 and f.NParams < spill {
+            spill = f.NParams
+        }
         self.p(fmt.sprintf("  for (int i = 0; i < argc && i < %d; i++) " ||
-                           "vl_set(&F->r[i], vl_retain(argv[i]));", nregs))
+                           "vl_set(&F->r[i], vl_retain(argv[i]));", spill))
 
         var seq = 0
         each ins in f.Instrs {

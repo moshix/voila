@@ -40,6 +40,9 @@ const VERSION = "0.3.2"
 // cache key hashes it; the program compile and the archive build use it.
 // If these ever diverged, a cached archive built with old flags would be
 // linked into builds claiming new ones.
+// NEVER add -flto here: the -O2 frame-elision macro (VL_FRAME_ON_STACK)
+// and setjmp-crossing stack frames are only conforming because the runtime
+// archive is a separate translation unit the C optimizer cannot see into.
 const CFLAGS = "-std=c11 -O2"
 
 func main() {
@@ -198,7 +201,7 @@ func main() {
         return
     }
     if verb == "build" {
-        build(src, csrc, args)
+        build(src, csrc, args, optLevel)
         return
     }
     if verb == "run" {
@@ -233,7 +236,7 @@ func run(prog load.Program, csrc str, args []str, optLevel int,
         // forever. The rename itself is atomic, so the loser simply replaces an
         // identical file.
         let tmp = exe || ".tmp" || host_tag() || "-" || str(os.pid())
-        compile_c(csrc, tmp)
+        compile_c(csrc, tmp, optLevel)
         if os.run("mv", ["-f", tmp, exe]) != 0 {
             fmt.eprintf("voila: cannot install %s\n", exe)
             os.exit(1)
@@ -364,7 +367,7 @@ func run_ast(p str) {
 // build writes the C and libvoila's source into a scratch directory and hands
 // the lot to the system cc. The binary that comes out links libc and nothing
 // else.
-func build(src str, csrc str, args []str) {
+func build(src str, csrc str, args []str, level int) {
     var out = default_out(src)
     var keep = ""
     var i = 2
@@ -379,18 +382,18 @@ func build(src str, csrc str, args []str) {
         i += 1
     }
 
-    compile_c_in(csrc, out, keep)
+    compile_c_in(csrc, out, keep, level)
     fmt.printf("voila: built %s\n", out)
 }
 
 // compile_c writes the C and libvoila's source into a scratch directory and
 // hands the lot to the system cc. The binary that comes out links libc and
 // nothing else.
-func compile_c(csrc str, out str) {
-    compile_c_in(csrc, out, "")
+func compile_c(csrc str, out str, level int) {
+    compile_c_in(csrc, out, "", level)
 }
 
-func compile_c_in(csrc str, out str, keep str) {
+func compile_c_in(csrc str, out str, keep str, level int) {
     // The scratch directory is per PROCESS. A fixed name would let two
     // concurrent builds — `make -j`, or a test harness — write the runtime into
     // the same place and delete it from under each other's cc.
@@ -420,9 +423,15 @@ func compile_c_in(csrc str, out str, keep str) {
     var rtdir = ""
     if keep == "" { rtdir = runtime_lib(cc) }
 
-    // Each whitespace-separated flag is its own argv element.
+    // Each whitespace-separated flag is its own argv element. `voila build
+    // -O3` also raises the C optimizer to -O3 for the PROGRAM translation
+    // unit; the runtime archive stays at CFLAGS so all levels share it.
+    var pflags = CFLAGS
+    if level >= 3 {
+        pflags = str.replace(pflags, "-O2", "-O3")
+    }
     var cargs = []
-    each f in fields(CFLAGS) {
+    each f in fields(pflags) {
         cargs.append(f)
     }
     if rtdir != "" {

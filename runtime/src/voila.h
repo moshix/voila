@@ -113,9 +113,15 @@ struct VlFrame {
   /* 1: some closure captured this frame (or a descendant), so it can cross
    * threads and its refcount needs atomic updates. A closure is the ONLY
    * way a frame escapes its thread, and vl_closure sets the flag on the
-   * whole up-chain BEFORE the closure value can be published — so a plain
-   * read of this flag is race-free, and the overwhelmingly common unshared
-   * frame keeps the plain non-atomic ++/-- it always had. */
+   * whole up-chain BEFORE the closure value escapes — so on every
+   * SYNCHRONIZED publication route (channel send, spawn, await, group,
+   * select, cell: each has a mutex/pthread_create happens-before edge) a
+   * plain read of this flag is race-free, and the overwhelmingly common
+   * unshared frame keeps the plain non-atomic ++/-- it always had.
+   * Publishing a closure through a MODULE GLOBAL has no such edge: plain
+   * 16-byte Value stores already tear there (a pre-existing data race on
+   * any cross-task global), and this flag adds one more reason that
+   * pattern is undefined — pass closures through channels, not globals. */
   uint8_t shared;
   Value *defers; /* closures, run LIFO on exit and on unwind */
   int ndefers, capdefers;
@@ -299,6 +305,72 @@ void vl_rethrow(Value exc);
 void vl_throw_from(Value exc, Value cause);
 void vl_throwf(const char *type, const char *fmt, ...);
 void vl_abort(const char *fmt, ...); /* §8.6: uncatchable, no defers */
+
+/* ------------------------------------------------- native arithmetic (-O3)
+ * The unboxing pass renders int/float/bool registers as C locals and their
+ * arithmetic as the inline `_ck` helpers below. TRAP IDENTITY is the
+ * contract: every trap message exists ONCE, in the cold vl_trap_* functions
+ * (ops.c), which are the bodies of BOTH the boxed path and these inlines —
+ * so optimized and unoptimized programs cannot disagree on a message. */
+
+void vl_trap_iovf(const char *op, int64_t a, int64_t b) __attribute__((noreturn));
+void vl_trap_div0(void) __attribute__((noreturn));
+void vl_trap_itof(int64_t n) __attribute__((noreturn));
+void vl_trap_shift(int64_t n) __attribute__((noreturn));
+void vl_trap_inegovf(void) __attribute__((noreturn));
+
+/* Out-of-line numeric cores shared by both paths (rare enough not to
+ * warrant inlining; each carries its trap checks inside). */
+int64_t vl_ifloordiv(int64_t a, int64_t b);   /* ~/ : div0, INT64_MIN~/-1 */
+int64_t vl_ifloormod(int64_t a, int64_t b);   /* %  : div0                */
+int64_t vl_ipow_i(int64_t a, int64_t b);      /* ** : overflow, neg exp   */
+double  vl_ffloormod(double x, double y);     /* %  : div0, sign fix      */
+int64_t vl_ifloordiv_f(double x, double y);   /* ~/ : div0, floor, trunc  */
+double  vl_fpow(double x, double y);          /* ** : no traps            */
+
+static inline int64_t vl_iadd_ck(int64_t a, int64_t b) {
+  int64_t c;
+  if (__builtin_add_overflow(a, b, &c)) vl_trap_iovf("+", a, b);
+  return c;
+}
+static inline int64_t vl_isub_ck(int64_t a, int64_t b) {
+  int64_t c;
+  if (__builtin_sub_overflow(a, b, &c)) vl_trap_iovf("-", a, b);
+  return c;
+}
+static inline int64_t vl_imul_ck(int64_t a, int64_t b) {
+  int64_t c;
+  if (__builtin_mul_overflow(a, b, &c)) vl_trap_iovf("*", a, b);
+  return c;
+}
+/* int → float only when exactly representable (§3.2) — same rule and same
+ * message as the boxed widening. */
+static inline double vl_itof_ck(int64_t n) {
+  if (n > (1LL << 53) || n < -(1LL << 53)) vl_trap_itof(n);
+  return (double)n;
+}
+/* `/` on two ints yields float (§5.1): div0 is checked BEFORE the operands
+ * widen, matching the boxed order of traps. */
+static inline double vl_idivf_ck(int64_t a, int64_t b) {
+  if (b == 0) vl_trap_div0();
+  return vl_itof_ck(a) / vl_itof_ck(b);
+}
+static inline double vl_fdiv_ck(double x, double y) {
+  if (y == 0) vl_trap_div0();
+  return x / y;
+}
+static inline int64_t vl_ishl_ck(int64_t a, int64_t n) {
+  if (n < 0 || n > 63) vl_trap_shift(n);
+  return a << n;
+}
+static inline int64_t vl_ishr_ck(int64_t a, int64_t n) {
+  if (n < 0 || n > 63) vl_trap_shift(n);
+  return a >> n;
+}
+static inline int64_t vl_ineg_ck(int64_t a) {
+  if (a == INT64_MIN) vl_trap_inegovf();
+  return -a;
+}
 
 /* `try expr` inside a function that returns T!: the generated code checks
  * vl_isfail and jumps to the function's exit with the failure as its result.

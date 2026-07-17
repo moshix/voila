@@ -1,0 +1,330 @@
+// opt/typing.voi — typed unboxing (-O3): whole-register type inference.
+//
+// Decides, per register slot, whether the slot can live as a native C local
+// (int64_t / double / bool) instead of a boxed Value in the frame. The
+// backend then renders its arithmetic with the inline `_ck` helpers
+// (voila.h) — same traps, same messages, no dispatch.
+//
+// The inference is WHOLE-REGISTER and FLOW-INSENSITIVE: a slot's type is
+// the join over ALL of its definition sites, so it over-approximates every
+// path and needs no CFG to be sound. Lattice:
+//
+//     UNSEEN  ⊑  INT | FLOAT | BOOL  ⊑  BOX
+//
+// join(UNSEEN, x) = x; join(x, x) = x; join of two different types = BOX.
+// Conversions are one-directional: a native value is boxed on demand
+// (vl_int(r5i)) wherever a Value is needed; a boxed value is NEVER unboxed
+// into a native register — so no dynamic type guards exist anywhere.
+//
+// Only these def sites can produce a native type:
+//     LOADK    of a CINT/CFLOAT/CBOOL constant
+//     MOVE     from a same-typed register
+//     ADD SUB MUL DIV IDIV MOD POW NEG    over native numeric operands
+//     SHL SHR BAND BOR BXOR BNOT          over native ints
+//     CMP*     over native numeric operands (result BOOL)
+//     NOT      of a native BOOL
+// EVERY other instruction that writes a register (calls, loads, news,
+// channel ops, CONV, TOSTR, ...) forces its destination to BOX, as do the
+// hidden writers that reach registers through the frame rather than as an
+// instruction destination:
+//     - parameters r0..NParams-1 (the calling convention passes Values)
+//     - PMATCH pattern binds and PARSE terms (vl_match/vl_parse write F->r)
+//     - VARARG / UNTUPLE / SELRECV / ITNEXT destinations
+//     - every slot in a descendant closure's Ups (read/written via vl_up)
+//
+// Functions containing EHPUSH are wholly exempt: setjmp may clobber C
+// locals modified after the setjmp point (frame slots are memory behind F
+// and immune — native locals are exactly what longjmp does not preserve).
+//
+// Definite assignment: a native local is declared `= 0`, but no accepted
+// program can observe that default — a register read before any write can
+// only come from source-level use-before-declaration (rejected by the
+// checker) or a `var x T` zero declaration (which lowers to ZERO, a def
+// site that forces BOX). Lowerer temporaries are def-then-use by
+// construction on every path (short-circuit both arms included).
+package opt
+
+use "voilac/ir"
+use "std/str"
+
+const T_UNSEEN = ir.RT_UNSEEN
+const T_INT    = ir.RT_INT
+const T_FLOAT  = ir.RT_FLOAT
+const T_BOOL   = ir.RT_BOOL
+const T_BOX    = ir.RT_BOX
+
+func t_join(a int, b int) int {
+    if a == T_UNSEEN { return b }
+    if b == T_UNSEEN { return a }
+    if a == b { return a }
+    return T_BOX
+}
+
+// type_func computes m.Funcs[fi].RegT, or leaves it empty when the function
+// is exempt (EHPUSH) or has no native slots worth the trouble.
+func type_func(m mut ir.Module, fi int) {
+    each ins in m.Funcs[fi].Instrs {
+        if ins.Op == "EHPUSH" { return }
+    }
+    let nregs = m.Funcs[fi].NRegs
+    if nregs == 0 { return }
+
+    var t = make([]int, nregs)
+    var i = 0
+    while i < nregs {
+        t[i] = T_UNSEEN
+        i += 1
+    }
+
+    // Hidden writers first: they never change during the fixpoint.
+    pin_boxed(m, fi, t)
+
+    // Then iterate the transfer until nothing changes. MOVE and operand
+    // types feed forward, so a couple of sweeps settle; the loop is bounded
+    // because a slot only ever moves UP the lattice.
+    var changed = true
+    while changed {
+        changed = false
+        each ins in m.Funcs[fi].Instrs {
+            let nt = def_type(m, fi, ins, t)
+            if nt == 0 - 1 { continue }        // not a register-writing op
+            let d = reg_slot(ins.Args[0])
+            if d < 0 or d >= nregs { continue }
+            let j = t_join(t[d], nt)
+            if j != t[d] {
+                t[d] = j
+                changed = true
+            }
+        }
+    }
+
+    // UNSEEN slots (never written by anything) read as nil today: box them —
+    // then re-run the fixpoint, because an instruction typed while its
+    // operand was still UNSEEN must see that operand's final BOX and demote
+    // its destination. (Monotone: types only move up, so this terminates.)
+    i = 0
+    while i < nregs {
+        if t[i] == T_UNSEEN { t[i] = T_BOX }
+        i += 1
+    }
+    changed = true
+    while changed {
+        changed = false
+        each ins in m.Funcs[fi].Instrs {
+            let nt = def_type(m, fi, ins, t)
+            if nt == 0 - 1 { continue }
+            let d = reg_slot(ins.Args[0])
+            if d < 0 or d >= nregs { continue }
+            let j = t_join(t[d], nt)
+            if j != t[d] {
+                t[d] = j
+                changed = true
+            }
+        }
+    }
+    var any = false
+    i = 0
+    while i < nregs {
+        if t[i] != T_BOX { any = true }
+        i += 1
+    }
+    if not any { return }                      // nothing unboxed: stay silent
+    m.Funcs[fi].RegT = t
+
+    // The decision is visible in `-S -O3` listings: one note per typed slot.
+    var notes = []
+    i = 0
+    while i < nregs {
+        if t[i] != T_BOX {
+            notes.append(ir.Instr{Labels: [], Op: "*",
+                Args: ["opt: r" || str(i) || ":" || t_name(t[i])],
+                Pat: 0, Terms: [], Src: 0})
+        }
+        i += 1
+    }
+    each ins in m.Funcs[fi].Instrs {
+        notes.append(ins)
+    }
+    m.Funcs[fi].Instrs = notes
+}
+
+func t_name(t int) str {
+    if t == T_INT { return "int" }
+    if t == T_FLOAT { return "float" }
+    if t == T_BOOL { return "bool" }
+    return "box"
+}
+
+// pin_boxed forces BOX on every slot written through the frame rather than
+// as an instruction destination (see the package comment for the list).
+func pin_boxed(m ir.Module, fi int, t mut []int) {
+    let f = m.Funcs[fi]
+    var pi = 0
+    while pi < f.NParams and pi < len(t) {
+        t[pi] = T_BOX
+        pi += 1
+    }
+    var used = make([]bool, len(t))
+    var i = 0
+    while i < len(used) {
+        used[i] = false
+        i += 1
+    }
+    each ins in f.Instrs {
+        if ins.Pat != 0 { mark_pat(m, ins.Pat, used) }
+        each tm in ins.Terms {
+            if tm.Reg != "" { mark_regs_in(tm.Reg, used) }
+        }
+        // Multi-write / frame-writing destinations that are NOT typed defs:
+        // their extra outputs are not Args[0], so def_type cannot see them.
+        if ins.Op == "UNTUPLE" or ins.Op == "SELRECV" or
+           ins.Op == "ITNEXT" or ins.Op == "VARARG" or ins.Op == "RECVOK" {
+            each a in ins.Args {
+                mark_regs_in(a, used)
+            }
+        }
+    }
+    let prefix = f.Name || "$fn"
+    each g in m.Funcs {
+        if str.starts_with(g.Name, prefix) {
+            each u in g.Ups {
+                if u.Slot >= 0 and u.Slot < len(t) { t[u.Slot] = T_BOX }
+            }
+        }
+    }
+    i = 0
+    while i < len(used) {
+        if used[i] { t[i] = T_BOX }
+        i += 1
+    }
+}
+
+// const_type gives the lattice type of "Kn", or BOX for non-numeric kinds.
+func const_type(m ir.Module, a str) int {
+    if len(a) < 2 { return T_BOX }
+    if a[0] != 'K' { return T_BOX }
+    var v = 0
+    var i = 1
+    while i < len(a) {
+        let c = a[i]
+        if c < '0' or c > '9' { return T_BOX }
+        v = v * 10 + (c - 48)
+        i += 1
+    }
+    if v >= len(m.Consts) { return T_BOX }
+    let k = m.Consts[v].Kind
+    if k == ir.CINT { return T_INT }
+    if k == ir.CFLOAT { return T_FLOAT }
+    if k == ir.CBOOL { return T_BOOL }
+    return T_BOX
+}
+
+// operand_type reads the current type of an operand: a register's slot from
+// t[], a constant's kind from the pool. Anything else (upvalues) is BOX.
+func operand_type(m ir.Module, a str, t []int) int {
+    let r = reg_slot(a)
+    if r >= 0 {
+        if r < len(t) { return t[r] }
+        return T_BOX
+    }
+    return const_type(m, a)
+}
+
+// def_type is the transfer function: the type this instruction's Args[0]
+// destination receives, or -1 when the op writes no register / is one of
+// the multi-write ops handled by pin_boxed.
+func def_type(m ir.Module, fi int, ins ir.Instr, t []int) int {
+    let op = ins.Op
+    if op == "LOADK" {
+        return const_type(m, ins.Args[1])
+    }
+    if op == "MOVE" {
+        return operand_type(m, ins.Args[1], t)
+    }
+    if op == "ADD" or op == "SUB" or op == "MUL" {
+        let x = operand_type(m, ins.Args[1], t)
+        let y = operand_type(m, ins.Args[2], t)
+        if x == T_INT and y == T_INT { return T_INT }
+        if is_num(x) and is_num(y) { return T_FLOAT }
+        return T_BOX
+    }
+    if op == "DIV" {
+        // `/` on ints yields float (§5.1); on any native mix, float.
+        let x = operand_type(m, ins.Args[1], t)
+        let y = operand_type(m, ins.Args[2], t)
+        if is_num(x) and is_num(y) { return T_FLOAT }
+        return T_BOX
+    }
+    if op == "IDIV" {
+        // `~/` yields int for both the int and the float pairing.
+        let x = operand_type(m, ins.Args[1], t)
+        let y = operand_type(m, ins.Args[2], t)
+        if is_num(x) and is_num(y) { return T_INT }
+        return T_BOX
+    }
+    if op == "MOD" or op == "POW" {
+        let x = operand_type(m, ins.Args[1], t)
+        let y = operand_type(m, ins.Args[2], t)
+        if x == T_INT and y == T_INT { return T_INT }
+        if is_num(x) and is_num(y) { return T_FLOAT }
+        return T_BOX
+    }
+    if op == "SHL" or op == "SHR" or op == "BAND" or op == "BOR" or
+       op == "BXOR" {
+        let x = operand_type(m, ins.Args[1], t)
+        let y = operand_type(m, ins.Args[2], t)
+        if x == T_INT and y == T_INT { return T_INT }
+        return T_BOX
+    }
+    if op == "BNOT" {
+        if operand_type(m, ins.Args[1], t) == T_INT { return T_INT }
+        return T_BOX
+    }
+    if op == "NEG" {
+        let x = operand_type(m, ins.Args[1], t)
+        if x == T_INT { return T_INT }
+        if x == T_FLOAT { return T_FLOAT }
+        return T_BOX
+    }
+    if op == "NOT" {
+        if operand_type(m, ins.Args[1], t) == T_BOOL { return T_BOOL }
+        return T_BOX
+    }
+    if op == "CMPLT" or op == "CMPLE" or op == "CMPGT" or op == "CMPGE" {
+        let x = operand_type(m, ins.Args[1], t)
+        let y = operand_type(m, ins.Args[2], t)
+        if is_num(x) and is_num(y) { return T_BOOL }
+        return T_BOX                            // strings/dec compare boxed
+    }
+    if op == "CMPEQ" or op == "CMPNE" {
+        let x = operand_type(m, ins.Args[1], t)
+        let y = operand_type(m, ins.Args[2], t)
+        if x == y and (x == T_INT or x == T_FLOAT or x == T_BOOL) {
+            return T_BOOL
+        }
+        return T_BOX                            // vl_equal handles the rest
+    }
+
+    // Every other register-writing op forces BOX. Ops that write no
+    // register at all return -1 so the fixpoint skips them; the list keys
+    // on "is Args[0] a register destination".
+    if len(ins.Args) == 0 { return 0 - 1 }
+    if op == "JUMP" or op == "JMPF" or op == "JMPT" or op == "RET" or
+       op == "ABORT" or op == "CKCANC" or op == "SAY" or op == "SEND" or
+       op == "SETGLB" or op == "SETIDX" or op == "SETFLD" or
+       op == "UPSET" or op == "THROW" or op == "RETHROW" or
+       op == "EHPOP" or op == "DROP" or op == "DEFER" or
+       op == "GRPBEG" or op == "GRPEND" or op == "GRPENDT" or
+       op == "SPAWN" or op == "NUMDIG" or
+       op == "ARGDEF" or op == "SELBEG" or op == "SELEND" or
+       op == "SELSEND" or op == "SELDEF" or op == "*" or
+       op == "NDSAVE" or op == "NDREST" or op == "EHPUSH" {
+        return 0 - 1
+    }
+    if reg_slot(ins.Args[0]) < 0 { return 0 - 1 }
+    return T_BOX
+}
+
+func is_num(t int) bool {
+    return t == T_INT or t == T_FLOAT
+}

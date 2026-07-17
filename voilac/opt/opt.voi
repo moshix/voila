@@ -14,8 +14,8 @@
 //   -O1  dead-code elimination (pure defs only — arithmetic can trap and is
 //        NEVER deleted), unreferenced-label pruning, frame shrinking, and
 //        the backend's retain-elision for immediate constants.
-//   -O2  + frame elision (stack frames; see elide.voi)          [pending]
-//   -O3  + typed unboxing (native arithmetic; see typing.voi)   [pending]
+//   -O2  + frame elision (stack frames; see elide.voi)
+//   -O3  + typed unboxing (native arithmetic; see typing.voi)
 package opt
 
 use "voilac/ir"
@@ -29,6 +29,9 @@ func Run(m mut ir.Module, level int) {
     while fi < len(m.Funcs) {
         dce_func(m, fi)
         shrink_func(m, fi)
+        if level >= 3 {
+            type_func(m, fi)
+        }
         if level >= 2 {
             elide_func(m, fi)
         }

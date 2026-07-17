@@ -1,0 +1,123 @@
+// Adversarial typing fixture (-O3). Each block aims at a soundness edge of
+// the unboxing pass; outputs must be byte-identical at every -O level.
+use "std/fmt"
+use "std/str"
+
+// 1. A counter that is ALSO a match bind: the PMATCH hidden write must pin
+//    the slot to BOX even though every visible def is arithmetic.
+func match_bind() int {
+    var n = 1
+    for i in 0..5 {
+        match n {
+            3 => n = n + 10
+            m => n = m + 1
+        }
+    }
+    return n
+}
+
+// 2. parse into a variable that then does arithmetic: PARSE terms are
+//    hidden writers.
+func parse_target() int {
+    parse "42 7" xs " " ys
+    let x = int(xs)
+    let y = int(ys)
+    return x + y * 2
+}
+
+// 3. A closure writing an enclosing counter via UPSET: the Ups slot must
+//    stay boxed, and the arithmetic inside the closure works on upvalues.
+func upset_counter() int {
+    var count = 100
+    let bump = fn(d int) {
+        count = count + d
+    }
+    bump(7)
+    bump(35)
+    return count
+}
+
+// 4. setjmp interplay: a counter modified across a throwing call inside
+//    try, read in catch — the whole function is EHPUSH-exempt, so every
+//    register stays boxed and longjmp cannot clobber anything.
+exception Poke { n int }
+func may_throw(x int) int {
+    if x > 2 { throw Poke{n: x} }
+    return x * 2
+}
+func setjmp_probe() int {
+    var acc = 0
+    var i = 0
+    while i < 6 {
+        try {
+            acc = acc + may_throw(i)
+        } catch e: Poke {
+            acc = acc + 100
+        }
+        i += 1
+    }
+    return acc
+}
+
+// 5. int/float mixing across a join: g starts int-typed, later joins float
+//    — must demote to BOX (or FLOAT via the mix rule) without changing
+//    results; division of ints yields float.
+func mixer(flag bool) float {
+    var g = 1.0
+    if flag {
+        g = 3.0 * 2.0
+    } else {
+        g = 7 / 2
+    }
+    return g + 0.5
+}
+
+// 6. Loop-carried temporaries defined later in instruction order than
+//    their first textual use in the next iteration.
+func carried() int {
+    var a = 1
+    var b = 2
+    var i = 0
+    while i < 10 {
+        let t = a + b
+        a = b
+        b = t
+        i += 1
+    }
+    return b
+}
+
+// 7. Overflow at a native site inside a hot loop, caught above.
+func hot_trap() str {
+    var x = 9223372036854775800
+    var msg = ""
+    try {
+        var i = 0
+        while i < 100 {
+            x = x + 1
+            i += 1
+        }
+    } catch e {
+        msg = str.substr(e.message(), 0, 20)
+    }
+    return msg
+}
+
+// 8. dec arithmetic must never unbox (and must still work at -O3).
+func dec_stays() str {
+    numeric digits 20
+    let a = 1.10d
+    let b = 2.20d
+    return str(a + b)
+}
+
+func main() {
+    fmt.printf("match_bind=%d\n", match_bind())
+    fmt.printf("parse_target=%d\n", parse_target())
+    fmt.printf("upset_counter=%d\n", upset_counter())
+    fmt.printf("setjmp_probe=%d\n", setjmp_probe())
+    fmt.printf("mixer_t=%v mixer_f=%v\n", mixer(true), mixer(false))
+    fmt.printf("carried=%d\n", carried())
+    fmt.printf("hot_trap=%s\n", hot_trap())
+    fmt.printf("dec_stays=%s\n", dec_stays())
+}
