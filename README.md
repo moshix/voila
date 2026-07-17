@@ -14,35 +14,6 @@ that compiles itself.**
 
 ---
 
-## 🚀 Two commands, one engine
-
-```console
-$ voila run hello.voi            # compiles (cached) and runs — 30 ms warm
-Hello, world!
-
-$ voila build hello.voi -o hello # a native binary
-$ ./hello
-Hello, world!
-$ otool -L hello                 # no VM, no runtime to install — just libc
-	/usr/lib/libSystem.B.dylib
-
-$ voila build -S hello.voi       # or emit the VM assembly listing instead
-$ head -4 hello.s
-*------------------------------------------------------------------------
-*        VOILA VM ASSEMBLY LISTING
-*        SOURCE: hello.voi
-*
-```
-
-Run mode and build mode share one front end, so a program accepted by one is
-accepted by the other and behaves **identically** — the *Equivalence
-Guarantee*, which a conformance suite checks by running every test through
-**both** engines and diffing them. `voila build` lowers the program to the
-register IR, emits C, and calls the system `cc`; the binary links libvoila and
-libc, and nothing else. Where the backend cannot yet express a semantic it
-**refuses to build** rather than produce a binary that would answer
-differently.
-
 ## 🧬 What the language borrows — and from whom
 
 | 🎁 From | Voilà takes |
@@ -155,7 +126,6 @@ let r = attempt risky()            // or demote an exception to a value
 
 ## 🏃 Quick start
 
-You need a C compiler. That is the whole list.
 
 ```console
 $ ./build.sh                          # cc the seed, then Voilà builds Voilà
@@ -189,23 +159,14 @@ See **[TESTING.md](TESTING.md)** for the full procedure and
 | `10_life.voi` | Conway's Life on a torus: 2-D slices, `str.Builder` frames |
 
 ## 🪞 It compiles itself
-
-```
-   bootstrap/voilac.c ──cc──▶ seed ──▶ voilac-1 ──▶ voilac-2
-      (generated C)                        │            │
-                                           └─ C == C ───┘   the fixpoint
-```
-
-The compiler is written in Voilà. To build it you need a compiler, so one
+Voilà is completely self-hosted and it compiles itself from the very first version. 
+In other words, the compiler is written in Voilà. To build it you need a compiler, so one
 generation of its own C output is checked in as `bootstrap/voilac.c` — a
 fossil, not a source. `./build.sh` compiles that with `cc`, uses the result to
 compile `voilac/*.voi`, uses *that* to compile `voilac/*.voi` again, and asserts
 the two emit **byte-identical C**. It bootstrapped from a Go compiler that no
 longer exists; every stage of the Voilà one was diffed against it, byte for
 byte, over every file in this repository — and then it was deleted.
-
-Compiling the compiler with itself found two bugs that stage-by-stage diffing
-never could. Both are in [BOOTSTRAP.md](BOOTSTRAP.md).
 
 ## 🗺️ Roadmap
 
@@ -227,13 +188,6 @@ references, syntax diagrams included — and the
 
 Voilà is free software under the **GNU General Public License, version 2** —
 see [LICENSE](LICENSE).
-
-## 📦 Releasing
-
-`./release.bash` cuts a GitHub Release for the current version: it builds the
-toolchain, reads the version from `voila version`, tags `v<version>`, and
-publishes the source tarball and native binaries produced by
-`build_voila.bash`. Run `./release.bash --dry-run` to preview.
 
 ---
 
