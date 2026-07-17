@@ -5,7 +5,7 @@
 **A statically typed, memory-safe, concurrent language —<br>
 that compiles itself.**
 
-![language](https://img.shields.io/badge/language-Voil%C3%A0%200.3.2-blueviolet?style=for-the-badge)
+![language](https://img.shields.io/badge/language-Voil%C3%A0%200.4.0-blueviolet?style=for-the-badge)
 ![gc](https://img.shields.io/badge/GC-none-orange?style=for-the-badge)
 
 </div>
@@ -128,7 +128,8 @@ let r = attempt risky()            // or demote an exception to a value
 ```console
 $ ./build.sh                          # cc the seed, then Voilà builds Voilà
   ✓ fixpoint: C(voilac-1) == C(voilac-2)
-  ✓ bin/voila
+  ✓ optimized fixpoint: C(-O3, gen1) == C(-O3, gen2)
+  ✓ bin/voila-0.4.0
 
 $ bin/voila run samples/04_calculator.voi
 $ bin/voila check samples/07_orgchart.voi
@@ -168,11 +169,34 @@ the two emit **byte-identical C**. It bootstrapped from a Go compiler that no
 longer exists; every stage of the Voilà one was diffed against it, byte for
 byte, over every file in this repository — and then it was deleted.
 
+## Performance (0.4)
+
+The optimizer is **opt-in**: without `-O`, the output is byte-identical to
+0.3. With it (darwin/arm64, best-of-N; Linux/amd64 gains are similar or
+larger):
+
+| benchmark | what it stresses | default | `-O3` | delta |
+|---|---|---|---|---|
+| `bench/b2_life.voi` | int arithmetic in loops | 1181 ms | 710 ms | **−40 %** |
+| `bench/b6_partasks.voi` | tasks + channels | 851 ms | 716 ms | −16 % |
+| `bench/b1_queens.voi` | recursion via parameters | 4153 ms | 3589 ms | −14 % |
+| `bench/b5_churn.voi` | struct allocation | 810 ms | 742 ms | −8 % |
+| `bench/b4_ledger.voi` | `dec` money arithmetic | 987 ms | 971 ms | −2 % (by design: `dec` is exact, never unboxed) |
+
+Compile time (10-kline self-compile): `load` 2.26 s → **1.0 s**; a small
+program's `voila build` 0.9 s → **~0.12 s** (the runtime library is now
+compiled once and cached). Full tables: `bench/BASELINE.md`,
+`bench/RESULTS.md`.
+
 ## Roadmap
 
 - ✅ **Self-hosted** — the compiler is written in Voilà; the fixpoint holds
 - ✅ Native binaries, multi-file packages, the full checker, `run`/`build`/`check`
-- ⬜ an unboxing pass (values are boxed; performance is not yet C-class)
+- ✅ **An optimizing backend** (0.4): `-O1` scalar cleanup, `-O2` frame
+  elision, `-O3` typed unboxing + `cc -O3`, opt-in `--native` — same
+  outputs, same trap messages, byte-for-byte, at every level
+- ⬜ interprocedural unboxing (parameters are still boxed) and native
+  `for`-range counters — the next performance frontier
 - ⬜ green threads (tasks are OS threads today: right semantics, wrong cost model)
 - ⬜ `std/regex`, `std/http` in C; `voila fmt/test/repl`; the flow-sensitive
   borrow checker

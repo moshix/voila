@@ -46,7 +46,7 @@ void vl_trap_inegovf(void) {
 /* Shared out-of-line cores (declared in voila.h). */
 int64_t vl_ifloordiv(int64_t a, int64_t b) {
   if (b == 0) vl_trap_div0();
-  if (b == -1 && a == INT64_MIN) vl_trap_iovf("//", a, -1);
+  if (b == -1 && a == INT64_MIN) vl_trap_iovf("~/", a, -1);
   int64_t q = a / b;
   if ((a % b != 0) && ((a < 0) != (b < 0))) q--;
   return q;
@@ -82,6 +82,11 @@ double vl_ffloormod(double x, double y) {
 int64_t vl_ifloordiv_f(double x, double y) {
   if (y == 0) vl_trap_div0();
   double q = floor(x / y);
+  /* The cast would be undefined (and platform-divergent) out of range:
+   * arm64 saturates, x86-64 gives INT64_MIN. Trap instead — both the boxed
+   * and the -O3 path share this function, so the message cannot diverge. */
+  if (!(q >= -9223372036854775808.0 && q < 9223372036854775808.0))
+    vl_throwf("OverflowError", "floor division result %g is out of int range", q);
   return (int64_t)q;
 }
 double vl_fpow(double x, double y) { return pow(x, y); }
@@ -282,7 +287,7 @@ static int64_t want_i(Value v) {
 Value vl_shl(Value a, Value b) {
   int64_t n = want_i(b);
   if (n < 0 || n > 63) vl_trap_shift(n);
-  return vl_int(want_i(a) << n);
+  return vl_int((int64_t)((uint64_t)want_i(a) << n));
 }
 
 Value vl_shr(Value a, Value b) {

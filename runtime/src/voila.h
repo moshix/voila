@@ -353,7 +353,10 @@ static inline double vl_itof_ck(int64_t n) {
  * widen, matching the boxed order of traps. */
 static inline double vl_idivf_ck(int64_t a, int64_t b) {
   if (b == 0) vl_trap_div0();
-  return vl_itof_ck(a) / vl_itof_ck(b);
+  /* Sequenced: C leaves the division's operand order unspecified, and the
+   * ConvError must name the LEFT operand first on every toolchain. */
+  double x = vl_itof_ck(a);
+  return x / vl_itof_ck(b);
 }
 static inline double vl_fdiv_ck(double x, double y) {
   if (y == 0) vl_trap_div0();
@@ -361,7 +364,9 @@ static inline double vl_fdiv_ck(double x, double y) {
 }
 static inline int64_t vl_ishl_ck(int64_t a, int64_t n) {
   if (n < 0 || n > 63) vl_trap_shift(n);
-  return a << n;
+  /* Via uint64_t: shifting a negative (or into the sign bit) is UB on the
+   * signed type; two's-complement wrap is the documented behavior. */
+  return (int64_t)((uint64_t)a << n);
 }
 static inline int64_t vl_ishr_ck(int64_t a, int64_t n) {
   if (n < 0 || n > 63) vl_trap_shift(n);

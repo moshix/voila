@@ -781,7 +781,7 @@ impl Gen {
             // trap as the boxed path.
             var w = ir.RT_INT
             if tx != ir.RT_INT or ty != ir.RT_INT { w = ir.RT_FLOAT }
-            if tx == ir.RT_BOOL { w = ir.RT_BOOL }
+            if tx == ir.RT_BOOL and ty == ir.RT_BOOL { w = ir.RT_BOOL }
             self.p(fmt.sprintf("  %s = %s %s %s;", lhs,
                                self.nat(f, a[1], w), c,
                                self.nat(f, a[2], w)))

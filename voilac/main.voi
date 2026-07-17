@@ -34,7 +34,7 @@ use "std/os"
 use "std/fmt"
 use "std/str"
 
-const VERSION = "0.3.2"
+const VERSION = "0.4.0"
 
 // CFLAGS is the single home of the C compilation flags. The runtime-archive
 // cache key hashes it; the program compile and the archive build use it.

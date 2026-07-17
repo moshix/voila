@@ -2,13 +2,13 @@
 
 ## Language Reference and Programming Guide
 
-**Program Number 5799-VLA · Version 0, Release 3, Modification 2**
+**Program Number 5799-VLA · Version 0, Release 4, Modification 0**
 
 ---
 
-**Second Edition (July 2026)**
+**Third Edition (July 2026)**
 
-This edition applies to Version 0 Release 3 Modification 2 of the Voilà Language
+This edition applies to Version 0 Release 4 Modification 0 of the Voilà Language
 Toolchain (self-hosted), and to all subsequent releases and modifications
 until otherwise indicated in new editions. Make sure you are using the
 correct edition for the level of the product.
@@ -20,7 +20,7 @@ diagrams, general rules, and usage notes. Read Chapter 1 first;
 thereafter the manual is designed for random access.
 
 **Note.** Where the behavior of the toolchain deliberately differs from
-the *Voilà Language Specification, Version 0.3.2 (Draft)*, the difference
+the *Voilà Language Specification, Version 0.4.0 (Draft)*, the difference
 is recorded in Appendix D. Programs should be written to this manual.
 
 ---
@@ -1047,7 +1047,10 @@ use "app/geom" as g       // ...under another qualifier
 
 ```
 voila run   <file.voi> [args...]    compile (cached) and execute
+voila run -O2 <file.voi> [args...]  the same, optimized (12.5)
 voila build <file.voi> -o <name>    produce a native executable
+voila build -O1|-O2|-O3 <file.voi>  optimize the executable (12.5)
+voila build --native <file.voi>     additionally tune for THIS machine
 voila build -S <file.voi>           produce an assembly listing (12.4)
 voila build --emit=c <file.voi>     produce the C translation unit
 voila check <file.voi>              translate and verify only
@@ -1066,7 +1069,7 @@ Voilà — and a runtime library written in C:
                                                           │
                                                         lower
                                                           ▼
-                                              register IR (§12.3)
+                                              register IR (§12.4)
                                                           │
                                                      emit C
                                                           ▼
@@ -1103,9 +1106,9 @@ held to them on every build. The oracle is gone; its verdicts are not.
 The -S option translates and verifies the program, lowers it to the
 Voilà VM's register-based linear intermediate representation (the
 "register bytecode" of specification §12), and writes an assembly
-listing instead of an executable. The default output name is the input
-name with `.s` substituted for `.voi`; `-o -` directs the listing to
-the standard output stream.
+listing instead of an executable. The listing is written to the
+standard output stream; redirect it to keep it
+(`voila build -S prog.voi > prog.lst`).
 
 The listing is presented in the style of a mainframe assembler
 SYSPRINT: a heading block, the constant pool (`DC` entries, deduplicated
@@ -1136,7 +1139,50 @@ continued line ending in `+`.
    run` and `voila build` share this one path, the Equivalence Guarantee
    (12.2) is unaffected.
 
-## 12.5 Completion Codes
+## 12.5 The Optimizer (-O1, -O2, -O3)
+
+Optimization is a request, never a default: a build without an `-O`
+option produces exactly the translation the toolchain has always
+produced, byte for byte. Each level contains the ones below it.
+
+```
+-O1   Dead pure definitions are removed, unreferenced labels pruned,
+      frames shrunk to the registers actually used, and retains of
+      immediate constants elided. Arithmetic is NEVER removed: an
+      addition can signal OVERFLOWERROR, and a signal is observable
+      behavior (12.3).
+
+-O2   Frame elision. A procedure that creates no closure and defers
+      nothing keeps its registers in the machine stack frame rather
+      than allocated storage. The exception mechanism is unaffected:
+      an elided frame is registered for unwinding exactly as an
+      allocated one. NOTE: deep recursion reaches the machine stack
+      limit sooner under -O2 (the registers now occupy stack); the
+      limit expresses itself as an abnormal termination, not a
+      diagnostic.
+
+-O3   Typed registers. The translator proves, per register, that only
+      INT, FLOAT, or BOOL values can ever reach it, and translates
+      such registers to machine-typed storage with direct arithmetic.
+      The proof is conservative: procedure parameters, registers
+      bound by MATCH or PARSE, registers captured by closures, and
+      any procedure containing TRY are left in the general form.
+      DECIMAL arithmetic (Sections 3.3, 5.10) is never converted. The C
+      translation unit is additionally compiled at the C compiler's
+      highest standard level.
+```
+
+**The Equivalence Guarantee extends to every level** (12.3): outputs,
+signals, and signal messages are byte-identical at -O0 through -O3.
+Every trap message exists once, in the runtime, and is shared by the
+optimized and unoptimized forms; the toolchain's own test procedure
+compiles its whole conformance suite at every level and compares.
+
+`--native` additionally tunes the program for the processor of the
+machine performing the build. The resulting executable may not run on
+older processors of the same family; it is never the default.
+
+## 12.6 Completion Codes
 
 See Appendix C.
 
@@ -1236,8 +1282,12 @@ cost model does not. A million tasks is not yet fine.
 unavailable; a program that calls them is refused, not silently
 mistranslated.
 
-Values are boxed. Performance is interpreter-class-plus, not C-class,
-until an unboxing pass lands.
+Values are boxed in the default translation. Under `-O3` (Section 12.5)
+the toolchain converts provably-typed INT, FLOAT, and BOOL registers to
+machine arithmetic and elides frame allocation; measured gains reach
+40 percent on arithmetic-bound programs. Procedure parameters and
+values that cross procedure boundaries remain boxed — C-class arithmetic
+throughout is future work, not a present property.
 
 **D.7 — Reference cycles through closures.** The Acyclicity Rule (Section
 8.4) governs the type graph and makes owning cycles among *values*

@@ -58,9 +58,13 @@ func main() {
     }
 
     // ---- 1. the compiler compiles the compiler
-    head("1. the compiler compiles itself  →  voilac-1")
+    // The shipped compiler is built at -O3: the optimizer changes the
+    // compiler's SPEED, never its output, so the fixpoint below still
+    // compares DEFAULT emission — and step 2b proves the optimized binary
+    // emits the very same bytes.
+    head("1. the compiler compiles itself (-O3)  →  voilac-1")
     let one = BUILD || "/voilac-1"
-    must_run(voila, ["build", "voilac/main.voi", "-o", one])
+    must_run(voila, ["build", "-O3", "voilac/main.voi", "-o", one])
     ok(one)
 
     // ---- 2. …and the result compiles it again
@@ -69,7 +73,7 @@ func main() {
     let c2 = BUILD || "/gen2.c"
     let two = BUILD || "/voilac-2"
     emit_c(one, c1)
-    must_run(one, ["build", "voilac/main.voi", "-o", two])
+    must_run(one, ["build", "-O3", "voilac/main.voi", "-o", two])
     emit_c(two, c2)
 
     let g1 = read_or(c1, "")
@@ -78,6 +82,18 @@ func main() {
         fail("NO FIXPOINT — generation 1 and 2 emit different C")
     }
     ok("fixpoint: C(voilac-1) == C(voilac-2)")
+
+    // ---- 2b. the optimizer must not change WHAT the compiler emits, only
+    // how fast it emits it: voilac-2 (built -O3 by an -O3 binary) must
+    // produce byte-identical -O3 C for the compiler itself.
+    let c3 = BUILD || "/gen1-O3.c"
+    let c4 = BUILD || "/gen2-O3.c"
+    emit_c_at(one, "-O3", c3)
+    emit_c_at(two, "-O3", c4)
+    if read_or(c3, "1") != read_or(c4, "2") {
+        fail("NO OPTIMIZED FIXPOINT — -O3 emission differs between generations")
+    }
+    ok("optimized fixpoint: C(-O3, gen1) == C(-O3, gen2)")
 
     // The seed must be what the compiler actually emits for itself. When it has
     // drifted, the checked-in C is stale — which is not an error (the seed is
@@ -181,6 +197,15 @@ func emit_c(compiler str, out str) {
     let rc = os.run("bash", ["-c", compiler || " --emit=c voilac/main.voi > " || out])
     if rc != 0 {
         fail("could not emit C with " || compiler)
+    }
+}
+
+// emit_c_at is emit_c with an optimization level.
+func emit_c_at(compiler str, level str, out str) {
+    let rc = os.run("bash", ["-c", compiler || " build " || level ||
+                             " --emit=c voilac/main.voi > " || out])
+    if rc != 0 {
+        fail("could not emit " || level || " C with " || compiler)
     }
 }
 

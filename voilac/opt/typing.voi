@@ -315,7 +315,7 @@ func def_type(m ir.Module, fi int, ins ir.Instr, t []int) int {
        op == "UPSET" or op == "THROW" or op == "RETHROW" or
        op == "EHPOP" or op == "DROP" or op == "DEFER" or
        op == "GRPBEG" or op == "GRPEND" or op == "GRPENDT" or
-       op == "SPAWN" or op == "NUMDIG" or
+       op == "NUMDIG" or
        op == "ARGDEF" or op == "SELBEG" or op == "SELEND" or
        op == "SELSEND" or op == "SELDEF" or op == "*" or
        op == "NDSAVE" or op == "NDREST" or op == "EHPUSH" {

@@ -22,7 +22,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="0.3.2"
+VERSION="0.4.0"
 DIST="dist"
 
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }

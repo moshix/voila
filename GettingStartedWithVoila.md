@@ -6,7 +6,7 @@
 
 ### A Programming Guide for the New User
 
-**Program Number 0.3.2**
+**Program Number 5799-VLA · Version 0.4.0**
 
 *First Edition*
 
@@ -99,14 +99,15 @@ $ ./build.sh
   ✓ build/voila-seed
 ==> 0. the embedded runtime
   ✓ voilac/rt/blob.voi is current
-==> 1. the compiler compiles itself  →  voilac-1
+==> 1. the compiler compiles itself (-O3)  →  voilac-1
   ✓ build/voilac-1
 ==> 2. voilac-1 compiles itself  →  voilac-2, and the C must match
   ✓ fixpoint: C(voilac-1) == C(voilac-2)
+  ✓ optimized fixpoint: C(-O3, gen1) == C(-O3, gen2)
   ✓ the checked-in seed is current
-  ✓ bin/voila-0.3.2
-  ✓ bin/voila  ->  voila-0.3.2
-  ✓ ./voila  ->  bin/voila-0.3.2
+  ✓ bin/voila-0.4.0
+  ✓ bin/voila  ->  voila-0.4.0
+  ✓ ./voila  ->  bin/voila-0.4.0
 ==> done — ./voila is ready
 ```
 
@@ -116,7 +117,7 @@ and *that* compiler compiled itself once more. The two generations emitted
 byte-identical C, which is the classical proof that a self-hosted compiler
 is not quietly mistranslating itself.
 
-The binary is named for its version — `bin/voila-0.3.2` — with `bin/voila`
+The binary is named for its version — `bin/voila-0.4.0` — with `bin/voila`
 and `./voila` as symlinks to it, so `voila` always means the version you
 last built. Run `voila version` to see it.
 
@@ -175,6 +176,7 @@ this guide uses procedure form exclusively.
 ```
   voila run    <file.voi> [args…]   compile (cached) and run
   voila build  <file.voi> [-o exe]  compile to a binary
+  voila build -O2 <file.voi>        the same, optimized (see below)
   voila build -S       <file.voi>   emit the assembly listing
   voila build --emit=c <file.voi>   emit the C
   voila check  <file.voi>           verify only
@@ -220,6 +222,20 @@ ok
 
 `check` runs the whole front end — lexer, parser, package loader, and every
 static check — and stops. It is what you bind to a key in your editor.
+
+### The Optimizer
+
+`voila build -O1`, `-O2`, or `-O3` (and `voila run -O2 file.voi`) ask for
+an optimized binary; without the option you get the plain translation,
+byte for byte, every time. The levels are cumulative — `-O2` elides frame
+allocations, `-O3` turns provably-typed registers (int, float, and bool) into machine arithmetic —
+and the guarantee is the one that matters: **the program's outputs, its
+error signals, and even the text of its error messages are identical at
+every level.** The compiler's own test procedure compiles its entire
+conformance suite at `-O1`, `-O2`, and `-O3` and compares against the same
+goldens. Arithmetic-heavy programs gain up to about 40 percent at `-O3`;
+a program that mostly shuffles strings gains little. When the machine
+that builds is the machine that runs, `--native` tunes for its processor.
 
 ## 2.2 What CHECK Rejects
 
@@ -1169,7 +1185,7 @@ reference: every statement, every rule, with syntax diagrams. Appendix D
 lists the places where the implementation deliberately departs from the
 specification, and why.
 
-**Read the compiler.** It is 9,600 lines of Voilà in `voilac/`, and it is
+**Read the compiler.** It is some 11,800 lines of Voilà in `voilac/`, and it is
 the largest Voilà program in existence: a lexer, a recursive-descent parser
 building a flat node arena, a package loader, a checker, an IR lowerer and a
 C back end. If you want to see what idiomatic Voilà looks like at scale,

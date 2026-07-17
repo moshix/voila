@@ -82,3 +82,23 @@ Per-arch verification:
 - Windows/mingw, Linux/arm64: tarball cross-builds unchanged; not
   re-verified this milestone (no toolchain at hand — "as available" per
   plan).
+
+## After M7 (self-host at -O3; version 0.4.0) — 2026-07-17
+
+`bin/voila` itself is now built at -O3, with a second fixpoint gate: the
+-O3-built generation-1 and generation-2 compilers must emit byte-identical
+-O3 C for the compiler itself (build.sh asserts both fixpoints every run).
+
+Honest finding — the hoped-for compile-time dividend from optimizing the
+compiler is ~zero (check 1036 vs 1022 ms; small build 113 vs 127 ms,
+within noise): the compiler's hot paths are string scanning, slice
+traffic, and parameter-passing — exactly the shapes -O3's intraprocedural
+unboxing cannot reach (parameters stay boxed). The compile-time wins of
+0.4 came from M1 (runtime archive cache: small build 867 → ~120 ms) and
+M2 (front-end rewrite: load 2.26 s → ~1.0 s), not from M7.
+
+Headline 0.4.0 table (darwin/arm64):
+  compile: self check 2109 → 1036 ms; self build 6497 → ~5.2 s;
+           small build 867 → ~115 ms
+  runtime: b2_life -40% (-O3), b6_partasks -16%, b1_queens -14%,
+           b5_churn -8..-12%, b4_ledger flat by design (dec)

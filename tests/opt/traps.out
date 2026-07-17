@@ -1,7 +1,7 @@
 t1: OverflowError{op: "integer overflow: 9223372036854775807 + 1"}
 t2: OverflowError{op: "integer overflow: -9223372036854775808 - 1"}
 t3: OverflowError{op: "integer overflow: 9223372036854775807 * 2"}
-t4: OverflowError{op: "integer overflow: -9223372036854775808 // -1"}
+t4: OverflowError{op: "integer overflow: -9223372036854775808 ~/ -1"}
 t5: RangeError{msg: "division by zero"}
 t6: RangeError{msg: "division by zero"}
 t7: RangeError{msg: "division by zero"}
