@@ -12,16 +12,16 @@ that compiles itself.**
 
 ---
 
-## 🧬 What the language borrows — and from whom
+##What the language borrows — and from whom
 
-| 🎁 From | Voilà takes |
+| From | Voilà takes |
 |---|---|
 | **Go** | braces, packages, channels, `select`, familiar `func` |
 | **Rust** | ownership + moves + deterministic destruction — **without lifetime annotations** |
 | **REXX** | `say`, `parse`, exact decimal arithmetic, learn-it-in-an-afternoon |
 | **C** | the `printf` verbs everyone already knows |
 
-## 👀 Thirty seconds of syntax
+##Thirty seconds of syntax
 
 ```go
 package main
@@ -65,7 +65,7 @@ func main() {
 
 ## The guarantees (not conventions — **compile errors**)
 
-- 🚫 **No leaks.** The type graph must be acyclic through owning edges;
+- **No leaks.** The type graph must be acyclic through owning edges;
   back-edges are `weak[T]`. Refcounts always reach zero:
 
   ```text
@@ -87,7 +87,7 @@ func main() {
   is a compile error until you write `float(x)`. Overflow **traps**.
 - **No 59.96999999999999.** `19.99d * 3d == 59.97d`. Exactly.
 
-## ⚡ Concurrency that can't leak threads
+##Concurrency that can't leak threads
 
 ```go
 try group {
@@ -99,7 +99,7 @@ try group {
 Channels **move** their payloads (`ch <- v` kills `v` in the sender), so
 data races are unrepresentable. A million tasks is a normal Tuesday.
 
-## 🎭 Errors: values *and* exceptions — pick per call site
+##Errors: values *and* exceptions — pick per call site
 
 ```go
 let p = try parse_port(s)          // propagate the error value
@@ -108,7 +108,7 @@ let p = must parse_port(s)         // or promote it to an exception
 let r = attempt risky()            // or demote an exception to a value
 ```
 
-## 📦 What's in the box
+##What's in the box
 
 | | |
 |---|---|
@@ -122,7 +122,7 @@ let r = attempt risky()            // or demote an exception to a value
 | `bootstrap/voilac.c` | the seed: the C the compiler emits **for itself**, so `cc` alone can rebuild everything |
 | tests | goldens, negative fixtures, and the **fixpoint**: the compiler compiled by itself emits identical C ([TESTING.md](TESTING.md)) |
 
-## 🏃 Quick start
+##Quick start
 
 
 ```console
@@ -141,7 +141,7 @@ $ ./selftest.bash                     # the toolchain reproduces every golden
 See **[TESTING.md](TESTING.md)** for the full procedure and
 **[BOOTSTRAP.md](BOOTSTRAP.md)** for how the compiler compiles itself.
 
-## 📖 Ten sample programs (none of them trivial)
+##Ten sample programs (none of them trivial)
 
 | Sample | Shows off |
 |---|---|
@@ -156,7 +156,7 @@ See **[TESTING.md](TESTING.md)** for the full procedure and
 | `09_jsonreport.voi` | typed & dynamic JSON, `dec`-safe money round-trips |
 | `10_life.voi` | Conway's Life on a torus: 2-D slices, `str.Builder` frames |
 
-## It compiles itself
+##It compiles itself
 Voilà is completely self-hosted and it compiles itself from the very first version. 
 In other words, the compiler is written in Voilà. To build it you need a compiler, so one
 generation of its own C output is checked in as `bootstrap/voilac.c` — a
@@ -166,7 +166,7 @@ the two emit **byte-identical C**. It bootstrapped from a Go compiler that no
 longer exists; every stage of the Voilà one was diffed against it, byte for
 byte, over every file in this repository — and then it was deleted.
 
-##  Roadmap
+##Roadmap
 
 - ✅ **Self-hosted** — the compiler is written in Voilà; the fixpoint holds
 - ✅ Native binaries, multi-file packages, the full checker, `run`/`build`/`check`
@@ -182,7 +182,7 @@ the reference — written in the house style of the IBM mainframe language
 references, syntax diagrams included — and the
 [Language Specification](voila_specification.md).
 
-## 📜 License
+##License
 
 Voilà is free software under the **GNU General Public License, version 2** —
 see [LICENSE](LICENSE).
