@@ -1,0 +1,45 @@
+// Floor division `~/`, and `//` as a comment only.
+//
+// `~/` is the dedicated floor-division operator (spacing never matters). `//`
+// is always a line comment — it never divides — so the classic `a // b`
+// spacing footgun cannot occur.
+use "std/fmt"
+
+func divmod(a int, b int) (int, int) {
+    return a ~/ b, a % b
+}
+
+func main() {
+    // Floor division rounds toward negative infinity.
+    say 17 ~/ 5, -17 ~/ 5, 17 ~/ -5, -17 ~/ -5
+
+    // Spacing is irrelevant: all three forms divide.
+    say 17~/5, 17 ~/5, 17~/ 5
+
+    // The paired identity a == (a~/b)*b + a%b holds for every sign.
+    var ok = true
+    each a in [17, -17, 100, -100, 7] {
+        each b in [5, -5, 3, -3] {
+            let q, r = divmod(a, b)
+            if q * b + r != a { ok = false }
+        }
+    }
+    say "identity holds:", ok
+
+    // `//` is a comment. The `//2` below is stripped, so y stays 10.
+    let y = 10//2
+    say "y =", y
+    let z = 20 // this whole tail is a comment, z is 20
+    say "z =", z
+
+    // Precedence: `~/` binds like `*` and `%` (tighter than `+`).
+    say 1 + 17 ~/ 5, 2 * 3 ~/ 2
+
+    // Floor division on decimals and floats.
+    say 19.99d ~/ 3d, 7.5 ~/ 2.0
+
+    // Division by zero and the INT64_MIN ~/ -1 overflow both trap.
+    try { say 1 ~/ 0 } catch e: RangeError { say "div by zero trapped" }
+    let lo = -9223372036854775807 - 1
+    try { say lo ~/ -1 } catch e: OverflowError { say "overflow trapped" }
+}

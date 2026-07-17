@@ -6,7 +6,7 @@
 
 ### A Programming Guide for the New User
 
-**Program Number 0.2.0**
+**Program Number 0.3.0**
 
 *First Edition*
 
@@ -393,7 +393,7 @@ each i, city in cities {
 
 say ""
 say "STATIONS REPORTED:", len(cities)
-say "MEAN TEMPERATURE :", sum(temps)//len(temps)   // floor division: no spaces
+say "MEAN TEMPERATURE :", sum(temps) ~/ len(temps)   // floor division
 ```
 
 ```console
@@ -414,19 +414,25 @@ widths (`%-16s` left-justifies in sixteen columns, `%4d` right-justifies in
 four). The compiler counts your arguments at compile time and refuses a
 format string that lies about them.
 
-> ### Programming Note 3 — the two readings of `//`
+> ### Programming Note 3 — floor division is `~/`, and `//` is only a comment
 >
-> `//` is *both* the comment marker and the floor-division operator. The
-> rule that separates them: **floor division must touch an operand.**
+> Floor division — divide and round down to an integer — is spelled `~/`:
 >
 > ```voila
-> let mean = total//count      // floor division
-> let mean = total // count    // a COMMENT — `mean` is assigned nothing!
+> let mean = total ~/ count    // floor division; 17 ~/ 5 is 3
 > ```
 >
-> The author of this guide wrote the second form by accident while drafting
-> Chapter 4 and reported a mean temperature of 79 degrees. Write floor
-> division tight.
+> In Voilà `//` is **always** a comment, never division. This is a trap for
+> anyone arriving from Python, where `//` divides:
+>
+> ```voila
+> let mean = total // count    // a COMMENT — `mean` is assigned `total`!
+> ```
+>
+> The author of this guide wrote exactly that by accident while drafting
+> Chapter 4 and reported a mean temperature of 79 degrees. The lesson is
+> not "mind the spaces" — it is "use `~/` to divide." Spacing around `~/`
+> never matters.
 
 ---
 

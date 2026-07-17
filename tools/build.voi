@@ -53,8 +53,7 @@ func main() {
     if mode == "blob" { return }
 
     if mode == "seed" {
-        install(voila, OUT)
-        ok(OUT || " (the seed itself)")
+        install_versioned(voila)
         return
     }
 
@@ -93,15 +92,7 @@ func main() {
         warn("bootstrap/voilac.c is stale — run: voila run tools/build.voi reseed")
     }
 
-    // Unlink before copying. `cp` over an existing binary reuses the inode,
-    // and macOS keeps the code signature cached against it — the new contents
-    // then fail validation and the kernel SIGKILLs the process on exec.
-    install(two, OUT)
-    ok(OUT)
-    // The toolchain is `voila`, and the manual says so. `voilac/` is the
-    // compiler's SOURCE directory, so the binary cannot be called that.
-    install(two, "voila")
-    ok("./voila")
+    install_versioned(two)
     sh("rm", ["-rf", BUILD])
     head("done — ./voila is ready")
 }
@@ -211,6 +202,40 @@ func install(src str, dst str) {
     os.remove(dst)
     if os.run("cp", [src, dst]) != 0 {
         fail("cannot install " || dst)
+    }
+}
+
+// install_versioned puts the compiler at `bin/voila-<version>` — the version
+// read from the binary itself, so the name can never disagree with what
+// `voila version` reports — and points the stable names `bin/voila` and
+// `./voila` at it. Aliases are symlinks, so there is exactly one real binary.
+func install_versioned(bin str) {
+    let ver = compiler_version(bin)
+    let versioned = "bin/voila-" || ver
+    install(bin, versioned)
+    ok(versioned)
+    symlink("voila-" || ver, OUT)          // bin/voila  -> voila-<ver>
+    ok(OUT || "  ->  voila-" || ver)
+    symlink(versioned, "voila")            // ./voila    -> bin/voila-<ver>
+    ok("./voila  ->  " || versioned)
+}
+
+// compiler_version asks the freshly built binary for its version. os.run
+// inherits stdout, so the answer is captured through a shell redirection.
+func compiler_version(bin str) str {
+    let tmp = BUILD || "/version.txt"
+    os.run("bash", ["-c", bin || " version > " || tmp])
+    let f = fields(read_or(tmp, ""))
+    if len(f) >= 2 { return f[1] }         // "voila 0.3.0" -> "0.3.0"
+    return "unknown"
+}
+
+// symlink points `link` at `target`, replacing any existing link. os.remove
+// unlinks the symlink itself, never its target.
+func symlink(target str, link str) {
+    os.remove(link)
+    if os.run("ln", ["-s", target, link]) != 0 {
+        fail("cannot symlink " || link || "  ->  " || target)
     }
 }
 

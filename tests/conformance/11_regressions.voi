@@ -68,7 +68,7 @@ func main() {
     // (Note the tight `//`: spaced, it would be a comment — rule D.1.)
     var lo = -9_223_372_036_854_775_807 - 1
     var neg = -1
-    try { say lo//neg } catch e: OverflowError { say "idiv overflow trapped" }
+    try { say lo~/neg } catch e: OverflowError { say "idiv overflow trapped" }
 
     // dec.format rejects a negative width instead of corrupting the heap.
     try { say 1.5d.format(-2) } catch e: ValueError { say "format guard" }

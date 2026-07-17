@@ -1,7 +1,7 @@
 // Numeric tower: exact division, floor div/mod, power, overflow traps.
 func main() {
     say 7 / 2, 1 / 4
-    say 17//5, -17//5, 17 % 5, -17 % 5
+    say 17~/5, -17~/5, 17 % 5, -17 % 5
     say 2 ** 10, 2 ** 0
     say 1 + 2.5, 2.0 * 3
     say 19.99d * 3d, 0.1d + 0.2d, 1d / 3d

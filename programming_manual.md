@@ -2,14 +2,14 @@
 
 ## Language Reference and Programming Guide
 
-**Program Number 5799-VLA · Version 0, Release 2**
+**Program Number 5799-VLA · Version 0, Release 3**
 
 ---
 
-**First Edition (July 2026)**
+**Second Edition (July 2026)**
 
-This edition applies to Version 0 Release 2 of the Voilà Language
-Toolchain (stage 0), and to all subsequent releases and modifications
+This edition applies to Version 0 Release 3 of the Voilà Language
+Toolchain (self-hosted), and to all subsequent releases and modifications
 until otherwise indicated in new editions. Make sure you are using the
 correct edition for the level of the product.
 
@@ -19,10 +19,9 @@ reference, not a tutorial. Statements are presented with syntax
 diagrams, general rules, and usage notes. Read Chapter 1 first;
 thereafter the manual is designed for random access.
 
-**Note.** Where the behavior of the stage-0 toolchain deliberately
-differs from the *Voilà Language Specification, Version 0.2 (Draft)*,
-the difference is recorded in Appendix D. Programs should be written to
-this manual.
+**Note.** Where the behavior of the toolchain deliberately differs from
+the *Voilà Language Specification, Version 0.3 (Draft)*, the difference
+is recorded in Appendix D. Programs should be written to this manual.
 
 ---
 
@@ -43,7 +42,7 @@ this manual.
 - Appendix A. Reserved Words
 - Appendix B. Format Verb Summary
 - Appendix C. Completion Codes
-- Appendix D. Stage-0 Deviations from the Specification
+- Appendix D. Deviations from the Specification
 - Appendix E. Glossary
 
 ---
@@ -157,9 +156,9 @@ exported from its package. A lowercase identifier is package-private.
 /// documentation comment (attaches to the following declaration)
 ```
 
-**Note.** The token `//` also denotes floor division. The rule that
-separates the two readings is given in Section 4.4 and recorded as
-Deviation D.1.
+**Note.** `//` is *only* a comment. Floor division is the distinct
+operator `~/` (Section 4.4), so no spacing rule is needed to tell them
+apart.
 
 ## 2.3 Statement Termination
 
@@ -325,7 +324,7 @@ From highest (bound first) to lowest:
 | 11 | `x.f  x[i]  x(...)` | left |
 | 10 | unary `-  not  ~  <-` | right |
 | 9 | `**` (power) | right |
-| 8 | `*  /  //  %` | left |
+| 8 | `*  /  ~/  %` | left |
 | 7 | `+  -` | left |
 | 6 | `<<  >>  &  \|  ^` | left |
 | 5.5 | `..  ..=` (range) | — |
@@ -340,10 +339,10 @@ From highest (bound first) to lowest:
 
 1. `/` applied to two integers performs *exact division* and produces a
    `float`: `7 / 2` is `3.5`.
-2. `//` is floor division and produces an integer: `17//5` is `3`,
-   `-17//5` is `-4`.
-3. `%` is the floor remainder, paired with `//`: the identity
-   `a == (a//b)*b + a%b` holds for all signs.
+2. `~/` is floor division and produces an integer: `17~/5` is `3`,
+   `-17~/5` is `-4`.
+3. `%` is the floor remainder, paired with `~/`: the identity
+   `a == (a~/b)*b + a%b` holds for all signs.
 4. `**` is exponentiation; `2 ** 10` is `1024`. A negative integer
    exponent of an integer base signals RangeError.
 5. Mixed operands widen by the rule of Section 3.5: `int` with `dec`
@@ -356,17 +355,21 @@ From highest (bound first) to lowest:
 `||` concatenates, converting both operands to string form. The `+`
 operator **never** concatenates. `x in s` tests substring containment.
 
-## 4.4 The Two Readings of `//`
+## 4.4 Floor Division
 
-Because `//` introduces both a comment (Section 2.2) and floor
-division (Section 4.2), the following disambiguation rule applies:
+Floor division is the operator `~/`. It rounds the quotient toward
+negative infinity and produces an integer:
 
-> `//` denotes floor division only where a binary operator is
-> permitted, and only when it touches at least one operand:
-> `a//b`, `a// b`, and `a //b` divide; `a // b`, with blanks on both
-> sides, begins a comment.
+```voila
+17 ~/ 5        //  3
+-17 ~/ 5       // -4
+```
 
-Write floor division tightly. See Deviation D.1.
+`~/` binds at the multiplicative level (Section 4.1) and is
+left-associative. Its spelling is deliberately unrelated to the comment
+marker `//`, which never divides, so spacing around `~/` is immaterial:
+`a~/b`, `a ~/b`, and `a ~/ b` are identical. See Deviation D.1 for the
+history of this choice.
 
 ## 4.5 Ranges
 
@@ -550,7 +553,7 @@ heritage; see Deviation D.4.)
 ```voila
 func add(a int, b int) int  { return a + b }
 func add(a, b int) int      { return a + b }         // shared type
-func divmod(a, b int) (int, int) { return a//b, a % b }
+func divmod(a, b int) (int, int) { return a~/b, a % b }
 func sum(nums ...int) int   { ... }                  // variadic
 func greet(name str, greeting str = "Hello") str     // default value
 ```
@@ -1045,9 +1048,10 @@ use "app/geom" as g       // ...under another qualifier
 ```
 voila run   <file.voi> [args...]    compile (cached) and execute
 voila build <file.voi> -o <name>    produce a native executable
-voila build -S <file.voi>           produce an assembly listing (12.3)
+voila build -S <file.voi>           produce an assembly listing (12.4)
 voila build --emit=c <file.voi>     produce the C translation unit
 voila check <file.voi>              translate and verify only
+voila version                       print the toolchain version
 ```
 
 ## 12.2 How a Program Is Compiled
@@ -1127,10 +1131,10 @@ continued line ending in `+`.
    (CKCANC), MATCH becomes PMATCH tests ending in ABORT, and TRY
    becomes EHPUSH/EHPOP with the FINALLY block duplicated on every exit
    edge, each copy commented with its edge.
-4. The stage-0 toolchain does not execute this form: `voila run` and
-   the built executable share the verified-AST engine, so the
-   Equivalence Guarantee (12.2) is unaffected. The listing is the
-   authoritative preview of the stage-1 bytecode VM.
+4. The listing is not executed directly: it is the intermediate form
+   the C backend consumes on the way to a native binary. Because `voila
+   run` and `voila build` share this one path, the Equivalence Guarantee
+   (12.2) is unaffected.
 
 ## 12.5 Completion Codes
 
@@ -1184,12 +1188,13 @@ Flags `-` `+` `0` (blank) `#`; width and precision, either literal or
 
 # Appendix D. Deviations from the Specification
 
-**D.1 — Floor division and comments.** The specification assigns `//`
-both to comments (§2.2) and to floor division (§5.1) with no
-disambiguation; the two are irreconcilable for input such as
-`return a // b`. The implementation adopts the rule of Section 4.4
-(division must touch an operand). The specification's own sample
-`return a // b, a % b` must be written `return a//b, a % b`.
+**D.1 — Floor division.** The Version 0.1/0.2 specification spelled floor
+division `//`, which also introduces a comment (§2.2); the two readings
+are irreconcilable for input such as `return a // b`. As of Version 0.3
+the implementation spells floor division `~/` (Section 4.4) and reserves
+`//` for comments exclusively. The earlier heuristic — that `//` divided
+only when it touched an operand — is withdrawn, and with it the class of
+bug where a stray blank silently turned `a // b` into a comment.
 
 **D.2 — String indices.** The specification's std/str tables inherit
 REXX's 1-based positions for `substr` and `overlay` in spirit; the

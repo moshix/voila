@@ -33,8 +33,17 @@ use "std/os"
 use "std/fmt"
 use "std/str"
 
+const VERSION = "0.3.0"
+
 func main() {
     let args = os.args()
+
+    // `voila version` takes no file, so it is answered before the usage guard.
+    if len(args) >= 1 and (args[0] == "version" or args[0] == "--version" or
+                           args[0] == "-v") {
+        say "voila " || VERSION
+        return
+    }
     if len(args) < 2 {
         usage()
         os.exit(2)
@@ -217,12 +226,13 @@ func cache_dir() str {
 }
 
 func usage() {
-    fmt.eprintf("voila — the Voilà compiler\n\n")
+    fmt.eprintf("voila %s — the Voilà compiler\n\n", VERSION)
     fmt.eprintf("  voila run    <file.voi> [args…]   compile (cached) and run\n")
     fmt.eprintf("  voila build  <file.voi> [-o exe]  compile to a binary\n")
     fmt.eprintf("  voila build -S      <file.voi>    emit the assembly listing\n")
     fmt.eprintf("  voila build --emit=c <file.voi>   emit the C\n")
     fmt.eprintf("  voila check  <file.voi>           verify only\n")
+    fmt.eprintf("  voila version                     print the version\n")
     fmt.eprintf("\n  ast | tokens | load              dump a front-end stage\n")
 }
 

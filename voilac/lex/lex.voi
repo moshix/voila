@@ -124,16 +124,10 @@ impl Lexer {
             }
 
             let c = self.peek()
-            // `//` is floor division only in operator position, touching an
-            // operand; spaced on both sides it is a comment (Deviation D.1).
+            // `//` always begins a line comment (§2.2). Floor division is the
+            // dedicated operator `~/`, which the operator scanner handles — so
+            // there is no comment-vs-division heuristic to get wrong.
             if c == 47 and self.peek_at(1) == 47 {
-                if self.is_floor_div() {
-                    let line = self.line
-                    let col = self.col
-                    self.advance()
-                    self.advance()
-                    return self.emit(tok.FLOORDIV, "//", line, col)
-                }
                 while self.pos < len(self.src) and self.peek() != 10 {
                     self.advance()
                 }
@@ -146,23 +140,6 @@ impl Lexer {
             return self.scan()
         }
         return self.mk(tok.EOF, "", self.line, self.col)
-    }
-
-    func is_floor_div(self) bool {
-        if not self.seen { return false }
-        if not can_end_expr(self.last) { return false }
-        if self.peek_at(2) == 47 { return false }        // /// doc comment
-        var tight_before = false
-        if self.pos > 0 {
-            let b = self.at(self.pos - 1)
-            if b != 32 and b != 9 and b != 13 and b != 10 { tight_before = true }
-        }
-        var tight_after = false
-        let a = self.peek_at(2)
-        if a != -1 and a != 32 and a != 9 and a != 13 and a != 10 {
-            tight_after = true
-        }
-        return tight_before or tight_after
     }
 
     func block_comment(mut self) {

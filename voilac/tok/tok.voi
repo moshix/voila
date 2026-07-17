@@ -96,7 +96,7 @@ const PLUS      = 200
 const MINUS     = 201
 const STAR      = 202
 const SLASH     = 203
-const FLOORDIV  = 204
+const FLOORDIV  = 204   // floor division; spelled `~/` (`//` is a comment only)
 const PERCENT   = 205
 const POWER     = 206
 const CONCAT    = 207
@@ -154,7 +154,9 @@ func Ops3() []str  { return ["...", "..=", "||="] }
 func Ops3Code() []int { return [ELLIPSIS, RANGEEQ, CONCATEQ] }
 
 func Ops2() []str {
-    return ["..", "**", "||", "//", "<<", ">>", "<=", ">=", "==", "!=",
+    // `~/` is floor division (FLOORDIV). `//` is NOT here: it is a comment,
+    // handled in the lexer before operator matching (§2.2).
+    return ["..", "**", "||", "~/", "<<", ">>", "<=", ">=", "==", "!=",
             "+=", "-=", "*=", "/=", "%=", "<-", "=>", ":="]
 }
 func Ops2Code() []int {

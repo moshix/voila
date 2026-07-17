@@ -1,0 +1,9 @@
+3 -4 -4 3
+3 3 3
+identity holds: true
+y = 10
+z = 20
+4 3
+6 3
+div by zero trapped
+overflow trapped

@@ -13,7 +13,7 @@ impl[T] Stack[T] {
     func pop(mut self) ?T { return self.items.pop() }
     func depth(self) int { return len(self.items) }
 }
-func divmod(a, b int) (int, int) { return a//b, a % b }
+func divmod(a, b int) (int, int) { return a~/b, a % b }
 func greet(name str, greeting str = "Hello") str { return "{greeting}, {name}!" }
 func total(nums ...int) int {
     var t = 0

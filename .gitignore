@@ -9,13 +9,16 @@
 /dist/
 /bin/
 /build/
-
+/.codegraph/
 # claude
 .claude
 
 
-# Executables produced by `voila build` from the samples
-/samples/*[0-9]
+# Executables produced by `voila build` from the samples. A sample is
+# samples/NN_name.voi; its built binary is samples/NN_name (no extension), so
+# ignore the whole NN_* family and re-include the sources.
+/samples/[0-9][0-9]_*
+!/samples/[0-9][0-9]_*.voi
 /life
 /hello
 /txnreport

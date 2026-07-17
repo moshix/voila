@@ -1,6 +1,6 @@
 # Voilà — Language Specification
 
-**Version 0.2 (Draft)** — adds exceptions (§8), implicit numeric conversions (§3.2), and the core library (§13)
+**Version 0.3 (Draft)** — floor division is spelled `~/`; `//` is a comment only (§5.1). Version 0.2 added exceptions (§8), implicit numeric conversions (§3.2), and the core library (§13).
 File extension: `.voi` · Module file: `voila.mod` · Toolchain: `voila`
 
 ---
@@ -353,7 +353,7 @@ There are **no uninitialised variables** and **no null pointers**. `nil` inhabit
 | 11 | `x.f` `x[i]` `x(...)` `x!` `x?` | left |
 | 10 | unary `-` `not` `~` | right |
 | 9 | `**` (power) | right |
-| 8 | `*` `/` `//` `%` | left |
+| 8 | `*` `/` `~/` `%` | left |
 | 7 | `+` `-` | left |
 | 6 | `<<` `>>` `&` `\|` `^` | left |
 | 5 | `\|\|` (string concat) | left |
@@ -363,7 +363,7 @@ There are **no uninitialised variables** and **no null pointers**. `nil` inhabit
 | 1 | `=` `+=` `-=` `*=` `/=` `%=` `\|\|=` | none (statements) |
 
 Notes:
-- `/` on integers is **exact division producing `float`**; `//` is floor division producing `int`. (Removes the classic C/Go trap.)
+- `/` on integers is **exact division producing `float`**; `~/` is floor division producing `int`. (Removes the classic C/Go trap.) `//` is *only* a comment; floor division has its own operator `~/` so the two never collide.
 - `||` concatenates strings (REXX). `+` never concatenates.
 - `and` / `or` short-circuit and require `bool`. `&&`/`!` are *not* in the language — spelled `and`/`not` for readability.
 - `x in coll` works on slices, maps (keys), sets, strings (substring), and ranges.
@@ -1360,4 +1360,4 @@ voila run f.voi | voila build   // same source, same semantics
 
 ---
 
-*Voilà 0.2 draft specification. Designed for review — the acyclicity rule (§6.3), the structured-concurrency guarantee (§9.1), and the two-mechanism error story (§8) are the three claims most worth attacking first.*
+*Voilà 0.3 draft specification. Designed for review — the acyclicity rule (§6.3), the structured-concurrency guarantee (§9.1), and the two-mechanism error story (§8) are the three claims most worth attacking first.*
