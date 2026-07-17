@@ -26,6 +26,7 @@ const P_POW    = 90
 
 struct Parser {
     ts    []tok.Token
+    ip    []tok.IstrParts   // interpolated-string payloads (Token.Ref - 1)
     i     int
     file  str
     T     ast.Tree
@@ -42,7 +43,8 @@ func New(file str, src str) Parser { return NewAt(file, src, 1, 1) }
 func NewAt(file str, src str, line int, col int) Parser {
     var lx = lex.NewAt(file, src, line, col)
     let ts = lx.Tokens()
-    var p = Parser{ts: ts, i: 0, file: file, T: ast.NewTree(), Errs: lx.Errs,
+    var p = Parser{ts: ts, ip: lx.IParts, i: 0, file: file,
+                   T: ast.NewTree(), Errs: lx.Errs,
                    noLit: 0, lev: 0, selfFlags: 0}
     return p
 }
@@ -82,8 +84,7 @@ impl Parser {
         if self.at(k) { return self.next() }
         self.error("expected {tok.Spelling(k)}, found {self.show()}")
         return tok.Token{Kind: k, Lit: "", Line: self.cur().Line,
-                         Col: self.cur().Col, Parts: [], IsExpr: [],
-                         PartLine: [], PartCol: [], Virtual: false}
+                         Col: self.cur().Col, Ref: 0, Virtual: false}
     }
 
     func show(self) str {

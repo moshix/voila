@@ -31,6 +31,14 @@ struct Lexer {
     c2 []int
     o1 []str
     c1 []int
+
+    // Interpolated-string payloads, one entry per ISTR token (Token.Ref is
+    // 1 + the index here). Tokens themselves carry no slices.
+    IParts []tok.IstrParts
+
+    // Byte classes for the C-speed scanners (str.skip_any / str.find_any).
+    idChars  str   // identifier continuation bytes: [A-Za-z0-9_] + >= 128
+    digChars str   // decimal digits and `_`
 }
 
 func New(file str, src str) Lexer { return NewAt(file, src, 1, 1) }
@@ -47,7 +55,9 @@ func NewAt(file str, src str, line int, col int) Lexer {
                    last: tok.EOF, seen: false, Errs: [], kw: kw,
                    o3: tok.Ops3(), c3: tok.Ops3Code(),
                    o2: tok.Ops2(), c2: tok.Ops2Code(),
-                   o1: tok.Ops1(), c1: tok.Ops1Code()}
+                   o1: tok.Ops1(), c1: tok.Ops1Code(),
+                   IParts: [], idChars: ident_chars(),
+                   digChars: "0123456789_"}
     // A shebang line is skipped entirely (§1, script form).
     if str.starts_with(src, "#!") {
         while lx.pos < len(src) and lx.at(lx.pos) != 10 {
@@ -97,23 +107,21 @@ impl Lexer {
     func next(mut self) tok.Token {
         while true {
             // Whitespace, with a virtual semicolon at a line end (§2.4).
+            // Blanks/tabs/CRs are skipped in one native scan; \n is not in
+            // the class, so the newline logic below still sees every one.
             while self.pos < len(self.src) {
-                let c = self.peek()
-                if c == 10 {
-                    if can_end_expr(self.last) and self.seen {
-                        let t = self.mk(tok.SEMI, "", self.line, self.col)
-                        self.advance()
-                        self.last = tok.SEMI
-                        self.seen = false
-                        return t
-                    }
+                self.skip_to(self.src.skip_any(" \t\r", self.pos))
+                if self.pos >= len(self.src) { break }
+                if self.peek() != 10 { break }
+                if can_end_expr(self.last) and self.seen {
+                    let t = self.mk(tok.SEMI, "", self.line, self.col)
                     self.advance()
+                    self.last = tok.SEMI
                     self.seen = false
-                } else if c == 32 or c == 9 or c == 13 {
-                    self.advance()
-                } else {
-                    break
+                    return t
                 }
+                self.advance()
+                self.seen = false
             }
             if self.pos >= len(self.src) {
                 if can_end_expr(self.last) and self.seen {
@@ -128,8 +136,11 @@ impl Lexer {
             // dedicated operator `~/`, which the operator scanner handles — so
             // there is no comment-vs-division heuristic to get wrong.
             if c == 47 and self.peek_at(1) == 47 {
-                while self.pos < len(self.src) and self.peek() != 10 {
-                    self.advance()
+                let e = self.src.find_any("\n", self.pos)
+                if e < 0 {
+                    self.skip_to(len(self.src))
+                } else {
+                    self.skip_to(e)
                 }
                 continue
             }
@@ -148,12 +159,23 @@ impl Lexer {
         self.advance()
         self.advance()
         var depth = 1
+        // Hop between the only bytes that matter: `*`, `/` (nesting and
+        // closing) and newline (line accounting).
         while self.pos < len(self.src) {
-            if self.peek() == 47 and self.peek_at(1) == 42 {
+            let e = self.src.find_any("*/\n", self.pos)
+            if e < 0 {
+                self.skip_to(len(self.src))
+                break
+            }
+            self.skip_to(e)
+            let c = self.peek()
+            if c == 10 {
+                self.advance()
+            } else if c == 47 and self.peek_at(1) == 42 {
                 self.advance()
                 self.advance()
                 depth += 1
-            } else if self.peek() == 42 and self.peek_at(1) == 47 {
+            } else if c == 42 and self.peek_at(1) == 47 {
                 self.advance()
                 self.advance()
                 depth -= 1
@@ -167,8 +189,15 @@ impl Lexer {
 
     func mk(self, kind int, lit str, line int, col int) tok.Token {
         return tok.Token{Kind: kind, Lit: lit, Line: line, Col: col,
-                         Parts: [], IsExpr: [], PartLine: [], PartCol: [],
-                         Virtual: false}
+                         Ref: 0, Virtual: false}
+    }
+
+    // skip_to advances the cursor to byte offset e. The span MUST contain no
+    // newline — every caller guarantees it by construction (the scan classes
+    // treat \n as a stop) — so the column moves by the span length.
+    func skip_to(mut self, e int) {
+        self.col += e - self.pos
+        self.pos = e
     }
 
     func emit(mut self, kind int, lit str, line int, col int) tok.Token {
@@ -189,14 +218,7 @@ impl Lexer {
 
         if is_letter(c) {
             let start = self.pos
-            while self.pos < len(self.src) {
-                let ch = self.peek()
-                if is_letter(ch) or is_digit(ch) {
-                    self.advance()
-                } else {
-                    break
-                }
-            }
+            self.skip_to(self.src.skip_any(self.idChars, self.pos))
             let word = self.src[start..self.pos]
             if word in self.kw {
                 return self.emit(self.kw[word], word, line, col)
@@ -204,19 +226,15 @@ impl Lexer {
             return self.emit(tok.IDENT, word, line, col)
         }
 
-        // Operators, longest match first.
-        each i, op in self.o3 {
-            if self.match_op(op) { return self.emit(self.c3[i], op, line, col) }
-        }
-        each i, op in self.o2 {
-            if self.match_op(op) { return self.emit(self.c2[i], op, line, col) }
-        }
-        if c == 59 {
-            self.advance()
-            return self.emit(tok.SEMI, ";", line, col)
-        }
-        each i, op in self.o1 {
-            if self.match_op(op) { return self.emit(self.c1[i], op, line, col) }
+        // Operators: first-byte dispatch with direct byte peeks. The old
+        // table walk sliced a substring out of the source for EVERY spelling
+        // tried — about twenty allocations to lex a lone comma.
+        let kind = self.op_scan(c)
+        if kind >= 0 {
+            // Operator tokens carry no Lit: every consumer derives the text
+            // from the Kind (tok.Spelling), and Spelling() itself rebuilds
+            // tables — calling it here would cost more than the whole scan.
+            return self.emit(kind, "", line, col)
         }
 
         let bad = self.advance()
@@ -224,13 +242,97 @@ impl Lexer {
         return self.emit(tok.ILLEGAL, chr(bad), line, col)
     }
 
-    func match_op(mut self, op str) bool {
-        if self.pos + len(op) > len(self.src) { return false }
-        if self.src[self.pos..self.pos + len(op)] != op { return false }
-        for i in 0..len(op) {
-            self.advance()
+    // op_scan recognises an operator by its leading byte, longest match
+    // first, advancing past it. Returns the token kind, or -1. The cases
+    // mirror tok.Ops3/Ops2/Ops1 exactly; tok.Spelling is the single source
+    // of the operator's text, so the tables and this scanner cannot drift
+    // in what they EMIT — only in what they accept, which the token-stream
+    // goldens pin.
+    func op_scan(mut self, c int) int {
+        let n1 = self.peek_at(1)
+        if c == 46 {                                    // .
+            if n1 == 46 {
+                let n2 = self.peek_at(2)
+                if n2 == 46 { return self.take(3, tok.ELLIPSIS) }
+                if n2 == 61 { return self.take(3, tok.RANGEEQ) }
+                return self.take(2, tok.RANGE)
+            }
+            return self.take(1, tok.DOT)
         }
-        return true
+        if c == 124 {                                   // |
+            if n1 == 124 {
+                if self.peek_at(2) == 61 { return self.take(3, tok.CONCATEQ) }
+                return self.take(2, tok.CONCAT)
+            }
+            return self.take(1, tok.PIPE)
+        }
+        if c == 60 {                                    // <
+            if n1 == 60 { return self.take(2, tok.SHL) }
+            if n1 == 61 { return self.take(2, tok.LE) }
+            if n1 == 45 { return self.take(2, tok.ARROW) }
+            return self.take(1, tok.LT)
+        }
+        if c == 62 {                                    // >
+            if n1 == 62 { return self.take(2, tok.SHR) }
+            if n1 == 61 { return self.take(2, tok.GE) }
+            return self.take(1, tok.GT)
+        }
+        if c == 61 {                                    // =
+            if n1 == 61 { return self.take(2, tok.EQ) }
+            if n1 == 62 { return self.take(2, tok.FATARROW) }
+            return self.take(1, tok.ASSIGN)
+        }
+        if c == 42 {                                    // *
+            if n1 == 42 { return self.take(2, tok.POWER) }
+            if n1 == 61 { return self.take(2, tok.STAREQ) }
+            return self.take(1, tok.STAR)
+        }
+        if c == 43 {                                    // +
+            if n1 == 61 { return self.take(2, tok.PLUSEQ) }
+            return self.take(1, tok.PLUS)
+        }
+        if c == 45 {                                    // -
+            if n1 == 61 { return self.take(2, tok.MINUSEQ) }
+            return self.take(1, tok.MINUS)
+        }
+        if c == 47 {                                    // /   (// and /* were
+            if n1 == 61 { return self.take(2, tok.SLASHEQ) }   // handled above)
+            return self.take(1, tok.SLASH)
+        }
+        if c == 37 {                                    // %
+            if n1 == 61 { return self.take(2, tok.PERCENTEQ) }
+            return self.take(1, tok.PERCENT)
+        }
+        if c == 126 {                                   // ~
+            if n1 == 47 { return self.take(2, tok.FLOORDIV) }
+            return self.take(1, tok.TILDE)
+        }
+        if c == 33 {                                    // !
+            if n1 == 61 { return self.take(2, tok.NE) }
+            return self.take(1, tok.BANG)
+        }
+        if c == 58 {                                    // :
+            if n1 == 61 { return self.take(2, tok.DEFINE) }
+            return self.take(1, tok.COLON)
+        }
+        if c == 59  { return self.take(1, tok.SEMI) }
+        if c == 38  { return self.take(1, tok.AMP) }
+        if c == 94  { return self.take(1, tok.CARET) }
+        if c == 40  { return self.take(1, tok.LPAREN) }
+        if c == 41  { return self.take(1, tok.RPAREN) }
+        if c == 91  { return self.take(1, tok.LBRACKET) }
+        if c == 93  { return self.take(1, tok.RBRACKET) }
+        if c == 123 { return self.take(1, tok.LBRACE) }
+        if c == 125 { return self.take(1, tok.RBRACE) }
+        if c == 44  { return self.take(1, tok.COMMA) }
+        if c == 63  { return self.take(1, tok.QUESTION) }
+        return 0 - 1
+    }
+
+    func take(mut self, w int, kind int) int {
+        self.col += w
+        self.pos += w
+        return kind
     }
 
     func number(mut self, line int, col int) tok.Token {
@@ -239,23 +341,17 @@ impl Lexer {
         // Radix prefixes: 0x, 0o, 0b (§2.6).
         if c0 == 48 and (c1 == 120 or c1 == 88 or c1 == 111 or c1 == 79 or
                          c1 == 98 or c1 == 66) {
-            var lit = ""
-            lit = lit || chr(self.advance())
+            let start = self.pos
+            self.advance()
             let base = self.advance()
-            lit = lit || chr(base)
             // Each base admits only its own digits: `0b12` is `0b1` then `2`.
-            var n = 0
-            while self.pos < len(self.src) {
-                let ch = self.peek()
-                if ch == 95 {
-                    self.advance()
-                    continue
-                }
-                if not in_base(ch, base) { break }
-                lit = lit || chr(self.advance())
-                n += 1
-            }
-            if n == 0 {
+            var cls = "0123456789abcdefABCDEF_"
+            if base == 98 or base == 66 { cls = "01_" }
+            if base == 111 or base == 79 { cls = "01234567_" }
+            self.skip_to(self.src.skip_any(cls, self.pos))
+            var lit = self.src[start..self.pos]
+            if str.contains(lit, "_") { lit = str.replace(lit, "_", "") }
+            if len(lit) <= 2 {
                 self.error(line, col, "malformed number literal")
             }
             return self.emit(tok.INT, lit, line, col)
@@ -296,18 +392,11 @@ impl Lexer {
     }
 
     func digits(mut self) str {
-        var out = ""
-        while self.pos < len(self.src) {
-            let ch = self.peek()
-            if ch == 95 {
-                self.advance()
-            } else if is_digit(ch) {
-                out = out || chr(self.advance())
-            } else {
-                break
-            }
-        }
-        return out
+        let start = self.pos
+        self.skip_to(self.src.skip_any(self.digChars, self.pos))
+        let run = self.src[start..self.pos]
+        if str.contains(run, "_") { return str.replace(run, "_", "") }
+        return run
     }
 
     func escape(mut self) str {
@@ -357,7 +446,10 @@ impl Lexer {
     }
 
     // string_lit lexes "…". An unescaped `{` makes it an interpolated string,
-    // whose pieces are carried on the token.
+    // whose pieces land in the lexer's side table (Token.Ref points at them).
+    // The scan JUMPS between the four bytes that matter — `"`, `\`, `{` and
+    // newline — via one native find_any per hop; a 30 KB literal that used to
+    // cost 30 000 boxed advance() calls now costs one.
     func string_lit(mut self, line int, col int) tok.Token {
         self.advance()
         var parts = []
@@ -368,6 +460,12 @@ impl Lexer {
         var seg = self.pos
         var interp = false
         while true {
+            let hop = self.src.find_any("\"\\\{\n", self.pos)
+            if hop < 0 {
+                self.skip_to(len(self.src))
+            } else {
+                self.skip_to(hop)
+            }
             if self.pos >= len(self.src) or self.peek() == 10 {
                 // Flush the run scanned so far: an unterminated string still
                 // carries its text (the Go lexer accumulates byte by byte).
@@ -406,8 +504,6 @@ impl Lexer {
                 plines.append(eline)
                 pcols.append(ecol)
                 seg = self.pos
-            } else {
-                self.advance()
             }
         }
         if not interp {
@@ -421,9 +517,10 @@ impl Lexer {
         }
         self.last = tok.ISTR
         self.seen = true
+        self.IParts.append(tok.IstrParts{Parts: parts, IsExpr: isexpr,
+                                         PartLine: plines, PartCol: pcols})
         return tok.Token{Kind: tok.ISTR, Lit: "", Line: line, Col: col,
-                         Parts: parts, IsExpr: isexpr, PartLine: plines,
-                         PartCol: pcols, Virtual: false}
+                         Ref: len(self.IParts), Virtual: false}
     }
 
     // interp_expr consumes a balanced {…}, skipping nested strings and runes.
@@ -487,9 +584,19 @@ impl Lexer {
     func raw_string(mut self, line int, col int) tok.Token {
         self.advance()
         let start = self.pos
-        while self.pos < len(self.src) and self.peek() != 96 {
-            self.advance()
+        // One hop to the closing backtick; the skipped span may contain
+        // newlines, so line/col are recomputed from the span itself.
+        var e = self.src.find_any("`", self.pos)
+        if e < 0 { e = len(self.src) }
+        let span = self.src[self.pos..e]
+        let nl = str.count(span, "\n")
+        if nl > 0 {
+            self.line += nl
+            self.col = len(span) - str.last_index(span, "\n")
+        } else {
+            self.col += len(span)
         }
+        self.pos = e
         if self.pos >= len(self.src) {
             self.error(line, col, "unterminated raw string literal")
             return self.emit(tok.STR, self.src[start..self.pos], line, col)
@@ -546,19 +653,22 @@ func can_end_expr(k int) bool {
 
 func is_digit(c int) bool { return c >= 48 and c <= 57 }
 
+// ident_chars builds the identifier-continuation byte class once:
+// [0-9A-Za-z_] plus every byte >= 128 (multi-byte UTF-8 sequences).
+func ident_chars() str {
+    var bs = [95]
+    for c in 48..58 { bs.append(c) }
+    for c in 65..91 { bs.append(c) }
+    for c in 97..123 { bs.append(c) }
+    for c in 128..256 { bs.append(c) }
+    return str.from_bytes(bs)
+}
+
 func is_letter(c int) bool {
     if c == 95 { return true }
     if c >= 65 and c <= 90 { return true }
     if c >= 97 and c <= 122 { return true }
     return c >= 128
-}
-
-// in_base reports whether c is a digit of the radix introduced by `base`
-// (the character after the leading 0): b/B binary, o/O octal, x/X hex.
-func in_base(c int, base int) bool {
-    if base == 98 or base == 66 { return c == 48 or c == 49 }
-    if base == 111 or base == 79 { return c >= 48 and c <= 55 }
-    return is_hex(c)
 }
 
 // hex_val is the value of one hex digit, or -1.

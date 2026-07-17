@@ -27,7 +27,8 @@ func prelude_natives() []str {
 // str_natives are std/str's functions, reachable bare (the method-call
 // duality s.upper() == str.upper(s)) and as `str.NAME`.
 func str_natives() []str {
-    return ["upper", "lower", "title", "trim", "trim_left", "trim_right",
+    return ["find_any", "skip_any",
+            "upper", "lower", "title", "trim", "trim_left", "trim_right",
             "strip", "pad", "pad_left", "center", "contains", "index",
             "last_index", "starts_with", "ends_with", "count", "equal_fold",
             "substr", "left", "right", "split", "split_n", "lines", "fields",

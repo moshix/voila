@@ -6,10 +6,7 @@
 that compiles itself.**
 
 ![language](https://img.shields.io/badge/language-Voil%C3%A0%200.3.2-blueviolet?style=for-the-badge)
-![backend](https://img.shields.io/badge/backend-C%20(native)-555555?style=for-the-badge&logo=c&logoColor=white)
-![tests](https://img.shields.io/badge/tests-passing-brightgreen?style=for-the-badge)
 ![gc](https://img.shields.io/badge/GC-none-orange?style=for-the-badge)
-![leaks](https://img.shields.io/badge/memory%20leaks-unrepresentable-red?style=for-the-badge)
 
 `say "Hello, world!"` · files end in `.voi` · the toolchain is `voila`, and it is written in Voilà
 

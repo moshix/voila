@@ -10,15 +10,23 @@ struct Token {
     Lit     str
     Line    int
     Col     int
-    // An interpolated string carries its pieces: Parts[i] is either literal
-    // text (IsExpr[i] false) or the source of an embedded expression.
-    // PartLine/PartCol locate each piece in the enclosing file, so a
-    // diagnostic inside `"{x + }"` points at the real column.
+    // An interpolated string's pieces live in the LEXER's side table, not on
+    // the token: Ref > 0 is 1 + the index into Lexer.IParts. Carrying four
+    // slices on EVERY token — when only ISTR needs them — was four heap
+    // allocations per token, the lexer's dominant cost.
+    Ref     int
+    Virtual bool   // a semicolon inserted at a line end (§2.4)
+}
+
+// IstrParts is one interpolated string's payload: Parts[i] is either literal
+// text (IsExpr[i] false) or the source of an embedded expression.
+// PartLine/PartCol locate each piece in the enclosing file, so a diagnostic
+// inside `"{x + }"` points at the real column.
+struct IstrParts {
     Parts    []str
     IsExpr   []bool
     PartLine []int
     PartCol  []int
-    Virtual bool   // a semicolon inserted at a line end (§2.4)
 }
 
 const EOF     = 0

@@ -421,11 +421,13 @@ impl Parser {
     // the string.
     func interp_str(mut self, t tok.Token) int {
         var parts = []
+        // The payload lives in the lexer's side table; Ref is 1-based.
+        let ip = self.ip[t.Ref - 1]
         var i = 0
-        while i < len(t.Parts) {
-            if t.IsExpr[i] {
-                var sub = NewAt(self.file, t.Parts[i], t.PartLine[i],
-                                t.PartCol[i])
+        while i < len(ip.Parts) {
+            if ip.IsExpr[i] {
+                var sub = NewAt(self.file, ip.Parts[i], ip.PartLine[i],
+                                ip.PartCol[i])
                 let e = sub.expr()
                 if not sub.at(tok.EOF) and not sub.at(tok.SEMI) {
                     sub.error("unexpected {sub.show()} after interpolated " ||
@@ -435,7 +437,7 @@ impl Parser {
                 each err in sub.Errs { self.Errs.append(err) }
                 parts.append(id)
             } else {
-                parts.append(self.add(ast.STR, t, 0, 0, t.Parts[i], []))
+                parts.append(self.add(ast.STR, t, 0, 0, ip.Parts[i], []))
             }
             i += 1
         }
