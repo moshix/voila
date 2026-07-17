@@ -67,11 +67,13 @@ impl Checker {
         let n = self.T.Get(node)
         let k = n.Kind
         if k == ast.PARAM or k == ast.VAR or k == ast.CATCH or
-           k == ast.PARSETERM or k == ast.SELCASE {
+           k == ast.PARSETERM {
             if n.Sval != "" { bound.add(n.Sval) }
-        } else if k == ast.LET {
+        } else if k == ast.LET or k == ast.SELCASE {
+            // Both store comma-joined names ("a,b"; SELCASE keeps a
+            // trailing comma for the missing ok-name: "f,").
             each part in str.split(n.Sval, ",") {
-                bound.add(part)
+                if part != "" { bound.add(part) }
             }
         } else if k == ast.FOR or k == ast.EACH {
             // Sval is "names|label"; both halves are cheap to add.
