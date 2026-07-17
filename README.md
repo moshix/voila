@@ -16,10 +16,10 @@ that compiles itself.**
 
 | 🎁 From | Voilà takes |
 |---|---|
-| 🐹 **Go** | braces, packages, channels, `select`, familiar `func` |
-| 🦀 **Rust** | ownership + moves + deterministic destruction — **without lifetime annotations** |
-| 🖥️ **REXX** | `say`, `parse`, exact decimal arithmetic, learn-it-in-an-afternoon |
-| ⚙️ **C** | the `printf` verbs everyone already knows |
+| **Go** | braces, packages, channels, `select`, familiar `func` |
+| **Rust** | ownership + moves + deterministic destruction — **without lifetime annotations** |
+| **REXX** | `say`, `parse`, exact decimal arithmetic, learn-it-in-an-afternoon |
+| **C** | the `printf` verbs everyone already knows |
 
 ## 👀 Thirty seconds of syntax
 
@@ -63,7 +63,7 @@ func main() {
 }
 ```
 
-## 🛡️ The guarantees (not conventions — **compile errors**)
+## The guarantees (not conventions — **compile errors**)
 
 - 🚫 **No leaks.** The type graph must be acyclic through owning edges;
   back-edges are `weak[T]`. Refcounts always reach zero:
@@ -78,14 +78,14 @@ func main() {
      = help: use `weak[Node]` for a back-edge
   ```
 
-- 🚫 **No dangling.** Borrows can't be stored in structs, channels, or
+- **No dangling.** Borrows can't be stored in structs, channels, or
   escaping closures — so they can't dangle, and nobody writes `'a`.
-- 🚫 **No orphaned tasks.** `spawn` lives inside `group { }`; the group
+- **No orphaned tasks.** `spawn` lives inside `group { }`; the group
   joins **all** of its tasks before it exits. A failing task cancels its
   siblings and the failure rethrows at the boundary.
-- 🚫 **No silent precision loss.** `u16 → int` is free; `i64 → float`
+- **No silent precision loss.** `u16 → int` is free; `i64 → float`
   is a compile error until you write `float(x)`. Overflow **traps**.
-- 🚫 **No 59.96999999999999.** `19.99d * 3d == 59.97d`. Exactly.
+- **No 59.96999999999999.** `19.99d * 3d == 59.97d`. Exactly.
 
 ## ⚡ Concurrency that can't leak threads
 
@@ -112,15 +112,15 @@ let r = attempt risky()            // or demote an exception to a value
 
 | | |
 |---|---|
-| 🪞 `voilac/` | **the compiler, written in Voilà** — `lex` · `par` · `load` · `chk` · `low` · `cg` |
-| 🔤 `voilac/lex` `par` | full grammar: interpolation, nested comments, semicolon insertion, the arena AST |
-| 🔎 `voilac/chk` | acyclicity rule, widening lattice, exhaustive `match`, use-after-move, compile-time `printf` checking |
-| 📦 `voilac/cg` | **C backend**: IR → C → `cc`. Real native binaries; zero leaks under `leaks` |
-| ⚙️ `runtime/` | **libvoila**: the C runtime — refcounted values (no GC), exact decimals, exceptions, tasks/channels/select |
+| `voilac/` | **the compiler, written in Voilà** — `lex` · `par` · `load` · `chk` · `low` · `cg` |
+| `voilac/lex` `par` | full grammar: interpolation, nested comments, semicolon insertion, the arena AST |
+| `voilac/chk` | acyclicity rule, widening lattice, exhaustive `match`, use-after-move, compile-time `printf` checking |
+| `voilac/cg` | **C backend**: IR → C → `cc`. Real native binaries; zero leaks under `leaks` |
+|  `runtime/` | **libvoila**: the C runtime — refcounted values (no GC), exact decimals, exceptions, tasks/channels/select |
 | 📚 stdlib | `fmt` `str` `os` `math` `time` `json` `log` `conv` `sort` `rand` `uuid` |
-| 📜 `voila build -S` | register-IR **assembly listings** in HLASM style — location counter, constant pool, DSECTs, ≤79 columns |
-| 🌱 `bootstrap/voilac.c` | the seed: the C the compiler emits **for itself**, so `cc` alone can rebuild everything |
-| 🧪 tests | goldens, negative fixtures, and the **fixpoint**: the compiler compiled by itself emits identical C ([TESTING.md](TESTING.md)) |
+| `voila build -S` | register-IR **assembly listings** in HLASM style — location counter, constant pool, DSECTs, ≤79 columns |
+| `bootstrap/voilac.c` | the seed: the C the compiler emits **for itself**, so `cc` alone can rebuild everything |
+| tests | goldens, negative fixtures, and the **fixpoint**: the compiler compiled by itself emits identical C ([TESTING.md](TESTING.md)) |
 
 ## 🏃 Quick start
 
@@ -156,7 +156,7 @@ See **[TESTING.md](TESTING.md)** for the full procedure and
 | `09_jsonreport.voi` | typed & dynamic JSON, `dec`-safe money round-trips |
 | `10_life.voi` | Conway's Life on a torus: 2-D slices, `str.Builder` frames |
 
-## 🪞 It compiles itself
+## It compiles itself
 Voilà is completely self-hosted and it compiles itself from the very first version. 
 In other words, the compiler is written in Voilà. To build it you need a compiler, so one
 generation of its own C output is checked in as `bootstrap/voilac.c` — a
@@ -166,7 +166,7 @@ the two emit **byte-identical C**. It bootstrapped from a Go compiler that no
 longer exists; every stage of the Voilà one was diffed against it, byte for
 byte, over every file in this repository — and then it was deleted.
 
-## 🗺️ Roadmap
+##  Roadmap
 
 - ✅ **Self-hosted** — the compiler is written in Voilà; the fixpoint holds
 - ✅ Native binaries, multi-file packages, the full checker, `run`/`build`/`check`
