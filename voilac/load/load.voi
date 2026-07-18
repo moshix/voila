@@ -18,10 +18,13 @@ use "voilac/par"
 use "std/os"
 use "std/str"
 use "voilac/path"
+use "voilac/std"
 
-const KIND_STD  = 0   // a std package: left to the runtime
-const KIND_USER = 1   // a directory under the module root
-const KIND_BAD  = 2   // neither — a typo, or an escape attempt
+const KIND_STD    = 0   // a C std package: left to the runtime
+const KIND_USER   = 1   // a directory under the module root
+const KIND_BAD    = 2   // neither — a typo, or an escape attempt
+const KIND_STDSRC = 3   // a std package written in Voilà: grafted from the
+                        // embedded source (voilac/std), like a user package
 
 struct Pkg {
     name    str          // the qualifier: the directory's base name
@@ -32,6 +35,10 @@ struct Pkg {
     paths   []str        // each file's openable path
     imports map[str]int  // qualifier (honouring `as`) → index into Loader.pkgs
     decls   set[str]
+    // A Voilà-source std package (std/net): its files come from the embedded
+    // blob, not the filesystem, so they must NOT enter the run-cache key
+    // (which re-opens every path). See the graft loop and source_key.
+    embedded bool
 }
 
 // Program is a loaded, flattened program.
@@ -141,8 +148,14 @@ func Load(entry str) Program {
             }
             fi += 1
         }
-        each s in l.pkgs[pi].sources { l.Sources.append(s) }
-        each s in l.pkgs[pi].paths { l.Paths.append(s) }
+        // Embedded (std-source) packages have no on-disk files, so they must
+        // not enter Sources/Paths — source_key re-opens every Path and would
+        // fail on an in-binary "std/net/net.voi". Diagnostics still work: the
+        // display name is recorded into the arena by BeginFile above.
+        if not l.pkgs[pi].embedded {
+            each s in l.pkgs[pi].sources { l.Sources.append(s) }
+            each s in l.pkgs[pi].paths { l.Paths.append(s) }
+        }
     }
 
     // main is rewritten with no self package: its own names stay bare.
@@ -201,6 +214,16 @@ impl Loader {
 
             let dir, k = self.resolve(ipath)
             if k == KIND_STD { continue }
+            if k == KIND_STDSRC {
+                // Load and graft the embedded Voilà source, but do NOT add it
+                // to the imports map: a `net.listen` call must survive as a
+                // FIELD so the lowerer forms `net.listen` (net is a package
+                // name), which resolves to the grafted module function —
+                // whereas the rewriter would only touch capitalized members.
+                self.load_std_pkg(std_src_base(ipath), un.Line, un.Col)
+                self.at = saved
+                continue
+            }
             if k == KIND_BAD {
                 self.err(un.Line, un.Col,
                          "no package `{ipath}`: it is not a std package and no " ||
@@ -277,6 +300,10 @@ impl Loader {
     // must never be waved through as "probably std", which would let a broken
     // program pass `check` and fail at run time.
     func resolve(self, p str) (str, int) {
+        // A Voilà-source std package (std/net, or the bare form `net`) is
+        // classified BEFORE the generic std/ check, so the C std packages
+        // (std/os, std/str, …) keep their exact KIND_STD path unchanged.
+        if std_src_base(p) != "" { return "", KIND_STDSRC }
         if str.starts_with(p, "std/") { return "", KIND_STD }
         if not str.contains(p, "/") and is_std(p) { return "", KIND_STD }
         if path.IsAbs(p) or str.contains(p, "\\") { return "", KIND_BAD }
@@ -359,7 +386,8 @@ impl Loader {
         }
 
         var pk = Pkg{name: name, dir: dir, trees: [], roots: [], sources: [],
-                     paths: [], imports: make(map[str]int), decls: set([])}
+                     paths: [], imports: make(map[str]int), decls: set([]),
+                     embedded: false}
         // Register BEFORE recursing, so a cycle is caught by the stack check.
         self.pkgs.append(pk)
         let pi = len(self.pkgs) - 1
@@ -405,6 +433,86 @@ impl Loader {
             k += 1
         }
         self.order.append(pi)   // dependencies were appended first
+        self.stack = self.stack[0..len(self.stack) - 1]
+        return pi
+    }
+
+    // load_std_pkg is load_pkg for a Voilà-source std package: it reads the
+    // files from the embedded blob (voilac/std) instead of the filesystem,
+    // then parses, records and orders them exactly as a user package — so the
+    // graft loop treats it identically. The identity key is `std/<name>`,
+    // which cannot collide with any user directory. Returns the pkgs index,
+    // or -1 on failure.
+    func load_std_pkg(mut self, name str, line int, col int) int {
+        let ident = "std/" || name
+
+        each on in self.stack {
+            if on == ident {
+                var chain = []
+                each d in self.stack { chain.append(path.Base(d)) }
+                chain.append(name)
+                self.err(line, col,
+                         "std package `{name}` imports itself (through " ||
+                         str.join(chain, " -> ") || ")")
+                return 0 - 1
+            }
+        }
+        if ident in self.byDir { return self.byDir[ident] }
+
+        if name in self.qualifier and self.qualifier[name] != ident {
+            self.err(line, col,
+                     "package `{name}` collides with std/{name}; a package's " ||
+                     "flat name must be unique in a program")
+            return 0 - 1
+        }
+        self.qualifier[name] = ident
+
+        let files = std.Files(name)
+        if len(files) == 0 {
+            self.err(line, col, "std package `{name}` has no embedded source")
+            return 0 - 1
+        }
+
+        self.stack.append(ident)
+        var pk = Pkg{name: name, dir: ident, trees: [], roots: [], sources: [],
+                     paths: [], imports: make(map[str]int), decls: set([]),
+                     embedded: true}
+        self.pkgs.append(pk)
+        let pi = len(self.pkgs) - 1
+        self.byDir[ident] = pi
+
+        each f in files {
+            let text = std.Source(name, f)
+            let disp = ident || "/" || f          // "std/net/net.voi"
+            self.at = disp
+            var p = par.New(disp, text)
+            let root = p.File()
+            each e in p.Errs { self.Errs.append(e) }
+            self.pkgs[pi].trees.append(p.T)
+            self.pkgs[pi].roots.append(root)
+            self.pkgs[pi].sources.append(disp)
+            // An embedded file has no openable path; disp is a stable label and
+            // the graft loop keeps embedded sources out of the run-cache key.
+            self.pkgs[pi].paths.append(disp)
+            each d in p.T.Get(p.T.Kid(root, 1)).Kids {
+                each dn in decl_names(p.T, d) {
+                    self.pkgs[pi].decls.add(dn)
+                }
+            }
+        }
+
+        // Transitive imports: a std/net that `use`s std/str (C, skipped) or
+        // another Voilà-source std package (grafted) is resolved here.
+        var k = 0
+        while k < len(self.pkgs[pi].trees) {
+            let deps = self.imports_of(self.pkgs[pi].trees[k],
+                                       self.pkgs[pi].roots[k])
+            each q in keys(deps) {
+                self.pkgs[pi].imports[q] = deps[q]
+            }
+            k += 1
+        }
+        self.order.append(pi)
         self.stack = self.stack[0..len(self.stack) - 1]
         return pi
     }
@@ -459,9 +567,29 @@ func module_name(root str) str {
 func is_std(name str) bool {
     let stds = ["fmt", "str", "os", "math", "time", "json", "log", "regex",
                 "http", "conv", "sort", "rand", "uuid", "io", "sync", "chan",
-                "test", "vm", "ffi"]
+                "test", "vm", "ffi", "net"]
     each s in stds {
         if s == name { return true }
     }
     return false
+}
+
+// is_std_src reports whether a std package is written in Voilà source (and so
+// is grafted from the embedded blob), rather than provided as C natives. This
+// is the single registry the loader, and future packages, extend.
+func is_std_src(name str) bool {
+    return name == "net"
+}
+
+// std_src_base returns the package base name if `p` names a Voilà-source std
+// package ("std/net" or the bare "net"), else "". It is the sole classifier
+// resolve() consults for KIND_STDSRC.
+func std_src_base(p str) str {
+    if str.starts_with(p, "std/") {
+        let b = p[4..len(p)]
+        if is_std_src(b) { return b }
+        return ""
+    }
+    if not str.contains(p, "/") and is_std_src(p) { return p }
+    return ""
 }

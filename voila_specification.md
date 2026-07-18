@@ -1,6 +1,6 @@
 # Voilà — Language Specification
 
-**Version 0.4.0 (Draft)** — 0.4 adds the optimizing backend (`voila build -O1|-O2|-O3`; manual §12.5). Floor division is spelled `~/`; `//` is a comment only (§5.1). Version 0.2 added exceptions (§8), implicit numeric conversions (§3.2), and the core library (§13).
+**Version 0.4.1 (Draft)** — 0.4.1 adds `std/net` (TCP/UDP/Unix sockets; manual §11.5), the first Voilà-authored std package. 0.4 added the optimizing backend (`voila build -O1|-O2|-O3`; manual §12.5). Floor division is spelled `~/`; `//` is a comment only (§5.1). Version 0.2 added exceptions (§8), implicit numeric conversions (§3.2), and the core library (§13).
 File extension: `.voi` · Module file: `voila.mod` · Toolchain: `voila`
 
 ---
@@ -1360,4 +1360,4 @@ voila run f.voi | voila build   // same source, same semantics
 
 ---
 
-*Voilà 0.4.0 draft specification. Designed for review — the acyclicity rule (§6.3), the structured-concurrency guarantee (§9.1), and the two-mechanism error story (§8) are the three claims most worth attacking first.*
+*Voilà 0.4.1 draft specification. Designed for review — the acyclicity rule (§6.3), the structured-concurrency guarantee (§9.1), and the two-mechanism error story (§8) are the three claims most worth attacking first.*

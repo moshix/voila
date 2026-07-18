@@ -1,0 +1,78 @@
+// 12_udp.voi — connectionless messaging with UDP (§10, §13). Unlike TCP,
+// UDP has no connection: each datagram carries its own destination, and the
+// receiver learns the sender's address from the datagram itself. A responder
+// task and a sender task run in one group over the loopback interface; the
+// responder binds port 0 and reports its address, so the run is deterministic
+// (the ephemeral port is never printed).
+package main
+
+use "std/net"
+use "std/fmt"
+
+// respond binds a UDP socket, echoes each datagram back to its sender with a
+// prefix, and stops when it receives "DONE".
+func respond(addr chan[str], done chan[str]) {
+    match net.listen_udp("127.0.0.1:0") {
+        Err(e) => { addr <- "" ; done <- ("bind failed: " || e.message()) }
+        Ok(sock) => {
+            addr <- sock.addr()
+            var served = 0
+            while true {
+                match sock.recv_from(2048) {
+                    Err(e) => { done <- ("recv failed: " || e.message()) ; return }
+                    Ok(pair) => {
+                        let msg, from = pair
+                        if msg == "DONE" {
+                            sock.close()
+                            done <- ("responder: handled {served} datagrams")
+                            return
+                        }
+                        served += 1
+                        match sock.send_to("pong: " || msg, from) {
+                            Ok(n)  => n
+                            Err(e) => { done <- ("send failed: " || e.message())
+                                        return }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// send_all fires three datagrams at the responder, prints each reply, then
+// tells the responder to stop.
+func send_all(addr chan[str]) {
+    let where = <-addr
+    if where == "" { return }
+    match net.listen_udp("127.0.0.1:0") {
+        Err(e) => say "sender bind failed:", e.message()
+        Ok(sock) => {
+            for word in ["one", "two", "three"] {
+                match sock.send_to(word, where) {
+                    Ok(n)  => n
+                    Err(e) => { say "send failed:", e.message() ; return }
+                }
+                match sock.recv_from(2048) {
+                    Err(e)   => { say "recv failed:", e.message() ; return }
+                    Ok(pair) => { let reply, from = pair ; say reply }
+                }
+            }
+            match sock.send_to("DONE", where) {
+                Ok(n)  => n
+                Err(e) => say "send DONE failed:", e.message()
+            }
+            sock.close()
+        }
+    }
+}
+
+func main() {
+    let addr = chan[str](1)
+    let done = chan[str](1)
+    group {
+        spawn respond(addr, done)
+        spawn send_all(addr)
+    }
+    say <-done
+}

@@ -86,7 +86,8 @@ typedef enum {
   O_BUILDER,
   O_TYPE,
   O_FRAME,
-  O_ITER
+  O_ITER,
+  O_SOCKET      /* a network socket (std/net); owns an OS file descriptor */
 } VlKind;
 
 struct VlObj {

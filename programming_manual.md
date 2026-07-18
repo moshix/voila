@@ -2,13 +2,13 @@
 
 ## Language Reference and Programming Guide
 
-**Program Number 5799-VLA · Version 0, Release 4, Modification 0**
+**Program Number 5799-VLA · Version 0, Release 4, Modification 1**
 
 ---
 
 **Third Edition (July 2026)**
 
-This edition applies to Version 0 Release 4 Modification 0 of the Voilà Language
+This edition applies to Version 0 Release 4 Modification 1 of the Voilà Language
 Toolchain (self-hosted), and to all subsequent releases and modifications
 until otherwise indicated in new editions. Make sure you are using the
 correct edition for the level of the product.
@@ -20,7 +20,7 @@ diagrams, general rules, and usage notes. Read Chapter 1 first;
 thereafter the manual is designed for random access.
 
 **Note.** Where the behavior of the toolchain deliberately differs from
-the *Voilà Language Specification, Version 0.4.0 (Draft)*, the difference
+the *Voilà Language Specification, Version 0.4.1 (Draft)*, the difference
 is recorded in Appendix D. Programs should be written to this manual.
 
 ---
@@ -984,6 +984,7 @@ is_upper hex unhex b64 unb64`. Efficient building: `str.Builder{}` with
 | std/time | `now since sleep after millis seconds`; `Second`, `Millisecond`, ... durations with integer arithmetic |
 | std/json | `encode pretty decode decode[T]` — numbers with fractions decode as `dec` |
 | std/log | `info warn error debug` to the standard error stream |
+| std/net | TCP, UDP and Unix-domain sockets — `listen connect listen_udp dial_udp listen_unix dial_unix resolve`; `Listener`, `Conn`, `Udp` methods. See 11.5. |
 | std/regex | RE2 semantics (linear time): `compile matches find find_all replace`; compiled `Regex` methods incl. `groups` |
 | std/http | `get post` returning `Response{status, body, headers}` |
 | std/conv | the conversion functions, package-qualified |
@@ -997,7 +998,108 @@ any all each`; maps have `keys values has get set delete`; sets have
 
 ---
 
-## 11.5 Packages
+## 11.5 The std/net Package
+
+`std/net` is Voilà's networking package: TCP and UDP over IPv4 and IPv6, and
+Unix-domain sockets for local inter-process communication. It is the first
+standard package **written in Voilà**: only the raw system calls are in the C
+runtime, and the interface the program uses is Voilà source that `use
+"std/net"` compiles into the program (11.6, and 12.7 for the pattern).
+
+### 11.5.1 The Connection Model
+
+A program opens a connection in one of two roles. A **server** creates a
+`Listener` and repeatedly ACCEPTs connections; each accepted connection is a
+`Conn`. A **client** CONNECTs and receives a `Conn` directly. A `Conn` is a
+byte stream in both directions.
+
+```
+   >>──NET.LISTEN──(──"host:port"──)──────────────────────────────><
+   >>──NET.CONNECT──(──"host:port"──)─────────────────────────────><
+```
+
+An address is `"host:port"`. The host may be a name (`"example.com"`), an
+IPv4 literal (`"127.0.0.1"`), or a bracketed IPv6 literal (`"[::1]"`); an
+empty host (`":8080"`) means every local interface. Binding **port 0** asks
+the operating system to choose a free port, which the `Listener` then reports
+through `addr()` — the idiom for a self-contained server.
+
+Because a task is an operating-system thread (Chapter 10), the natural design
+is **one task per connection**: ACCEPT in a loop and SPAWN a task to serve
+each `Conn`.
+
+```voila
+let server = must net.listen(":8080")
+group {
+    while true {
+        let conn = must server.accept()
+        spawn handle(conn)
+    }
+}
+```
+
+### 11.5.2 Constructors
+
+| Function | Result | Purpose |
+|---|---|---|
+| `net.listen(addr)` | `Listener` | a TCP listener |
+| `net.connect(addr)` | `Conn` | a TCP client connection |
+| `net.listen_udp(addr)` | `Udp` | a bound UDP socket |
+| `net.dial_udp(addr)` | `Udp` | a UDP socket connected to one peer |
+| `net.listen_unix(path)` | `Listener` | a Unix-domain stream listener |
+| `net.dial_unix(path)` | `Conn` | a Unix-domain stream client |
+| `net.resolve(host)` | `[]str` | the host's IP addresses (DNS) |
+
+Each may fail, returning an `IOError` value; see 11.5.5.
+
+### 11.5.3 Methods
+
+**`Listener`** — `accept()` (blocks for the next connection), `addr()` (the
+bound `"host:port"`), `set_timeout(ms)`, `close()`.
+
+**`Conn`** — `read(max)` (up to `max` bytes; `""` at end of stream),
+`read_line()` (through the next newline, or to end of stream), `read_all()`
+(to end of stream), `write(data)` (returns bytes written), `write_all(data)`
+(all of it, or an error), `local_addr()`, `remote_addr()`,
+`set_timeout(ms)`, `close()`.
+
+**`Udp`** — `send_to(data, addr)`, `recv_from(max)` (returns
+`(data, sender)`), `send(data)` / `recv(max)` (for a `dial_udp` socket),
+`addr()`, `set_timeout(ms)`, `close()`.
+
+A socket's descriptor is closed automatically when the last reference to it
+is dropped; `close()` is for closing it earlier, and is idempotent.
+
+### 11.5.4 Blocking and Timeouts
+
+Every read and ACCEPT **blocks** the calling task's thread until data
+arrives or the connection ends. A blocked socket call is **not** interrupted
+by a GROUP timeout (Chapter 10) — the group's cancellation is observed only
+at the language's own blocking points, not inside a system call. Where a
+socket must not block indefinitely, give it a deadline with
+`set_timeout(ms)`; a read or ACCEPT that then exceeds the deadline fails with
+an `IOError` whose message is `timed out`. `set_timeout(0)` clears the
+deadline. This is recorded as deviation D.6.
+
+### 11.5.5 Errors
+
+Every fallible operation follows the standard two-mechanism model (Chapter
+8): it returns the value on success, or an `IOError` value on failure.
+
+```voila
+match net.connect("127.0.0.1:80") {
+    Ok(conn) => serve(conn)
+    Err(e)   => say "cannot connect:", e.message()
+}
+```
+
+`try` propagates such a failure to the caller; `must` turns it into a thrown
+exception. A malformed address (`net.connect("nonsense")`) fails the same
+way, as an `IOError` — it is never a program-ending abort.
+
+---
+
+## 11.6 Packages
 
 A program may be divided into packages. **One directory is one package.**
 
@@ -1186,6 +1288,39 @@ older processors of the same family; it is never the default.
 
 See Appendix C.
 
+## 12.7 Authoring a Standard Package in Voilà
+
+`std/net` (11.5) is the first standard package written in Voilà rather than
+in C, and the mechanism is the template for the next. A package that a
+program reaches with `use "std/X"` may now be Voilà source carried inside the
+compiler and compiled into the program, exactly as the C runtime is (12.2).
+Only the operations that cross into the operating system — the true system
+calls — remain a thin C shim.
+
+The parts of such a package, and where each lives:
+
+```
+   1.  std/X/*.voi          the package source, `package X`
+   2.  a C shim (optional)  one runtime function per system call, in
+                            runtime/src, returning a value or an IOError
+   3.  runtime/src/std.c    each shim function entered in the native table
+   4.  voilac/cg/instr.voi  each shim name added to the native allow-list
+   5.  voilac/low/names.voi  X added to the package-name table
+   6.  voilac/load/load.voi  X registered as a Voilà-source std package
+   7.  voilac/std/blob.voi  REGENERATED — std/X embedded in the compiler
+```
+
+Step 7 is not edited by hand: `voila run tools/build.voi stdblob` regenerates
+it from `std/`, and a full build regenerates it as its first act. After a
+change to the shim or the package, rebuild and reseed as for any compiler
+change (`./build.sh` then `./build.sh reseed`).
+
+The division of labour is the point. The package's public functions are
+Voilà, so a call to one of them compiles to a direct call into grafted Voilà
+code; only the shim names resolve to C. A program therefore pays for the
+system calls in C and for nothing else — the logic, the types, the error
+handling, and the address parsing are all Voilà the reader can follow.
+
 ---
 
 # Appendix A. Reserved Words
@@ -1276,11 +1411,16 @@ produce a binary that would behave differently from the specification:
 Tasks are **operating-system threads**, not green threads: the semantics
 of Chapter 10 hold exactly — a group joins every task, a failure cancels
 the siblings, `select` and cancellation behave as specified — but the
-cost model does not. A million tasks is not yet fine.
+cost model does not. A million tasks is not yet fine. A corollary reaches
+`std/net` (11.5.4): a task blocked in a socket `read` or `accept` is
+inside a system call, where the language's cooperative cancellation cannot
+reach it, so a GROUP timeout does not interrupt it. A socket that must not
+block indefinitely is given a deadline with `set_timeout`, which the
+operating system enforces.
 
 `std/regex` and `std/http` have no C implementation and are therefore
 unavailable; a program that calls them is refused, not silently
-mistranslated.
+mistranslated. (`std/net`, by contrast, is implemented — Section 11.5.)
 
 Values are boxed in the default translation. Under `-O3` (Section 12.5)
 the toolchain converts provably-typed INT, FLOAT, and BOOL registers to
@@ -1304,7 +1444,7 @@ non-letter such as `€` is admitted where the specification would reject
 it. Identifiers in the standard library and in the compiler are ASCII.
 
 **D.9 — Not yet implemented.** `voila get`, `voila fmt/test/doc/bench/repl`,
-`std/vm`, `std/ffi`, `std/csv/xml/yaml`, `std/net/crypto`, checked `throws`
+`std/vm`, `std/ffi`, `std/csv/xml/yaml`, `std/crypto`, checked `throws`
 verification, and the full flow-sensitive borrow checker (a straight-line
 use-after-move analysis is provided). Cross-compilation is by C: `voila build
 --emit=c` produces a translation unit that any C compiler for any target can

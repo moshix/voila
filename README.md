@@ -5,7 +5,7 @@
 **A statically typed, memory-safe, concurrent language —<br>
 that compiles itself.**
 
-![language](https://img.shields.io/badge/language-Voil%C3%A0%200.4.0-blueviolet?style=for-the-badge)
+![language](https://img.shields.io/badge/language-Voil%C3%A0%200.4.1-blueviolet?style=for-the-badge)
 ![gc](https://img.shields.io/badge/GC-none-orange?style=for-the-badge)
 
 </div>
@@ -129,7 +129,7 @@ let r = attempt risky()            // or demote an exception to a value
 $ ./build.sh                          # cc the seed, then Voilà builds Voilà
   ✓ fixpoint: C(voilac-1) == C(voilac-2)
   ✓ optimized fixpoint: C(-O3, gen1) == C(-O3, gen2)
-  ✓ bin/voila-0.4.0
+  ✓ bin/voila-0.4.1
 
 $ bin/voila run samples/04_calculator.voi
 $ bin/voila check samples/07_orgchart.voi
@@ -142,9 +142,9 @@ $ ./selftest.bash                     # the toolchain reproduces every golden
 See **[TESTING.md](TESTING.md)** for the full procedure and
 **[BOOTSTRAP.md](BOOTSTRAP.md)** for how the compiler compiles itself.
 
-## Ten sample programs (none of them trivial)
+## Fourteen sample programs (none of them trivial)
 
-This distro supplies 10 sample programs which are also used in the Programming Handbook. 
+This distro supplies 14 sample programs which are also used in the Programming Handbook. 
 
 | Sample | Shows off |
 |---|---|
@@ -158,6 +158,10 @@ This distro supplies 10 sample programs which are also used in the Programming H
 | `08_shapes.voi` | traits + dynamic dispatch + generic `Stack[T]` |
 | `09_jsonreport.voi` | typed & dynamic JSON, `dec`-safe money round-trips |
 | `10_life.voi` | Conway's Life on a torus: 2-D slices, `str.Builder` frames |
+| `11_echo.voi` | a TCP echo service with `std/net`: `listen`/`accept`, thread-per-connection |
+| `12_udp.voi` | connectionless UDP messaging: `send_to`/`recv_from` |
+| `13_http.voi` | a minimal HTTP/1.0 client and server on raw sockets |
+| `14_unix.voi` | local IPC over a Unix-domain socket: a tiny command service |
 
 ## It compiles itself
 Voilà is completely self-hosted and it compiles itself from the very first version. 
@@ -195,15 +199,18 @@ compiled once and cached). Full tables: `bench/BASELINE.md`,
 - ✅ **An optimizing backend** (0.4): `-O1` scalar cleanup, `-O2` frame
   elision, `-O3` typed unboxing + `cc -O3`, opt-in `--native` — same
   outputs, same trap messages, byte-for-byte, at every level
+- ✅ **`std/net`** (0.4.1): TCP, UDP and Unix-domain sockets — and the
+  first standard package **written in Voilà** on a thin C syscall shim, the
+  template for Voilà-authored std packages to come
 - ⬜ interprocedural unboxing (parameters are still boxed) and native
   `for`-range counters — the next performance frontier
 - ⬜ green threads (tasks are OS threads today: right semantics, wrong cost model)
-- ⬜ `std/regex`, `std/http` in C; `voila fmt/test/repl`; the flow-sensitive
+- ⬜ `std/regex`, `std/http`; `voila fmt/test/repl`; the flow-sensitive
   borrow checker
 
 📕 **Docs:** start with **[Getting Started](GettingStartedWithVoila.md)** — a
-tutorial from `hello.voi` to a parallel eight-queens solver, every program
-tested on every build. Then the [Programming Manual](programming_manual.md),
+tutorial from `hello.voi` through a parallel eight-queens solver to a network
+service, every program tested on every build. Then the [Programming Manual](programming_manual.md),
 the reference — written in the house style of the IBM mainframe language
 references, syntax diagrams included — and the
 [Language Specification](voila_specification.md).

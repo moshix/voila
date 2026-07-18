@@ -25,7 +25,7 @@ func PreludeNames() []str {
 }
 
 func PackageNames() []str {
-    return ["conv", "fmt", "http", "json", "log", "math", "os", "rand",
+    return ["conv", "fmt", "http", "json", "log", "math", "net", "os", "rand",
             "regex", "sort", "str", "time", "uuid"]
 }
 

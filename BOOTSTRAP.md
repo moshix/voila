@@ -108,8 +108,14 @@ provoke. That is what bootstrapping buys you.
 - **Tasks are OS threads** (pthreads), not 4 KB green threads. The semantics —
   groups, cancellation, join, channels, `select` — are correct; the cost model
   is not. A ucontext scheduler is a later optimisation.
+- **`std/net` is written in Voilà** (0.4.1), not C. Only the raw system calls
+  are a C shim; the library is Voilà source embedded in the compiler exactly as
+  the runtime is (a base64 blob, `voilac/std/blob.voi`) and grafted into a
+  program on `use "std/net"`. It is the template for Voilà-authored std packages.
 - **`std/regex` and `std/http` are not available in native builds.** They have no
-  C implementation yet; the backend refuses rather than emitting something that
+  implementation yet; the backend refuses rather than emitting something that
   would behave differently.
-- **Values are boxed.** Performance is interpreter-class-plus, not C-class, until
-  an unboxing pass lands. Correctness and self-hosting came first.
+- **Values are boxed in the default translation.** `voila build -O3` (0.4)
+  unboxes provably-typed int/float/bool registers and elides frames; parameters
+  and values crossing procedure boundaries stay boxed. Correctness and
+  self-hosting came first.

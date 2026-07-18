@@ -239,6 +239,36 @@ for LV in $OPT_LEVELS; do
     done
     ok "optimizer $LV: $opass goldens hold"
 done
+
+# The tests/opt probes carry their own goldens and must hold byte-for-byte at
+# EVERY level — that identity (traps, typed unboxing, frame elision, and the
+# thread-safe frame refcounts) is the whole point of these fixtures. Gating
+# them here keeps a golden from silently drifting (a message-rendering change
+# once slipped past because these were run by hand, not by the suite).
+if ls tests/opt/*.voi >/dev/null 2>&1; then
+    bold "==> optimizer: tests/opt probes at -O0/-O1/-O2/-O3"
+    ppass=0
+    for f in tests/opt/*.voi; do
+        n="$(basename "${f%.voi}")"
+        want="tests/opt/$n.out"
+        [ -f "$want" ] || continue
+        for LV in "" "-O1" "-O2" "-O3"; do
+            exe="$TMP/optp_$n"
+            if ! "$VOILA" build $LV "$f" -o "$exe" >"$TMP/optp.log" 2>&1; then
+                bad "$n: build failed at ${LV:--O0}"
+                head -3 "$TMP/optp.log" | sed 's/^/      /'
+                fail=$((fail + 1)); continue
+            fi
+            if ! "$exe" 2>/dev/null | cmp -s - "$want"; then
+                bad "$n: output differs from golden at ${LV:--O0}"
+                fail=$((fail + 1)); continue
+            fi
+        done
+        ppass=$((ppass + 1))
+    done
+    ok "optimizer probes: $ppass held at every level"
+fi
+
 bold "==> optimizer: determinism (--emit=c -O1 twice, byte-identical)"
 "$VOILA" build -O1 --emit=c tests/conformance/05_control.voi > "$TMP/det1.c" 2>&1
 "$VOILA" build -O1 --emit=c tests/conformance/05_control.voi > "$TMP/det2.c" 2>&1

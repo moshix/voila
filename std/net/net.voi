@@ -1,0 +1,304 @@
+// std/net — Voilà's networking package: TCP and UDP over IPv4/IPv6, plus
+// Unix-domain sockets for local IPC.
+//
+// std/net is the first standard-library package written in Voilà rather than
+// C. Only the irreducible syscall surface is a C shim — the `net._*` natives
+// (one syscall each) and the public `net.resolve` — and everything a program
+// touches (this file) is Voilà, grafted into the program by `use "std/net"`.
+//
+// Concurrency model: tasks are OS threads, so the idiom is thread-per-
+// connection — `accept` in a loop and `spawn` a task per `Conn`. A blocking
+// `accept`/`read` is NOT interrupted by a group timeout; give a socket a
+// deadline with `set_timeout` if it must not block forever (§10, Appendix D).
+//
+// Errors: every fallible call returns a value on success or an IOError value
+// on failure (never a thrown exception unless you write `must`), so it
+// composes with `match { Ok(x) => …, Err(e) => … }`, `try`, and `must`.
+package net
+
+use "std/str"
+use "std/fmt"
+
+// Sock is an opaque handle to the OS socket the C shim owns. It is never
+// constructed in Voilà; it only names the type of the field that carries the
+// shim's socket object, whose file descriptor is closed automatically when
+// the last reference is dropped.
+struct Sock {}
+
+// Listener accepts incoming stream connections (TCP or Unix-domain).
+struct Listener {
+    h       Sock
+    network str
+}
+
+// Conn is a connected stream: from `connect`, `dial_unix`, or `accept`.
+struct Conn {
+    h Sock
+}
+
+// Udp is a bound datagram socket.
+struct Udp {
+    h Sock
+}
+
+// ------------------------------------------------------------- constructors
+
+// listen opens a TCP listener bound to `addr`, which is "host:port" —
+// ":8080" binds every interface, "127.0.0.1:0" an OS-chosen port on
+// loopback, "[::1]:0" the IPv6 loopback. The backlog is a sensible default.
+func listen(addr str) Listener throws IOError {
+    let host, port = try parse_hostport(addr)
+    let s = try net._listen_tcp(host, port, 128)
+    return Listener{h: s, network: "tcp"}
+}
+
+// connect opens a TCP connection to `addr` ("host:port").
+func connect(addr str) Conn throws IOError {
+    let host, port = try parse_hostport(addr)
+    let s = try net._connect_tcp(host, port)
+    return Conn{h: s}
+}
+
+// listen_unix opens a Unix-domain stream listener on the filesystem `path`
+// (a stale socket file at that path is removed first).
+func listen_unix(path str) Listener throws IOError {
+    let s = try net._listen_unix(path, 128)
+    return Listener{h: s, network: "unix"}
+}
+
+// dial_unix connects to a Unix-domain stream listener at `path`.
+func dial_unix(path str) Conn throws IOError {
+    let s = try net._connect_unix(path)
+    return Conn{h: s}
+}
+
+// listen_udp binds a UDP socket to `addr` for receiving datagrams (and
+// sending with send_to).
+func listen_udp(addr str) Udp throws IOError {
+    let host, port = try parse_hostport(addr)
+    let s = try net._udp(host, port)
+    return Udp{h: s}
+}
+
+// dial_udp creates a UDP socket connected to `addr`, so plain send/recv talk
+// to that one peer. The socket is opened in the peer's address family (IPv4
+// or IPv6), so an IPv4 peer works as readily as an IPv6 one.
+func dial_udp(addr str) Udp throws IOError {
+    let host, port = try parse_hostport(addr)
+    let s = try net._dial_udp(host, port)
+    return Udp{h: s}
+}
+
+// ---------------------------------------------------------------- Listener
+
+impl Listener {
+    // accept blocks until a client connects and returns the new Conn.
+    func accept(self) Conn throws IOError {
+        let s = try net._accept(self.h)
+        return Conn{h: s}
+    }
+
+    // addr is the bound local address as "host:port" (the OS-chosen port
+    // after binding port 0). Returns "?" if it cannot be determined.
+    func addr(self) str {
+        match net._local_addr(self.h) {
+            Ok(a)  => {
+                let host, port = a
+                return format_hostport(host, port)
+            }
+            Err(e) => return "?"
+        }
+    }
+
+    // set_timeout bounds how long accept() blocks, in milliseconds (0 clears
+    // the deadline). A timed-out accept fails with an IOError "timed out".
+    func set_timeout(self, ms int) throws IOError {
+        try net._set_timeout(self.h, ms)
+    }
+
+    // close stops listening. Idempotent.
+    func close(self) {
+        net._close(self.h)
+    }
+}
+
+// -------------------------------------------------------------------- Conn
+
+impl Conn {
+    // read returns up to `max` bytes. An empty result means the peer closed
+    // the connection (end of stream).
+    func read(self, max int) str throws IOError {
+        return try net._recv(self.h, max)
+    }
+
+    // read_line reads up to and including the next newline, or to end of
+    // stream. It reads a byte at a time so it never consumes past the line;
+    // wrap a Conn in your own buffering for high-throughput line protocols.
+    func read_line(self) str throws IOError {
+        var b = str.Builder{}
+        while true {
+            let ch = try net._recv(self.h, 1)
+            if len(ch) == 0 { break }        // end of stream
+            b.write(ch)
+            if ch == "\n" { break }
+        }
+        return b.done()
+    }
+
+    // read_all reads until the peer closes the connection.
+    func read_all(self) str throws IOError {
+        var b = str.Builder{}
+        while true {
+            let chunk = try net._recv(self.h, 65536)
+            if len(chunk) == 0 { break }
+            b.write(chunk)
+        }
+        return b.done()
+    }
+
+    // write sends `data`, looping over partial writes, and returns the number
+    // of bytes written (which is len(data) unless the peer went away).
+    func write(self, data str) int throws IOError {
+        var total = 0
+        let n = len(data)
+        while total < n {
+            let sent = try net._send(self.h, data[total..n])
+            if sent <= 0 { break }
+            total += sent
+        }
+        return total
+    }
+
+    // write_all sends every byte of `data`, or fails with an IOError.
+    func write_all(self, data str) throws IOError {
+        let n = try self.write(data)
+        if n < len(data) {
+            return errf("short write: {n} of {len(data)} bytes")
+        }
+    }
+
+    // local_addr / remote_addr are this end's and the peer's "host:port".
+    func local_addr(self) str throws IOError {
+        let host, port = try net._local_addr(self.h)
+        return format_hostport(host, port)
+    }
+
+    func remote_addr(self) str throws IOError {
+        let host, port = try net._remote_addr(self.h)
+        return format_hostport(host, port)
+    }
+
+    // set_timeout bounds read and write, in milliseconds (0 clears it).
+    func set_timeout(self, ms int) throws IOError {
+        try net._set_timeout(self.h, ms)
+    }
+
+    // close ends the connection. Idempotent.
+    func close(self) {
+        net._close(self.h)
+    }
+}
+
+// --------------------------------------------------------------------- Udp
+
+impl Udp {
+    // send_to sends `data` to `addr` ("host:port") and returns bytes sent.
+    func send_to(self, data str, addr str) int throws IOError {
+        let host, port = try parse_hostport(addr)
+        return try net._sendto(self.h, data, host, port)
+    }
+
+    // recv_from receives one datagram (up to `max` bytes) and returns
+    // (data, sender-address).
+    func recv_from(self, max int) (str, str) throws IOError {
+        let data, host, port = try net._recvfrom(self.h, max)
+        return (data, format_hostport(host, port))
+    }
+
+    // send/recv talk to the peer a dial_udp socket is connected to.
+    func send(self, data str) int throws IOError {
+        return try net._send(self.h, data)
+    }
+
+    func recv(self, max int) str throws IOError {
+        return try net._recv(self.h, max)
+    }
+
+    // addr is the bound local address as "host:port".
+    func addr(self) str {
+        match net._local_addr(self.h) {
+            Ok(a)  => {
+                let host, port = a
+                return format_hostport(host, port)
+            }
+            Err(e) => return "?"
+        }
+    }
+
+    func set_timeout(self, ms int) throws IOError {
+        try net._set_timeout(self.h, ms)
+    }
+
+    func close(self) {
+        net._close(self.h)
+    }
+}
+
+// ------------------------------------------------------------------ address
+
+// parse_hostport splits an address into (host, port). It accepts
+// "host:port", ":port" (host defaults to "", meaning every interface), and
+// "[ipv6]:port" for IPv6 literals.
+func parse_hostport(addr str) (str, int) throws IOError {
+    if len(addr) == 0 {
+        return errf("empty address (want host:port)")
+    }
+    // IPv6 literal in brackets: [::1]:8080
+    if addr[0] == '[' {
+        let end = str.index(addr, "]")
+        if end < 0 {
+            return errf("invalid address {addr}: unbalanced '['")
+        }
+        let host = addr[1..end]
+        let rest = addr[end + 1..len(addr)]
+        if len(rest) == 0 or rest[0] != ':' {
+            return errf("invalid address {addr}: want [host]:port")
+        }
+        let port = try parse_port(rest[1..len(rest)])
+        return (host, port)
+    }
+    let colon = str.last_index(addr, ":")
+    if colon < 0 {
+        return errf("invalid address {addr}: want host:port")
+    }
+    let host = addr[0..colon]
+    let port = try parse_port(addr[colon + 1..len(addr)])
+    return (host, port)
+}
+
+// parse_port validates and parses a decimal port in 0..65535.
+func parse_port(s str) int throws IOError {
+    if len(s) == 0 {
+        return errf("missing port number")
+    }
+    var p = 0
+    each c in s {
+        if c < '0' or c > '9' {
+            return errf("invalid port {s}: not a number")
+        }
+        p = p * 10 + (int(c) - 48)
+        if p > 65535 {
+            return errf("port {s} out of range (0..65535)")
+        }
+    }
+    return p
+}
+
+// format_hostport renders (host, port) as an address, bracketing an IPv6
+// literal so it round-trips through parse_hostport.
+func format_hostport(host str, port int) str {
+    if str.contains(host, ":") {
+        return "[" || host || "]:" || str(port)
+    }
+    return host || ":" || str(port)
+}

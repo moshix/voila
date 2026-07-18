@@ -1,0 +1,70 @@
+// g09_net.voi — the network service from Chapter 10 of the Getting Started
+// guide. A server task and a client task run in one group over the loopback
+// interface: the client sends words, the server shouts them back in capitals.
+// The server binds port 0, so the operating system chooses the port and the
+// run is deterministic (the port is never printed).
+package main
+
+use "std/net"
+use "std/str"
+
+func server(addr chan[str], done chan[str]) {
+    match net.listen("127.0.0.1:0") {
+        Err(e) => { addr <- "" ; done <- ("listen: " || e.message()) }
+        Ok(lis) => {
+            addr <- lis.addr()
+            match lis.accept() {
+                Err(e) => done <- ("accept: " || e.message())
+                Ok(conn) => {
+                    shout(conn)
+                    conn.close()
+                    lis.close()
+                    done <- "server: done"
+                }
+            }
+        }
+    }
+}
+
+func shout(conn net.Conn) {
+    while true {
+        match conn.read_line() {
+            Err(e)   => return
+            Ok(line) => {
+                if len(line) == 0 { return }
+                match conn.write_all(str.upper(line)) {
+                    Ok(u)  => u
+                    Err(e) => return
+                }
+            }
+        }
+    }
+}
+
+func client(addr chan[str]) {
+    let where = <-addr
+    if where == "" { return }
+    match net.connect(where) {
+        Err(e) => say "connect:", e.message()
+        Ok(conn) => {
+            for word in ["hello\n", "voila\n", "networks\n"] {
+                must conn.write_all(word)
+                match conn.read_line() {
+                    Err(e)  => say "read:", e.message()
+                    Ok(got) => say str.trim(got)
+                }
+            }
+            conn.close()
+        }
+    }
+}
+
+func main() {
+    let addr = chan[str](1)
+    let done = chan[str](1)
+    group {
+        spawn server(addr, done)
+        spawn client(addr)
+    }
+    say <-done
+}

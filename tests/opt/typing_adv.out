@@ -4,5 +4,5 @@ upset_counter=142
 setjmp_probe=306
 mixer_t=6.5 mixer_f=4
 carried=233
-hot_trap=OverflowError{op: "i
+hot_trap=integer overflow: 92
 dec_stays=3.3

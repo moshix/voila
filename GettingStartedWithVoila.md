@@ -6,7 +6,7 @@
 
 ### A Programming Guide for the New User
 
-**Program Number 5799-VLA · Version 0.4.0**
+**Program Number 5799-VLA · Version 0.4.1**
 
 *First Edition*
 
@@ -46,8 +46,9 @@ by running them.
 | 7 | **The eight queens** — a backtracking search |
 | 8 | Tasks, channels, and structured concurrency |
 | 9 | **The eight queens, in parallel** |
-| 10 | Dividing a program into packages |
-| 11 | What to read next |
+| 10 | **A network service** — sockets and structured concurrency |
+| 11 | Dividing a program into packages |
+| 12 | What to read next |
 
 ### Notation
 
@@ -62,7 +63,7 @@ is a command you type at your terminal; the `$` is the prompt and is not
 typed. Text shown below such a command is what the system prints back.
 
 **Programming Notes** call out a rule that surprises newcomers. There are
-five of them in this guide, and each one is a mistake the author made while
+six of them in this guide, and each one is a mistake the author made while
 writing it.
 
 ---
@@ -105,9 +106,9 @@ $ ./build.sh
   ✓ fixpoint: C(voilac-1) == C(voilac-2)
   ✓ optimized fixpoint: C(-O3, gen1) == C(-O3, gen2)
   ✓ the checked-in seed is current
-  ✓ bin/voila-0.4.0
-  ✓ bin/voila  ->  voila-0.4.0
-  ✓ ./voila  ->  bin/voila-0.4.0
+  ✓ bin/voila-0.4.1
+  ✓ bin/voila  ->  voila-0.4.1
+  ✓ ./voila  ->  bin/voila-0.4.1
 ==> done — ./voila is ready
 ```
 
@@ -117,7 +118,7 @@ and *that* compiler compiled itself once more. The two generations emitted
 byte-identical C, which is the classical proof that a self-hosted compiler
 is not quietly mistranslating itself.
 
-The binary is named for its version — `bin/voila-0.4.0` — with `bin/voila`
+The binary is named for its version — `bin/voila-0.4.1` — with `bin/voila`
 and `./voila` as symlinks to it, so `voila` always means the version you
 last built. Run `voila version` to see it.
 
@@ -1091,9 +1092,165 @@ you never write a data race by hand.
 
 ---
 
-# Chapter 10. Packages
+# Chapter 10. A Network Service
 
-## 10.1 One Directory, One Package
+Chapters 8 and 9 taught tasks and channels. A network server is the program
+those chapters were preparing you for: it does nothing but wait for other
+programs to connect, and serve each one while the others wait their turn.
+Voilà's `std/net` package gives you the sockets; structured concurrency gives
+you a clean way to serve many clients at once.
+
+## 10.1 The Shape of a Server
+
+A server **listens** on an address, then **accepts** connections one at a
+time. Each accepted connection is a `Conn` — a two-way stream of bytes you
+`read` from and `write` to. A client does the mirror image: it **connects**
+to the address and gets a `Conn` directly.
+
+```voila
+use "std/net"
+
+let server = must net.listen(":8080")     // every interface, port 8080
+group {
+    while true {
+        let conn = must server.accept()    // waits for the next client
+        spawn serve(conn)                  // serve it in its own task
+    }
+}
+```
+
+That is the whole pattern: accept in a loop, and `spawn` a task per
+connection so a slow client never blocks the others. Because the tasks live
+in a `group`, none of them can outlive the server.
+
+An address is `"host:port"`. Use `":8080"` to accept on every interface,
+`"127.0.0.1:8080"` for loopback only, or **port 0** to let the operating
+system pick a free port — which you then read back with `server.addr()`.
+That last trick is what makes the program below self-contained: it runs its
+own server *and* its own client, in one process, and needs no fixed port.
+
+## 10.2 A Complete Example
+
+The program in `samples/guide/g09_net.voi` is a "shout" service. The server
+reads lines and writes each one back in capitals; the client sends three
+words and prints the replies. Both run as tasks in one group, talking over
+the loopback interface.
+
+The server hands its real address to the client through a channel, then
+accepts one connection and serves it:
+
+```voila
+func server(addr chan[str], done chan[str]) {
+    match net.listen("127.0.0.1:0") {
+        Err(e) => { addr <- "" ; done <- ("listen: " || e.message()) }
+        Ok(lis) => {
+            addr <- lis.addr()             // tell the client where to connect
+            match lis.accept() {
+                Err(e) => done <- ("accept: " || e.message())
+                Ok(conn) => {
+                    shout(conn)
+                    conn.close()
+                    lis.close()
+                    done <- "server: done"
+                }
+            }
+        }
+    }
+}
+```
+
+`shout` reads a line at a time until the client hangs up — `read_line`
+returns an empty string at end of stream — and writes back the upper-cased
+line:
+
+```voila
+func shout(conn net.Conn) {
+    while true {
+        match conn.read_line() {
+            Err(e)   => return
+            Ok(line) => {
+                if len(line) == 0 { return }        // the client closed
+                match conn.write_all(str.upper(line)) {
+                    Ok(u)  => u
+                    Err(e) => return
+                }
+            }
+        }
+    }
+}
+```
+
+The client connects to the address it was given, then sends three words and
+prints each reply:
+
+```voila
+func client(addr chan[str]) {
+    let where = <-addr
+    if where == "" { return }
+    match net.connect(where) {
+        Err(e) => say "connect:", e.message()
+        Ok(conn) => {
+            for word in ["hello\n", "voila\n", "networks\n"] {
+                must conn.write_all(word)
+                match conn.read_line() {
+                    Err(e)  => say "read:", e.message()
+                    Ok(got) => say str.trim(got)
+                }
+            }
+            conn.close()
+        }
+    }
+}
+```
+
+`main` starts the two tasks in one group and waits for the server to report
+that it is finished:
+
+```voila
+func main() {
+    let addr = chan[str](1)
+    let done = chan[str](1)
+    group {
+        spawn server(addr, done)
+        spawn client(addr)
+    }
+    say <-done
+}
+```
+
+```console
+$ voila run samples/guide/g09_net.voi
+HELLO
+VOILA
+NETWORKS
+server: done
+```
+
+> ### Programming Note 6
+>
+> Every read blocks the task until data arrives — and a *blocking* read is
+> not interrupted by a `group` timeout, because the task is asleep inside
+> the operating system, not at one of Voilà's own waiting points. If a
+> connection must not hang forever, give it a deadline with
+> `conn.set_timeout(ms)`; a read that then runs out of time fails with an
+> `IOError` you can catch. This is the one place the structured-concurrency
+> guarantees of Chapter 8 need a little help from you.
+
+## 10.3 Beyond TCP
+
+`std/net` also speaks **UDP**, for connectionless datagrams
+(`net.listen_udp`, `send_to`, `recv_from`), and **Unix-domain sockets**, for
+fast local communication addressed by a filesystem path rather than a port
+(`net.listen_unix`, `net.dial_unix`). The samples `12_udp.voi`,
+`13_http.voi` (a tiny web server), and `14_unix.voi` show each in turn.
+`std/net` is itself written in Voilà — only the raw system calls are C — so
+it doubles as a worked example of extending the standard library.
+
+---
+
+# Chapter 11. Packages
+
+## 11.1 One Directory, One Package
 
 A program larger than a page belongs in packages. **A directory is a
 package.** A file names the package it belongs to on its first line, and a
@@ -1157,7 +1314,7 @@ N =  7   SOLUTIONS =   40
 N =  8   SOLUTIONS =   92
 ```
 
-## 10.2 The Rules
+## 11.2 The Rules
 
 - A package may not import itself, directly or through a chain. The compiler
   reports the cycle and names the path.
@@ -1173,12 +1330,12 @@ N =  8   SOLUTIONS =   92
 
 ---
 
-# Chapter 11. What to Read Next
+# Chapter 12. What to Read Next
 
 You now know enough to write real programs. Three suggestions for what to do
 with the rest of the afternoon:
 
-**Read the ten sample programs** in `samples/`. They are not toys: a worker
+**Read the fourteen sample programs** in `samples/`. They are not toys: a worker
 pool that counts primes, a fixed-width ledger with exact decimal totals, a
 recursive-descent expression evaluator, a channel pipeline with timeouts and
 cancellation, an org chart that demonstrates the ownership cycle rule, a

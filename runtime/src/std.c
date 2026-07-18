@@ -12,6 +12,13 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/socket.h>   /* std/net: sockets */
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <sys/un.h>
+#include <sys/time.h>     /* struct timeval for SO_RCVTIMEO */
+#include <poll.h>         /* poll() to bound accept() on every platform */
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #endif
@@ -675,6 +682,451 @@ BI(os_exit) {
 
 BI(os_on_abort) { UNUSED; vl_set_abort_handler(argv[0]); return vl_unit(); }
 
+/* ---------------------------------------------------------------- std/net
+ *
+ * The irreducible C syscall shim for std/net. Everything a program touches —
+ * the Listener/Conn/Udp types, "host:port" parsing, timeouts, partial-I/O
+ * loops — is Voilà (the std/net package, grafted into the program). These
+ * natives
+ * do one syscall each and, on failure, return an IOError value (never throw)
+ * so Ok/Err composition works exactly as for os.read. The socket-taking ones
+ * are net._* (internal); the one public helper is net.resolve. `sockaddr`
+ * and getaddrinfo (IPv4/IPv6/AF_UNIX) are C; address string handling is Voilà.
+ */
+
+#ifdef MSG_NOSIGNAL
+#define NET_SEND_FLAGS MSG_NOSIGNAL   /* Linux: no SIGPIPE on a dead peer */
+#else
+#define NET_SEND_FLAGS 0              /* macOS uses SO_NOSIGPIPE (sock_setup) */
+#endif
+
+static Value vl_socket_new(int fd) {
+  VlSocket *o = (VlSocket *)vl_obj_new(O_SOCKET, sizeof(VlSocket));
+  o->fd = fd;
+  o->closed = false;
+  o->timeout_ms = 0;
+  Value v;
+  v.t = VL_OBJ;
+  v.u.o = &o->hdr;
+  return v;
+}
+
+static VlSocket *want_sock(Value v) {
+  if (v.t != VL_OBJ || v.u.o->kind != O_SOCKET)
+    vl_abort("expected a socket, got %s", vl_kind_name(v));
+  return (VlSocket *)v.u.o;
+}
+
+static Value net_err(const char *msg) {
+  Value m = vl_str(msg);
+  Value e = vl_exc_new("IOError", &m, 1, NULL, NULL, 0);
+  vl_release(m);
+  return e;
+}
+
+static Value net_errno(const char *op) {
+  char buf[256];
+  snprintf(buf, sizeof buf, "%s: %s", op, strerror(errno));
+  return net_err(buf);
+}
+
+/* A blocking read that timed out (SO_RCVTIMEO) fails with EAGAIN/EWOULDBLOCK;
+ * give it a stable "timed out" message the Voilà layer can recognise. */
+static Value net_recv_err(const char *op) {
+  if (errno == EAGAIN || errno == EWOULDBLOCK) return net_err("timed out");
+  return net_errno(op);
+}
+
+static void sock_setup(int fd) {
+#ifdef SO_NOSIGPIPE
+  int on = 1;
+  setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+#endif
+  (void)fd;
+}
+
+/* net_fill resolves (host, port) into a sockaddr. An empty host means "any
+ * local address" (AI_PASSIVE, for bind). Returns 0, or a getaddrinfo code. */
+static int net_fill(const char *host, int port, int socktype,
+                    struct sockaddr_storage *ss, socklen_t *slen, int *fam) {
+  struct addrinfo hints;
+  struct addrinfo *res = NULL;
+  memset(&hints, 0, sizeof hints);
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = socktype;
+  const char *node = (host && host[0]) ? host : NULL;
+  if (node == NULL) hints.ai_flags = AI_PASSIVE;
+  char portbuf[16];
+  snprintf(portbuf, sizeof portbuf, "%d", port);
+  int rc = getaddrinfo(node, portbuf, &hints, &res);
+  if (rc != 0) return rc;
+  memcpy(ss, res->ai_addr, res->ai_addrlen);
+  *slen = res->ai_addrlen;
+  *fam = res->ai_family;
+  freeaddrinfo(res);
+  return 0;
+}
+
+/* net_addr_parts renders a sockaddr as a numeric host string + port int. */
+static void net_addr_parts(struct sockaddr *sa, socklen_t slen, Value *host,
+                           int *port) {
+  char h[NI_MAXHOST], srv[NI_MAXSERV];
+  if (getnameinfo(sa, slen, h, sizeof h, srv, sizeof srv,
+                  NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
+    *host = vl_str("");
+    *port = 0;
+    return;
+  }
+  *host = vl_str(h);
+  *port = atoi(srv);
+}
+
+/* ---- TCP ---- */
+
+BI(net_listen_tcp) {
+  UNUSED;
+  const char *host = vl_cstr(argv[0]);
+  int port = (int)raw_int(argv[1]);
+  int backlog = (int)raw_int(argv[2]);
+  struct sockaddr_storage ss;
+  socklen_t slen;
+  int fam;
+  int rc = net_fill(host, port, SOCK_STREAM, &ss, &slen, &fam);
+  if (rc != 0) return net_err(gai_strerror(rc));
+  int fd = socket(fam, SOCK_STREAM, 0);
+  if (fd < 0) return net_errno("socket");
+  sock_setup(fd);
+  int on = 1;
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+  if (bind(fd, (struct sockaddr *)&ss, slen) < 0) {
+    Value e = net_errno("bind");
+    close(fd);
+    return e;
+  }
+  if (listen(fd, backlog > 0 ? backlog : 128) < 0) {
+    Value e = net_errno("listen");
+    close(fd);
+    return e;
+  }
+  return vl_socket_new(fd);
+}
+
+BI(net_connect_tcp) {
+  UNUSED;
+  const char *host = vl_cstr(argv[0]);
+  int port = (int)raw_int(argv[1]);
+  struct sockaddr_storage ss;
+  socklen_t slen;
+  int fam;
+  int rc = net_fill(host, port, SOCK_STREAM, &ss, &slen, &fam);
+  if (rc != 0) return net_err(gai_strerror(rc));
+  int fd = socket(fam, SOCK_STREAM, 0);
+  if (fd < 0) return net_errno("socket");
+  sock_setup(fd);
+  if (connect(fd, (struct sockaddr *)&ss, slen) < 0) {
+    Value e = net_errno("connect");
+    close(fd);
+    return e;
+  }
+  return vl_socket_new(fd);
+}
+
+BI(net_accept) {
+  UNUSED;
+  VlSocket *s = want_sock(argv[0]);
+  if (s->closed) return net_err("socket is closed");
+  /* SO_RCVTIMEO does not bound accept() on macOS/BSD, only on Linux — so
+   * enforce the listener's deadline portably with poll() first. */
+  if (s->timeout_ms > 0) {
+    struct pollfd pfd;
+    pfd.fd = s->fd;
+    pfd.events = POLLIN;
+    int pr = poll(&pfd, 1, s->timeout_ms);
+    if (pr == 0) return net_err("timed out");
+    if (pr < 0) return net_errno("poll");
+  }
+  int fd = accept(s->fd, NULL, NULL);
+  if (fd < 0) return net_recv_err("accept");
+  sock_setup(fd);
+  return vl_socket_new(fd);
+}
+
+/* ---- byte I/O (one syscall each; the Voilà layer loops for partial I/O) ---- */
+
+BI(net_send) {
+  UNUSED;
+  VlSocket *s = want_sock(argv[0]);
+  if (s->closed) return net_err("socket is closed");
+  const char *data = vl_cstr(argv[1]);
+  int64_t len = vl_strlen(argv[1]);
+  ssize_t sent = send(s->fd, data, (size_t)len, NET_SEND_FLAGS);
+  if (sent < 0) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return net_err("timed out");
+    return net_errno("send");
+  }
+  return vl_int((int64_t)sent);
+}
+
+BI(net_recv) {
+  UNUSED;
+  VlSocket *s = want_sock(argv[0]);
+  if (s->closed) return net_err("socket is closed");
+  int64_t n = raw_int(argv[1]);
+  if (n <= 0) return vl_str("");
+  if (n > (1 << 24)) n = 1 << 24;   /* cap a single read at 16 MiB */
+  char *buf = (char *)vl_alloc((size_t)n);
+  ssize_t got = recv(s->fd, buf, (size_t)n, 0);
+  if (got < 0) {
+    Value e = net_recv_err("recv");
+    free(buf);
+    return e;
+  }
+  Value r = vl_str_n(buf, (int64_t)got);   /* got == 0 is EOF → "" */
+  free(buf);
+  return r;
+}
+
+/* ---- addresses ---- */
+
+BI(net_local_addr) {
+  UNUSED;
+  VlSocket *s = want_sock(argv[0]);
+  if (s->closed) return net_err("socket is closed");
+  struct sockaddr_storage ss;
+  socklen_t slen = sizeof ss;
+  if (getsockname(s->fd, (struct sockaddr *)&ss, &slen) < 0)
+    return net_errno("getsockname");
+  Value host;
+  int port;
+  net_addr_parts((struct sockaddr *)&ss, slen, &host, &port);
+  Value elems[2];
+  elems[0] = host;
+  elems[1] = vl_int(port);
+  Value t = vl_tuple_new(elems, 2);
+  vl_release(host);
+  return t;
+}
+
+BI(net_remote_addr) {
+  UNUSED;
+  VlSocket *s = want_sock(argv[0]);
+  if (s->closed) return net_err("socket is closed");
+  struct sockaddr_storage ss;
+  socklen_t slen = sizeof ss;
+  if (getpeername(s->fd, (struct sockaddr *)&ss, &slen) < 0)
+    return net_errno("getpeername");
+  Value host;
+  int port;
+  net_addr_parts((struct sockaddr *)&ss, slen, &host, &port);
+  Value elems[2];
+  elems[0] = host;
+  elems[1] = vl_int(port);
+  Value t = vl_tuple_new(elems, 2);
+  vl_release(host);
+  return t;
+}
+
+/* ---- UDP ---- */
+
+BI(net_udp) {
+  UNUSED;
+  const char *host = vl_cstr(argv[0]);
+  int port = (int)raw_int(argv[1]);
+  struct sockaddr_storage ss;
+  socklen_t slen;
+  int fam;
+  int rc = net_fill(host, port, SOCK_DGRAM, &ss, &slen, &fam);
+  if (rc != 0) return net_err(gai_strerror(rc));
+  int fd = socket(fam, SOCK_DGRAM, 0);
+  if (fd < 0) return net_errno("socket");
+  sock_setup(fd);
+  int on = 1;
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+  if (bind(fd, (struct sockaddr *)&ss, slen) < 0) {
+    Value e = net_errno("bind");
+    close(fd);
+    return e;
+  }
+  return vl_socket_new(fd);
+}
+
+/* net._dial_udp resolves the peer, creates a UDP socket in the PEER's address
+ * family, and connects it. Doing both from one getaddrinfo result avoids the
+ * family mismatch that a bind-any-then-connect hits (an IPv6 socket cannot
+ * connect to an IPv4 peer); the kernel auto-binds a local address of the
+ * right family on the first send. */
+BI(net_dial_udp) {
+  UNUSED;
+  const char *host = vl_cstr(argv[0]);
+  int port = (int)raw_int(argv[1]);
+  struct sockaddr_storage ss;
+  socklen_t slen;
+  int fam;
+  int rc = net_fill(host, port, SOCK_DGRAM, &ss, &slen, &fam);
+  if (rc != 0) return net_err(gai_strerror(rc));
+  int fd = socket(fam, SOCK_DGRAM, 0);
+  if (fd < 0) return net_errno("socket");
+  sock_setup(fd);
+  if (connect(fd, (struct sockaddr *)&ss, slen) < 0) {
+    Value e = net_errno("connect");
+    close(fd);
+    return e;
+  }
+  return vl_socket_new(fd);
+}
+
+BI(net_sendto) {
+  UNUSED;
+  VlSocket *s = want_sock(argv[0]);
+  if (s->closed) return net_err("socket is closed");
+  const char *data = vl_cstr(argv[1]);
+  int64_t len = vl_strlen(argv[1]);
+  const char *host = vl_cstr(argv[2]);
+  int port = (int)raw_int(argv[3]);
+  struct sockaddr_storage ss;
+  socklen_t slen;
+  int fam;
+  int rc = net_fill(host, port, SOCK_DGRAM, &ss, &slen, &fam);
+  if (rc != 0) return net_err(gai_strerror(rc));
+  ssize_t sent = sendto(s->fd, data, (size_t)len, NET_SEND_FLAGS,
+                        (struct sockaddr *)&ss, slen);
+  if (sent < 0) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return net_err("timed out");
+    return net_errno("sendto");
+  }
+  return vl_int((int64_t)sent);
+}
+
+BI(net_recvfrom) {
+  UNUSED;
+  VlSocket *s = want_sock(argv[0]);
+  if (s->closed) return net_err("socket is closed");
+  int64_t n = raw_int(argv[1]);
+  if (n > (1 << 24)) n = 1 << 24;
+  char *buf = (char *)vl_alloc((size_t)(n > 0 ? n : 1));
+  struct sockaddr_storage ss;
+  socklen_t slen = sizeof ss;
+  ssize_t got = recvfrom(s->fd, buf, (size_t)(n > 0 ? n : 0), 0,
+                         (struct sockaddr *)&ss, &slen);
+  if (got < 0) {
+    Value e = net_recv_err("recvfrom");
+    free(buf);
+    return e;
+  }
+  Value data = vl_str_n(buf, (int64_t)got);
+  free(buf);
+  Value host;
+  int port;
+  net_addr_parts((struct sockaddr *)&ss, slen, &host, &port);
+  Value elems[3];
+  elems[0] = data;
+  elems[1] = host;
+  elems[2] = vl_int(port);
+  Value t = vl_tuple_new(elems, 3);   /* (data, host, port) */
+  vl_release(data);
+  vl_release(host);
+  return t;
+}
+
+/* ---- Unix-domain (local IPC) ---- */
+
+BI(net_listen_unix) {
+  UNUSED;
+  const char *path = vl_cstr(argv[0]);
+  int backlog = (int)raw_int(argv[1]);
+  struct sockaddr_un un;
+  if (vl_strlen(argv[0]) >= (int64_t)sizeof un.sun_path)
+    return net_err("unix socket path too long");
+  memset(&un, 0, sizeof un);
+  un.sun_family = AF_UNIX;
+  strncpy(un.sun_path, path, sizeof un.sun_path - 1);
+  unlink(path);   /* a stale socket file makes bind fail with EADDRINUSE */
+  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) return net_errno("socket");
+  sock_setup(fd);
+  if (bind(fd, (struct sockaddr *)&un, sizeof un) < 0) {
+    Value e = net_errno("bind");
+    close(fd);
+    return e;
+  }
+  if (listen(fd, backlog > 0 ? backlog : 128) < 0) {
+    Value e = net_errno("listen");
+    close(fd);
+    return e;
+  }
+  return vl_socket_new(fd);
+}
+
+BI(net_connect_unix) {
+  UNUSED;
+  const char *path = vl_cstr(argv[0]);
+  struct sockaddr_un un;
+  if (vl_strlen(argv[0]) >= (int64_t)sizeof un.sun_path)
+    return net_err("unix socket path too long");
+  memset(&un, 0, sizeof un);
+  un.sun_family = AF_UNIX;
+  strncpy(un.sun_path, path, sizeof un.sun_path - 1);
+  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) return net_errno("socket");
+  sock_setup(fd);
+  if (connect(fd, (struct sockaddr *)&un, sizeof un) < 0) {
+    Value e = net_errno("connect");
+    close(fd);
+    return e;
+  }
+  return vl_socket_new(fd);
+}
+
+/* ---- lifecycle & options ---- */
+
+BI(net_close) {
+  UNUSED;
+  VlSocket *s = want_sock(argv[0]);
+  if (!s->closed && s->fd >= 0) close(s->fd);
+  s->closed = true;
+  s->fd = -1;   /* defensive: no native touches the fd once closed */
+  return vl_unit();
+}
+
+BI(net_set_timeout) {
+  UNUSED;
+  VlSocket *s = want_sock(argv[0]);
+  if (s->closed) return net_err("socket is closed");
+  int64_t ms = raw_int(argv[1]);
+  s->timeout_ms = (int)ms;   /* poll() bound for accept(); see net_accept */
+  struct timeval tv;
+  tv.tv_sec = (time_t)(ms / 1000);
+  tv.tv_usec = (long)((ms % 1000) * 1000);
+  if (setsockopt(s->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) < 0)
+    return net_errno("setsockopt");
+  setsockopt(s->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+  return vl_unit();
+}
+
+/* ---- DNS (public) ---- */
+
+BI(net_resolve) {
+  UNUSED;
+  const char *host = vl_cstr(argv[0]);
+  struct addrinfo hints;
+  struct addrinfo *res = NULL;
+  memset(&hints, 0, sizeof hints);
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  int rc = getaddrinfo(host, NULL, &hints, &res);
+  if (rc != 0) return net_err(gai_strerror(rc));
+  Value out = vl_slice_new(0);
+  for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
+    char h[NI_MAXHOST];
+    if (getnameinfo(ai->ai_addr, ai->ai_addrlen, h, sizeof h, NULL, 0,
+                    NI_NUMERICHOST) == 0) {
+      vl_slice_append(out, vl_str(h));   /* append takes ownership */
+    }
+  }
+  freeaddrinfo(res);
+  return out;
+}
+
 /* ---------------------------------------------------------------- math */
 
 static double asdouble(Value v) {
@@ -1136,6 +1588,17 @@ static const Entry table[] = {
     {"os.run", os_run}, {"os.cwd", os_cwd}, {"os.pid", os_pid},
     {"os.exe", os_exe}, {"os.mtime", os_mtime}, {"os.size", os_size},
     {"os.hostname", os_hostname},
+
+    /* net (the C syscall shim; the API is Voilà, in std/net) */
+    {"net._listen_tcp", net_listen_tcp}, {"net._connect_tcp", net_connect_tcp},
+    {"net._accept", net_accept}, {"net._send", net_send},
+    {"net._recv", net_recv}, {"net._local_addr", net_local_addr},
+    {"net._remote_addr", net_remote_addr}, {"net._udp", net_udp},
+    {"net._dial_udp", net_dial_udp},
+    {"net._sendto", net_sendto},
+    {"net._recvfrom", net_recvfrom}, {"net._listen_unix", net_listen_unix},
+    {"net._connect_unix", net_connect_unix}, {"net._close", net_close},
+    {"net._set_timeout", net_set_timeout}, {"net.resolve", net_resolve},
 
     /* math */
     {"math.sqrt", math_sqrt}, {"math.sin", math_sin}, {"math.cos", math_cos},

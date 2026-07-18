@@ -1,0 +1,79 @@
+// 11_echo.voi — a TCP echo service with std/net (§10, §13). A server task and
+// a client task run in one process, in one group, talking over the loopback
+// interface. The server binds port 0 (the OS picks a free port) and hands its
+// real address to the client through a channel — so the program is fully
+// self-contained and its output is deterministic (the ephemeral port is never
+// printed). This is the thread-per-connection pattern std/net is built for:
+// accept a connection, then serve it in its own task.
+package main
+
+use "std/net"
+use "std/fmt"
+
+// serve accepts ONE connection and echoes each line back, prefixed, until the
+// client closes the stream. Its own address goes out on `addr` first.
+func serve(addr chan[str], done chan[str]) {
+    match net.listen("127.0.0.1:0") {
+        Err(e) => { addr <- "" ; done <- ("listen failed: " || e.message()) }
+        Ok(lis) => {
+            addr <- lis.addr()
+            match lis.accept() {
+                Err(e) => done <- ("accept failed: " || e.message())
+                Ok(conn) => {
+                    echo_lines(conn)
+                    conn.close()
+                    lis.close()
+                    done <- "server: client disconnected"
+                }
+            }
+        }
+    }
+}
+
+// echo_lines reads lines until end of stream, echoing each one back.
+func echo_lines(conn net.Conn) {
+    while true {
+        match conn.read_line() {
+            Err(e)   => return
+            Ok(line) => {
+                if len(line) == 0 { return }        // the peer closed
+                match conn.write_all("echo: " || line) {
+                    Ok(u)  => u
+                    Err(e) => return
+                }
+            }
+        }
+    }
+}
+
+// speak connects to the server, sends three greetings, and prints each echo.
+func speak(addr chan[str]) {
+    let where = <-addr
+    if where == "" { return }
+    match net.connect(where) {
+        Err(e) => say "connect failed:", e.message()
+        Ok(conn) => {
+            for word in ["HELLO", "VOILA", "GOODBYE"] {
+                match conn.write_all(word || "\n") {
+                    Ok(u)  => u
+                    Err(e) => { say "write failed:", e.message() ; return }
+                }
+                match conn.read_line() {
+                    Err(e)  => { say "read failed:", e.message() ; return }
+                    Ok(got) => fmt.printf("%s", got)
+                }
+            }
+            conn.close()
+        }
+    }
+}
+
+func main() {
+    let addr = chan[str](1)
+    let done = chan[str](1)
+    group {
+        spawn serve(addr, done)
+        spawn speak(addr)
+    }
+    say <-done
+}

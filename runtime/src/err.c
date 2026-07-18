@@ -155,6 +155,27 @@ Value vl_err_message(Value ev) {
   if (e->fields.t == VL_OBJ && e->fields.u.o->kind == O_MAP)
     has_fields = ((VlMap *)e->fields.u.o)->count > 0;
 
+  /* A builtin error whose only field carries its whole message — `msg`
+   * (IOError, RangeError, ValueError, …) or `op` (OverflowError) — returns
+   * that text bare from `.message()` rather than the structural
+   * `Type{msg: "…"}` form. Domain errors with other single fields
+   * (NotFound{path}) or several fields (ParseError{line, col}) still render
+   * structurally, so `.message()` stays informative for them. */
+  if (has_fields) {
+    VlMap *fm = (VlMap *)e->fields.u.o;
+    if (fm->count == 1) {
+      for (int64_t i = 0; i < fm->nents; i++) {
+        if (!fm->ents[i].used) continue;
+        if (fm->ents[i].k.t == VL_OBJ && fm->ents[i].k.u.o->kind == O_STR) {
+          const char *fk = vl_cstr(fm->ents[i].k);
+          if (strcmp(fk, "msg") == 0 || strcmp(fk, "op") == 0)
+            return vl_tostr(fm->ents[i].v);
+        }
+        break;
+      }
+    }
+  }
+
   Value b = vl_builder_new();
   vl_builder_write(b, e->type_name);
   if (has_fields) {

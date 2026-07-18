@@ -144,6 +144,16 @@ typedef struct {
   bool closed, is_std;
 } VlFile;
 
+/* A network socket owns an OS file descriptor and closes it when the last
+ * reference is released (obj_free), mirroring VlFile. std/net wraps it in a
+ * Voilà Listener/Conn/Udp struct; this struct is deliberately opaque. */
+typedef struct {
+  VlObj hdr;
+  int fd;
+  bool closed;
+  int timeout_ms;   /* 0 = no deadline; used to bound accept() portably */
+} VlSocket;
+
 typedef struct {
   VlObj hdr;
   char *b;

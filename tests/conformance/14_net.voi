@@ -1,0 +1,76 @@
+// 14_net.voi — std/net conformance: a connected-UDP round trip (exercises
+// dial_udp, the address-family path), a TCP round trip, and the error model
+// (a refused connection and a malformed address, both as clean IOError
+// messages). Client and server run as tasks over the loopback interface, so
+// the test is self-contained and deterministic.
+use "std/net"
+
+// --- connected UDP (dial_udp) over IPv4 ---
+func udp_server(addr chan[str], done chan[str]) {
+    match net.listen_udp("127.0.0.1:0") {
+        Err(e) => { addr <- "" ; done <- e.message() }
+        Ok(s) => {
+            addr <- s.addr()
+            match s.recv_from(256) {
+                Err(e)   => done <- e.message()
+                Ok(pair) => {
+                    let msg, from = pair
+                    match s.send_to("reply:" || msg, from) {
+                        Ok(n)  => n
+                        Err(e) => { done <- e.message() ; s.close() ; return }
+                    }
+                    s.close()
+                    done <- "udp-served"
+                }
+            }
+        }
+    }
+}
+
+func udp_client(addr chan[str], out chan[str]) {
+    let where = <-addr
+    if where == "" { out <- "no-server" ; return }
+    match net.dial_udp(where) {          // connected UDP to an IPv4 peer
+        Err(e) => out <- ("dial: " || e.message())
+        Ok(u) => {
+            match u.send("ping") {
+                Ok(n)  => n
+                Err(e) => { out <- e.message() ; u.close() ; return }
+            }
+            match u.recv(256) {
+                Err(e)   => out <- e.message()
+                Ok(data) => out <- data
+            }
+            u.close()
+        }
+    }
+}
+
+func main() {
+    let addr = chan[str](1)
+    let done = chan[str](1)
+    let out  = chan[str](1)
+    group {
+        spawn udp_server(addr, done)
+        spawn udp_client(addr, out)
+    }
+    say "udp:", <-out
+    say "srv:", <-done
+
+    // Error model: a refused connection and a malformed address both yield a
+    // clean IOError message (not a struct dump, not an abort).
+    match net.connect("127.0.0.1:1") {
+        Ok(c)  => { say "unexpected connect" ; c.close() }
+        Err(e) => say "refused:", e.message()
+    }
+    match net.listen("not-an-address") {
+        Ok(l)  => { say "unexpected listen" ; l.close() }
+        Err(e) => say "bad-addr:", e.message()
+    }
+
+    // resolve returns at least one address for loopback.
+    match net.resolve("127.0.0.1") {
+        Ok(ips) => say "resolve:", len(ips) > 0
+        Err(e)  => say "resolve failed:", e.message()
+    }
+}

@@ -1,0 +1,4 @@
+PING -> PONG
+UPPER hello -> HELLO
+LEN world -> 5
+server: session closed

@@ -1,0 +1,3 @@
+-do not commit anything to the github repository.
+-do not updte the version number
+-always use a senior code reviewer after finishing a change

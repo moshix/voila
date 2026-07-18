@@ -9,6 +9,7 @@ static void frame_retain(VlFrame *f);
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>   /* close() for O_SOCKET in obj_free */
 
 void *vl_alloc(size_t n) {
   void *p = calloc(1, n);
@@ -290,6 +291,14 @@ static void obj_free(VlObj *o) {
     vl_release(f->name);
     break;
   }
+  case O_SOCKET: {
+    /* Close the fd when the last reference drops. This arm is mandatory:
+     * the build has no -Wswitch, so its absence would silently leak the
+     * descriptor on every dropped socket. */
+    VlSocket *s = (VlSocket *)o;
+    if (!s->closed && s->fd >= 0) close(s->fd);
+    break;
+  }
   case O_BUILDER:
     free(((VlBuilder *)o)->b);
     break;
@@ -496,6 +505,7 @@ const char *vl_kind_name(Value v) {
   case O_WEAK: return "weak";
   case O_RANGE: return "range";
   case O_FILE: return "file";
+  case O_SOCKET: return "socket";
   case O_BUILDER: return "builder";
   case O_TYPE: return "type";
   case O_FRAME: return "frame";
@@ -947,6 +957,13 @@ static void str_into(Value b, Value v) {
     Value n = ((VlFile *)v.u.o)->name;
     bwrite(b, vl_cstr(n), vl_strlen(n));
     bputs(b, ">");
+    return;
+  }
+  case O_SOCKET: {
+    VlSocket *s = (VlSocket *)v.u.o;
+    snprintf(tmp, sizeof tmp, "<socket fd=%d%s>", s->fd,
+             s->closed ? " closed" : "");
+    bputs(b, tmp);
     return;
   }
   case O_BUILDER: bputs(b, "<builder>"); return;

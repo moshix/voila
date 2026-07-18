@@ -1,0 +1,4 @@
+echo: HELLO
+echo: VOILA
+echo: GOODBYE
+server: client disconnected

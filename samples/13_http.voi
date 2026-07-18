@@ -1,0 +1,105 @@
+// 13_http.voi — a minimal HTTP/1.0 client and server built on std/net (§10,
+// §13). There is no std/http package; this sample shows that a real
+// line-oriented protocol is a few lines of Voilà on top of raw sockets. A
+// server task and a client task run in one group over the loopback interface,
+// so the run is self-contained and deterministic (the ephemeral port is never
+// printed).
+package main
+
+use "std/net"
+use "std/str"
+use "std/fmt"
+
+// handle serves ONE HTTP request: read the request line and headers, then
+// reply 200 with a plain-text body that echoes the requested path.
+func handle(conn net.Conn) throws IOError {
+    let request = try conn.read_line()          // e.g. "GET /hello HTTP/1.0"
+    let parts = str.fields(request)
+    var path = "/"
+    if len(parts) >= 2 { path = parts[1] }
+
+    // Consume the request headers, up to the blank line that ends them.
+    while true {
+        let line = try conn.read_line()
+        if len(line) == 0 { break }             // peer closed early
+        if line == "\r\n" or line == "\n" { break }
+    }
+
+    let body = "You asked for: " || path || "\n"
+    var resp = str.Builder{}
+    resp.write("HTTP/1.0 200 OK\r\n")
+    resp.write("Content-Type: text/plain\r\n")
+    resp.write("Content-Length: " || str(len(body)) || "\r\n")
+    resp.write("\r\n")
+    resp.write(body)
+    try conn.write_all(resp.done())
+}
+
+func server(addr chan[str], done chan[str]) {
+    match net.listen("127.0.0.1:0") {
+        Err(e) => { addr <- "" ; done <- ("listen failed: " || e.message()) }
+        Ok(lis) => {
+            addr <- lis.addr()
+            match lis.accept() {
+                Err(e) => done <- ("accept failed: " || e.message())
+                Ok(conn) => {
+                    match handle(conn) {
+                        Ok(u)  => u
+                        Err(e) => say "handler error:", e.message()
+                    }
+                    conn.close()
+                    lis.close()
+                    done <- "server: request served"
+                }
+            }
+        }
+    }
+}
+
+// fetch performs a GET and prints the status line and body it got back.
+func fetch(addr chan[str]) {
+    let where = <-addr
+    if where == "" { return }
+    match net.connect(where) {
+        Err(e) => say "connect failed:", e.message()
+        Ok(conn) => {
+            let req = "GET /hello HTTP/1.0\r\nHost: localhost\r\n\r\n"
+            match conn.write_all(req) {
+                Ok(u)  => u
+                Err(e) => { say "write failed:", e.message() ; return }
+            }
+            match conn.read_all() {
+                Err(e)   => say "read failed:", e.message()
+                Ok(resp) => print_response(resp)
+            }
+            conn.close()
+        }
+    }
+}
+
+// print_response splits an HTTP response into its status line and body and
+// prints both — the deterministic part of the exchange.
+func print_response(resp str) {
+    let head, body = split_once(resp, "\r\n\r\n")
+    let lines = str.lines(head)
+    if len(lines) > 0 { say "status:", lines[0] }
+    fmt.printf("body: %s", body)
+}
+
+// split_once splits `s` at the first occurrence of `sep`, returning the parts
+// before and after it (and (s, "") when `sep` is absent).
+func split_once(s str, sep str) (str, str) {
+    let i = str.index(s, sep)
+    if i < 0 { return (s, "") }
+    return (s[0..i], s[i + len(sep)..len(s)])
+}
+
+func main() {
+    let addr = chan[str](1)
+    let done = chan[str](1)
+    group {
+        spawn server(addr, done)
+        spawn fetch(addr)
+    }
+    say <-done
+}

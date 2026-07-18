@@ -1,0 +1,96 @@
+// 14_unix.voi — local IPC over a Unix-domain socket (§10, §13). A Unix socket
+// is addressed by a filesystem path, not a port, and never leaves the
+// machine — the right tool for a local daemon and its client. This sample is
+// a tiny command service: the client sends one-line commands and the server
+// answers each. A pid-based socket path keeps concurrent runs from colliding,
+// and it is never printed, so the output is deterministic.
+package main
+
+use "std/net"
+use "std/str"
+use "std/os"
+
+// answer computes the reply to a single command line.
+//   PING            -> PONG
+//   UPPER <text>    -> the text upper-cased
+//   LEN <text>      -> the text's length
+func answer(cmd str) str {
+    let parts = str.fields(cmd)
+    if len(parts) == 0 { return "EMPTY" }
+    let verb = parts[0]
+    if verb == "PING" { return "PONG" }
+    if verb == "UPPER" and len(parts) >= 2 { return str.upper(parts[1]) }
+    if verb == "LEN" and len(parts) >= 2 { return str(len(parts[1])) }
+    return "UNKNOWN"
+}
+
+func server(path str, ready chan[int], done chan[str]) {
+    match net.listen_unix(path) {
+        Err(e) => { ready <- 0 ; done <- ("listen failed: " || e.message()) }
+        Ok(lis) => {
+            ready <- 1
+            match lis.accept() {
+                Err(e) => done <- ("accept failed: " || e.message())
+                Ok(conn) => {
+                    serve(conn)
+                    conn.close()
+                    lis.close()
+                    done <- "server: session closed"
+                }
+            }
+        }
+    }
+}
+
+// serve answers each command line until the client closes the connection.
+func serve(conn net.Conn) {
+    while true {
+        match conn.read_line() {
+            Err(e)   => return
+            Ok(line) => {
+                if len(line) == 0 { return }
+                let cmd = str.trim(line)
+                match conn.write_all(answer(cmd) || "\n") {
+                    Ok(u)  => u
+                    Err(e) => return
+                }
+            }
+        }
+    }
+}
+
+func client(path str, ready chan[int]) {
+    if <-ready == 0 { return }
+    match net.dial_unix(path) {
+        Err(e) => say "dial failed:", e.message()
+        Ok(conn) => {
+            for cmd in ["PING", "UPPER hello", "LEN world"] {
+                match conn.write_all(cmd || "\n") {
+                    Ok(u)  => u
+                    Err(e) => { say "write failed:", e.message() ; return }
+                }
+                match conn.read_line() {
+                    Err(e)  => { say "read failed:", e.message() ; return }
+                    Ok(got) => fmt_reply(cmd, str.trim(got))
+                }
+            }
+            conn.close()
+        }
+    }
+}
+
+func fmt_reply(cmd str, reply str) {
+    say cmd, "->", reply
+}
+
+func main() {
+    let path  = "/tmp/voila-cmd-" || str(os.pid()) || ".sock"
+    let ready = chan[int](1)
+    let done  = chan[str](1)
+    group {
+        spawn server(path, ready, done)
+        spawn client(path, ready)
+    }
+    say <-done
+    os.remove(path)        // a Unix socket leaves its path behind; tidy up
+}
