@@ -22,7 +22,6 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="0.4.1"
 DIST="dist"
 
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
@@ -30,9 +29,34 @@ ok()   { printf '\033[32m  ✓ %s\033[0m\n' "$1"; }
 skip() { printf '\033[33m  – %s\033[0m\n' "$1"; }
 
 # The toolchain must be able to build itself before it is shipped anywhere.
+# Cut the release from the checked-in C seed (bootstrap.bash) so the shipped
+# binary is reproducible from source alone — independent of whatever voila
+# happens to be installed on the build machine — and so the fossil is proven
+# to build.
 bold "==> bootstrap"
-./build.sh >/dev/null
+./bootstrap.bash >/dev/null
 ok "bin/voila (fixpoint verified)"
+
+# The version is the built binary's own — never a second, drifting copy.
+VERSION="$(bin/voila version | awk '{print $2}')"
+[ -n "$VERSION" ] || { echo "could not read the version from 'voila version'"; exit 1; }
+
+# The source tarball and the cross-compiled natives below build the C seed
+# DIRECTLY, so bootstrap/voilac.c must be current — else the release would ship
+# a seed that reports an older version than $VERSION. Assert it (the seed is
+# fresh iff it equals what this compiler emits for its own source). The check
+# file is a temp outside the repo, cleaned up even on interrupt.
+SEEDCHECK="$(mktemp)"
+trap 'rm -f "$SEEDCHECK"' EXIT
+if ! bin/voila build --emit=c voilac/main.voi > "$SEEDCHECK" 2>/dev/null; then
+    echo "could not emit C for the seed-freshness check" >&2
+    exit 1
+fi
+if ! cmp -s "$SEEDCHECK" bootstrap/voilac.c; then
+    echo "bootstrap/voilac.c is stale — run ./build.sh reseed before packaging" >&2
+    exit 1
+fi
+ok "bootstrap seed is current ($VERSION)"
 
 if [[ "${SKIP_TESTS:-}" != "1" ]]; then
     bold "==> tests"

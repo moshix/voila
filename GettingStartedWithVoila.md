@@ -6,7 +6,7 @@
 
 ### A Programming Guide for the New User
 
-**Program Number 5799-VLA · Version 0.4.1**
+**Program Number 5799-VLA · Version 0.4.2**
 
 *First Edition*
 
@@ -92,37 +92,46 @@ which is a stronger claim than any brochure could make.
 
 ## 1.2 Installing the Compiler
 
-You need a C compiler. That is the entire list of prerequisites.
+Because the compiler is written in Voilà, there are two ways to obtain a
+working `voila`, and which one you use depends on whether you already have a
+Voilà binary.
+
+**If you already have a Voilà binary** (from a release, or a previous build)
+of version **0.4.1 or newer**, that binary builds the compiler — Voilà builds
+Voilà:
 
 ```console
 $ ./build.sh
-==> cc: bootstrap/voilac.c + runtime  →  the seed
-  ✓ build/voila-seed
-==> 0. the embedded runtime
-  ✓ voilac/rt/blob.voi is current
-==> 1. the compiler compiles itself (-O3)  →  voilac-1
-  ✓ build/voilac-1
-==> 2. voilac-1 compiles itself  →  voilac-2, and the C must match
+==> bootstrap: prebuilt binary  bin/voila  (0.4.1)
   ✓ fixpoint: C(voilac-1) == C(voilac-2)
   ✓ optimized fixpoint: C(-O3, gen1) == C(-O3, gen2)
-  ✓ the checked-in seed is current
-  ✓ bin/voila-0.4.1
-  ✓ bin/voila  ->  voila-0.4.1
-  ✓ ./voila  ->  bin/voila-0.4.1
+  ✓ ./voila  ->  bin/voila-0.4.2
 ==> done — ./voila is ready
 ```
 
-What just happened: `cc` compiled a checked-in C file into a working
-compiler; that compiler compiled the real compiler from its Voilà source;
-and *that* compiler compiled itself once more. The two generations emitted
-byte-identical C, which is the classical proof that a self-hosted compiler
-is not quietly mistranslating itself.
+**On a fresh machine with only a C compiler** and no Voilà yet, there is a
+checked-in copy of the compiler's own C output — the *seed*. `bootstrap.bash`
+compiles it with `cc` into the first `voila` for your machine, then builds the
+real compiler with it:
 
-The binary is named for its version — `bin/voila-0.4.1` — with `bin/voila`
-and `./voila` as symlinks to it, so `voila` always means the version you
-last built. Run `voila version` to see it.
+```console
+$ ./bootstrap.bash
+==> cc: bootstrap/voilac.c + runtime  →  the seed
+  ✓ build/voila-seed
+  ✓ fixpoint: C(voilac-1) == C(voilac-2)
+==> done — ./voila is ready
+```
 
-Put `voila` on your PATH, or call it as `./voila`.
+You need `bootstrap.bash` only once per machine; afterwards `./build.sh` is the
+faster, self-hosted path. (A C compiler is still required either way: Voilà's
+backend emits C, and `voila build` calls `cc` to turn it into a native binary.)
+
+What just happened, on both paths: a working compiler compiled the real
+compiler from its Voilà source, and *that* compiler compiled itself once more.
+The two generations emitted byte-identical C — the classical proof that a
+self-hosted compiler is not quietly mistranslating itself. The binary is named
+for its version — `bin/voila-0.4.2` — with `bin/voila` and `./voila` as
+symlinks to it. Put `voila` on your PATH, or call it as `./voila`.
 
 ## 1.3 The First Program
 

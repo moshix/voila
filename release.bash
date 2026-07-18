@@ -37,8 +37,10 @@ if [ -n "$(git status --porcelain)" ]; then
 fi
 
 # ---- 1. build, and read the version from the binary itself -------------------
+# Build from the checked-in C seed (bootstrap.bash), so the released binary is
+# reproducible from source and does not depend on a pre-installed voila.
 bold "==> building the toolchain"
-./build.sh >/dev/null
+./bootstrap.bash >/dev/null
 VER="$(bin/voila version | awk '{print $2}')"
 [ -n "$VER" ] || die "could not read the version from 'voila version'"
 TAG="v$VER"

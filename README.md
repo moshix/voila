@@ -5,7 +5,7 @@
 **A statically typed, memory-safe, concurrent language —<br>
 that compiles itself.**
 
-![language](https://img.shields.io/badge/language-Voil%C3%A0%200.4.1-blueviolet?style=for-the-badge)
+![language](https://img.shields.io/badge/language-Voil%C3%A0%200.4.2-blueviolet?style=for-the-badge)
 ![gc](https://img.shields.io/badge/GC-none-orange?style=for-the-badge)
 
 </div>
@@ -119,18 +119,35 @@ let r = attempt risky()            // or demote an exception to a value
 |  `runtime/` | **libvoila**: the C runtime — refcounted values (no GC), exact decimals, exceptions, tasks/channels/select |
 | 📚 stdlib | `fmt` `str` `os` `math` `time` `json` `log` `conv` `sort` `rand` `uuid` |
 | `voila build -S` | register-IR **assembly listings** in HLASM style — location counter, constant pool, DSECTs, ≤79 columns |
-| `bootstrap/voilac.c` | the seed: the C the compiler emits **for itself**, so `cc` alone can rebuild everything |
+| `bootstrap/voilac.c` | the seed: the C the compiler emits **for itself** — the portability fallback so `cc` alone can bootstrap a fresh machine (`./bootstrap.bash`) |
 | tests | goldens, negative fixtures, and the **fixpoint**: the compiler compiled by itself emits identical C ([TESTING.md](TESTING.md)) |
 
 ## Quick start
 
+Voilà builds itself. If you already have a Voilà binary (≥ 0.4.1), `./build.sh`
+uses it to build the compiler — the self-hosted path:
 
 ```console
-$ ./build.sh                          # cc the seed, then Voilà builds Voilà
+$ ./build.sh                          # Voilà builds Voilà
+==> bootstrap: prebuilt binary  bin/voila  (0.4.1)
   ✓ fixpoint: C(voilac-1) == C(voilac-2)
   ✓ optimized fixpoint: C(-O3, gen1) == C(-O3, gen2)
-  ✓ bin/voila-0.4.1
+  ✓ bin/voila-0.4.2
+```
 
+On a fresh machine with only a C compiler and no Voilà yet, `./bootstrap.bash`
+compiles the checked-in C seed into the first binary, then builds:
+
+```console
+$ ./bootstrap.bash                    # cc the seed → the first voila, then build
+  ✓ build/voila-seed
+  ✓ fixpoint: C(voilac-1) == C(voilac-2)
+  ✓ bin/voila-0.4.2
+```
+
+Then:
+
+```console
 $ bin/voila run samples/04_calculator.voi
 $ bin/voila check samples/07_orgchart.voi
 $ bin/voila build samples/10_life.voi -o life && ./life
@@ -164,14 +181,20 @@ This distro supplies 14 sample programs which are also used in the Programming H
 | `14_unix.voi` | local IPC over a Unix-domain socket: a tiny command service |
 
 ## It compiles itself
-Voilà is completely self-hosted and it compiles itself from the very first version. 
-In other words, the compiler is written in Voilà. To build it you need a compiler, so one
-generation of its own C output is checked in as `bootstrap/voilac.c` — a
-fossil, not a source. `./build.sh` compiles that with `cc`, uses the result to
-compile `voilac/*.voi`, uses *that* to compile `voilac/*.voi` again, and asserts
-the two emit **byte-identical C**. It bootstrapped from a Go compiler that no
-longer exists; every stage of the Voilà one was diffed against it, byte for
-byte, over every file in this repository — and then it was deleted.
+Voilà is completely self-hosted: the compiler is written in Voilà, and the
+normal way to build it (`./build.sh`) is to have a prior Voilà binary
+(≥ 0.4.1) compile `voilac/*.voi`, then have *that* compile it again, and assert
+the two emit **byte-identical C** — the self-hosting fixpoint. Building 0.4.2
+needs a 0.4.1 (or newer) Voilà; that is the minimum.
+
+To bring Voilà up on a machine that has no Voilà binary at all, one generation
+of the compiler's own C output is checked in as `bootstrap/voilac.c` — a
+fossil, not a source. `./bootstrap.bash` compiles it with `cc` into the first
+native binary, which then drives the same self-hosted build. (`cc` is still the
+backend inside every `voila build` either way — Voilà emits C.) It originally
+bootstrapped from a Go compiler that no longer exists; every stage of the Voilà
+one was diffed against it, byte for byte, over every file in this repository —
+and then it was deleted.
 
 ## Performance (0.4)
 

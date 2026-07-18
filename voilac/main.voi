@@ -34,7 +34,9 @@ use "std/os"
 use "std/fmt"
 use "std/str"
 
-const VERSION = "0.4.1"
+// MIN_BOOTSTRAP (build.sh) is 0.4.1 — the oldest voila that can build this
+// source; 0.4.2 is built by any voila >= 0.4.1. See BOOTSTRAP.md.
+const VERSION = "0.4.2"
 
 // CFLAGS is the single home of the C compilation flags. The runtime-archive
 // cache key hashes it; the program compile and the archive build use it.

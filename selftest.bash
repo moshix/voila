@@ -20,8 +20,10 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 if [ ! -x "$VOILA" ]; then
-    bold "==> building the self-hosted toolchain"
-    ./build.sh >/dev/null || { bad "build.sh failed"; exit 1; }
+    # No voila binary yet — bootstrap from the C seed (needs only cc). Once a
+    # binary exists, ./build.sh (the self-hosted path) is what rebuilds it.
+    bold "==> bootstrapping the toolchain from the C seed"
+    ./bootstrap.bash >/dev/null || { bad "bootstrap.bash failed"; exit 1; }
 fi
 
 fail=0

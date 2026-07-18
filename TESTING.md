@@ -6,13 +6,15 @@ There is one command:
 ./selftest.bash
 ```
 
-It builds the toolchain from the checked-in seed, verifies the self-hosting
-fixpoint, and then holds the compiler to every golden output and every negative
-fixture in the repository. Green means the language works.
+It builds the toolchain (from an existing Voilà binary, or — on a machine with
+none — from the checked-in C seed via `bootstrap.bash`), verifies the
+self-hosting fixpoint, and then holds the compiler to every golden output and
+every negative fixture in the repository. Green means the language works.
 
 ```
-./build.sh          bootstrap only: seed → voilac-1 → voilac-2, BOTH fixpoints asserted
-./selftest.bash     the above, plus the whole corpus
+./build.sh          self-hosted build: a voila >= 0.4.1 → voilac-1 → voilac-2, BOTH fixpoints
+./bootstrap.bash    new machine, no voila yet: cc the C seed first, then build.sh
+./selftest.bash     build (bootstrap.bash if there is no binary yet), plus the whole corpus
 ./build_voila.bash  package for distribution (runs selftest first)
 ```
 

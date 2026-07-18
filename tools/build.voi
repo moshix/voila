@@ -1,13 +1,12 @@
 // tools/build.voi — the Voilà toolchain's build, written in Voilà.
 //
-// The bootstrap has an irreducible first step: something that is not Voilà must
-// turn the checked-in C seed into a binary, because until that binary exists
-// there is nothing to run a Voilà program with. That step is one `cc` command,
-// and `build.sh` is the four lines that issue it.
-//
-// EVERYTHING ELSE IS THIS PROGRAM. The seed binary runs it, and it drives the
-// rest of the build: compile the compiler, compile the compiler with the
-// compiler, and assert that the two agree.
+// The first compiler comes from one of two places, and a shell script picks
+// which: `build.sh` uses a prebuilt Voilà binary (>= 0.4.1) — the self-hosted
+// primary path — while `bootstrap.bash` compiles the checked-in C seed with
+// `cc` for a machine that has no Voilà binary yet. Either way, that first
+// compiler `run`s THIS program, which drives the rest of the build: compile
+// the compiler, compile the compiler with the compiler, and assert that the
+// two agree. (Both scripts hand it the compiler as $VOILA=build/voila-boot.)
 //
 //     voila run tools/build.voi              build and verify the fixpoint
 //     voila run tools/build.voi reseed       …and rewrite bootstrap/voilac.c
@@ -32,8 +31,9 @@ func main() {
     var mode = "all"
     if len(args) > 0 { mode = args[0] }
 
-    // The compiler that is running this program IS the seed: whoever invoked us
-    // already has a working toolchain. `voila` on PATH, or the one that ran us.
+    // The compiler that is running this program is our bootstrap: whoever
+    // invoked us already has a working toolchain (build.sh's prebuilt binary,
+    // or bootstrap.bash's cc-compiled seed — both exported as $VOILA).
     let voila = tool()
 
     sh("mkdir", ["-p", BUILD, "bin", "voilac/std"])
@@ -304,7 +304,10 @@ func sh(prog str, args []str) {
 
 // install replaces a binary. The unlink is not paranoia: overwriting a Mach-O
 // in place leaves the kernel holding a signature computed over the OLD bytes,
-// and the next exec of it dies with SIGKILL.
+// and the next exec of it dies with SIGKILL. This MUST stay unlink-then-cp:
+// `cp` over the live file (rather than onto a fresh inode) would reintroduce
+// that SIGKILL — including on the very binary `build.sh` bootstrapped from,
+// which is why build.sh execs a copy in build/, never the install target.
 func install(src str, dst str) {
     os.remove(dst)
     if os.run("cp", [src, dst]) != 0 {

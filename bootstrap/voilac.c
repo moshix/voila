@@ -171,7 +171,7 @@ static void init_consts(void) {
   K[162] = vl_str_n("/", 1);
   K[163] = vl_int(79LL);
   K[164] = vl_int(26LL);
-  K[165] = vl_str_n("0.4.1", 5);
+  K[165] = vl_str_n("0.4.2", 5);
   K[166] = vl_bool(false);
   K[167] = vl_str_n("-std=c11 -O2", 12);
   K[168] = vl_str_n("and", 3);

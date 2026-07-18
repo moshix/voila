@@ -2,13 +2,13 @@
 
 ## Language Reference and Programming Guide
 
-**Program Number 5799-VLA · Version 0, Release 4, Modification 1**
+**Program Number 5799-VLA · Version 0, Release 4, Modification 2**
 
 ---
 
-**Third Edition (July 2026)**
+**Fourth Edition (July 2026)**
 
-This edition applies to Version 0 Release 4 Modification 1 of the Voilà Language
+This edition applies to Version 0 Release 4 Modification 2 of the Voilà Language
 Toolchain (self-hosted), and to all subsequent releases and modifications
 until otherwise indicated in new editions. Make sure you are using the
 correct edition for the level of the product.
@@ -20,7 +20,7 @@ diagrams, general rules, and usage notes. Read Chapter 1 first;
 thereafter the manual is designed for random access.
 
 **Note.** Where the behavior of the toolchain deliberately differs from
-the *Voilà Language Specification, Version 0.4.1 (Draft)*, the difference
+the *Voilà Language Specification, Version 0.4.2 (Draft)*, the difference
 is recorded in Appendix D. Programs should be written to this manual.
 
 ---
@@ -1162,7 +1162,10 @@ voila version                       print the toolchain version
 ## 12.2 How a Program Is Compiled
 
 Voilà is a compiled language. The toolchain is a compiler — written in
-Voilà — and a runtime library written in C:
+Voilà — and a runtime library written in C. It is itself built by a prior
+Voilà compiler (`./build.sh`, the self-hosted path, needs a Voilà ≥ 0.4.1),
+or, on a machine with no Voilà binary, from a checked-in C seed (`./bootstrap.bash`);
+either way the system `cc` produces the final binaries (BOOTSTRAP.md):
 
 ```
    source ──lex──▶ tokens ──parse──▶ tree ──load──▶ flattened program
@@ -1313,7 +1316,8 @@ The parts of such a package, and where each lives:
 Step 7 is not edited by hand: `voila run tools/build.voi stdblob` regenerates
 it from `std/`, and a full build regenerates it as its first act. After a
 change to the shim or the package, rebuild and reseed as for any compiler
-change (`./build.sh` then `./build.sh reseed`).
+change — `./build.sh` then `./build.sh reseed` (or `./bootstrap.bash` on a
+machine without a Voilà binary).
 
 The division of labour is the point. The package's public functions are
 Voilà, so a call to one of them compiles to a direct call into grafted Voilà
