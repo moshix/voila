@@ -1,0 +1,12 @@
+// Imported for its EFFECT and nothing else. The initializer runs when the
+// program starts; an importer may want no name from this package at all.
+// Voilà has no blank import (`use _ "boot"`), so a plain `use` is the only
+// way to spell that — and dropping it drops the effect with nothing said
+// anywhere at all, which is the quietest way this warning could do harm.
+package boot
+
+var Ready = announce()
+
+func announce() bool {
+    return true
+}

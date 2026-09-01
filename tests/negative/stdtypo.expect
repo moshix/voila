@@ -1,0 +1,1 @@
+no std package `stf`: the std packages are conv, crypto, csv, fmt, http, io, json, log, math, net, os, path, rand, regex, sort, str, sync, test, time, uuid

@@ -1,0 +1,12 @@
+package main
+
+// Both imports offer a bare `Empty`. The short-name rule resolves a variant
+// in exactly ONE import; two candidates is an error naming both, never a
+// silent pick.
+use "bad/one"
+use "bad/two"
+
+func main() {
+    let x = Empty
+    say x
+}

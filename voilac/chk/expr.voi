@@ -1,0 +1,1166 @@
+// chk/expr.voi — expression TYPES, judged for the first time.
+//
+// Everything before this file checked the shape of a program: arities, method
+// sets, binding modes, names that resolve. None of it ever asked the one
+// question a type checker exists to ask — does the value that arrives here
+// fit the hole it is being put into. `var x int = greeting()` where
+// `greeting` returns `str` compiled, ran, and put a string in an `int`.
+//
+// Six questions are asked here, all from one walk:
+//
+//   1. an INITIALISER against its annotation      `var x int = f()`
+//   2. an ASSIGNMENT against the target's type    `x = f()`
+//   3. an ARGUMENT against the parameter          `f(1, "a")`
+//   4. a RETURNED value against the result        `return "a"`
+//   5. a FIELD against the struct's declaration   `p.z`
+//   6. a METHOD's existence and arity on a nominal receiver  `p.foo(1)`
+//
+// and, folded into 1–4, the thing that finally makes `[]Describe` mean
+// something: a trait-typed hole accepts only a type that implements the
+// trait, and a trait-typed RECEIVER answers only the trait's own methods.
+//
+// THE DESIGN RULE, and it governs every line below: THE CHECKER SAYS NOTHING
+// UNLESS IT IS SURE. `ty_of` is a partial function — 0 means "I do not know"
+// — and `mismatch` is written as a positive test for a KNOWN-BAD pair rather
+// than as the negation of an assignability relation. Those are not the same
+// program. A compatibility relation has to be complete to be safe, and any
+// gap in it rejects a working program; a known-bad test has to be sound to be
+// safe, and any gap in it merely loses a diagnostic. The plan's Hazards
+// section records three separate occasions on which a check of the first kind
+// broke a build in this repository, so this file is written the second way.
+//
+// WHAT IS NEVER JUDGED, and why each one is a refusal rather than an omission:
+//
+//   · anything whose type contains a GENERIC PARAMETER. Generics are
+//     type-erased; `T` at a use site stands for a type nothing wrote down.
+//     typ.HasParam is the gate — except where the receiver supplies the
+//     answer, which is what typ.Subst is for (see subst_all).
+//   · anything containing TK_ERROR. chk/sig.voi already reported the name;
+//     a second diagnostic about the same annotation is noise.
+//   · a TRAIT on the value side. A trait-typed value dispatches dynamically
+//     and its dynamic type is unknown here, so it fits any hole.
+//   · a std package's type. `str.Builder` resolves through typ.Resolves'
+//     escape hatch precisely because it has no Voilà source; there is no
+//     declaration to judge it against.
+//   · a name a local binding may have SHADOWED. callsite.voi's discipline,
+//     reused wholesale — the env below IS the scope, so a shadowed module
+//     function simply is not found.
+//   · `?T` and `T!` on either side, unwrapped one layer and then judged on
+//     the payload. They are not sum types (`Some`/`Ok`/`Err` are patterns,
+//     never constructors), so `?int` genuinely accepts an `int` and nil.
+//
+// SHADOWING AND SCOPE. `env` maps a name to a type id and is COPIED ON ENTRY
+// to every nested scope, exactly as chk/bind.voi's does and for the same
+// reason: a `var x str` inside a block genuinely shadows an outer `x int`.
+// The copy walks map keys, whose order is nondeterministic; that is safe
+// because the copy is content-only and NO DIAGNOSTIC IS EVER PRODUCED FROM A
+// MAP WALK. Every loop that can reach a report goes over a declaration-
+// ordered slice.
+//
+// ROLLOUT. Every diagnostic here is a WARNING under the code `type-mismatch`,
+// not an error. The corpus sweep that justified promoting it is recorded in
+// TESTING.md; see the note at the bottom of this file for what is still not
+// judged and would have to be built before a promotion is honest.
+package chk
+
+use "voilac/ast"
+use "voilac/tok"
+use "voilac/typ"
+use "std/str"
+
+// The warning code every diagnostic in this file carries. Spelled once.
+const TYPE_MISMATCH = "type-mismatch"
+
+impl Checker {
+    func check_expr_types(mut self) {
+        self.collect_fields()
+
+        let decls = self.T.Get(self.T.Kid(self.file, 1)).Kids
+
+        // The module scope, WHOLE and first: a function body may name a
+        // global declared after it.
+        var menv = make(map[str]int)
+        each d in decls {
+            if self.T.Kind(d) == ast.GLOBAL {
+                self.env_bind_stmt(self.T.Kid(d, 0), menv)
+            }
+        }
+        each s in self.T.Get(self.T.Kid(self.file, 2)).Kids {
+            self.env_bind_stmt(s, menv)
+        }
+
+        each d in decls {
+            let n = self.T.Get(d)
+            if n.Kind == ast.FUNC {
+                self.ty_fn(d, menv, 0)
+            } else if n.Kind == ast.IMPLDEC {
+                // The impl's generics are in scope for every method in it,
+                // and so is `self` — whose type is the impl TARGET, written
+                // with its own parameters (`Stack[T]`), which is exactly what
+                // makes every method of a generic type unjudgeable rather
+                // than wrongly judged.
+                self.Ty.PushParams(self.generic_names(self.T.Kid(d, 1)))
+                let selft = self.Ty.FromAST(self.T, n.Ival)
+                each m in self.T.Get(self.T.Kid(d, 0)).Kids {
+                    self.ty_fn(m, menv, selft)
+                }
+                self.Ty.PopParams()
+            } else if n.Kind == ast.EXCDEC {
+                let selft = self.Ty.Nominal(n.Sval)
+                each m in self.T.Get(self.T.Kid(d, 1)).Kids {
+                    self.ty_fn(m, menv, selft)
+                }
+            } else if n.Kind == ast.TRAITDEC {
+                // A trait DEFAULT body is compiled and run (low's
+                // lower_trait_default), so its expressions are real code. Its
+                // `self` is of no type at all — the body is shared by every
+                // implementor — so it is typed with selft 0 and every check
+                // that needs a receiver stays quiet.
+                each m in self.T.Get(self.T.Kid(d, 0)).Kids {
+                    self.ty_fn(m, menv, 0)
+                }
+            } else if n.Kind == ast.GLOBAL {
+                // A COPY, and not menv itself. menv was built whole above
+                // precisely so that a body may name a global declared after
+                // it; walking each global back INTO menv re-binds the name as
+                // the walk passes it, and a function declared between two
+                // module-level bindings of one name was then judged against
+                // the first while the runtime uses the second.
+                var genv = self.copy_env(menv)
+                self.ty_stmt(self.T.Kid(d, 0), genv)
+            }
+        }
+        // The script statements ARE the module scope, so they are walked in
+        // it rather than in a copy.
+        self.eSelf = 0
+        self.eRes = 0
+        self.eFn = ""
+        each s in self.T.Get(self.T.Kid(self.file, 2)).Kids {
+            self.ty_stmt(s, menv)
+        }
+    }
+
+    // ---------------------------------------------------------- the tables
+
+    // collect_fields records every struct field's declared type node under
+    // "Type|field", plus the field NAMES per type so that "has no field" can
+    // be answered without a second walk. Exceptions are recorded too: their
+    // fields are ordinary struct fields and cg registers them the same way.
+    //
+    // Declaration order (sNames, never the map) — though nothing here can
+    // reach a diagnostic, the walk is ordered anyway so that a later reader
+    // does not have to work out whether it may.
+    func collect_fields(mut self) {
+        each name in self.sNames {
+            self.absorb_fields(name, self.T.Kid(self.structs[name], 0))
+        }
+        // … and every method NAME the program declares, from the same
+        // declaration-ordered list. A trait's methods count: a default body
+        // is registered for every implementor, and an abstract one is
+        // somebody's obligation.
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            let n = self.T.Get(d)
+            var list = 0
+            if n.Kind == ast.IMPLDEC or n.Kind == ast.TRAITDEC {
+                list = self.T.Kid(d, 0)
+            } else if n.Kind == ast.EXCDEC {
+                list = self.T.Kid(d, 1)
+            }
+            if list == 0 { continue }
+            each m in self.T.Get(list).Kids {
+                if self.T.Kind(m) != ast.FUNC { continue }
+                let mn = self.T.Get(m).Sval
+                if mn != "" { self.mnames.add(mn) }
+            }
+        }
+    }
+
+    func absorb_fields(mut self, name str, list int) {
+        if list == 0 { return }
+        each f in self.T.Get(list).Kids {
+            if self.T.Kind(f) != ast.FIELDDECL { continue }
+            let fn = self.T.Get(f)
+            let k = name || "|" || fn.Sval
+            if k in self.flds { continue }
+            self.flds[k] = f
+        }
+    }
+
+    // ---------------------------------------------------------- functions
+
+    // ty_fn judges one function or method body against its own signature.
+    func ty_fn(mut self, fn int, outer map[str]int, selft int) {
+        if self.T.Kind(fn) != ast.FUNC { return }
+        let body = self.T.Kid(fn, 0)
+        if body == 0 { return }
+        let n = self.T.Get(fn)
+        self.Ty.PushParams(self.generic_names(self.T.Kid(fn, 3)))
+
+        var env = make(map[str]int)
+        each k in keys(outer) {
+            env[k] = outer[k]
+        }
+        each p in self.T.Get(self.T.Kid(fn, 1)).Kids {
+            if self.T.Kind(p) != ast.PARAM { continue }
+            let pn = self.T.Get(p)
+            self.env_put(env, pn.Sval, self.param_ty(p))
+        }
+
+        let saveSelf = self.eSelf
+        let saveRes = self.eRes
+        let saveFn = self.eFn
+        self.eSelf = selft
+        self.eRes = self.single_result(fn)
+        self.eFn = n.Sval
+        each s in self.T.Get(body).Kids {
+            self.ty_stmt(s, env)
+        }
+        self.eSelf = saveSelf
+        self.eRes = saveRes
+        self.eFn = saveFn
+        self.Ty.PopParams()
+    }
+
+    // param_ty is a parameter's declared type, with the VARIADIC rule
+    // applied: `args …str` binds `args` to a `[]str`, not to a `str`, and a
+    // checker that missed that would accuse every use of the name.
+    func param_ty(mut self, p int) int {
+        let pn = self.T.Get(p)
+        let base = self.Ty.FromAST(self.T, pn.Ival)
+        if base == 0 { return 0 }
+        if (pn.Ival2 & 16) == 0 { return base }
+        return self.Ty.MkSlice(base)
+    }
+
+    // single_result is a function's result type when it declares EXACTLY one,
+    // and 0 otherwise. Two results are a tuple the callers of this file are
+    // not equipped to take apart, and `unit` is the empty type — chk/sig.voi's
+    // result_count explains why counting the annotation is wrong.
+    func single_result(mut self, fn int) int {
+        let list = self.T.Kid(fn, 2)
+        if self.T.NKids(list) != 1 { return 0 }
+        let r = self.T.Kid(list, 0)
+        let rn = self.T.Get(r)
+        if rn.Kind == ast.TNAMED and rn.Sval == "unit" { return 0 }
+        return self.Ty.FromAST(self.T, r)
+    }
+
+    // ---------------------------------------------------------- statements
+
+    // ty_stmt walks a statement, judging what it can and binding what it
+    // learns. It mirrors chk/bind.voi's bind_stmt construct for construct —
+    // deliberately, because that walker's scope handling is the one that has
+    // been proved right against this corpus.
+    func ty_stmt(mut self, s int, env mut map[str]int) {
+        if s == 0 { return }
+        let n = self.T.Get(s)
+        let k = n.Kind
+
+        if k == ast.LET or k == ast.VAR {
+            self.ty_exprs(self.T.Kid(s, 0), env)
+            self.check_init(s, env)
+            self.env_bind_stmt(s, env)
+        } else if k == ast.ASSIGN {
+            self.ty_exprs(self.T.Kid(s, 0), env)
+            self.ty_exprs(self.T.Kid(s, 1), env)
+            self.check_assign(s, env)
+        } else if k == ast.RETURN {
+            each a in n.Kids {
+                self.ty_exprs(a, env)
+            }
+            self.check_return(s, env)
+        } else if k == ast.BLOCK {
+            self.ty_block(s, env)
+        } else if k == ast.EXPRSTMT or k == ast.DROP {
+            self.ty_exprs(self.T.Kid(s, 0), env)
+        } else if k == ast.IF {
+            self.ty_exprs(self.T.Kid(s, 0), env)
+            // `if let` binds into the THEN branch only. Pattern binds carry
+            // no type this release can work out, so they enter as unknown —
+            // which also, and importantly, SHADOWS any outer name of the same
+            // spelling instead of leaving a stale type behind.
+            var inner = self.copy_env(env)
+            self.env_bind_pattern(n.Ival, inner)
+            self.ty_stmts_in(self.T.Kid(s, 1), inner)
+            self.ty_stmt(self.T.Kid(s, 2), env)
+        } else if k == ast.EACH or k == ast.FOR {
+            let it = self.T.Kid(s, 0)
+            self.ty_exprs(it, env)
+            var inner = self.copy_env(env)
+            self.bind_loop_vars(n.Sval, it, inner, k == ast.EACH)
+            self.ty_stmts_in(self.T.Kid(s, 1), inner)
+        } else if k == ast.WHILE or k == ast.GROUP {
+            self.ty_exprs(self.T.Kid(s, 0), env)
+            self.ty_block(self.T.Kid(s, 1), env)
+        } else if k == ast.SWITCH {
+            self.ty_exprs(self.T.Kid(s, 0), env)
+            each c in self.T.Get(self.T.Kid(s, 1)).Kids {
+                each v in self.T.Get(self.T.Kid(c, 0)).Kids {
+                    self.ty_exprs(v, env)
+                }
+                var inner = self.copy_env(env)
+                self.ty_stmt_list(self.T.Kid(c, 1), inner)
+            }
+        } else if k == ast.MATCH {
+            self.ty_exprs(self.T.Kid(s, 0), env)
+            each a in self.T.Get(self.T.Kid(s, 1)).Kids {
+                var inner = self.copy_env(env)
+                self.env_bind_pattern(self.T.Get(a).Ival, inner)
+                self.ty_exprs(self.T.Kid(a, 0), inner)
+                self.ty_stmt_list(self.T.Kid(a, 1), inner)
+            }
+        } else if k == ast.SELECTSTMT {
+            each c in self.T.Get(self.T.Kid(s, 0)).Kids {
+                self.ty_exprs(self.T.Kid(c, 0), env)
+                self.ty_exprs(self.T.Kid(c, 1), env)
+                var inner = self.copy_env(env)
+                each nm in str.split(self.T.Get(c).Sval, ",") {
+                    self.env_put(inner, nm, 0)
+                }
+                self.ty_stmt_list(self.T.Kid(c, 2), inner)
+            }
+        } else if k == ast.PARSESTMT {
+            self.ty_exprs(self.T.Kid(s, 0), env)
+            each term in self.T.Get(self.T.Kid(s, 1)).Kids {
+                let tn = self.T.Get(term)
+                if tn.Ival == 0 { self.env_put(env, tn.Sval, 0) }
+            }
+        } else if k == ast.SAY {
+            each a in n.Kids {
+                self.ty_exprs(a, env)
+            }
+        } else if k == ast.THROW {
+            self.ty_exprs(self.T.Kid(s, 0), env)
+            self.ty_exprs(self.T.Kid(s, 1), env)
+        } else if k == ast.DEFERSTMT {
+            if n.Ival2 == 1 {
+                self.ty_block(self.T.Kid(s, 0), env)
+            } else {
+                self.ty_exprs(self.T.Kid(s, 0), env)
+            }
+        } else if k == ast.TRYCATCH {
+            self.ty_block(self.T.Kid(s, 0), env)
+            each cc in self.T.Get(self.T.Kid(s, 1)).Kids {
+                var inner = self.copy_env(env)
+                self.env_put(inner, self.T.Get(cc).Sval, 0)
+                self.ty_block(self.T.Kid(cc, 0), inner)
+            }
+            self.ty_block(self.T.Kid(s, 2), env)
+        }
+    }
+
+    func ty_block(mut self, b int, env map[str]int) {
+        if b == 0 { return }
+        var inner = self.copy_env(env)
+        each s in self.T.Get(b).Kids {
+            self.ty_stmt(s, inner)
+        }
+    }
+
+    // ty_stmts_in walks a BLOCK whose scope has ALREADY been opened by the
+    // caller (an `if let` branch, a loop body with its variables bound), so
+    // it must not open a second one and lose them.
+    func ty_stmts_in(mut self, b int, env mut map[str]int) {
+        if b == 0 { return }
+        each s in self.T.Get(b).Kids {
+            self.ty_stmt(s, env)
+        }
+    }
+
+    // ty_stmt_list walks a bare statement LIST — a match arm's body, a switch
+    // case's — which is not a BLOCK node.
+    func ty_stmt_list(mut self, list int, env mut map[str]int) {
+        if list == 0 { return }
+        each b in self.T.Get(list).Kids {
+            self.ty_stmt(b, env)
+        }
+    }
+
+    // ty_exprs types an expression for its SIDE EFFECTS — the checks that
+    // hang off a call or a selection — and descends into the statements
+    // hiding inside a closure or a `spawn { … }`.
+    func ty_exprs(mut self, e int, env map[str]int) {
+        if e == 0 { return }
+        let n = self.T.Get(e)
+        let k = n.Kind
+        if k == ast.CLOSURE {
+            var inner = self.copy_env(env)
+            each p in self.T.Get(self.T.Kid(e, 1)).Kids {
+                if self.T.Kind(p) != ast.PARAM { continue }
+                self.env_put(inner, self.T.Get(p).Sval, self.param_ty(p))
+            }
+            // A closure answers to its OWN result list, not the enclosing
+            // function's — chk/sig.voi refuses to judge one for exactly the
+            // same reason — so the return context is cleared for its body.
+            let saveRes = self.eRes
+            self.eRes = 0
+            each s in self.T.Get(self.T.Kid(e, 0)).Kids {
+                self.ty_stmt(s, inner)
+            }
+            self.eRes = saveRes
+            return
+        }
+        if k == ast.SPAWNEXPR and n.Ival2 == 1 {
+            self.ty_block(self.T.Kid(e, 0), env)
+            return
+        }
+        if k == ast.CALL {
+            self.check_call(e, env)
+            // The callee of `x.m(…)` is a FIELD node, and it is NOT a field
+            // access: descending into it would ask check_field whether `m` is
+            // a field of `x` and report the same missing method twice, once
+            // in each vocabulary. Only the RECEIVER is descended into.
+            let callee = self.T.Kid(e, 0)
+            if self.T.Kind(callee) == ast.FIELD {
+                self.ty_exprs(self.T.Kid(callee, 0), env)
+            } else {
+                self.ty_exprs(callee, env)
+            }
+            each a in self.T.Get(self.T.Kid(e, 1)).Kids {
+                self.ty_exprs(self.T.Kid(a, 0), env)
+            }
+            return
+        }
+        if k == ast.FIELD {
+            self.check_field(e, env)
+        }
+        if (k == ast.ARM or k == ast.IF) and n.Ival != 0 {
+            self.ty_exprs(n.Ival, env)
+        }
+        each c in n.Kids {
+            self.ty_exprs(c, env)
+        }
+    }
+
+    // ---------------------------------------------------------- the checks
+
+    // check_init judges `var x T = e` and `let x T = e`.
+    //
+    // Only a SINGLE-name binding is judged. `let a, b = divmod(…)` spreads a
+    // tuple over two names and neither one is the type of the whole value.
+    func check_init(mut self, s int, env map[str]int) {
+        let n = self.T.Get(s)
+        if n.Ival == 0 { return }               // no annotation, nothing to fit
+        let v = self.T.Kid(s, 0)
+        if v == 0 { return }                    // `var x T` — the zero value
+        if n.Kind == ast.LET and len(str.split(n.Sval, ",")) != 1 { return }
+        let want = self.Ty.FromAST(self.T, n.Ival)
+        let got = self.ty_of(v, env)
+        if not self.mismatch(want, got) { return }
+        self.warn_at(v, TYPE_MISMATCH, "`{n.Sval}` is " ||
+            self.tq(want) || ", but its initialiser is " || self.tq(got))
+    }
+
+    // check_assign judges `x = e` — and only a PLAIN assignment: `+=` and its
+    // relatives apply an operator whose result type is the operator's
+    // business, not the operand's.
+    func check_assign(mut self, s int, env map[str]int) {
+        let n = self.T.Get(s)
+        if n.Ival != tok.ASSIGN { return }
+        let lhs = self.T.Kid(s, 0)
+        let rhs = self.T.Kid(s, 1)
+        if lhs == 0 or rhs == 0 { return }
+        if self.T.Kind(lhs) != ast.IDENT and self.T.Kind(lhs) != ast.FIELD {
+            return
+        }
+        let want = self.ty_of(lhs, env)
+        let got = self.ty_of(rhs, env)
+        if not self.mismatch(want, got) { return }
+        self.warn_at(rhs, TYPE_MISMATCH, "cannot assign " || self.tq(got) ||
+            " to `" || self.lhs_text(lhs) || "`, which is " || self.tq(want))
+    }
+
+    // check_return judges `return e` against the enclosing function's single
+    // declared result. eRes is 0 inside a closure and for every multi-result
+    // signature, so both are silently skipped.
+    func check_return(mut self, s int, env map[str]int) {
+        if self.eRes == 0 { return }
+        let n = self.T.Get(s)
+        if len(n.Kids) != 1 { return }
+        let v = n.Kids[0]
+        let got = self.ty_of(v, env)
+        if not self.mismatch(self.eRes, got) { return }
+        self.warn_at(v, TYPE_MISMATCH, "`" || self.eFn || "` returns " ||
+            self.tq(self.eRes) || ", but " || self.tq(got) || " is given")
+    }
+
+    // check_call judges a call's ARGUMENTS, and — when the callee is a
+    // selection — the receiver's method as well.
+    func check_call(mut self, call int, env map[str]int) {
+        let callee = self.T.Kid(call, 0)
+        if callee == 0 { return }
+        let ck = self.T.Kind(callee)
+        if ck == ast.IDENT {
+            let nm = self.T.Get(callee).Sval
+            if nm in env { return }             // shadowed by a local binding
+            if not (nm in self.funcs) { return }
+            let fn = self.funcs[nm]
+            if self.T.NKids(self.T.Kid(fn, 3)) != 0 { return }   // generic
+            self.check_args(call, self.T.Kid(fn, 1), nm, env, [], [])
+        } else if ck == ast.FIELD {
+            self.check_method_call(call, callee, env)
+        }
+    }
+
+    // check_args pairs a call's POSITIONAL arguments with a declared
+    // parameter list. A named argument or a spread makes the pairing
+    // meaningless, and the whole call is abandoned — chk/callsite.voi already
+    // refuses to count arity in both cases, for the same reason.
+    //
+    // `names`/`args` carry a generic substitution when the receiver supplied
+    // one; they are empty for an ordinary function, which is never generic
+    // here (check_call refuses those).
+    //
+    // The names are PUSHED as a generic scope as well as substituted, and
+    // both steps are needed: without the push, `v T` interns as TK_ERROR —
+    // `T` names no declared type — and mismatch would go silent on the very
+    // parameter the substitution exists to make judgeable.
+    func check_args(mut self, call int, plist int, who str,
+                    env map[str]int, names []str, args []int) {
+        self.Ty.PushParams(names)
+        self.check_args_in(call, plist, who, env, names, args)
+        self.Ty.PopParams()
+    }
+
+    func check_args_in(mut self, call int, plist int, who str,
+                       env map[str]int, names []str, args []int) {
+        let ps = self.T.Get(plist).Kids
+        let argl = self.T.Get(self.T.Kid(call, 1)).Kids
+        var i = 0
+        while i < len(argl) {
+            let an = self.T.Get(argl[i])
+            if an.Ival == 1 { return }          // spread: unpairable
+            if an.Sval != "" { return }         // named: not positional
+            if i >= len(ps) { return }          // arity is callsite.voi's
+            let p = ps[i]
+            if self.T.Kind(p) != ast.PARAM { return }
+            if (self.T.Get(p).Ival2 & 16) != 0 { return }   // variadic tail
+            let want = self.subst_all(self.Ty.FromAST(self.T,
+                                                      self.T.Get(p).Ival),
+                                      names, args)
+            let v = self.T.Kid(argl[i], 0)
+            let got = self.ty_of(v, env)
+            if self.mismatch(want, got) {
+                self.warn_at(v, TYPE_MISMATCH, "argument " || str(i + 1) ||
+                    " of `" || who || "` is " || self.tq(want) || ", but " ||
+                    self.tq(got) || " is given")
+            }
+            i += 1
+        }
+    }
+
+    // check_method_call is the hole the task list called the biggest one
+    // left: `x.m(…)` is resolved entirely at run time, by string, against a
+    // flat table — and `vl_callm` ABORTS when it finds nothing.
+    //
+    // Judged only when the receiver's type is a nominal this program declares
+    // in full. A primitive receiver is not judged (`s.upper()` is
+    // `str.upper(s)` through the method-call duality, and the duality set has
+    // no rows in the method table); nor is a std package's type, nor a box, a
+    // slice, a map — all of which answer methods the runtime provides and no
+    // declaration lists.
+    func check_method_call(mut self, call int, callee int, env map[str]int) {
+        let mn = self.T.Get(callee).Sval
+        let recv = self.T.Kid(callee, 0)
+        let rt = self.ty_of(recv, env)
+        if rt == 0 { return }
+        let t = self.Ty.Get(rt)
+        if t.Kind != typ.TK_NAMED { return }
+        let tn = t.Name
+
+        // A TRAIT-typed receiver. The obvious rule — "only the trait's own
+        // methods" — IS WRONG, and it was written that way first and caught
+        // by review against a program that runs:
+        //
+        //     var d Describe = Point{x: 1}
+        //     say d.extra()          // an inherent method of Point
+        //
+        // vl_callm resolves by the value's DYNAMIC type name (call.c's
+        // vl_find_method), and the static annotation plays no part whatever.
+        // So every method of the concrete type is reachable through a
+        // trait-typed binding, and this checker does not know the concrete
+        // type.
+        //
+        // What is still a fact is that a name NO declaration in the whole
+        // program spells cannot be dispatched by anything — the flat table
+        // has no row to find and vl_callm aborts. That is the only thing
+        // said here.
+        //
+        // The trait's OWN methods keep their arity and argument checks: the
+        // implementation's shape is judged against the trait's by
+        // chk/traits.voi, so the trait declaration speaks for every
+        // implementor.
+        if tn in self.traits {
+            let want = self.trait_method(tn, mn)
+            if want == 0 {
+                if mn in self.mnames { return }
+                if mn == "str" or mn == "clone" { return }
+                self.warn_at(callee, TYPE_MISMATCH, "no method `" || mn ||
+                    "` is declared anywhere in this program, and `" || tn ||
+                    "` is a trait — a trait-typed value dispatches on its " ||
+                    "runtime type (§3.6)")
+                return
+            }
+            self.method_arity(call, want, tn, mn)
+            self.check_args(call, self.T.Kid(want, 1), tn || "." || mn, env,
+                            [], [])
+            return
+        }
+
+        if not (tn in self.structs) { return }
+        let k = tn || "|" || mn
+        if not (k in self.mset) {
+            // A field holding a callable is dispatched too (call.c step 4),
+            // and `str`/`clone` are answered for every value whatsoever
+            // (step 2). Neither leaves a row anywhere a checker can walk.
+            if k in self.flds { return }
+            if mn == "str" or mn == "clone" { return }
+            self.warn_at(callee, TYPE_MISMATCH, "`" || tn ||
+                "` has no method `" || mn || "` (§3.6)")
+            return
+        }
+        let m = self.mset[k]
+        self.method_arity(call, m, tn, mn)
+        let names = self.impl_params(tn, mn)
+        self.check_args(call, self.T.Kid(m, 1), tn || "." || mn, env,
+                        names, t.Args)
+    }
+
+    // method_arity is chk/callsite.voi's arity check, which only ever saw
+    // plain function calls: a method's parameter list is reached through the
+    // method table and nothing counted it.
+    func method_arity(mut self, call int, m int, tn str, mn str) {
+        var given = 0
+        each a in self.T.Get(self.T.Kid(call, 1)).Kids {
+            let an = self.T.Get(a)
+            if an.Ival == 1 { return }
+            if an.Sval != "" { return }
+            given += 1
+        }
+        var min = 0
+        var max = 0
+        each p in self.T.Get(self.T.Kid(m, 1)).Kids {
+            let pn = self.T.Get(p)
+            if (pn.Ival2 & 16) != 0 { return }      // variadic: uncountable
+            max += 1
+            if self.T.Kid(p, 0) == 0 { min += 1 }
+        }
+        if given >= min and given <= max { return }
+        var wants = str(max)
+        if min != max { wants = str(min) || " to " || str(max) }
+        self.warn_at(call, TYPE_MISMATCH, "`" || tn || "." || mn ||
+            "` takes " || wants || plural(max, " argument", " arguments") ||
+            ", but " || str(given) || plural(given, " is", " are") ||
+            " given")
+    }
+
+    // check_field judges `x.f` where `f` is not being called. A struct has
+    // exactly the fields it declares.
+    //
+    // A name the method table holds is nevertheless EXEMPT, and the reason is
+    // not that a bare method name is a method value — it is not: vl_field
+    // (runtime/src/types.c) has no method fallback and `say p.norm` aborts.
+    // The exemption stands because this walker sees `p.norm` in contexts the
+    // lowerer may yet rewrite, and losing a diagnostic on a spelling that
+    // names something real is the safe direction. The two universals go the
+    // same way.
+    func check_field(mut self, e int, env map[str]int) {
+        let fname = self.T.Get(e).Sval
+        let rt = self.ty_of(self.T.Kid(e, 0), env)
+        if rt == 0 { return }
+        let t = self.Ty.Get(rt)
+        if t.Kind != typ.TK_NAMED { return }
+        let tn = t.Name
+        if not (tn in self.structs) { return }
+        let k = tn || "|" || fname
+        if k in self.flds { return }
+        if k in self.mset { return }
+        if fname == "str" or fname == "clone" { return }
+        self.warn_at(e, TYPE_MISMATCH, "`" || tn || "` has no field `" ||
+            fname || "` (§3.4)")
+    }
+
+    // ------------------------------------------------------------ typing
+
+    // ty_of is the inference, and it is PARTIAL BY DESIGN: 0 means "no idea",
+    // and every caller treats 0 as "say nothing". Only the forms whose type
+    // is written down somewhere — a literal, an annotated binding, a
+    // declared signature, a composite literal — produce an answer.
+    func ty_of(mut self, e int, env map[str]int) int {
+        if e == 0 { return 0 }
+        let n = self.T.Get(e)
+        let k = n.Kind
+
+        if k == ast.INT   { return self.Ty.Nominal("int") }
+        if k == ast.FLOAT { return self.Ty.Nominal("float") }
+        if k == ast.DEC   { return self.Ty.Nominal("dec") }
+        if k == ast.RUNE  { return self.Ty.Nominal("rune") }
+        if k == ast.BOOL  { return self.Ty.Nominal("bool") }
+        if k == ast.STR or k == ast.INTERP { return self.Ty.Nominal("str") }
+        if k == ast.NILLIT { return 0 }
+        if k == ast.SELF  { return self.eSelf }
+        if k == ast.IDENT {
+            if n.Sval in env { return env[n.Sval] }
+            return 0
+        }
+        if k == ast.COMPOSITE { return self.Ty.FromAST(self.T, n.Ival) }
+        if k == ast.UNARY {
+            if n.Ival == tok.NOT { return self.Ty.Nominal("bool") }
+            return 0
+        }
+        if k == ast.BINARY {
+            // COMPARISONS and the logical operators are the only ones whose
+            // result type does not depend on the operands' — `a || b` is
+            // concatenation over strings AND slices, and `a + b` widens
+            // across the numeric lattice (§3.2). Answering 0 for the rest
+            // costs diagnostics and invents none.
+            if is_bool_op(n.Ival) { return self.Ty.Nominal("bool") }
+            return 0
+        }
+        if k == ast.FIELD  { return self.field_ty(e, env) }
+        if k == ast.CALL   { return self.call_ty(e, env) }
+        if k == ast.MUSTEXPR or k == ast.TRYEXPR {
+            // Both unwrap one `?T`/`T!` layer.
+            return self.unwrap(self.ty_of(self.T.Kid(e, 0), env))
+        }
+        return 0
+    }
+
+    // field_ty is the type of `x.f` when the receiver is a struct this
+    // program declares. The receiver's own type ARGUMENTS are substituted
+    // into the field's declared type, so `Stack[int]`'s `items []T` is
+    // `[]int` and not the unjudgeable `[]T`.
+    func field_ty(mut self, e int, env map[str]int) int {
+        let rt = self.ty_of(self.T.Kid(e, 0), env)
+        if rt == 0 { return 0 }
+        let t = self.Ty.Get(rt)
+        if t.Kind != typ.TK_NAMED { return 0 }
+        let k = t.Name || "|" || self.T.Get(e).Sval
+        if not (k in self.flds) { return 0 }
+        self.Ty.PushParams(self.decl_params(t.Name))
+        let ft = self.Ty.FromAST(self.T, self.T.Get(self.flds[k]).Ival)
+        self.Ty.PopParams()
+        return self.subst_all(ft, self.decl_params(t.Name), t.Args)
+    }
+
+    // call_ty is the type of a call's value: a declared function's single
+    // result, a method's single result, or a primitive CONVERSION (`int(x)`,
+    // `str(x)`), which is the one native whose result type is its own name.
+    func call_ty(mut self, e int, env map[str]int) int {
+        let callee = self.T.Kid(e, 0)
+        if callee == 0 { return 0 }
+        let ck = self.T.Kind(callee)
+        if ck == ast.IDENT {
+            let nm = self.T.Get(callee).Sval
+            if nm in env { return 0 }               // shadowed
+            if nm in self.funcs {
+                let fn = self.funcs[nm]
+                if self.T.NKids(self.T.Kid(fn, 3)) != 0 { return 0 }
+                return self.single_result(fn)
+            }
+            // A conversion, but only when nothing else claims the spelling:
+            // `str(x)` is the conversion, while a user function called `str`
+            // was already answered above and an enum VARIANT of that name
+            // must not be read as one.
+            if typ.IsPrimitive(nm) and not (nm in self.natShadow) {
+                return self.Ty.Nominal(nm)
+            }
+            return 0
+        }
+        if ck != ast.FIELD { return 0 }
+        let mn = self.T.Get(callee).Sval
+        let rt = self.ty_of(self.T.Kid(callee, 0), env)
+        if rt == 0 { return 0 }
+        let t = self.Ty.Get(rt)
+        if t.Kind != typ.TK_NAMED { return 0 }
+        if t.Name in self.traits {
+            let tm = self.trait_method(t.Name, mn)
+            if tm == 0 { return 0 }
+            return self.single_result(tm)
+        }
+        let k = t.Name || "|" || mn
+        if not (k in self.mset) { return 0 }
+        let m = self.mset[k]
+        let names = self.impl_params(t.Name, mn)
+        self.Ty.PushParams(names)
+        let r = self.single_result(m)
+        self.Ty.PopParams()
+        return self.subst_all(r, names, t.Args)
+    }
+
+    // unwrap peels one `?T` or `T!` layer, which is what `must`, `try` and a
+    // successful `else` all do. Anything else is returned untouched.
+    func unwrap(mut self, id int) int {
+        if id == 0 { return 0 }
+        let t = self.Ty.Get(id)
+        if t.Kind == typ.TK_OPTION or t.Kind == typ.TK_RESULT { return t.Elem }
+        return id
+    }
+
+    // --------------------------------------------------------- generics
+
+    // decl_params names the generic parameters of the declaration a nominal
+    // type denotes — `Stack`'s `[T]`.
+    func decl_params(self, name str) []str {
+        if name in self.structs {
+            return self.generic_names(self.T.Kid(self.structs[name], 1))
+        }
+        if name in self.enums {
+            return self.generic_names(self.T.Kid(self.enums[name], 1))
+        }
+        return []
+    }
+
+    // impl_params names the generic parameters that a METHOD's types are
+    // written in terms of, expressed as the TARGET's positional parameters.
+    //
+    // The distinction matters and is not pedantry: `impl[E] Stack[E]` writes
+    // its methods in `E` while the struct is declared `Stack[T]`, and a
+    // receiver typed `Stack[int]` supplies its argument POSITIONALLY. So the
+    // list returned here is read off the impl block's own TARGET annotation —
+    // position i of `Stack[E]` is `E` — which is exactly what pairs with
+    // position i of the receiver's `Stack[int]`.
+    //
+    // Empty when the method is not found in an impl block at all (an
+    // exception's own method, a trait default), which makes subst_all a
+    // no-op and leaves any `T` in the signature unjudgeable. That is the
+    // right answer: there is no receiver argument to put in its place.
+    func impl_params(mut self, tn str, mn str) []str {
+        let k = tn || "|" || mn
+        if k in self.implOf {
+            let d = self.implOf[k]
+            let te = self.T.Get(d).Ival
+            var out = []
+            if te == 0 or self.T.Kind(te) != ast.TNAMED { return out }
+            let mine = self.generic_names(self.T.Kid(d, 1))
+            each a in self.T.Get(te).Kids {
+                var nm = ""
+                if self.T.Kind(a) == ast.TNAMED {
+                    let cand = self.T.Get(a).Sval
+                    each g in mine {
+                        if g == cand { nm = cand }
+                    }
+                }
+                out.append(nm)
+            }
+            return out
+        }
+        return []
+    }
+
+    // subst_all replaces each named parameter by the receiver's type argument
+    // at the same position. A name that is "" (a target position written with
+    // a concrete type, as in `impl Stack[int]`) substitutes nothing.
+    func subst_all(mut self, id int, names []str, args []int) int {
+        if id == 0 { return 0 }
+        var out = id
+        var i = 0
+        while i < len(names) and i < len(args) {
+            if names[i] != "" and args[i] != 0 {
+                out = self.Ty.Subst(out, names[i], args[i])
+            }
+            i += 1
+        }
+        return out
+    }
+
+    // trait_method finds a trait's declaration of `mn`, or 0.
+    func trait_method(self, tn str, mn str) int {
+        if not (tn in self.traits) { return 0 }
+        each m in self.T.Get(self.T.Kid(self.traits[tn], 0)).Kids {
+            if self.T.Kind(m) != ast.FUNC { continue }
+            if self.T.Get(m).Sval == mn { return m }
+        }
+        return 0
+    }
+
+    // ------------------------------------------------------- the verdict
+
+    // mismatch is the ONE place a type is judged wrong, and it is a positive
+    // test for a KNOWN-BAD pair — never the negation of a compatibility
+    // relation. See this file's header for why the difference is the whole
+    // safety argument.
+    //
+    // It answers true only when both sides are SOLID: a concrete nominal
+    // type, or a slice/map/set of one, with no unknown, no error, no generic
+    // parameter and no trait anywhere inside. Everything else is false, which
+    // is to say silent.
+    func mismatch(mut self, want int, got int) bool {
+        if want == 0 or got == 0 { return false }
+        if self.Ty.HasError(want) or self.Ty.HasError(got) { return false }
+        if self.Ty.HasParam(want) or self.Ty.HasParam(got) { return false }
+        if want == got { return false }
+
+        let w = self.Ty.Get(want)
+        let g = self.Ty.Get(got)
+
+        // A borrow is the same value, lent. `&T` and `T` fit each other's
+        // holes at every site this file checks (§6.1 governs WRITING through
+        // one, which is chk/bind.voi's business).
+        if w.Kind == typ.TK_BORROW { return self.mismatch(w.Elem, got) }
+        if g.Kind == typ.TK_BORROW { return self.mismatch(want, g.Elem) }
+
+        // `?T` accepts a T and accepts nil; `T!` accepts a T and accepts a
+        // thrown error. Neither is a sum type with constructors, so the
+        // payload is the only thing there is to compare.
+        if w.Kind == typ.TK_OPTION or w.Kind == typ.TK_RESULT {
+            return self.mismatch(w.Elem, got)
+        }
+        // The other direction is NOT symmetric — putting a `?int` where an
+        // `int` is wanted is a real error — but recognising it needs the
+        // nil-exclusivity analysis that is still deferred, and `try`/`must`/
+        // `else` are already unwrapped by ty_of. Silent.
+        if g.Kind == typ.TK_OPTION or g.Kind == typ.TK_RESULT { return false }
+
+        // A box is a handle, not the value: `shared[T]` answers `T`'s methods
+        // through the runtime and is written where a `T` is wanted all over
+        // the corpus.
+        if w.Kind == typ.TK_BOX or g.Kind == typ.TK_BOX { return false }
+
+        if w.Kind == typ.TK_SLICE and g.Kind == typ.TK_SLICE {
+            // Extents are not compared: `[3]int` and `[]int` are the same
+            // element type and the lowerer treats them alike.
+            return self.mismatch(w.Elem, g.Elem)
+        }
+        if (w.Kind == typ.TK_SET and g.Kind == typ.TK_SET) or
+           (w.Kind == typ.TK_CHAN and g.Kind == typ.TK_CHAN) {
+            return self.mismatch(w.Elem, g.Elem)
+        }
+        if w.Kind == typ.TK_MAP and g.Kind == typ.TK_MAP {
+            if self.mismatch(w.Key, g.Key) { return true }
+            return self.mismatch(w.Elem, g.Elem)
+        }
+
+        if w.Kind != typ.TK_NAMED or g.Kind != typ.TK_NAMED {
+            // A structural type against something else — a function type, a
+            // tuple, a slice where a nominal is wanted. Every one of those IS
+            // a real mismatch, and not one of them can be produced by ty_of
+            // with enough confidence to say so. Silent.
+            return false
+        }
+        return self.nominal_mismatch(w.Name, g.Name)
+    }
+
+    // nominal_mismatch judges two names. Both must be SOLID — a primitive or
+    // a type this program declares whole — before a difference between them
+    // is a fact rather than an admission of ignorance.
+    func nominal_mismatch(mut self, wn str, gn str) bool {
+        if wn == gn { return false }
+        // `unit` is the empty type: it is what a function with no result
+        // "returns", and nothing is wrong with any value flowing into it.
+        if wn == "unit" or gn == "unit" { return false }
+        // The numeric lattice (§3.2) widens across the integer and float
+        // families and the literals are untyped, so any numeric fits any
+        // numeric hole here. Narrowing is chk/checks.voi's business and it
+        // judges the LITERAL, which is where the information is.
+        if is_numeric(wn) and is_numeric(gn) { return false }
+
+        // A trait-typed hole takes any implementor, and the answer is a fact
+        // only when this program can see the whole method set — judgeable is
+        // chk/traits.voi's, unchanged and deliberately not re-derived.
+        if wn in self.traits {
+            if not self.judgeable(gn) { return false }
+            return self.missing_for(gn, wn) != ""
+        }
+        // A trait on the VALUE side dispatches dynamically: its runtime type
+        // is not written anywhere and may well be the one wanted.
+        if gn in self.traits { return false }
+
+        if not self.solid(wn) or not self.solid(gn) { return false }
+        return true
+    }
+
+    // solid reports whether a nominal name is one this checker knows the
+    // whole story about. A primitive, a struct, an enum or a `type`
+    // declaration qualifies. An EXCEPTION does not: `error` and the
+    // predeclared exceptions are related by a subtyping the checker does not
+    // model, and `throws IOError` catching an `error` is ordinary code. Nor
+    // does a std package's type, which typ.Resolves waves through precisely
+    // because it has no declaration to compare against.
+    func solid(self, name str) bool {
+        if typ.IsPrimitive(name) { return true }
+        if name in self.excs { return false }
+        if name in self.structs { return true }
+        if name in self.enums { return true }
+        return false
+    }
+
+    // tq renders a type for a diagnostic, in backticks.
+    func tq(self, id int) str {
+        return "`" || self.Ty.Text(id) || "`"
+    }
+
+    // ------------------------------------------------------------ the env
+
+    func copy_env(self, env map[str]int) map[str]int {
+        var out = make(map[str]int)
+        each k in keys(env) {
+            out[k] = env[k]
+        }
+        return out
+    }
+
+    // env_put records a name's type, ignoring the ones that are not bindings:
+    // the blank `_`, and the empty half of a "bind,bindok" pair. A name whose
+    // type is unknown is entered ANYWAY, with 0 — that is what makes an inner
+    // binding SHADOW an outer one instead of leaving its type behind.
+    func env_put(self, env mut map[str]int, name str, id int) {
+        if name == "" or name == "_" { return }
+        env[name] = id
+    }
+
+    // env_bind_stmt enters the names a LET or VAR introduces, with the type
+    // its annotation gives or the one its value can be inferred to have.
+    func env_bind_stmt(mut self, s int, env mut map[str]int) {
+        if s == 0 { return }
+        let n = self.T.Get(s)
+        if n.Kind != ast.LET and n.Kind != ast.VAR { return }
+        var id = 0
+        if n.Ival != 0 {
+            id = self.Ty.FromAST(self.T, n.Ival)
+        } else {
+            id = self.ty_of(self.T.Kid(s, 0), env)
+        }
+        if n.Kind == ast.VAR {
+            self.env_put(env, n.Sval, id)
+            return
+        }
+        let names = str.split(n.Sval, ",")
+        if len(names) != 1 {
+            // A destructuring `let`: the value is a tuple and no name has its
+            // type. They are entered as unknown so that they still SHADOW.
+            each nm in names {
+                self.env_put(env, nm, 0)
+            }
+            return
+        }
+        self.env_put(env, names[0], id)
+    }
+
+    // env_bind_pattern enters a pattern's binds as unknown. A variant's
+    // payload type is decidable — it is a VARIANTDEC's field list — but the
+    // enum the pattern belongs to is not known without the subject's type,
+    // and guessing it from the global variant namespace would be exactly the
+    // kind of confident wrong answer this file refuses to give.
+    func env_bind_pattern(mut self, p int, env mut map[str]int) {
+        if p == 0 { return }
+        let n = self.T.Get(p)
+        if n.Kind == ast.PBIND {
+            self.env_put(env, n.Sval, 0)
+            return
+        }
+        each sub in n.Kids {
+            self.env_bind_pattern(sub, env)
+        }
+    }
+
+    // bind_loop_vars enters a loop's variables, and the SHAPE of an `each`
+    // is per-iterable rather than uniform — this was checked against the
+    // runtime rather than assumed, because guessing it wrong is a false
+    // positive on every use of the variable:
+    //
+    //     each x in xs        a slice yields ELEMENTS
+    //     each i, x in xs     … and an index alongside them
+    //     each v in m         a map yields VALUES, not keys
+    //     each k, v in m      … and the key alongside them
+    //     each e in s         a set yields its elements
+    //
+    // Anything else — a range, a channel, a reader, a string, a struct with
+    // `next()` — binds unknown. Binding a name to 0 still SHADOWS an outer
+    // name of the same spelling, which is the point of doing it at all.
+    func bind_loop_vars(mut self, sval str, iter int, env mut map[str]int,
+                        is_each bool) {
+        // Sval is "a,b|label" and the parser writes the comma ALWAYS, so a
+        // one-variable `each` arrives as "q," — the empty half has to be
+        // dropped before the count means anything. Reading it as two names
+        // bound `q` to the INDEX of a slice instead of its element, and every
+        // use of `q` was then reported against the wrong type. (chk/bind.voi
+        // and chk/callsite.voi both split the same string and are unaffected:
+        // they enter every half into a set, and "" is ignored on the way in.)
+        var names = []
+        each part in str.split(str.split(sval, "|")[0], ",") {
+            if part != "" { names.append(part) }
+        }
+        var et = 0      // the value bound by the LAST name
+        var ft = 0      // the index or key bound by the first of two
+        if is_each and iter != 0 {
+            let it = self.ty_of(iter, env)
+            if it != 0 {
+                let t = self.Ty.Get(it)
+                if t.Kind == typ.TK_SLICE {
+                    et = t.Elem
+                    ft = self.Ty.Nominal("int")
+                } else if t.Kind == typ.TK_MAP {
+                    et = t.Elem
+                    ft = t.Key
+                } else if t.Kind == typ.TK_SET or t.Kind == typ.TK_CHAN {
+                    et = t.Elem
+                }
+            }
+        }
+        if len(names) == 1 {
+            self.env_put(env, names[0], et)
+            return
+        }
+        var i = 0
+        while i < len(names) {
+            var id = 0
+            if i == 0 { id = ft }
+            if i == len(names) - 1 { id = et }
+            self.env_put(env, names[i], id)
+            i += 1
+        }
+    }
+
+}
+
+// is_bool_op reports whether a binary operator's result is a `bool`
+// regardless of its operands.
+func is_bool_op(op int) bool {
+    return op == tok.LT or op == tok.LE or op == tok.GT or op == tok.GE or
+           op == tok.EQ or op == tok.NE or op == tok.AND or op == tok.OR or
+           op == tok.IN
+}
+
+// ---------------------------------------------------------------------------
+// WHAT IS STILL NOT JUDGED, and what a promotion to a hard error would need.
+//
+// The sweep behind this file is recorded in TESTING.md: 156 programs, one
+// report, and that one is a negative fixture whose program genuinely cannot
+// run. The code is a WARNING and DEFAULTS OFF all the same, and the reason is
+// not the measurement — it is that everything below is a place where the
+// inference is silent rather than right, and a check that has never been
+// wrong in a corpus it was written against has not yet been tested.
+//
+//   · `?T` NIL-EXCLUSIVITY. `var x int = maybe()` where maybe returns `?int`
+//     is a real error and is not reported: mismatch unwraps the option on the
+//     VALUE side and says nothing. Reporting it needs to know where a `?T`
+//     has been narrowed — `if x != nil`, `match`, `else`, `must` — and a
+//     version without that narrowing would reject the ordinary way of using
+//     an option.
+//   · MULTIPLE RESULTS. A function declaring two results is skipped entirely
+//     (single_result answers 0), so `let a, b = f()` types neither name and
+//     `return f()` forwarding a tuple is not judged. It needs a tuple type
+//     flowing through the destructuring, which nothing here builds.
+//   · ENUM VARIANT PAYLOADS. A pattern's binds enter as unknown. The payload
+//     types are written down — a VARIANTDEC's field list — but the enum they
+//     belong to is only knowable from the subject's type, and the variant
+//     namespace is global, so guessing from the name would be a confident
+//     wrong answer.
+//   · ENUM and EXCEPTION receivers. Method existence is judged for STRUCTS
+//     only. An exception answers `message` and `trace` from err_method with
+//     no row anywhere, and the subtyping between `error` and the predeclared
+//     exceptions is not modelled (see solid).
+//   · COLLECTION LITERALS. `[]`, `[1, 2]`, `make(map[…])` and `set([…])` all
+//     type as unknown; only an annotation gives a collection a type here.
+//   · OPERATORS. Only the comparisons and the logical operators are typed.
+//     `a || b` concatenates strings AND slices and `a + b` widens across the
+//     numeric lattice, and neither is worth guessing at.
+//   · CLOSURE and FUNCTION-TYPED values. A `fn(int) int` in a hole expecting
+//     something else is a real mismatch that mismatch declines to make (see
+//     its last arm), because ty_of never produces a TK_FN to compare.
+//
+// A promotion to SEV_ERROR wants two things this release does not have: a
+// release's worth of field exposure with the warning on, and the option
+// narrowing above — because the first thing anyone will do with `--strict` is
+// write `?T` code, and being silent there is far better than being wrong.

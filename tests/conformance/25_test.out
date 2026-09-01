@@ -1,0 +1,37 @@
+-- eq and ne --
+FAIL demo/int wrong: expected 3, got 2
+FAIL demo/str wrong: expected "ab", got "ab "
+FAIL demo/list wrong: expected [1, 3], got [1, 2]
+FAIL demo/differs wrong: expected anything but "a"
+-- ok and not_ok --
+FAIL demo/true wrong: expected true, got false
+FAIL demo/false wrong: expected false, got true
+-- near, for float and for dec --
+FAIL demo/float wrong: expected 2 within 0.25, got 1 (off by 1)
+FAIL demo/dec wrong: expected 1.5 within 0.05, got 1.1 (off by 0.4)
+-- raises --
+message: Boom{why: "on purpose"}
+FAIL demo/raises wrong: expected a throw, none happened (the call returned 41)
+FAIL demo/message wrong: expected a throw whose message contains "banana", got "Boom{why: \"on purpose\"}"
+FAIL demo/nothing thrown: expected a throw whose message contains "banana", none happened
+-- fail --
+FAIL demo/outright: no assertion fits this one
+-- a table of finished rows --
+FAIL demo/len/wrong: expected 9, got 2
+-- a table applied to a function --
+FAIL demo/upper/wrong: expected "ab", got "AB"
+-- verbose prints the passes too --
+ok   demo/seen
+-- merge folds another suite in, names intact --
+FAIL other/disagrees: expected "y", got "x"
+-- what was collected --
+failures: 15
+first: FAIL demo/int wrong: expected 3, got 2
+summary: demo: 16 passed, 15 failed
+demo: 16 passed, 15 failed
+report: false
+-- repr --
+" x " 3 [1, "a"] nil
+-- done on a green suite --
+green: 1 passed, 0 failed
+still here

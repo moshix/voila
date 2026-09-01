@@ -1,0 +1,1 @@
+abort: str.trim_left takes at most 1 argument, but 2 are given

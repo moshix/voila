@@ -1,0 +1,41 @@
+// unreachable — a statement written after the four keywords that flatly leave
+// a block. One firing per keyword; the constructs that must stay SILENT are
+// in reachable.voi beside this file.
+use "std/fmt"
+
+exception Boom {
+    why str
+}
+
+func after_return() {
+    return
+    say "never"
+}
+
+func after_throw() throws Boom {
+    throw Boom{why: "x"}
+    say "never"
+}
+
+func after_break() {
+    each x in [1, 2] {
+        break
+        say "never"
+    }
+}
+
+func after_continue() {
+    var i = 0
+    while i < 2 {
+        i += 1
+        continue
+        say "never"
+    }
+}
+
+func main() {
+    after_return()
+    after_break()
+    after_continue()
+    fmt.printf("done\n")
+}

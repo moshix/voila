@@ -1,0 +1,80 @@
+-- the four rules --
+plain
+    ["a", "b", "c"]
+    ["d", "e", "f"]
+quoted comma
+    ["a", "b,c", "d"]
+escaped quote
+    ["a", "he said \"hi\"", "z"]
+newline in a quoted field
+    ["a", "line1\nline2", "c"]
+    ["next", "row", "here"]
+-- shapes a real file has --
+ragged
+    ["a", "b", "c"]
+    ["d"]
+    ["e", "f"]
+blank lines carry no record
+    ["a", "b"]
+    ["c", "d"]
+crlf
+    ["a", "b"]
+    ["c", "d"]
+crlf blank line
+    ["a", "b"]
+    ["c", "d"]
+no trailing newline
+    ["a", "b"]
+empty quoted field
+    ["", "x"]
+trailing empty field
+    ["a", ""]
+empty document
+newlines only
+-- documented leniency --
+lone cr is data
+    ["a\rb", "c"]
+text after the closing quote
+    ["abc", "d"]
+bare quote
+    ["a\"b", "c"]
+-- the one refusal --
+csv: unterminated quoted field after record 0
+-- encode quotes only what needs it --
+["a,\"b,c\"\n\"he said \"\"hi\"\"\",\"x\ny\"\n\" pad \",z\n,plain\n"]
+-- round trip: encode then decode --
+back
+    ["a", "b,c"]
+    ["he said \"hi\"", "x\ny"]
+    [" pad ", "z"]
+    ["", "plain"]
+identical: true
+-- streaming: each rec in a Reader --
+3 ["id", "note", "qty"]
+3 ["1", "a,b", "7"]
+3 ["2", "multi\nline\nfield", "8"]
+3 ["3", "say \"hi\"", "9"]
+2 ["4", "short"]
+records: 5
+-- the same file through all() --
+true
+-- next() by hand, and the end --
+["id", "note", "qty"]
+["1", "a,b", "7"]
+["2", "multi\nline\nfield", "8"]
+["3", "say \"hi\"", "9"]
+["4", "short"]
+past the end: nil
+-- a malformed file is refused at the record, not at the end --
+got: ["ok", "row"]
+caught: csv: unterminated quoted field after record 1
+-- crlf on the way out --
+["a,b\r\nc,d\r\n"]
+read back
+    ["a", "b"]
+    ["c", "d"]
+-- another delimiter --
+["a\tb,c\n\"d\te\"\tf\n"]
+read back
+    ["a", "b,c"]
+    ["d\te", "f"]

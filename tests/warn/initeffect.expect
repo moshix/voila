@@ -1,0 +1,2 @@
+warning[unused-import]: unused import `plain`
+!unused import `boot`

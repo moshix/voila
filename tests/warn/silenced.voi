@@ -1,0 +1,11 @@
+// -Wno-<code> must silence a warning that would otherwise fire, and must not
+// change the exit status. Both codes are turned off here (see silenced.flags)
+// and this file gives each of them something to find.
+use "std/fmt"
+use "std/time"
+
+func main() {
+    fmt.printf("quiet\n")
+    return
+    say "never"
+}

@@ -1,0 +1,14 @@
+// Every type name in a declaration or an annotation must resolve. Nothing
+// used to look, so a misspelling lowered to a zero value of a type that did
+// not exist and the mistake surfaced somewhere else entirely — or nowhere.
+struct Holder { items []Widgit }
+
+func take(b Bufer) map[str]Gadgit {
+    var x Doohickey
+    say x
+    return make(map[str]Gadgit)
+}
+
+func main() {
+    say take(Bufer{})
+}

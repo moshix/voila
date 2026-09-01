@@ -1,0 +1,19 @@
+// The right method NAME with the wrong shape: `mut self` where the trait says
+// `self`, one parameter too many, one result too many. The runtime would have
+// dispatched to it regardless — the flat method table matches on the name.
+trait Show {
+    func show(self) str
+}
+
+struct P { x int }
+
+impl Show for P {
+    func show(mut self, verbose bool) (str, int) {
+        return ("p", self.x)
+    }
+}
+
+func main() {
+    var p = P{x: 1}
+    say p.show(true)
+}

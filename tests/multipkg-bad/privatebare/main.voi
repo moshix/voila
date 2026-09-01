@@ -1,0 +1,8 @@
+package main
+
+// `secret` is package-private. `one.secret` is refused as private — and the
+// BARE spelling must be refused too, or short-name resolution would be a way
+// around package privacy rather than a convenience on top of it.
+use "bad/one"
+
+func main() { say secret }

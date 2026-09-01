@@ -6,7 +6,7 @@
 
 ### A Programming Guide for the New User
 
-**Program Number 5799-VLA · Version 0.4.2**
+**Program Number 5799-VLA · Version 0.5.0**
 
 *First Edition*
 
@@ -105,7 +105,7 @@ $ ./build.sh
 ==> bootstrap: prebuilt binary  bin/voila  (0.4.1)
   ✓ fixpoint: C(voilac-1) == C(voilac-2)
   ✓ optimized fixpoint: C(-O3, gen1) == C(-O3, gen2)
-  ✓ ./voila  ->  bin/voila-0.4.2
+  ✓ ./voila  ->  bin/voila-0.5.0
 ==> done — ./voila is ready
 ```
 
@@ -130,7 +130,7 @@ What just happened, on both paths: a working compiler compiled the real
 compiler from its Voilà source, and *that* compiler compiled itself once more.
 The two generations emitted byte-identical C — the classical proof that a
 self-hosted compiler is not quietly mistranslating itself. The binary is named
-for its version — `bin/voila-0.4.2` — with `bin/voila` and `./voila` as
+for its version — `bin/voila-0.5.0` — with `bin/voila` and `./voila` as
 symlinks to it. Put `voila` on your PATH, or call it as `./voila`.
 
 ## 1.3 The First Program
@@ -384,8 +384,8 @@ COUNT = 2
 ```
 
 `use "std/str"` makes the standard string library available. The libraries
-are `fmt`, `str`, `os`, `math`, `time`, `json`, `log`, `conv`, `sort`,
-`rand` and `uuid`.
+are `fmt`, `str`, `os`, `io`, `net`, `math`, `time`, `json`, `csv`, `log`,
+`conv`, `sort`, `path`, `sync`, `test`, `crypto`, `rand` and `uuid`.
 
 ---
 
@@ -884,7 +884,6 @@ select {
 `samples/guide/g07_tasks.voi`:
 
 ```voila
-use "std/fmt"
 use "std/time"
 
 func worker(id int, jobs chan[int], results chan[int]) {
@@ -1333,9 +1332,12 @@ N =  8   SOLUTIONS =   92
 - `use "pkg" *` and `use "pkg" { name }` are *not* available for your own
   packages. Write `board.New`, so a reader can always see where a name comes
   from.
-- Enumeration **variant** names and **trait** names are global across the
-  program, because a pattern (`Deposit(a)`) and a trait bound have no
-  qualified form. Two packages may not both define a variant called `Empty`.
+- Enumeration **variant** names and **trait** names are qualified by their
+  package like everything else — `ledger.Deposit`, `ledger.Named` — so two
+  packages may both define an `Empty`. They are the only names you may still
+  write *bare*: an unqualified one is looked for in the current package and
+  then in exactly one import, and if two imports offer it the compiler asks you
+  to say which.
 
 ---
 

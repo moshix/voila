@@ -1,0 +1,144 @@
+// 15_io.voi — std/io: buffered readers and writers, the standard handles,
+// and lazy iteration (§13). Four things are pinned here because each has a
+// silent failure mode.
+//
+//   1. A reader RETAINS the file it came from. `io.reader(try os.open(p))`
+//      throws the O_FILE away the moment the expression finishes; if the
+//      reader did not hold it, obj_free would fclose() the stream and every
+//      read below would be a use-after-free that happens to work on a good
+//      day. leftover_reader() is that expression, in a function that returns.
+//   2. read_line's "" means END OF STREAM and nothing else. A blank line
+//      reads as "\n", so the two can never be confused — the same convention
+//      std/net's Conn.read_line has always used.
+//   3. os.stdin is ONE reader for the whole process. The backend re-runs
+//      vl_lookup_value at every use site, so a fresh reader per `os.stdin`
+//      would throw away the 8 KiB the previous one read ahead: the `each`
+//      below would see end-of-stream instead of the rest of the input.
+//   4. `each line in os.stdin` STREAMS. It is a runtime-only protocol —
+//      `each` lowers to bare ITER/ITNEXT with no typing — and a user type
+//      joins it by defining `next(mut self) ?T`.
+//
+// The scratch file is keyed on the pid and its name is never printed, so the
+// golden is byte-identical at every -O level.
+package main
+
+use "std/str"
+
+func tmp() str {
+    return "/tmp/voila-io-" || str(os.pid()) || ".dat"
+}
+
+// leftover_reader makes a reader and drops the file value that fed it. The
+// caller reads from what comes back — see note 1 above.
+func leftover_reader(path str) io.Reader throws IOError {
+    return try io.reader(try os.open(path))
+}
+
+// Counter is a user type that joins the iteration protocol by defining
+// `next`. Nil ends the loop; nothing else is required of it.
+struct Counter {
+    n int
+}
+
+impl Counter {
+    func next(mut self) ?int {
+        if self.n <= 0 { return nil }
+        self.n -= 1
+        return self.n + 1
+    }
+}
+
+func main() {
+    let path = tmp()
+    let out = must os.create(path)
+    out.write("alpha\nbeta\n\ngamma\n")
+    out.close()
+
+    say "-- a reader outliving the file it came from --"
+    var r = must leftover_reader(path)
+    say r.read_line() == "alpha\n"
+    say r.read_line() == "beta\n"
+    say r.read_line() == "\n"          // a blank line, not the end
+    say r.read_line() == "gamma\n"
+    say r.read_line() == ""            // THIS is the end
+    say "at_eof:", r.at_eof()
+    say "read_byte past the end:", r.read_byte()
+    r.close()
+    r.close()                          // idempotent
+    match r.read_line() {
+        Ok(s)  => say "unexpected read after close:", s
+        Err(e) => say "after close:", e.message()
+    }
+
+    say "-- peek, read, read_all, records --"
+    var p = must io.reader(must os.open(path))
+    say "peek:", p.peek(5)
+    say "peek again:", p.peek(5)       // peek does not consume
+    say "read:", p.read(5)
+    say "byte:", p.read_byte()
+    say "rest:", str.replace(p.read_all(), "\n", "|")
+    p.close()
+
+    var q = must io.buffered(must os.open(path), 64)
+    say "records:", q.records(6)
+    q.close()
+
+    say "-- io.copy and io.read_all --"
+    let n = must io.copy(os.stdout, must os.open(path))
+    say "copied:", n
+    say "read_all:", str.replace(must io.read_all(must os.open(path)),
+                                 "\n", "|")
+
+    say "-- the unifier --"
+    let same = must io.reader(os.stdin)
+    say "io.reader is idempotent:", same.name() == os.stdin.name()
+    match io.reader(42) {
+        Ok(x)  => say "unexpected reader:", x
+        Err(e) => say "bad source:", e.message()
+    }
+    match io.writer("nope") {
+        Ok(x)  => say "unexpected writer:", x
+        Err(e) => say "bad sink:", e.message()
+    }
+
+    say "-- writers --"
+    os.stdout.write("written", "with", "spaces")
+    os.stdout.writeln()
+    os.stdout.write_all("exact bytes, no newline of its own\n")
+    os.stdout.flush()
+    let sink = io.discard()
+    sink.writeln("this line goes nowhere")
+    sink.close()
+    say "discard swallowed it:", true
+
+    say "-- io.pipe --"
+    let pr, pw = must io.pipe()
+    pw.write_all("through the pipe\n")
+    pw.close()
+    say pr.read_line() == "through the pipe\n"
+    say "pipe at eof:", pr.at_eof()
+    pr.close()
+
+    say "-- a user type that defines next(mut self) ?T --"
+    var c = Counter{n: 3}
+    each v in c {
+        say "count:", v
+    }
+
+    // os.stdin is read LAST, and in one place: the singleton's position is
+    // carried from the read_line below into the `each` that follows it.
+    say "-- os.stdin --"
+    say "isatty:", os.isatty(os.stdin)
+    say "first:", os.stdin.read_line() == "one\n"
+    each line in os.stdin {
+        say "each:", line, "(len", len(line) || ")"
+    }
+    say "at_eof:", os.stdin.at_eof()
+    say "past the end:", os.stdin.read_line() == ""
+    match os.input("prompt> ") {
+        Ok(s)  => say "unexpected input:", s
+        Err(e) => say "input at end:", e.message()
+    }
+
+    os.remove(path)
+}

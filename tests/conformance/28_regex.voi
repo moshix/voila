@@ -1,0 +1,118 @@
+// 28_regex.voi — std/regex: a linear-time engine, and what that buys.
+//
+// The specification (§13.4) promises RE2's guarantee — linear time, no
+// catastrophic backtracking — so the engine is a Pike VM (a thread-list
+// simulation) rather than the recursive backtracker that is easier to write.
+// The last case here is that promise made testable: `^(a+)+$` against thirty
+// `a`s with a failing suffix is the classic bomb, 2^30 paths for a
+// backtracker, and it must return at once.
+//
+// UTF-8: matching is byte-oriented, but `.` and a NEGATED class each consume
+// a WHOLE character, so a capture can never be cut through the middle of one
+// and hand back a string that is not valid UTF-8. A positive class is
+// ASCII-oriented — brackets cannot spell a multi-byte character.
+//
+// Not supported, deliberately: backreferences and lookaround. Neither is
+// expressible in a finite automaton, and adding them is exactly how a
+// linear-time engine quietly becomes exponential.
+package main
+
+use "std/fmt"
+use "std/regex"
+use "std/str"
+
+func show[T](label str, v T) { fmt.printf("%-22s %v\n", label, v) }
+
+func main() {
+    // ---- anchors and the three simple quantifiers
+    show("^a+b$ / aaab", regex.matches("^a+b$", "aaab"))
+    show("^a+b$ / aaac", regex.matches("^a+b$", "aaac"))
+    show("^a*$ / (empty)", regex.matches("^a*$", ""))
+    show("^a?b$ / b", regex.matches("^a?b$", "b"))
+
+    // ---- greedy against non-greedy: the same pattern, one `?` apart
+    show("<(.+)>", regex.find("<(.+)>", "<a><b>"))
+    show("<(.+?)>", regex.find("<(.+?)>", "<a><b>"))
+
+    // ---- counted repetition, both bounds and the non-greedy form
+    show("^a\{3\}$ / aaa", regex.matches("^a\{3\}$", "aaa"))
+    show("^a\{3\}$ / aa", regex.matches("^a\{3\}$", "aa"))
+    show("^a\{2,4\}$ / aaa", regex.matches("^a\{2,4\}$", "aaa"))
+    show("^a\{2,4\}$ / aaaaa", regex.matches("^a\{2,4\}$", "aaaaa"))
+    show("a\{2,\}? / aaaa", regex.find("(a\{2,\}?)", "aaaa"))
+
+    // ---- captures, including a group that takes no part in the match
+    show("(\\d+)-(\\d+)", regex.find("(\\d+)-(\\d+)", "x 12-34 y"))
+    show("(a)|(b) / b", regex.find("(a)|(b)", "b"))
+
+    // ---- alternation prefers its LEFT branch at the same start position
+    show("(ab|abc)", regex.find("(ab|abc)", "abc"))
+
+    // ---- classes: a range, a negation, and the escape families
+    show("[a-z]+", regex.find_all("[a-z]+", "one TWO three"))
+    show("[^aeiou]+", regex.find("[^aeiou]+", "aeiouXYZaeiou"))
+    show("\\w+@\\w+", regex.matches("\\w+@\\w+", "joe@corp"))
+    show("\\s", regex.matches("\\s", "a b"))
+    show("\\D+", regex.find("\\D+", "123abc456"))
+
+    // ---- find_all must advance past an EMPTY match or it never ends
+    show("a* / bab", regex.find_all("a*", "bab"))
+
+    // ---- replace, with capture references and a literal dollar
+    show("replace $2/$1", regex.replace("(\\w+)@(\\w+)", "joe@corp", "$2/$1"))
+    show("replace $$", regex.replace("x", "x", "$$"))
+    show("split", regex.split(",\\s*", "a, b,c"))
+
+    // ---- a compiled pattern is reusable, and knows its own source
+    let re = must regex.compile("^[0-9]+$")
+    show("compiled / 42", re.matches("42"))
+    show("compiled / 4x", re.matches("4x"))
+    show("source", re.source())
+
+    // ---- UTF-8: whole characters, never half of one
+    show("utf8 .", regex.find_all(".", "héllo"))
+    show("utf8 h(.)l", regex.find("h(.)l", "héllo"))
+    show("utf8 [^l]", regex.find_all("[^l]", "héllo"))
+    show("utf8 literal", regex.matches("é", "héllo"))
+
+    // ---- a bad pattern is an error VALUE, catchable, never a crash
+    each bad in ["(unbalanced", "trailing\\", "a\{2,1\}", "[z-a]", "*nothing",
+                 "back\\1ref", "(?=look)"] {
+        match regex.compile(bad) {
+            Ok(r)  => fmt.printf("%-22s COMPILED (bug)\n", bad)
+            Err(e) => fmt.printf("%-22s %s\n", bad, e.message())
+        }
+    }
+
+    // ---- REGRESSIONS. Every one of these shipped broken and was found by
+    // review, not by this file, so each is pinned by input rather than by
+    // description.
+    //
+    // The parser's node arena used to be a growing array: it copied itself
+    // into a larger allocation and freed the old one, while the parser still
+    // held raw pointers into it. Every pattern over 64 nodes was compiled
+    // from freed memory, and a 33-character literal matched only 32.
+    let long_lit = str.repeat("a", 40)
+    show("40-node literal", regex.find(long_lit, long_lit))
+
+    // addthread marked a pc in the same list it was about to un-mark, so
+    // epsilon instructions were never de-duplicated: a quantified
+    // empty-matching body recursed until the C stack was gone. All of these
+    // were SIGSEGV.
+    each p in ["(a*)*", "(a?)+", "(\\s*)*", "(a|b|)*", "()*", "^*", "$*"] {
+        fmt.printf("%-10s %v\n", p, must regex.compile(p).matches("aab"))
+    }
+
+    // A letter escape that names nothing is refused rather than silently
+    // becoming the letter: \b matching a literal `b` is quietly wrong, which
+    // is worse than loudly unsupported.
+    match regex.compile("\\bfoo") {
+        Ok(r)  => say "\\b accepted (bug)"
+        Err(e) => say "\\b refused"
+    }
+
+    // ---- the promise: this returns at once, where a backtracker never does
+    let bomb = str.repeat("a", 30)
+    show("bomb matches", regex.matches("^(a+)+$", bomb))
+    show("bomb fails", regex.matches("^(a+)+$", bomb || "!"))
+}

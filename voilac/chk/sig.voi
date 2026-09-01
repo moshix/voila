@@ -1,0 +1,524 @@
+// chk/sig.voi — declarations and constructions, judged for well-formedness.
+//
+// Four checks, all of them about things the pipeline used to discover much
+// later or not at all:
+//
+//  1. Every type NAME in a declaration or annotation must resolve. `var b
+//     Bufer` used to lower to a zero value of a type nobody had heard of.
+//     Package typ owns the classification — FromAST is total and yields
+//     TK_ERROR — and this file owns saying so, at the right node.
+//
+//  2. MISSING RETURN. A function that declares a result and whose control can
+//     fall off the end of its body returns whatever the runtime happens to
+//     have, silently. The analysis is a terminator walk, and it is
+//     deliberately GENEROUS: every doubtful construct counts as terminating.
+//     Erring that way loses a diagnostic; erring the other way rejects a
+//     working program, and there is no contest between the two.
+//
+//  3. RETURN ARITY, with the exception that matters: exactly ONE expression
+//     may satisfy N declared results, because `return divmod(a, b)` forwards
+//     a tuple. Get that wrong and the compiler's own source produces a pile
+//     of false positives.
+//
+//  4. ENUM-VARIANT ARITY, in construction AND in patterns. This is the
+//     compile-time counterpart of runtime/src/types.c, which pads a short
+//     payload with vl_nil() and says nothing: `Circle()` used to build a
+//     circle whose radius was nil and fail somewhere else entirely.
+//
+// SHADOWING. Only check 4 consults a name table that a local binding can
+// shadow — a `let Circle = …` legally hides the variant — so it reuses
+// callsite.voi's collect_bound and skips any name the function rebinds,
+// exactly as the arity check does. Checks 1 and 2 read declarations, which
+// nothing shadows; check 3 reads a function's own result list. Generic
+// parameters ARE a scope, and typ.Table carries a stack of them for check 1.
+//
+// WHAT THIS FILE DOES NOT ENTER. Closure bodies are skipped by checks 2 and
+// 3: a closure has its own result list and its own implicit-last-expression
+// rules, and judging it against the enclosing function's would be nonsense.
+// The impl TARGET type is skipped by check 1 because chk/traits.voi already
+// says something better about it.
+package chk
+
+use "voilac/ast"
+use "std/str"
+
+impl Checker {
+    func check_sigs(mut self) {
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            let n = self.T.Get(d)
+            if n.Kind == ast.FUNC {
+                self.sig_fn(d)
+            } else if n.Kind == ast.STRUCTDEC {
+                self.Ty.PushParams(self.generic_names(self.T.Kid(d, 1)))
+                self.sig_fields(self.T.Kid(d, 0))
+                self.Ty.PopParams()
+            } else if n.Kind == ast.ENUMDEC {
+                self.Ty.PushParams(self.generic_names(self.T.Kid(d, 1)))
+                each v in self.T.Get(self.T.Kid(d, 0)).Kids {
+                    self.sig_fields(self.T.Kid(v, 0))
+                }
+                self.Ty.PopParams()
+            } else if n.Kind == ast.EXCDEC {
+                self.sig_fields(self.T.Kid(d, 0))
+                each m in self.T.Get(self.T.Kid(d, 1)).Kids {
+                    self.sig_fn(m)
+                }
+            } else if n.Kind == ast.TRAITDEC {
+                each m in self.T.Get(self.T.Kid(d, 0)).Kids {
+                    self.sig_fn(m)
+                }
+            } else if n.Kind == ast.IMPLDEC {
+                // The impl's own generics are in scope for every method in
+                // it: `impl[T] Stack[T] { func push(mut self, own v T) }`.
+                self.Ty.PushParams(self.generic_names(self.T.Kid(d, 1)))
+                each m in self.T.Get(self.T.Kid(d, 0)).Kids {
+                    self.sig_fn(m)
+                }
+                self.Ty.PopParams()
+            } else if n.Kind == ast.TYPEDEC {
+                self.check_type(n.Ival)
+                let sd = self.T.Kid(d, 0)
+                if sd != 0 {
+                    self.Ty.PushParams(self.generic_names(self.T.Kid(sd, 1)))
+                    self.sig_fields(self.T.Kid(sd, 0))
+                    self.Ty.PopParams()
+                }
+            } else if n.Kind == ast.GLOBAL {
+                self.sweep_types(self.T.Kid(d, 0))
+            }
+        }
+        each s in self.T.Get(self.T.Kid(self.file, 2)).Kids {
+            self.sweep_types(s)
+        }
+        self.check_variant_arity()
+    }
+
+    func sig_fields(mut self, list int) {
+        if list == 0 { return }
+        each f in self.T.Get(list).Kids {
+            self.check_type(self.T.Get(f).Ival)
+        }
+    }
+
+    // sig_fn judges one function or method: its signature's types, its body's
+    // annotations, and then the two control-flow checks.
+    func sig_fn(mut self, fn int) {
+        if self.T.Kind(fn) != ast.FUNC { return }
+        self.Ty.PushParams(self.generic_names(self.T.Kid(fn, 3)))
+        self.sig_fields(self.T.Kid(fn, 1))            // parameters
+        each r in self.T.Get(self.T.Kid(fn, 2)).Kids {
+            self.check_type(r)
+        }
+        each th in self.T.Get(self.T.Kid(fn, 4)).Kids {
+            self.check_type(th)
+        }
+        let body = self.T.Kid(fn, 0)
+        if body != 0 {
+            self.sweep_types(body)
+            self.check_missing_return(fn)
+            self.check_return_arity(fn)
+        }
+        self.Ty.PopParams()
+    }
+
+    // generic_names lists a generic list's parameter names. GENERIC.Sval is
+    // "name|bound"; the bound is chk/traits.voi's business.
+    func generic_names(self, list int) []str {
+        var out = []
+        if list == 0 { return out }
+        each g in self.T.Get(list).Kids {
+            if self.T.Kind(g) != ast.GENERIC { continue }
+            out.append(str.split(self.T.Get(g).Sval, "|")[0])
+        }
+        return out
+    }
+
+    // ------------------------------------------------------- unknown types
+
+    // sweep_types finds the annotations hiding inside a body: `let x Foo`,
+    // `fn(a Foo) Bar`, `catch e: Foo`, `Foo{…}`, `f[Foo](…)`.
+    func sweep_types(mut self, node int) {
+        if node == 0 { return }
+        let n = self.T.Get(node)
+        let k = n.Kind
+        if k == ast.LET or k == ast.VAR or k == ast.PARAM or
+           k == ast.FIELDDECL or k == ast.COMPOSITE or k == ast.CLOSURE {
+            self.check_type(n.Ival)
+        } else if k == ast.CATCH {
+            each ty in self.T.Get(self.T.Kid(node, 1)).Kids {
+                self.check_type(ty)
+            }
+        } else if k == ast.CALL {
+            each ta in self.T.Get(self.T.Kid(node, 2)).Kids {
+                self.check_type(ta)
+            }
+        }
+        each kid in n.Kids {
+            self.sweep_types(kid)
+        }
+    }
+
+    // check_type interns an annotation and, only when the arena says it
+    // contains an unresolvable name, walks it again to find WHICH name and
+    // where. Two passes, and deliberately: the arena is the authority on what
+    // resolves, and it has no idea where anything is written.
+    //
+    // Then the OTHER question an annotation answers: does every type ARGUMENT
+    // in it satisfy the bound it stands in for. That check lives in
+    // chk/traits.voi beside the method union it needs, and is called from
+    // here because this is the one visitor that reaches every annotation in
+    // the program — signature, field, catch, composite literal, body — with
+    // the enclosing declaration's generic parameters already in scope.
+    func check_type(mut self, te int) {
+        if te == 0 { return }
+        let id = self.Ty.FromAST(self.T, te)
+        if self.Ty.HasError(id) { self.report_bad_names(te) }
+        self.check_type_args(te)
+    }
+
+    // report_bad_names mirrors load/rewrite.voi's typ_node: the same descent,
+    // for the same reason — a type's children hang off different slots
+    // depending on its kind, and TSLICE's second child is an EXTENT
+    // expression, not a type.
+    func report_bad_names(mut self, te int) {
+        if te == 0 { return }
+        let n = self.T.Get(te)
+        let k = n.Kind
+        if k == ast.TNAMED {
+            if not self.Ty.Resolves(n.Sval) and not self.Ty.IsParam(n.Sval) {
+                self.report_at(te, "unknown type `{n.Sval}` (§3.1)")
+            }
+            each a in n.Kids {
+                self.report_bad_names(a)
+            }
+        } else if k == ast.TFN {
+            each p in self.T.Get(self.T.Kid(te, 0)).Kids {
+                self.report_bad_names(p)
+            }
+            self.report_bad_names(n.Ival)
+        } else if k == ast.TMAP {
+            self.report_bad_names(self.T.Kid(te, 0))
+            self.report_bad_names(self.T.Kid(te, 1))
+        } else if k == ast.TTUPLE {
+            each e in n.Kids {
+                self.report_bad_names(e)
+            }
+        } else if k == ast.TSLICE or k == ast.TOPTION or k == ast.TRESULT or
+                  k == ast.TSET or k == ast.TCHAN or k == ast.TBOX or
+                  k == ast.TBORROW {
+            self.report_bad_names(self.T.Kid(te, 0))
+        }
+    }
+
+    // result_count is how many values a function actually owes its caller.
+    //
+    // It is NOT NKids of the result list: `unit` is the EMPTY type (§3.1) —
+    // "the return type of a function with no result" — so `func f() unit`
+    // owes nothing and may fall off its end or `return` bare, exactly like
+    // `func f()` and `func f() ()`, which the parser already gives an empty
+    // list. Counting the annotation would reject working programs, which is
+    // the one failure mode these checks must not have.
+    func result_count(self, fn int) int {
+        let list = self.T.Kid(fn, 2)
+        let n = self.T.NKids(list)
+        if n == 1 {
+            let r = self.T.Get(self.T.Kid(list, 0))
+            if r.Kind == ast.TNAMED and r.Sval == "unit" { return 0 }
+        }
+        return n
+    }
+
+    // ------------------------------------------------------ missing return
+
+    func check_missing_return(mut self, fn int) {
+        let nres = self.result_count(fn)
+        if nres == 0 { return }
+        if self.terminates(self.T.Kid(fn, 0)) { return }
+        self.report_at(fn, "`" || self.T.Get(fn).Sval || "` declares " ||
+            str(nres) || plural(nres, " result", " results") ||
+            ", but control can reach the end of its body")
+    }
+
+    // terminates reports whether control CANNOT fall out of the bottom of a
+    // statement. Every answer here leans towards `true`: a construct this
+    // analysis does not fully understand is assumed to divert control, so the
+    // check stays silent rather than accusing a working function.
+    func terminates(self, s int) bool {
+        if s == 0 { return false }
+        let n = self.T.Get(s)
+        let k = n.Kind
+
+        if k == ast.RETURN or k == ast.THROW or k == ast.BREAK or
+           k == ast.CONTINUE {
+            return true
+        }
+        // `fallthrough` leaves this case for the NEXT one, which is judged on
+        // its own merits below — so the case it ends does divert. Without
+        // this, `case 1: fallthrough` makes its whole switch look fallible
+        // and accuses a function that cannot reach its end.
+        if k == ast.FALLTHROUGH { return true }
+        if k == ast.BLOCK {
+            // A block terminates iff its LAST statement does — an earlier
+            // `return` would be unreachable code, which is a different
+            // (deferred) diagnostic, not this one.
+            let ks = n.Kids
+            if len(ks) == 0 { return false }
+            return self.terminates(ks[len(ks) - 1])
+        }
+        if k == ast.IF {
+            let e = self.T.Kid(s, 2)
+            if e == 0 { return false }        // no else: the cond may be false
+            return self.terminates(self.T.Kid(s, 1)) and self.terminates(e)
+        }
+        if k == ast.MATCH {
+            // Coverage is check_exhaustiveness's business and it has already
+            // run; a match whose every arm diverts is treated as diverting.
+            let arms = self.T.Get(self.T.Kid(s, 1)).Kids
+            if len(arms) == 0 { return false }
+            each a in arms {
+                if not self.terminates_list(self.T.Kid(a, 1)) { return false }
+            }
+            return true
+        }
+        if k == ast.SWITCH {
+            // Without a default, the subject may match nothing at all.
+            var hasDefault = false
+            let cases = self.T.Get(self.T.Kid(s, 1)).Kids
+            each c in cases {
+                if self.T.NKids(self.T.Kid(c, 0)) == 0 { hasDefault = true }
+                if not self.terminates_list(self.T.Kid(c, 1)) { return false }
+            }
+            return hasDefault
+        }
+        if k == ast.GROUP {
+            // A `return` inside a task group returns from the ENCLOSING
+            // function, so the group diverts exactly when its body does.
+            return self.terminates(self.T.Kid(s, 1))
+        }
+        if k == ast.FOR {
+            // `for { … }` with no iterator never finishes on its own. A
+            // `break` inside would falsify that — and would only cost a
+            // diagnostic, so it is not chased.
+            return self.T.Kid(s, 0) == 0
+        }
+        if k == ast.WHILE {
+            let c = self.T.Kid(s, 0)
+            if c == 0 { return true }
+            return self.T.Kind(c) == ast.BOOL and self.T.Get(c).Ival == 1
+        }
+        if k == ast.TRYCATCH {
+            let fin = self.T.Kid(s, 2)
+            if fin != 0 and self.terminates(fin) { return true }
+            if not self.terminates(self.T.Kid(s, 0)) { return false }
+            each cc in self.T.Get(self.T.Kid(s, 1)).Kids {
+                if not self.terminates(self.T.Kid(cc, 0)) { return false }
+            }
+            return true
+        }
+        if k == ast.SELECTSTMT {
+            // A select without a default blocks until one case fires, so it
+            // diverts exactly when every case body does.
+            let cs = self.T.Get(self.T.Kid(s, 0)).Kids
+            if len(cs) == 0 { return false }
+            each c in cs {
+                if not self.terminates_list(self.T.Kid(c, 2)) { return false }
+            }
+            return true
+        }
+        if k == ast.EXPRSTMT {
+            return self.diverging_call(self.T.Kid(s, 0))
+        }
+        return false
+    }
+
+    // diverging_call recognises the one call in the language that does not
+    // come back: `os.exit`. Without it, a function that ends by exiting the
+    // process is accused of falling off its own end — which it never reaches.
+    //
+    // The spelling is matched syntactically. `os` is a C std package, so the
+    // loader leaves the selection alone and it is still a FIELD `exit` over
+    // an IDENT `os` by the time we see it. A local binding called `os` would
+    // fool this — and would only cost a diagnostic, which is the direction
+    // this whole analysis errs in.
+    func diverging_call(self, e int) bool {
+        if e == 0 or self.T.Kind(e) != ast.CALL { return false }
+        let callee = self.T.Kid(e, 0)
+        if callee == 0 or self.T.Kind(callee) != ast.FIELD { return false }
+        if self.T.Get(callee).Sval != "exit" { return false }
+        let base = self.T.Kid(callee, 0)
+        if base == 0 or self.T.Kind(base) != ast.IDENT { return false }
+        return self.T.Get(base).Sval == "os"
+    }
+
+    // terminates_list judges a bare statement LIST — a match arm's body, a
+    // switch case's, a select case's — which is not a BLOCK node.
+    func terminates_list(self, list int) bool {
+        if list == 0 { return false }
+        let ks = self.T.Get(list).Kids
+        if len(ks) == 0 { return false }
+        return self.terminates(ks[len(ks) - 1])
+    }
+
+    // ------------------------------------------------------- return arity
+
+    func check_return_arity(mut self, fn int) {
+        let nres = self.result_count(fn)
+        self.walk_returns(self.T.Kid(fn, 0), nres, self.T.Get(fn).Sval)
+    }
+
+    func walk_returns(mut self, node int, nres int, name str) {
+        if node == 0 { return }
+        let n = self.T.Get(node)
+        let k = n.Kind
+        // A closure, a spawn block and a defer block are each a body of their
+        // own; their returns answer to a different signature.
+        if k == ast.CLOSURE { return }
+        if (k == ast.SPAWNEXPR or k == ast.DEFERSTMT) and n.Ival2 == 1 {
+            return
+        }
+        if k == ast.RETURN {
+            let given = len(n.Kids)
+            if not ok_arity(given, nres) {
+                self.report_at(node, "`" || name || "` declares " ||
+                    results_text(nres) || ", but returns " || str(given) ||
+                    plural(given, " value", " values"))
+            }
+        }
+        each kid in n.Kids {
+            self.walk_returns(kid, nres, name)
+        }
+    }
+
+    // ------------------------------------------------------ variant arity
+
+    // check_variant_arity judges every enum-variant construction and pattern
+    // against the variant's declared field count. The runtime pads a short
+    // payload with nil and truncates a long one, both without a word.
+    func check_variant_arity(mut self) {
+        var arity = make(map[str]int)
+        var owner = make(map[str]str)
+        each name in self.eNames {
+            each v in self.T.Get(self.T.Kid(self.enums[name], 0)).Kids {
+                if self.T.Kind(v) != ast.VARIANTDEC { continue }
+                let vn = self.T.Get(v).Sval
+                // Variant names are package-qualified, so two PACKAGES may
+                // each declare an `Empty` and only reach here spelled apart.
+                // Two enums of ONE package still cannot: both would flatten
+                // to the same name, and the short-name rule would have no
+                // way to tell them apart. Drop the name as well as reporting
+                // it, because an arity taken from whichever enum happened to
+                // be declared last would condemn every correct use of the
+                // other one.
+                if vn in owner {
+                    self.report_at(v, "variant `" || vn || "` is declared " ||
+                        "by both `" || owner[vn] || "` and `" || name ||
+                        "`; a package's variant names must be unique " ||
+                        "within it")
+                    if vn in arity { arity.delete(vn) }
+                    continue
+                }
+                owner[vn] = name
+                arity[vn] = self.T.NKids(self.T.Kid(v, 0))
+            }
+        }
+        if len(arity) == 0 { return }
+
+        // Per function, exactly as callsite.voi does it: a name the body
+        // rebinds is not the variant, and cannot be judged as one.
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            let n = self.T.Get(d)
+            if n.Kind == ast.FUNC {
+                self.variants_in(d, arity)
+            } else if n.Kind == ast.IMPLDEC or n.Kind == ast.TRAITDEC {
+                each m in self.T.Get(self.T.Kid(d, 0)).Kids {
+                    self.variants_in(m, arity)
+                }
+            } else if n.Kind == ast.EXCDEC {
+                each m in self.T.Get(self.T.Kid(d, 1)).Kids {
+                    self.variants_in(m, arity)
+                }
+            } else if n.Kind == ast.GLOBAL {
+                self.walk_variants(self.T.Kid(d, 0), arity, set([]))
+            }
+        }
+        var sbound = set([])
+        each s in self.T.Get(self.T.Kid(self.file, 2)).Kids {
+            self.collect_bound(s, sbound)
+        }
+        each s in self.T.Get(self.T.Kid(self.file, 2)).Kids {
+            self.walk_variants(s, arity, sbound)
+        }
+    }
+
+    func variants_in(mut self, fn int, arity map[str]int) {
+        if self.T.Kind(fn) != ast.FUNC { return }
+        if self.T.Kid(fn, 0) == 0 { return }
+        var bound = set([])
+        self.collect_bound(fn, bound)
+        self.walk_variants(self.T.Kid(fn, 0), arity, bound)
+    }
+
+    func walk_variants(mut self, node int, arity map[str]int,
+                       bound set[str]) {
+        if node == 0 { return }
+        let n = self.T.Get(node)
+        let k = n.Kind
+
+        if k == ast.CALL {
+            let callee = self.T.Kid(node, 0)
+            if callee != 0 and self.T.Kind(callee) == ast.IDENT {
+                let name = self.T.Get(callee).Sval
+                if name in arity and not (name in bound) {
+                    self.check_variant_call(node, name, arity[name])
+                }
+            }
+        } else if k == ast.PVARIANT {
+            // A BARE variant name in a pattern matches the tag and binds
+            // nothing — `None`, or `Circle` where the radius is not wanted —
+            // so only a non-empty payload list is judged.
+            let got = len(n.Kids)
+            if got > 0 and n.Sval in arity and arity[n.Sval] != got {
+                self.report_at(node, "variant `" || n.Sval || "` takes " ||
+                    str(arity[n.Sval]) ||
+                    plural(arity[n.Sval], " value", " values") || ", but " ||
+                    str(got) || plural(got, " is", " are") || " matched")
+            }
+        }
+        if (k == ast.ARM or k == ast.IF) and n.Ival != 0 {
+            self.walk_variants(n.Ival, arity, bound)
+        }
+        each kid in n.Kids {
+            self.walk_variants(kid, arity, bound)
+        }
+    }
+
+    func check_variant_call(mut self, call int, name str, want int) {
+        var given = 0
+        each a in self.T.Get(self.T.Kid(call, 1)).Kids {
+            let an = self.T.Get(a)
+            if an.Ival == 1 { return }          // spread: uncountable
+            if an.Sval != "" { return }         // named: not positional
+            given += 1
+        }
+        if given == want { return }
+        self.report_at(call, "variant `" || name || "` takes " || str(want) ||
+            plural(want, " value", " values") || ", but " || str(given) ||
+            plural(given, " is", " are") || " given")
+    }
+}
+
+// ok_arity applies the one exception that matters: a single expression may
+// satisfy N declared results, because `return divmod(a, b)` forwards a whole
+// tuple. Roughly nine sites in this repository depend on it.
+func ok_arity(given int, nres int) bool {
+    if given == nres { return true }
+    if nres > 1 and given == 1 { return true }
+    return false
+}
+
+// results_text spells a declared result count, with "no results" for zero
+// rather than the arithmetic-sounding "0 results".
+func results_text(n int) str {
+    if n == 0 { return "no results" }
+    return str(n) || plural(n, " result", " results")
+}

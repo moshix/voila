@@ -1,0 +1,10 @@
+// -Werror=<code> makes ONE warning fatal, and says `error` when it does: a
+// line that still read `warning` while the build failed would be a small lie
+// the reader has to decode.
+use "std/fmt"
+
+func main() {
+    fmt.printf("bye\n")
+    return
+    say "never"
+}

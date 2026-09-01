@@ -1,0 +1,14 @@
+// Adds a trait method to somebody ELSE's type. An importer gets `wide()` on a
+// `geom.Point` by DISPATCH, naming nothing that belongs to this package —
+// not the qualifier `deco`, not even the trait `Wide`.
+package deco
+
+use "geom"
+
+trait Wide {
+    func wide(self) bool
+}
+
+impl Wide for geom.Point {
+    func wide(self) bool { return self.X > 3 }
+}

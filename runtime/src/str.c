@@ -98,8 +98,84 @@ static Value fields_of(const char *s, int64_t n) {
 
 /* ---------------------------------------------------------------- api */
 
+/* Every str function's argument count — minimum and maximum, subject included
+ * — taken from the signatures in the specification (§13.2) and cross-checked
+ * against the argv[] each body actually reads.
+ *
+ * A native carries no static signature: the code generator knows only a bare
+ * name. Both directions of a wrong count were therefore invisible, and both
+ * were real bugs. A surplus argument was simply never looked at, so
+ * `str.trim_left("..x", ".")` returned "..x", reading like a trim that
+ * silently did nothing (the cutset form is `strip(s, cutset)`; trim_left takes
+ * the subject alone). A MISSING one was worse: `"hello".substr()` reached
+ * `I(argv[1])` and dereferenced past the end of the caller's array — SIGSEGV.
+ *
+ * THE COMPILER NOW CHECKS THIS FIRST, and this table is what covers the
+ * spelling it cannot see. voilac/low/names.voi's NativeArities gives every
+ * native both bounds and voilac/chk/native.voi refuses a bad call at compile
+ * time — but only where the callee is a NAME (`str.substr(s)`, `substr(s)`).
+ * The METHOD spelling `s.substr()` is a call on an ordinary expression whose
+ * type is what would decide, which is expression typing and does not exist
+ * yet. std/str is the one package with that second spelling, so it is the one
+ * package that needs a runtime bound as well. selftest compares the two tables
+ * column for column, so they cannot come to disagree about the same call.
+ *
+ * An optional trailing argument is REAL and rejecting one would be a worse bug
+ * than the crash: find_any and skip_any take a start offset, substr and
+ * delword and subword a length. Those minima say so.
+ *
+ * The subject is required even though the body reads it as
+ * `argc > 0 ? S(argv[0], &n) : ""`. That guard is defensive — it is what keeps
+ * a wrong call out of wild memory — not a claim that the subject is optional;
+ * §13.2 spells every one of these with one. */
+typedef struct {
+  const char *name;
+  int min;
+  int max;
+} StrArity;
+
+static const StrArity str_arity[] = {
+    {"upper", 1, 1},       {"lower", 1, 1},      {"title", 1, 1},
+    {"trim", 1, 1},        {"trim_left", 1, 1},  {"trim_right", 1, 1},
+    {"reverse", 1, 1},     {"lines", 1, 1},      {"fields", 1, 1},
+    {"words", 1, 1},       {"bytes", 1, 1},      {"runes", 1, 1},
+    {"rune_len", 1, 1},    {"is_digit", 1, 1},   {"is_alpha", 1, 1},
+    {"is_space", 1, 1},    {"is_upper", 1, 1},   {"hex", 1, 1},
+    {"unhex", 1, 1},       {"b64", 1, 1},        {"unb64", 1, 1},
+    {"from_bytes", 1, 1},  {"from_runes", 1, 1},
+    {"strip", 2, 2},       {"pad", 2, 2},        {"pad_left", 2, 2},
+    {"center", 2, 2},      {"contains", 2, 2},   {"index", 2, 2},
+    {"last_index", 2, 2},  {"starts_with", 2, 2},{"ends_with", 2, 2},
+    {"count", 2, 2},       {"equal_fold", 2, 2}, {"left", 2, 2},
+    {"right", 2, 2},       {"split", 2, 2},      {"word", 2, 2},
+    {"repeat", 2, 2},      {"join", 2, 2},
+    {"substr", 2, 3},      {"split_n", 3, 3},    {"delword", 2, 3},
+    {"subword", 2, 3},     {"replace", 3, 3},    {"translate", 3, 3},
+    {"overlay", 3, 3},     {"insert", 3, 3},     {"delstr", 3, 3},
+    {"find_any", 2, 3},    {"skip_any", 2, 3},
+    {"replace_n", 4, 4},
+    {NULL, 0, 0},
+};
+
+static void str_check_arity(const char *name, int argc) {
+  for (int i = 0; str_arity[i].name; i++) {
+    if (!eq(name, str_arity[i].name)) continue;
+    int min = str_arity[i].min, max = str_arity[i].max;
+    if (argc < min) {
+      vl_abort("str.%s takes at least %d argument%s, but %d %s given", name,
+               min, min == 1 ? "" : "s", argc, argc == 1 ? "is" : "are");
+    }
+    if (argc > max) {
+      vl_abort("str.%s takes at most %d argument%s, but %d %s given", name,
+               max, max == 1 ? "" : "s", argc, argc == 1 ? "is" : "are");
+    }
+    return;
+  }
+}
+
 Value vl_str_call(const char *name, Value *argv, int argc, bool *ok) {
   *ok = true;
+  str_check_arity(name, argc);
 
   /* These three take a slice as their subject, not a string. */
   if (eq(name, "join")) {
@@ -409,7 +485,11 @@ Value vl_str_call(const char *name, Value *argv, int argc, bool *ok) {
   if (eq(name, "repeat")) {
     int64_t k = I(argv[1]);
     if (k < 0) k = 0;
-    if (n > 0 && k > (int64_t)1 << 31 / (n > 0 ? n : 1))
+    /* Parenthesised: `/` binds tighter than `<<`, so `1 << 31 / n` was
+     * `1 << (31/n)` — for a ten-character string that capped the count at 8,
+     * and str.repeat("1234567890", 9) threw over a 90-byte result. The limit
+     * meant here is 2^31 bytes of OUTPUT, i.e. (1 << 31) / n. */
+    if (n > 0 && k > ((int64_t)1 << 31) / n)
       vl_throwf("RangeError", "repeat: result too large");
     char *b = (char *)vl_alloc((size_t)(n * k) + 1);
     for (int64_t i = 0; i < k; i++) memcpy(b + i * n, s, (size_t)n);

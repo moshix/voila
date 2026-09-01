@@ -1,0 +1,561 @@
+// Package typ — the compiler's type representation: an ARENA of interned
+// structural types, keyed by canonical text.
+//
+// Until now a "type" in the checker was whatever string was nearest to hand.
+// Strings work for identity and fail for structure — you cannot ask a string
+// what its element type is — and the two renderers that exist already
+// disagree: low/expr.voi's short_type spells a function type `fn(...)` while
+// cg/cg.voi's type_text spells it `fn`. Bare AST node ids fail the other way:
+// two identical annotations are two different nodes, so every equality test
+// becomes a recursive walk.
+//
+// So: build each type once, key it by its canonical text, and hand out the
+// arena index. Structure survives (Elem, Key, Res, Args are ids), and
+// identity is INTEGER EQUALITY — exact, not a heuristic, because interning
+// guarantees one id per distinct type.
+//
+// THREE BOUNDARY RULES, and they are not stylistic.
+//
+//  1. NEVER ITERATE `intern`. Map iteration order is nondeterministic and
+//     TESTING.md names it as *the* self-hosting fixpoint hazard: a compiler
+//     whose output depends on it does not reach a fixpoint. Every walk that
+//     can reach a diagnostic goes over a declaration-ordered slice —
+//     `Types`/`texts` here, `sNames`/`eNames` in chk.voi.
+//
+//  2. DO NOT retrofit Text onto low/expr.voi's short_type or cg/cg.voi's
+//     type_text. type_text feeds `vl_zero(...)` and `VlType.ftypes`, so its
+//     spelling is not cosmetic — it is runtime semantics. Those two renderers
+//     stay exactly as they are; this one is for diagnostics.
+//
+//  3. FromAST is TOTAL. An unresolvable name yields TK_ERROR, never a crash
+//     and never a guess. REPORTING it is chk/sig.voi's job — a type table
+//     that emitted diagnostics would report the same bad annotation once per
+//     visit.
+//
+// The package is consumed only by voilac/chk, which is diagnostic-only: it
+// returns []str to main.voi's report() and has no edge into low/opt/cg. So
+// nothing here can change emitted C — the same argument opt/opt.voi:5-7 makes
+// for the optimizer.
+package typ
+
+use "voilac/ast"
+use "voilac/low"
+use "std/str"
+
+// The type kinds. TK_ERROR is a real kind, not a sentinel: it carries the
+// spelling that failed to resolve, so a caller can say WHICH name was wrong.
+const TK_ERROR  = 0
+const TK_NAMED  = 1
+const TK_OPTION = 2
+const TK_RESULT = 3
+const TK_SLICE  = 4
+const TK_MAP    = 5
+const TK_SET    = 6
+const TK_CHAN   = 7
+const TK_BOX    = 8
+const TK_FN     = 9
+const TK_TUPLE  = 10
+const TK_BORROW = 11
+const TK_PARAM  = 12
+
+// Type is one node of the arena. Which fields carry payload depends on Kind,
+// exactly as ast.Node's do:
+//
+//   TK_NAMED   Name = the flat name (`geom.Point`); Args = type arguments
+//   TK_PARAM   Name = the generic parameter's name
+//   TK_ERROR   Name = the spelling that resolved to nothing
+//   TK_OPTION  Elem = T in `?T`          TK_RESULT  Elem = T in `T!`
+//   TK_SLICE   Elem = T; Name = the extent of `[N]T` ("" for a slice)
+//   TK_MAP     Key = K, Elem = V         TK_SET/TK_CHAN  Elem
+//   TK_BOX     Elem; Flag = 0 shared, 1 cell, 2 weak
+//   TK_FN      Args = parameters, Res = result (0 = none)
+//   TK_TUPLE   Args = members            TK_BORROW  Elem = T in `&T`
+struct Type {
+    Kind int
+    Name str
+    Elem int
+    Key  int
+    Res  int
+    Args []int
+    Flag int
+}
+
+struct Table {
+    Types []Type
+    texts []str          // id → display text, parallel to Types
+
+    // The intern map. PRIVATE and never iterated — see rule 1 above. It is
+    // keyed by a canonical string that is the display text plus, for the two
+    // kinds that would otherwise collide, a sigil the surface syntax cannot
+    // produce (see `key`).
+    intern map[str]int
+
+    // The nominal universe: every name a TNAMED may legally spell. Filled by
+    // Declare from the program's declarations; primed with the primitives,
+    // the predeclared exceptions and `error`.
+    names set[str]
+
+    // The generic parameters in scope, innermost last. A scope STACK rather
+    // than a set: `T` inside `impl[T] Stack[T]` is a parameter, and the same
+    // `T` outside it is not.
+    params []set[str]
+}
+
+// New builds an empty table. Index 0 is the NIL type — "there is no type
+// here" — mirroring ast.Tree's nil node, so an absent annotation and a wrong
+// one are never confused for each other.
+func New() Table {
+    var t = Table{Types: [], texts: [], intern: make(map[str]int),
+                  names: set([]), params: []}
+    t.Types.append(Type{Kind: TK_ERROR, Name: "", Elem: 0, Key: 0, Res: 0,
+                        Args: [], Flag: 0})
+    t.texts.append("?")
+    each n in Universe() {
+        t.names.add(n)
+    }
+    each n in low.BuiltinExceptions() {
+        t.names.add(n)
+    }
+    t.names.add("error")
+    return t
+}
+
+// Universe names the primitives every program starts with (§3.1).
+//
+// `dur` and `instant` are in this list and NOT in the specification's §3.1
+// table. They are real runtime tags all the same — value.c's vl_kind_name
+// returns them — and samples/guide/g07_tasks.voi annotates one. A universe
+// that trusted the table over the runtime would reject a working program, so
+// the runtime wins and the table is what needs amending.
+func Universe() []str {
+    return ["bool", "byte", "dec", "dur", "f32", "float", "i16", "i32", "i64",
+            "i8", "instant", "int", "rune", "str", "u16", "u32", "u64", "u8",
+            "unit"]
+}
+
+// BuiltinTraits are the traits the language predeclares (§3.6): a generic
+// bound may name one with no `trait` declaration anywhere in the program.
+//
+// NOT ONE OF THEM HAS A METHOD SET HERE, and that is the specification's
+// doing rather than an omission. §3.7 lists `Ord`, `Eq`, `Hash`, `Show`,
+// `Copy` and `Send` as constraints and spells out the methods of none of
+// them; `Copy` and `Send` are structural properties the compiler derives
+// (§6.4, §9), not things a type declares. The three that DO have a written
+// signature somewhere — `Show`'s `show` (§3.6), `Clone`'s `clone` (§6.4),
+// `Error`'s `message` (§8.1) — each has a RUNTIME FALLBACK that makes an
+// ordinary type satisfy it with nothing declared at all: vl_str_of renders a
+// struct structurally when it finds no `show`, vl_callm answers `clone` for
+// every kind, and `exception` is sugar for the struct plus the `Error` impl.
+//
+// So conformance to a builtin bound is not decidable from the program text,
+// and chk/traits.voi judges no type against one — the same refusal
+// check_impl already makes for `impl Show for T`. Writing the sets down here
+// would only give a later check something confident and wrong to consult.
+func BuiltinTraits() []str {
+    return ["Clone", "Copy", "Drop", "Eq", "Error", "Hash", "Ord", "Send",
+            "Show"]
+}
+
+// IsPrimitive reports whether a name is one of Universe()'s primitives. A
+// primitive carries no impl block of its own, so a bound on one is judged
+// against what the RUNTIME provides — see PrimitiveMethod.
+func IsPrimitive(name str) bool {
+    each n in Universe() {
+        if n == name { return true }
+    }
+    return false
+}
+
+// PrimitiveMethod reports whether the runtime already answers `m` on a
+// primitive receiver. std/str's functions are reachable as methods through
+// the method-call duality (`s.upper()` IS `str.upper(s)` — str_natives in
+// cg/instr.voi), and `clone` is answered for every kind whatsoever
+// (runtime/src/call.c). Neither leaves a row in the flat method table a
+// checker can walk, so a bound satisfied that way would be reported as
+// unsatisfied: a diagnostic against a working program, which is the one
+// failure mode these checks must not have.
+func PrimitiveMethod(m str) bool {
+    if m == "clone" { return true }
+    // The DUALITY set is the authority, not the prelude. They overlap but are
+    // not the same list, and consulting the wrong one rejected working
+    // programs: `trim_left`, `last_index`, `count` and a dozen more are
+    // callable as methods yet absent from PreludeNames. Both are checked
+    // because a prelude name reachable on a primitive (`len`) is real too.
+    each n in low.StrMethodNames() {
+        if n == m { return true }
+    }
+    each n in low.PreludeNames() {
+        if n == m { return true }
+    }
+    return false
+}
+
+impl Table {
+    // ------------------------------------------------------------ universe
+
+    // Declare records a nominal type the program brings into scope, under the
+    // FLAT name the loader produced (`geom.Point`, not `Point`).
+    func Declare(mut self, name str) {
+        if name != "" { self.names.add(name) }
+    }
+
+    // Resolves reports whether a name denotes a type this program can see.
+    //
+    // THE ESCAPE HATCH, and it is required, not a convenience. `str` is a C
+    // std package: it has no Voilà source, the loader deliberately never
+    // parses it, and so its types have no declaration to find. The compiler's
+    // own ir/listing.voi annotates `b mut str.Builder`. Any dotted name whose
+    // qualifier is in low.PackageNames() is therefore taken on trust — which
+    // is exactly as much checking as the rest of the pipeline does for those
+    // packages. A dotted name into a USER package is not affected: the loader
+    // flattened it to `geom.Point` long before we see it, and that is looked
+    // up whole.
+    func Resolves(self, name str) bool {
+        if name == "" { return false }
+        if name in self.names { return true }
+        let dot = dot_at(name)
+        if dot < 0 { return false }
+        let q = name[0..dot]
+        each p in low.PackageNames() {
+            if p == q { return true }
+        }
+        return false
+    }
+
+    // PushParams opens a generic scope; PopParams closes it. They come in
+    // pairs around a declaration's subtree, the way load/rewrite.voi's
+    // push/pop bracket a binding scope.
+    func PushParams(mut self, names []str) {
+        var s = set([])
+        each n in names {
+            if n != "" { s.add(n) }
+        }
+        self.params.append(s)
+    }
+
+    func PopParams(mut self) {
+        if len(self.params) == 0 { return }
+        self.params = self.params[0..len(self.params) - 1]
+    }
+
+    // IsParam searches the scope stack from the inside out.
+    func IsParam(self, name str) bool {
+        var i = len(self.params) - 1
+        while i >= 0 {
+            if name in self.params[i] { return true }
+            i -= 1
+        }
+        return false
+    }
+
+    // ------------------------------------------------------------ interning
+
+    // FromAST interns the type an annotation node denotes.
+    //
+    // TOTAL by construction: node 0 — an absent annotation — is the nil type
+    // 0, an unresolvable name is TK_ERROR carrying the spelling, and a node
+    // that is not a type at all is nil. Every sub-type is interned before its
+    // parent, so `render` can read the children's text straight out of
+    // `texts`.
+    func FromAST(mut self, t ast.Tree, te int) int {
+        if te == 0 { return 0 }
+        let n = t.Get(te)
+        let k = n.Kind
+
+        if k == ast.TNAMED {
+            var args = []
+            each a in n.Kids {
+                let id = self.FromAST(t, a)
+                args.append(id)
+            }
+            // A generic parameter shadows a nominal type of the same name,
+            // exactly as load/rewrite.voi's bind_generics makes it shadow a
+            // package declaration.
+            if self.IsParam(n.Sval) {
+                return self.mk(TK_PARAM, n.Sval, 0, 0, 0, args, 0)
+            }
+            if self.Resolves(n.Sval) {
+                return self.mk(TK_NAMED, n.Sval, 0, 0, 0, args, 0)
+            }
+            return self.mk(TK_ERROR, n.Sval, 0, 0, 0, args, 0)
+        }
+        if k == ast.TOPTION {
+            let e = self.FromAST(t, t.Kid(te, 0))
+            return self.mk(TK_OPTION, "", e, 0, 0, [], 0)
+        }
+        if k == ast.TRESULT {
+            let e = self.FromAST(t, t.Kid(te, 0))
+            return self.mk(TK_RESULT, "", e, 0, 0, [], 0)
+        }
+        if k == ast.TSLICE {
+            let e = self.FromAST(t, t.Kid(te, 0))
+            // Kids[1] is the EXTENT of `[N]T`; 0 is a plain slice. A literal
+            // extent is part of the type's identity so it goes in the text; a
+            // computed one folds to `_`, because it is an expression and this
+            // release compares element types, never extents.
+            var ext = ""
+            let ln = t.Kid(te, 1)
+            if ln != 0 {
+                ext = "_"
+                if t.Kind(ln) == ast.INT { ext = t.Get(ln).Sval }
+            }
+            return self.mk(TK_SLICE, ext, e, 0, 0, [], 0)
+        }
+        if k == ast.TMAP {
+            let kt = self.FromAST(t, t.Kid(te, 0))
+            let vt = self.FromAST(t, t.Kid(te, 1))
+            return self.mk(TK_MAP, "", vt, kt, 0, [], 0)
+        }
+        if k == ast.TSET {
+            let e = self.FromAST(t, t.Kid(te, 0))
+            return self.mk(TK_SET, "", e, 0, 0, [], 0)
+        }
+        if k == ast.TCHAN {
+            let e = self.FromAST(t, t.Kid(te, 0))
+            return self.mk(TK_CHAN, "", e, 0, 0, [], 0)
+        }
+        if k == ast.TBOX {
+            let e = self.FromAST(t, t.Kid(te, 0))
+            return self.mk(TK_BOX, "", e, 0, 0, [], n.Ival2)
+        }
+        if k == ast.TFN {
+            // A function type keeps its parameters in ONE list child and its
+            // result in Ival — see par.voi's fn_type.
+            var ps = []
+            each p in t.Get(t.Kid(te, 0)).Kids {
+                let id = self.FromAST(t, p)
+                ps.append(id)
+            }
+            let r = self.FromAST(t, n.Ival)
+            return self.mk(TK_FN, "", 0, 0, r, ps, 0)
+        }
+        if k == ast.TTUPLE {
+            var es = []
+            each el in n.Kids {
+                let id = self.FromAST(t, el)
+                es.append(id)
+            }
+            return self.mk(TK_TUPLE, "", 0, 0, 0, es, 0)
+        }
+        if k == ast.TBORROW {
+            let e = self.FromAST(t, t.Kid(te, 0))
+            return self.mk(TK_BORROW, "", e, 0, 0, [], 0)
+        }
+        return 0
+    }
+
+    // mk interns one node: render it, look the key up, and only allocate when
+    // the type is genuinely new.
+    func mk(mut self, kind int, name str, elem int, keyt int, res int,
+            args []int, flag int) int {
+        let text = self.render(kind, name, elem, keyt, res, args, flag)
+        let k = key_of(kind, text)
+        if k in self.intern { return self.intern[k] }
+        let id = len(self.Types)
+        self.Types.append(Type{Kind: kind, Name: name, Elem: elem, Key: keyt,
+                               Res: res, Args: args, Flag: flag})
+        self.texts.append(text)
+        self.intern[k] = id
+        return id
+    }
+
+    // render spells a type the way the specification does. It is the identity
+    // key as well as the diagnostic text, so it must be INJECTIVE — two
+    // different types may never render the same. (The two spellings that
+    // would collide are separated by key_of, not here: this is what the user
+    // reads.)
+    func render(self, kind int, name str, elem int, keyt int, res int,
+                args []int, flag int) str {
+        if kind == TK_NAMED or kind == TK_PARAM or kind == TK_ERROR {
+            if len(args) == 0 { return name }
+            var xs = []
+            each a in args {
+                xs.append(self.texts[a])
+            }
+            return name || "[" || str.join(xs, ", ") || "]"
+        }
+        if kind == TK_OPTION {
+            return "?" || self.texts[elem]
+        }
+        if kind == TK_RESULT {
+            return self.texts[elem] || "!"
+        }
+        if kind == TK_SLICE {
+            return "[" || name || "]" || self.texts[elem]
+        }
+        if kind == TK_MAP {
+            return "map[" || self.texts[keyt] || "]" || self.texts[elem]
+        }
+        if kind == TK_SET {
+            return "set[" || self.texts[elem] || "]"
+        }
+        if kind == TK_CHAN {
+            return "chan[" || self.texts[elem] || "]"
+        }
+        if kind == TK_BOX {
+            var b = "shared"
+            if flag == 1 {
+                b = "cell"
+            } else if flag == 2 {
+                b = "weak"
+            }
+            return b || "[" || self.texts[elem] || "]"
+        }
+        if kind == TK_FN {
+            var ps = []
+            each a in args {
+                ps.append(self.texts[a])
+            }
+            var s = "fn(" || str.join(ps, ", ") || ")"
+            if res != 0 { s = s || " " || self.texts[res] }
+            return s
+        }
+        if kind == TK_TUPLE {
+            var es = []
+            each a in args {
+                es.append(self.texts[a])
+            }
+            return "(" || str.join(es, ", ") || ")"
+        }
+        if kind == TK_BORROW {
+            return "&" || self.texts[elem]
+        }
+        return "?"
+    }
+
+    // ------------------------------------------------------------ queries
+
+    // Text is the canonical spelling of a type, for diagnostics.
+    func Text(self, id int) str {
+        if id < 0 or id >= len(self.texts) { return "?" }
+        return self.texts[id]
+    }
+
+    func Kind(self, id int) int {
+        if id < 0 or id >= len(self.Types) { return TK_ERROR }
+        return self.Types[id].Kind
+    }
+
+    func Get(self, id int) Type { return self.Types[id] }
+
+    // Same reports whether two ids denote the same type. Interning makes that
+    // integer equality — no walk, no heuristic.
+    //
+    // The NIL type and TK_ERROR are the exceptions, and deliberately so:
+    // neither is the same as anything, INCLUDING ITSELF. "I could not work
+    // out this type" must never satisfy an equality test; a checker that let
+    // two unknowns match would report the one place it understood least as
+    // the one place it was surest about.
+    func Same(self, a int, b int) bool {
+        if a == 0 or b == 0 { return false }
+        if self.Kind(a) == TK_ERROR or self.Kind(b) == TK_ERROR {
+            return false
+        }
+        return a == b
+    }
+
+    // HasError reports whether a type has an unresolvable name ANYWHERE
+    // inside it: `map[str]Fooo` is as broken as a bare `Fooo`. It is the
+    // question FromAST refuses to answer by itself — the arena classifies,
+    // and chk/sig.voi decides what to say about it and where.
+    func HasError(self, id int) bool {
+        if id == 0 { return false }
+        let ty = self.Types[id]
+        if ty.Kind == TK_ERROR { return true }
+        if self.HasError(ty.Elem) { return true }
+        if self.HasError(ty.Key) { return true }
+        if self.HasError(ty.Res) { return true }
+        each a in ty.Args {
+            if self.HasError(a) { return true }
+        }
+        return false
+    }
+
+    // Nominal interns a type SPELLED BY NAME rather than read from an
+    // annotation. Expression typing needs it constantly — an INT literal is
+    // `int` and no node in the tree says so — and it must classify exactly as
+    // FromAST does, or the same type would arrive at Same() under two ids and
+    // interning would stop meaning identity.
+    func Nominal(mut self, name str) int {
+        if name == "" { return 0 }
+        if self.IsParam(name) { return self.mk(TK_PARAM, name, 0, 0, 0, [], 0) }
+        if self.Resolves(name) { return self.mk(TK_NAMED, name, 0, 0, 0, [], 0) }
+        return self.mk(TK_ERROR, name, 0, 0, 0, [], 0)
+    }
+
+    // MkSlice interns `[]T`. A variadic parameter binds a SLICE of its
+    // declared element type and no annotation in the tree says so, which is
+    // the one place a type has to be BUILT rather than read.
+    func MkSlice(mut self, elem int) int {
+        if elem == 0 { return 0 }
+        return self.mk(TK_SLICE, "", elem, 0, 0, [], 0)
+    }
+
+    // HasParam reports whether a generic parameter appears ANYWHERE inside a
+    // type. It is the companion of HasError and it is asked the same kind of
+    // question: `[]T` is as unjudgeable as a bare `T`, because generics are
+    // TYPE-ERASED and nothing at a use site says what `T` stood for. Every
+    // comparison in chk/expr.voi is skipped when either side answers true —
+    // losing a diagnostic, never inventing one.
+    func HasParam(self, id int) bool {
+        if id == 0 { return false }
+        let ty = self.Types[id]
+        if ty.Kind == TK_PARAM { return true }
+        if self.HasParam(ty.Elem) { return true }
+        if self.HasParam(ty.Key) { return true }
+        if self.HasParam(ty.Res) { return true }
+        each a in ty.Args {
+            if self.HasParam(a) { return true }
+        }
+        return false
+    }
+
+    // Subst replaces every occurrence of the generic parameter `param` with
+    // the type `arg`, returning the interned result.
+    //
+    // chk/expr.voi is what finally calls it. A method declared as
+    // `func push(mut self, v T)` inside `impl[T] Stack[T]` is judged at a
+    // receiver whose type is `Stack[int]`, and the only honest way to compare
+    // the argument against `T` is to replace `T` by the receiver's written
+    // type argument first. Without that the parameter is TK_PARAM, which is
+    // compatible with nothing, and the check would have to stay silent.
+    func Subst(mut self, id int, param str, arg int) int {
+        if id == 0 { return 0 }
+        let ty = self.Types[id]
+        if ty.Kind == TK_PARAM {
+            if ty.Name == param { return arg }
+            return id
+        }
+        var args = []
+        each a in ty.Args {
+            let s = self.Subst(a, param, arg)
+            args.append(s)
+        }
+        let elem = self.Subst(ty.Elem, param, arg)
+        let keyt = self.Subst(ty.Key, param, arg)
+        let res = self.Subst(ty.Res, param, arg)
+        return self.mk(ty.Kind, ty.Name, elem, keyt, res, args, ty.Flag)
+    }
+}
+
+// key_of turns a rendered type into its intern key. Rendering is injective
+// WITHIN a kind but not across all of them: a generic parameter `T` and a
+// nominal type `T` both spell `T`, and an unresolvable `Foo` spells the same
+// as a `Foo` that resolves. Each gets a sigil the surface syntax cannot
+// produce, so the three stay three distinct arena entries while the user
+// still reads a plain `T`.
+func key_of(kind int, text str) str {
+    if kind == TK_PARAM { return "$" || text }
+    if kind == TK_ERROR { return "!" || text }
+    return text
+}
+
+// dot_at finds the first `.` of a qualified name, or -1.
+func dot_at(s str) int {
+    var i = 0
+    while i < len(s) {
+        if s[i] == '.' { return i }
+        i += 1
+    }
+    return 0 - 1
+}

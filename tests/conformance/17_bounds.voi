@@ -1,0 +1,134 @@
+// 17_bounds.voi — generic bounds, honoured where a real type is written.
+//
+// A bound parsed into "T|Bound" and was thrown away by the one place that
+// read it (load/rewrite.voi binds the name half), so `Stack[Point]` under
+// `struct Stack[T: Describe]` compiled happily and died at the first
+// `describe`. chk/traits.voi now judges the three sites that write an actual
+// type in place of a parameter — a composite literal, an annotation, an
+// explicit `f[T](x)` — and tests/negative/bound_*.voi pin the refusals.
+//
+// What is pinned HERE is everything that must still be ACCEPTED. A bounds
+// check that rejects a working program is worse than no bounds check at all,
+// and every case below is one a plausible over-tightening would break:
+//
+//   * THE UNION RULE, from the far side. `Ticket` writes `describe` in an
+//     INHERENT `impl Ticket { … }` block and there is no `impl Describe for
+//     Ticket` anywhere in this file. The runtime dispatch table is flat and
+//     does not remember which block a row came from, so `Stack[Ticket]`
+//     genuinely works — and the same rule is what makes 07_funcs pass.
+//   * A NESTED type argument, `Pair[Box[int]]{}`. The composite spelling was
+//     a parse error until par/expr.voi's expr_to_type learned to recurse,
+//     while the annotation `var p Pair[Box[int]]` had always been fine — the
+//     inconsistency was the bug.
+//   * A generic PARAMETER as the argument, `Stack[T]{}` inside `impl[T]
+//     Stack[T]`. That is the DEFINITION site, not an instantiation.
+//   * A TRAIT as the argument. `Stack[Describe]` dispatches dynamically
+//     (§3.6) and the elements, not the trait, answer the bound.
+//   * A BUILTIN bound. `Ord` and its neighbours have no method set anybody
+//     wrote down, so nothing — primitive or struct — is judged against one.
+//   * An explicit instantiation whose argument satisfies.
+//   * A method INHERITED from one trait's default satisfying a DIFFERENT
+//     trait that declares the same name. cg.collect_inherited puts that row
+//     in the method table, so it answers the call at run time; a checker
+//     that only counted WRITTEN methods called it missing and rejected a
+//     program that works.
+use "std/str"
+
+trait Describe {
+    func describe(self) str
+}
+
+// The union rule: an INHERENT impl, and no `impl Describe for Ticket`.
+struct Ticket { n int }
+impl Ticket {
+    func describe(self) str { return "ticket#{self.n}" }
+}
+
+// The ordinary way, for contrast.
+struct Badge { s str }
+impl Describe for Badge {
+    func describe(self) str { return "badge:" || self.s }
+}
+
+struct Stack[T: Describe] {
+    items []T
+}
+
+impl[T: Describe] Stack[T] {
+    func push(mut self, own v T) { self.items.append(v) }
+
+    // `Stack[T]{}` with T a PARAMETER: the definition site, which no
+    // instantiation check may touch.
+    func cleared(self) Stack[T] { return Stack[T]{items: []} }
+
+    func lines(self) str {
+        var out = []
+        each it in self.items {
+            out.append(it.describe())
+        }
+        return str.join(out, " ")
+    }
+}
+
+// Unbounded, so a nested argument has nothing to answer to.
+struct Box[T] { v T }
+struct Pair[A] { v A }
+
+func label[T: Describe](x T) str { return "<" || x.describe() || ">" }
+
+// A builtin bound: no method set exists for `Ord`, so neither a primitive
+// nor a struct is judged against it.
+func first[T: Ord](xs []T) T { return xs[0] }
+
+func main() {
+    // The union rule, at a composite literal and through a method.
+    var t = Stack[Ticket]{items: []}
+    t.push(Ticket{n: 7})
+    t.push(Ticket{n: 8})
+    say t.lines()
+
+    // The same bound at an ANNOTATION, satisfied the declared way.
+    var b Stack[Badge] = Stack[Badge]{items: []}
+    b.push(Badge{s: "vip"})
+    say b.lines()
+
+    // The definition site, reached from outside.
+    let e = t.cleared()
+    say len(e.items)
+
+    // A trait as the argument: the elements answer the bound, not `Describe`.
+    var d Stack[Describe] = Stack[Describe]{items: []}
+    d.push(Badge{s: "any"})
+    say d.lines()
+
+    // A NESTED type argument, in a composite literal and in an annotation.
+    // Inherited-default satisfaction, across two traits (see the header).
+    let cr = Crossed{}
+    say cr.tag()
+    let box = Keeper[Crossed]{v: cr}
+    say box.v.tag()
+
+    let nested = Pair[Box[int]]{v: Box[int]{v: 41}}
+    say nested.v.v + 1
+    var deep Pair[Box[int]] = nested
+    say deep.v.v
+
+    // An explicit instantiation, satisfied both ways round.
+    say label[Ticket](Ticket{n: 1})
+    say label[Badge](Badge{s: "x"})
+
+    // A builtin bound, over a primitive.
+    say first[int]([3, 4, 5])
+}
+
+// `Sourced` supplies `tag` as a default; `Wanted` declares it abstract.
+// Crossed implements both and writes NEITHER — the default is what answers
+// `Wanted`, so `Keeper[Crossed]` must be accepted.
+trait Sourced { func tag(self) str = "crossed-default" }
+trait Wanted  { func tag(self) str }
+
+struct Crossed { }
+impl Sourced for Crossed { }
+impl Wanted  for Crossed { }
+
+struct Keeper[X: Wanted] { v X }

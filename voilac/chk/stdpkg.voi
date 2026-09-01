@@ -1,0 +1,440 @@
+// chk/stdpkg.voi — members of a std package, judged where the answer is.
+//
+// A `pkg.member` reference used to be decidable only in the BACKEND, and only
+// as an absence: cgen looked the dotted name up in the natives table, failed
+// to find it and refused. `check` had already said `ok`, which is exactly the
+// "check said ok, build refused" split main.voi runs the lowerer to prevent:
+//
+//     use "std/sync"
+//     func main() { say sync.nonexistent(1) }   // ok, then dead in cgen
+//     func main() { say str.len("abc") }        // `len` is a PRELUDE name
+//
+// Everything cgen knows is available HERE. The std library keeps its surface
+// in two different places and this pass reads both.
+//
+//   VOILÀ SOURCE — the packages std.Packages() lists: csv, net, path, sync,
+//   test, and std/time's calendar half. The loader GRAFTS them into the
+//   merged tree as ordinary packages (KIND_STDSRC, load/load.voi), so by the
+//   time this pass runs every one of their declarations is present under its
+//   flat name: `sync.mutex` is a FUNC node like any other.
+//
+//   C NATIVE — the rest of low.PackageNames(): fmt, os, str, io, math, …
+//   These declare NOTHING in the tree, which is why this check used to skip
+//   them. But their surface is not unknown, it is just kept elsewhere: the
+//   natives table (low.StdCNatives, plus low.StrMethodNames under the `str.`
+//   spelling that cg's known_native_names registers alongside the bare one),
+//   and the package CONSTANTS (low.PkgConstantNames). The constants are
+//   deliberately absent from the natives table — the runtime answers
+//   `os.stdout` in vl_lookup_value, not as a function pointer — so a rule
+//   that consulted the table alone would reject `math.pi` and `time.Second`,
+//   working code, which is the one direction this check may not err in.
+//
+// std/time is in BOTH halves, so the answers are UNIONED and never chosen
+// between: `time.now` is a C native with no Voilà body, `time.now_utc` is a
+// grafted declaration with no native, and both are correct.
+//
+// A near miss may be drawn from any of them, minus the shims a program is not
+// meant to call: a name beginning with `_` is package-private by convention,
+// and suggesting one would be advice nobody should take.
+//
+// THE MISSING `use` is the same inconsistency wearing a different hat, and it
+// is why this does not simply skip a Voilà-source package it finds no
+// declarations for. A qualifier is a qualifier program-wide
+// (low.PackageNames), not per-import, so `time.now()` compiles with no `use`
+// at all — it is a native. `time.now_utc()` does not, because that half of
+// the package is Voilà and nothing grafted it; `check` said ok and the
+// backend then said the name does not exist. A package counts as GRAFTED when
+// a declaration of its own carries both the flat name `p.x` and the embedded
+// source path `std/p/…`, which no user package can forge. When it is not
+// grafted, the member is judged against the natives alone, and anything else
+// is reported as the import that is missing rather than as a member that is
+// not there. A C package is never in that state: it has no source to graft
+// and nothing an import could add, so a miss that survives the whole union
+// above is simply a miss.
+//
+// SHADOWING is the same two-part precedence low/expr.voi's is_pkg_qualifier
+// applies, and the second part is the one that bites. A local binding
+// shadowing a package name is obvious: this file collects it per declaration
+// the way callsite.voi does, and over-collecting can only lose a diagnostic,
+// never invent one. A top-level `var path = "/etc"` followed by
+// `path.upper()` is NOT obvious — it is an ordinary method call on a str, and
+// it is a working program that a table entry would otherwise break — so the
+// GLOBAL and script-form bindings are gathered separately and consulted at
+// every reference, exactly as low.globals is. A package's OWN global needs no
+// handling: the loader has already rewritten it to its flat name
+// (`mypkg.path`), so the FIELD's base identifier is no longer bare.
+//
+// Two more claims on the same identifier are answered the same way, by
+// silence: a TYPE named `time` (whose methods land in cg's fnIdx under
+// exactly the dotted spelling a package call would use), and a USER package
+// flattened to one of these qualifiers (reachable as `use "sub/net"`, since
+// the bare form resolves to std/net). Both are strange programs and both
+// WORK, so neither may be accused.
+//
+// The type claim is not only about DECLARED types, and that is the trap:
+// `str` is a primitive AND a package, so `impl str { … }` and
+// `impl Trait for str {}` both put `str.<method>` in fnIdx, where emit_call
+// looks before it looks at the natives. A struct/enum/exception table cannot
+// see any of that. The method union chk/traits.voi already builds is the
+// mirror of those rows and is consulted at every reference.
+package chk
+
+use "voilac/ast"
+use "voilac/low"
+use "voilac/std"
+use "std/str"
+
+impl Checker {
+    // check_std_members judges every `pkg.member` whose qualifier names a std
+    // package — grafted (is the member there?), C-native (is it in the
+    // runtime's surface?) or Voilà source that nothing grafted (is the `use`
+    // there?).
+    func check_std_members(mut self) {
+        self.collect_std_surface()
+
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            let n = self.T.Get(d)
+            if n.Kind == ast.IMPLDEC or n.Kind == ast.TRAITDEC {
+                // One bound set per METHOD, not per block: sibling methods
+                // are separate scopes and sharing one set would suppress a
+                // check in the second because the first bound the name.
+                each m in self.T.Get(self.T.Kid(d, 0)).Kids {
+                    self.std_scope(m)
+                }
+            } else {
+                self.std_scope(d)
+            }
+        }
+
+        // The script is one scope, exactly as check_call_sites treats it.
+        var sbound = set([])
+        each s in self.T.Get(self.T.Kid(self.file, 2)).Kids {
+            self.collect_bound(s, sbound)
+        }
+        each s in self.T.Get(self.T.Kid(self.file, 2)).Kids {
+            self.walk_std_members(s, sbound)
+        }
+    }
+
+    // std_scope walks one declaration with its own bindings collected. The
+    // whole node is walked, not just the body: a parameter's default value
+    // and a trait default expression are code too.
+    //
+    // That is one step wider than callsite.voi, which walks Kids[0] or the
+    // `= expr` at Kids[5] and so never sees a parameter default at all. The
+    // difference shows in exactly one construct: an ABSTRACT trait method,
+    // whose parameter defaults low never lowers (lower_trait_default returns
+    // early when there is neither a body nor an `= expr`), so a nonexistent
+    // member named in one is reported here and would not have been refused by
+    // the backend. It is the stricter direction, not the "check said ok"
+    // direction main.voi guards, and the name is a typo either way — but the
+    // asymmetry is deliberate and belongs on the record rather than being
+    // rediscovered.
+    func std_scope(mut self, d int) {
+        if d == 0 { return }
+        var bound = set([])
+        self.collect_bound(d, bound)
+        self.walk_std_members(d, bound)
+    }
+
+    // collect_std_surface fills the tables the check reads: which qualifiers
+    // are a std package of either kind and which of the Voilà-source ones this
+    // program actually grafted, which dotted names resolve, which of those are
+    // worth offering as a near miss, and which global names stop an identifier
+    // from being read as a qualifier at all.
+    func collect_std_surface(mut self) {
+        each p in std.Packages() {
+            self.sdSrc.add(p)
+        }
+        // The C packages are DERIVED — the qualifiers the lowerer accepts,
+        // minus the ones with Voilà source — rather than listed a fourth
+        // time. selftest holds load.std_c_packages plus std.Packages equal to
+        // low.PackageNames, so the subtraction cannot drift; a copy could.
+        // std/time falls on the source side of it and stays there: it is
+        // grafted, and its natives arrive below with the rest of the union.
+        each p in low.PackageNames() {
+            if not (p in self.sdSrc) {
+                self.sdC.add(p)
+            }
+        }
+        each nm in low.StdSrcNatives() {
+            self.sdHave.add(nm)
+        }
+        // The C half of the surface. A C package declares nothing, so these
+        // three lists ARE its API — and they are the same three cg resolves
+        // against, which is what makes `check` and `build` agree.
+        each nm in low.StdCNatives() {
+            self.add_std_native(nm)
+        }
+        each nm in low.PkgConstantNames() {
+            self.add_std_native(nm)
+        }
+        // std/str's functions are reachable as `str.NAME(s)` as well as bare
+        // and as the method `s.NAME()`; cg's known_native_names registers the
+        // qualified spelling explicitly, so it is accepted here explicitly.
+        each nm in low.StrMethodNames() {
+            self.add_std_native("str." || nm)
+        }
+        // Every declaration says which package it belongs to; only a FUNCTION
+        // or a package-level BINDING is a `pkg.member` EXPRESSION.
+        //
+        // A grafted TYPE is legal in type position — `sync.Mutex` as an
+        // annotation or a composite, where it is a TNAMED and this pass never
+        // sees it — and resolves to nothing in expression position: cg looks
+        // in fnIdx, in the variants and in the constants, and a struct name is
+        // in none of them. So a type name proves the package was grafted, and
+        // is not itself an answer. Accepting one would have re-opened the very
+        // split this pass closes, and offering one as a near miss — "did you
+        // mean `sync.Mutex`?" for `sync.Mutx` — would have been advice that
+        // passes `check` and dies in the backend.
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            let n = self.T.Get(d)
+            var names = []
+            var callable = false
+            if n.Kind == ast.STRUCTDEC or n.Kind == ast.ENUMDEC or
+               n.Kind == ast.EXCDEC or n.Kind == ast.TYPEDEC {
+                names.append(n.Sval)
+            } else if n.Kind == ast.FUNC {
+                names.append(n.Sval)
+                callable = true
+            } else if n.Kind == ast.GLOBAL {
+                // A package constant reaches a program as `path.SEP`, so it
+                // belongs to the surface. LET stores its names comma-joined.
+                let s = self.T.Kid(d, 0)
+                if s != 0 {
+                    let sn = self.T.Get(s)
+                    if sn.Kind == ast.LET {
+                        each nm in str.split(sn.Sval, ",") {
+                            if nm != "" { names.append(nm) }
+                        }
+                        callable = true
+                    } else if sn.Kind == ast.VAR {
+                        names.append(sn.Sval)
+                        callable = true
+                    }
+                }
+            }
+            if len(names) == 0 { continue }
+            // The embedded path is the proof: load_std_pkg labels every file
+            // it grafts `std/<pkg>/<file>`, which is not a path a user
+            // package can be loaded from (resolve() sends `std/…` elsewhere).
+            let src = self.T.FileOf(d)
+            each nm in names {
+                let dot = str.index(nm, ".")
+                if dot <= 0 { continue }
+                let q = nm[0..dot]
+                if not self.std_qualifier(q) { continue }
+                if str.starts_with(src, "std/" || q || "/") {
+                    self.sdPkgs.add(q)
+                    if not callable { continue }
+                    self.sdHave.add(nm)
+                    // Suggestible unless package-private: a leading `_` is
+                    // this project's convention for a name a program outside
+                    // the package is not meant to call.
+                    if not str.starts_with(nm[dot + 1..len(nm)], "_") {
+                        self.sdNames.append(nm)
+                    }
+                } else {
+                    // A USER package flattened to the same qualifier. It can
+                    // only be reached by a path (`use "sub/net"`), since a
+                    // bare `use "net"` resolves to std/net — but once it is
+                    // in the program its declarations are `net.Foo` in the
+                    // same flat namespace the lowerer resolves against, so
+                    // `net.Foo` in a file that did not import it COMPILES.
+                    // Nothing here can tell which package the writer meant,
+                    // so nothing here says anything.
+                    self.sdUser.add(q)
+                }
+            }
+        }
+        // The names a reference must NOT read as a package qualifier. Mirrors
+        // low.collect's two sources: GLOBAL declarations, and the script's own
+        // top-level bindings, which live in the global scope too.
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            if self.T.Kind(d) == ast.GLOBAL {
+                each nm in self.std_binding_names(self.T.Kid(d, 0)) {
+                    self.sdGlobals.add(nm)
+                }
+            }
+        }
+        each s in self.T.Get(self.T.Kid(self.file, 2)).Kids {
+            each nm in self.std_binding_names(s) {
+                self.sdGlobals.add(nm)
+            }
+        }
+
+        // The natives of a GRAFTED package are suggestible too — `net.resolve`
+        // has no Voilà body and is still public API. `net._send` is not: a
+        // leading `_` is this project's package-private convention.
+        each nm in low.StdSrcNatives() {
+            let dot = str.index(nm, ".")
+            if dot <= 0 { continue }
+            if not (nm[0..dot] in self.sdPkgs) { continue }
+            if str.starts_with(nm[dot + 1..len(nm)], "_") { continue }
+            self.sdNames.append(nm)
+        }
+    }
+
+    // std_qualifier reports whether a bare name is a std package qualifier of
+    // either kind. It is the same set low.PackageNames gives the lowerer, so
+    // a name this answers `true` for is one that WILL be lowered as a package
+    // reference — which is what makes the check's silence and cg's acceptance
+    // line up.
+    func std_qualifier(self, q str) bool {
+        return q in self.sdSrc or q in self.sdC
+    }
+
+    // add_std_native records one dotted name as resolvable and, unless it is
+    // package-private by the leading-underscore convention, as something a
+    // near miss may suggest. The first-writer-wins guard is not decoration:
+    // `math.pi` and the three `os` handles are in the natives list AND in the
+    // constants list, and a duplicate suggestion is a duplicate for no gain.
+    func add_std_native(mut self, nm str) {
+        if nm in self.sdHave { return }
+        self.sdHave.add(nm)
+        let dot = str.index(nm, ".")
+        if dot <= 0 { return }
+        if str.starts_with(nm[dot + 1..len(nm)], "_") { return }
+        self.sdNames.append(nm)
+    }
+
+    // std_binding_names is the names one LET or VAR introduces; anything else
+    // introduces none. LET stores them comma-joined.
+    func std_binding_names(self, node int) []str {
+        if node == 0 { return [] }
+        let n = self.T.Get(node)
+        if n.Kind == ast.VAR { return [n.Sval] }
+        if n.Kind != ast.LET { return [] }
+        var out = []
+        each nm in str.split(n.Sval, ",") {
+            if nm != "" { out.append(nm) }
+        }
+        return out
+    }
+
+    func walk_std_members(mut self, node int, bound set[str]) {
+        if node == 0 { return }
+        let n = self.T.Get(node)
+        if n.Kind == ast.FIELD {
+            self.check_std_member(node, bound)
+        }
+        if (n.Kind == ast.ARM or n.Kind == ast.IF) and n.Ival != 0 {
+            self.walk_std_members(n.Ival, bound)
+        }
+        each kid in n.Kids {
+            self.walk_std_members(kid, bound)
+        }
+    }
+
+    func check_std_member(mut self, fld int, bound set[str]) {
+        let base = self.T.Kid(fld, 0)
+        if base == 0 or self.T.Kind(base) != ast.IDENT { return }
+        let q = self.T.Get(base).Sval
+        // Shadowed: a value, not a package qualifier.
+        if q in bound or q in self.sdGlobals { return }
+        if not self.std_qualifier(q) { return }
+        // A user package flattened to the same qualifier (see sdUser).
+        if q in self.sdUser { return }
+        // A TYPE of that name makes the qualifier ambiguous rather than
+        // wrong: cg resolves `time.foo` against fnIdx, where the methods of
+        // a `struct time` also land, under exactly that dotted spelling. It
+        // is a strange program, but it is one that WORKS, and silence is the
+        // only direction this check may err in.
+        if q in self.structs or q in self.enums or q in self.excs { return }
+        let n = self.T.Get(fld)
+        if n.Sval == "" { return }
+        // A METHOD on a type of that name, which is the same story one level
+        // down and the one that actually bites. `str` is a PRIMITIVE as well
+        // as a package, so `impl str { func blank() str { … } }` is legal,
+        // low registers the method as the ir function `str.blank`
+        // (low/low.voi's method naming), and emit_call resolves fnIdx BEFORE
+        // the natives — so `str.blank()` compiles and runs, and a table
+        // lookup alone would have rejected it. mset is the checker's mirror
+        // of exactly those fnIdx rows: every impl block on the type, an
+        // exception's own methods, AND the trait defaults cg.collect_inherited
+        // registers, which is the hazard Y1 and R2-C both had to learn. It is
+        // keyed `Type|method` and built by check_traits, which Check runs
+        // first. It reaches the cases the line above cannot — a primitive, a
+        // `type os = int` alias (no STRUCTDEC child, so it is in no table
+        // here) and a trait — and it is NARROWER: only the member that really
+        // exists goes silent, not every member of the qualifier.
+        if (q || "|" || n.Sval) in self.mset { return }
+        if (q || "." || n.Sval) in self.sdHave { return }
+
+        // Named but never grafted: the reference may be perfectly correct and
+        // the `use` missing. "no member" would be a lie — the member may well
+        // exist, in source this program never loaded. Only a VOILÀ-SOURCE
+        // package can be in that state; a C package has no source to graft,
+        // so its whole surface was already consulted above.
+        if q in self.sdSrc and not (q in self.sdPkgs) {
+            self.report_at(fld, "package `" || q || "` is not imported: `" ||
+                           q || "." || n.Sval || "` needs `use \"std/" || q ||
+                           "\"` (§13.4)")
+            return
+        }
+
+        var cands = []
+        each nm in self.sdNames {
+            if str.starts_with(nm, q || ".") {
+                cands.append(nm[len(q) + 1..len(nm)])
+            }
+        }
+        var msg = "package `" || q || "` has no member `" || n.Sval || "`"
+        let near = near_miss(n.Sval, cands)
+        if near != "" {
+            msg = msg || "; did you mean `" || q || "." || near || "`?"
+        }
+        self.report_at(fld, msg || " (§13.4)")
+    }
+}
+
+// near_miss returns the candidate closest to `name`, or "" when none is close
+// enough to be advice. The budget is deliberately tight — one edit for a short
+// name, two for a longer one — because a wrong suggestion costs more than no
+// suggestion.
+func near_miss(name str, cands []str) str {
+    var limit = 2
+    if len(name) < 5 { limit = 1 }
+    var best = ""
+    var bestd = limit + 1
+    each c in cands {
+        let d = edit_distance(name, c)
+        if d < bestd {
+            best = c
+            bestd = d
+        }
+    }
+    return best
+}
+
+// edit_distance is Levenshtein over BYTES. A member name is an identifier, so
+// it is ASCII by construction and no unicode table is needed; the two-row
+// table keeps it O(len(a) * len(b)) time and O(len(b)) space.
+func edit_distance(a str, b str) int {
+    let m = len(b)
+    var prev = []
+    var j = 0
+    while j <= m {
+        prev.append(j)
+        j += 1
+    }
+    var i = 0
+    while i < len(a) {
+        var cur = []
+        cur.append(i + 1)
+        var k = 0
+        while k < m {
+            var best = prev[k + 1] + 1          // delete a[i]
+            let ins = cur[k] + 1                // insert b[k]
+            if ins < best { best = ins }
+            var sub = prev[k]                   // substitute
+            if a[i] != b[k] { sub += 1 }
+            if sub < best { best = sub }
+            cur.append(best)
+            k += 1
+        }
+        prev = cur
+        i += 1
+    }
+    return prev[m]
+}

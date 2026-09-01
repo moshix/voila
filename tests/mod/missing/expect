@@ -1,0 +1,2 @@
+no package `example.com/absent/thing`
+the module cache has no copy — run: voila get example.com/absent@v1.0.0

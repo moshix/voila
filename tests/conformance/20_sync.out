@@ -1,0 +1,22 @@
+4000
+4
+threw: inside
+true
+not recursive
+not held
+cancelled mid-section
+true
+4000
+10 6 7 6 6 20
+true false 21
+false
+true
+1000 1000
+1 true
+once threw: init failed false
+retried
+true
+6 0
+reused: sync.WaitGroup: reused after its count reached zero; count all the work with one add() before spawning it, or make a new WaitGroup per round
+empty wait returned
+negative: sync.WaitGroup: count went negative (more done() than add())

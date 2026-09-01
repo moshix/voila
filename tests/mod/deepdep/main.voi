@@ -1,0 +1,7 @@
+package main
+
+// This module requires `top` and nothing else. `lib` is selected because
+// top's own voila.mod requires it — the graph is walked transitively.
+use "example.com/top/top"
+
+func main() { say top.Say() }

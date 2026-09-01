@@ -1,0 +1,11 @@
+// `impl <trait> for T` naming a trait that was never declared. Nothing used to
+// read the trait name at all, so this compiled and ran.
+struct Point { x int, y int }
+
+impl Showable for Point {
+    func show(self) str { return "({self.x}, {self.y})" }
+}
+
+func main() {
+    say Point{x: 1, y: 2}.show()
+}

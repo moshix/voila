@@ -1,0 +1,1 @@
+no trait `Showable`: the traits in scope are Clone, Copy, Drop, Eq, Error, Hash, Ord, Send, Show (§3.6)

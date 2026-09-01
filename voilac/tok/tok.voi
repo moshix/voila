@@ -1,8 +1,8 @@
 // Package tok — the token vocabulary of Voilà, and the Token record.
 //
-// Kinds are integer constants rather than an enum: variant names are global
-// across a program (§11.5) and a compiler has hundreds of them, so plain
-// constants keep the namespace clean and make the tables below trivial.
+// Kinds are integer constants rather than an enum: a compiler has hundreds of
+// them and they are wanted bare from every stage, so plain constants keep the
+// spelling short and make the tables below trivial.
 package tok
 
 struct Token {

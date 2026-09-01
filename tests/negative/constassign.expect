@@ -1,0 +1,1 @@
+cannot assign to `MAX`: a `const` is fixed at compile time; use `var` (§4)

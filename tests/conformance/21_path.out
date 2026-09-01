@@ -1,0 +1,55 @@
+base(a/b/c.voi) -> c.voi
+base(c.voi) -> c.voi
+base(a/b/) -> b
+base(/) -> 
+base() -> 
+dir(a/b/c.voi) -> a/b
+dir(c.voi) -> .
+dir(/c.voi) -> /
+dir(a/b/) -> a
+dir(/) -> /
+split -> src main.voi
+join(a,b) -> a/b
+join(a/,/b) -> a/b
+join(/,a) -> /a
+join(a,,b,c) -> a/b/c
+join(,b) -> b
+join(a,) -> a
+join() -> 
+join(one) -> one
+join(.,x) -> x
+join(a,../b) -> b
+join(/srv,../../etc) -> /etc
+escapes false
+ext(x.voi) -> .voi
+ext(a/b.tar.gz) -> .gz
+ext(noext) -> 
+ext(.bashrc) -> .bashrc
+ext(a.d/b) -> 
+stem(a/b.voi) -> b
+stem(noext) -> noext
+stem(.bashrc) -> 
+with_ext(a/b.voi,.c) -> a/b.c
+with_ext(a/b.voi,c) -> a/b.c
+with_ext(b.voi,) -> b
+with_ext(./b.voi,.c) -> b.c
+clean(a/./b/../c//d) -> a/c/d
+clean() -> .
+clean(.) -> .
+clean(/) -> /
+clean(/../x) -> /x
+clean(../../x) -> ../../x
+clean(a/../../x) -> ../x
+clean(a/b/../..) -> .
+is_abs true false false
+abs is_abs true
+abs ends true
+abs clean true
+abs(/tmp/../x) -> /x
+rel(/a,/a/b/c) -> b/c
+rel(/a,/a) -> .
+rel(/a,/b/c) -> /b/c
+rel(/etc,/etcetera) -> /etcetera
+has_prefix true true false false
+sep /
+properties broken: 0

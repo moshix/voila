@@ -154,6 +154,80 @@ typedef struct {
   int timeout_ms;   /* 0 = no deadline; used to bound accept() portably */
 } VlSocket;
 
+/* std/io — a buffered reader over one byte source, and a writer over one byte
+ * sink. They are runtime KINDS rather than Voilà structs for two reasons:
+ * `os.stdin` must exist with no `use` at all, and vl_iter_next must be able to
+ * stream lines from one (`each line in os.stdin`).
+ *
+ * The source is named INDIRECTLY whenever a Voilà value owns it: `owner` is a
+ * retained O_FILE or O_SOCKET and the live handle is read back out of it on
+ * every operation (rd_src in io.c). That costs one branch and buys two things
+ * a cached FILE* or fd cannot:
+ *   - the owner cannot be freed under us — without the retain,
+ *     `io.reader(must os.open(p))` drops the file, obj_free fclose()s it, and
+ *     the reader is left holding a dangling stream;
+ *   - closing the owner (`f.close()`, `conn.close()`) is SEEN here, so the
+ *     reader reports "closed" instead of reading whatever the OS has since
+ *     handed that descriptor number to.
+ * `owner` is nil only for a source no Voilà value owns: the process's own
+ * stdin/stdout/stderr (is_std), and the two ends of io.pipe() (own_src, which
+ * says closing the descriptor is ours to do).
+ *
+ * b[r..w) is what has been read from the source and not yet handed out. Tasks
+ * are OS threads and the standard handles are process-wide singletons, so
+ * every method holds `mu` for the whole of its work. */
+typedef struct {
+  VlObj hdr;
+  int fd;      /* -1 when FILE*-backed */
+  FILE *f;     /* NULL when fd-backed */
+  Value owner; /* retained O_FILE / O_SOCKET, or nil */
+  Value name;  /* str, for name() and for printing */
+  char *b;
+  int64_t cap, r, w;
+  bool eof, closed, own_src, is_std;
+  pthread_mutex_t mu;
+} VlReader;
+
+/* A writer is deliberately UNBUFFERED: stdio already buffers a FILE*, and a
+ * second buffer in front of os.stdout would reorder output against `say`,
+ * which writes to stdout directly. flush() therefore only has work to do on
+ * the FILE*-backed ones. */
+typedef struct {
+  VlObj hdr;
+  int fd;
+  FILE *f;
+  Value owner;
+  Value name;
+  bool closed, own_src, is_std, discard;
+  pthread_mutex_t mu;
+} VlWriter;
+
+/* std/sync — the three primitives that need a machine-level object. They are
+ * runtime KINDS and not Voilà structs because a pthread_mutex_t has to sit at
+ * a fixed address for its whole life: a Voilà struct is a heap object whose
+ * fields are Values, with nowhere to keep one.
+ *
+ * std/sync wraps each of these in a Voilà struct (`Mutex{h: …}`), exactly as
+ * std/net wraps VlSocket in `Conn{h: …}`, so the closure-shaped API can be
+ * written in Voilà with `defer` — see sync.c's header for why that matters. */
+typedef struct {
+  VlObj hdr;
+  pthread_mutex_t mu; /* PTHREAD_MUTEX_ERRORCHECK; see sync.c */
+} VlMutex;
+
+typedef struct {
+  VlObj hdr;
+  pthread_rwlock_t rw;
+} VlRWLock;
+
+/* `n` is touched ONLY through __atomic_* (sync.c). Nothing else in the runtime
+ * may read or write it directly — a plain load beside an atomic store is a
+ * data race whether or not the compiler happens to emit the same instruction. */
+typedef struct {
+  VlObj hdr;
+  int64_t n;
+} VlAtomic;
+
 typedef struct {
   VlObj hdr;
   char *b;
@@ -247,6 +321,119 @@ Value vl_str_call(const char *name, Value *argv, int argc, bool *ok);
 Value vl_str_method(Value self, const char *name, Value *argv, int argc, bool *ok);
 Value vl_file_method(Value self, const char *name, Value *argv, int argc, bool *ok);
 
+/* vl_records_of is the shared body of File.records and Reader.records: the
+ * fixed-width record split of §13.2. One copy, so the two cannot drift. */
+Value vl_records_of(Value text, int64_t width);
+
+/* ---------------------------------------------------------------- std/io */
+
+/* io.c. The standard handles are process-wide singletons made once by
+ * vl_io_init (called from vl_init): vl_lookup_value re-runs at EVERY LOADFN,
+ * so a fresh reader per `os.stdin` would drop whatever the previous one had
+ * buffered. vl_stdin/vl_stdout/vl_stderr return them BORROWED. */
+void vl_io_init(void);
+Value vl_stdin(void);
+Value vl_stdout(void);
+Value vl_stderr(void);
+
+/* io.reader / io.writer as C: an owned reader/writer, or an IOError VALUE. */
+Value vl_reader_of(Value src);
+Value vl_writer_of(Value dst);
+
+Value vl_reader_method(Value self, const char *name, Value *argv, int argc,
+                       bool *ok);
+Value vl_writer_method(Value self, const char *name, Value *argv, int argc,
+                       bool *ok);
+bool vl_io_isatty(Value h);
+
+/* obj_free's arms, kept in io.c so the POSIX close(2) stays in one file. */
+void vl_reader_free(VlObj *o);
+void vl_writer_free(VlObj *o);
+
+/* The std/io natives, registered by name in std.c's table[]. They are
+ * VlFn-shaped so the table can point straight at them. */
+Value vl_io_reader(Value *argv, int argc, VlFrame *up);
+Value vl_io_writer(Value *argv, int argc, VlFrame *up);
+Value vl_io_buffered(Value *argv, int argc, VlFrame *up);
+Value vl_io_copy(Value *argv, int argc, VlFrame *up);
+Value vl_io_pipe(Value *argv, int argc, VlFrame *up);
+Value vl_io_read_all(Value *argv, int argc, VlFrame *up);
+Value vl_io_discard(Value *argv, int argc, VlFrame *up);
+
+/* -------------------------------------------------------------- std/crypto */
+
+/* crypto.c. vl_random_bytes is the process's ONLY cryptographically secure
+ * random source — getrandom(2) on Linux, getentropy(2) on macOS and the BSDs,
+ * /dev/urandom where neither is reachable — and it ABORTS rather than
+ * degrading to a weak one. crypto.random, crypto.random_int and uuid.new all
+ * go through it.
+ *
+ * vl_try_random_bytes is the same source, reporting failure instead. It has
+ * ONE caller by design: vl_init's seeding of std/rand, which runs in every
+ * program including those that never draw a random number, and so must not
+ * be able to stop one from starting. std/rand is random(3) either way — fast,
+ * reproducible, and fit for neither uuid.new's job nor a key. */
+void vl_random_bytes(void *out, size_t n);
+bool vl_try_random_bytes(void *out, size_t n);
+
+/* uuid.new's body, kept beside the entropy source it depends on. */
+Value vl_uuid_v4(void);
+
+/* The std/crypto natives, registered by name in std.c's table[]. SHA-1 and
+ * MD5 are LEGACY — collisions are practical for both — and exist for
+ * checksums and interop, never for anything that must resist an attacker. */
+Value vl_crypto_md5(Value *argv, int argc, VlFrame *up);
+Value vl_crypto_md5_raw(Value *argv, int argc, VlFrame *up);
+Value vl_crypto_sha1(Value *argv, int argc, VlFrame *up);
+Value vl_crypto_sha1_raw(Value *argv, int argc, VlFrame *up);
+Value vl_crypto_sha256(Value *argv, int argc, VlFrame *up);
+Value vl_crypto_sha256_raw(Value *argv, int argc, VlFrame *up);
+Value vl_crypto_sha512(Value *argv, int argc, VlFrame *up);
+Value vl_crypto_sha512_raw(Value *argv, int argc, VlFrame *up);
+Value vl_crypto_hmac_md5(Value *argv, int argc, VlFrame *up);
+Value vl_crypto_hmac_md5_raw(Value *argv, int argc, VlFrame *up);
+Value vl_crypto_hmac_sha1(Value *argv, int argc, VlFrame *up);
+Value vl_crypto_hmac_sha1_raw(Value *argv, int argc, VlFrame *up);
+Value vl_crypto_hmac_sha256(Value *argv, int argc, VlFrame *up);
+Value vl_crypto_hmac_sha256_raw(Value *argv, int argc, VlFrame *up);
+Value vl_crypto_hmac_sha512(Value *argv, int argc, VlFrame *up);
+Value vl_crypto_hmac_sha512_raw(Value *argv, int argc, VlFrame *up);
+Value vl_crypto_random(Value *argv, int argc, VlFrame *up);
+Value vl_crypto_random_int(Value *argv, int argc, VlFrame *up);
+Value vl_crypto_equal(Value *argv, int argc, VlFrame *up);
+
+/* ---------------------------------------------------------------- std/sync */
+
+/* sync.c. The natives are VlFn-shaped so std.c's table[] can point straight at
+ * them, and NONE of them calls back into Voilà — no lock is ever held across
+ * user code by the runtime. The closure forms (`with`, `Once.do`) are Voilà
+ * source over `defer`, which unlocks on the throw path too. */
+Value vl_sync_mutex_new(void);
+Value vl_sync_rwlock_new(void);
+Value vl_sync_atomic_new(int64_t n);
+
+/* obj_free's arms, and the one read str_into needs. */
+void vl_sync_mutex_free(VlObj *o);
+void vl_sync_rwlock_free(VlObj *o);
+int64_t vl_sync_atomic_peek(VlObj *o);
+
+Value vl_sync_mutex(Value *argv, int argc, VlFrame *up);
+Value vl_sync_lock(Value *argv, int argc, VlFrame *up);
+Value vl_sync_unlock(Value *argv, int argc, VlFrame *up);
+Value vl_sync_try_lock(Value *argv, int argc, VlFrame *up);
+Value vl_sync_rwlock(Value *argv, int argc, VlFrame *up);
+Value vl_sync_rlock(Value *argv, int argc, VlFrame *up);
+Value vl_sync_wlock(Value *argv, int argc, VlFrame *up);
+Value vl_sync_rwunlock(Value *argv, int argc, VlFrame *up);
+Value vl_sync_try_rlock(Value *argv, int argc, VlFrame *up);
+Value vl_sync_try_wlock(Value *argv, int argc, VlFrame *up);
+Value vl_sync_atomic(Value *argv, int argc, VlFrame *up);
+Value vl_sync_load(Value *argv, int argc, VlFrame *up);
+Value vl_sync_store(Value *argv, int argc, VlFrame *up);
+Value vl_sync_add(Value *argv, int argc, VlFrame *up);
+Value vl_sync_swap(Value *argv, int argc, VlFrame *up);
+Value vl_sync_cas(Value *argv, int argc, VlFrame *up);
+
 /* method dispatch shared with std.c */
 const VlMethod *vl_find_method(const char *type, const char *name);
 Value vl_user_show(Value v, bool *ok);
@@ -275,5 +462,18 @@ Value vl_file_new(FILE *f, const char *name, bool is_std);
 
 /* iteration over a channel needs the task layer */
 Value vl_chan_iter_next(Value ch, bool *ok);
+
+/* ------------------------------------------------------------------ regex */
+
+void vl_regex_free(VlObj *o);
+const char *vl_regex_src(Value v);
+Value vl_regex_compile(Value pat);
+Value vl_regex_matches(Value pat, Value subject);
+Value vl_regex_find(Value pat, Value subject);
+Value vl_regex_find_all(Value pat, Value subject);
+Value vl_regex_replace(Value pat, Value subject, Value repl);
+Value vl_regex_split(Value pat, Value subject);
+Value vl_regex_method(Value self, const char *name, Value *argv, int argc,
+                      bool *ok);
 
 #endif /* VOILA_INT_H */

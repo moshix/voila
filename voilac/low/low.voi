@@ -10,7 +10,6 @@ package low
 
 use "voilac/ast"
 use "voilac/ir"
-use "voilac/tok"
 use "std/str"
 use "std/fmt"
 
@@ -61,8 +60,23 @@ struct SwitchCtx {
 }
 
 // `enum` is a keyword, so the enclosing enum's name is `owner`.
+// variant_short is the variant half of a flattened variant name: `geom.Circle`
+// is the package's `Circle`, and the runtime tag pairs the SHORT name with the
+// enum's own (already qualified) name. A package name never contains a dot, so
+// the last dot is the only separator there is.
+func variant_short(name str) str {
+    let i = str.last_index(name, ".")
+    if i < 0 { return name }
+    return name[i + 1..len(name)]
+}
+
 struct VariantInfo {
     owner   str
+    // The runtime tag, `{enum}.{variant}` — `geom.Shape.Circle`. Both halves
+    // are package-qualified now, so this can no longer be rebuilt from the
+    // map KEY (which is the qualified variant name, `geom.Circle`); it is
+    // formed once, where the enum declaration is in hand.
+    tag     str
     payload bool
 }
 
@@ -160,6 +174,7 @@ impl Lowerer {
                     let fs = self.T.Kid(v, 0)
                     self.variants[vn.Sval] = VariantInfo{
                         owner: n.Sval,
+                        tag: n.Sval || "." || variant_short(vn.Sval),
                         payload: self.T.NKids(fs) > 0,
                     }
                 }
@@ -255,6 +270,10 @@ impl Lowerer {
                 each m in self.T.Get(self.T.Kid(d, 1)).Kids {
                     self.lower_func_decl(n.Sval || "." || self.T.Get(m).Sval, m)
                 }
+            } else if n.Kind == ast.TRAITDEC {
+                each m in self.T.Get(self.T.Kid(d, 0)).Kids {
+                    self.lower_trait_default(n.Sval, m)
+                }
             }
         }
     }
@@ -296,7 +315,10 @@ impl Lowerer {
                 var lines = []
                 each v in self.T.Get(self.T.Kid(d, 0)).Kids {
                     let vn = self.T.Get(v)
-                    var sig = vn.Sval
+                    // The SHORT name: this line is what cg turns into a
+                    // VlVariant, whose `variant` field the runtime pairs with
+                    // the already-qualified enum name in `type`.
+                    var sig = variant_short(vn.Sval)
                     let fs = self.T.Kid(v, 0)
                     if self.T.NKids(fs) > 0 {
                         var ps = []
@@ -367,6 +389,15 @@ impl Lowerer {
     }
 
     func lower_func_decl(mut self, name str, d int) throws LowerError {
+        self.lower_func_body(name, d, self.T.Kid(d, 0))
+    }
+
+    // lower_func_body is lower_func_decl with the body passed separately. A
+    // trait default written `= expr` has no block of its own; the one
+    // synthesised for it below is not a child of the declaration, so the
+    // body cannot always be read back off the FUNC node.
+    func lower_func_body(mut self, name str, d int,
+                         body int) throws LowerError {
         let saved = self.save_fn()
         let dn = self.T.Get(d)
         self.begin_fn(name, self.func_sig(d), dn.Line)
@@ -399,7 +430,6 @@ impl Lowerer {
                 self.mark(done)
             }
         }
-        let body = self.T.Kid(d, 0)
         if body != 0 {
             self.lower_body(body, false)
         }
@@ -407,6 +437,60 @@ impl Lowerer {
         self.M.Funcs[self.fi].NRegs = self.nextReg
         self.pop_scope()
         self.restore_fn(saved)
+    }
+
+    // lower_trait_default lowers a trait method's DEFAULT body — the one an
+    // implementor inherits when its own `impl` block does not write the
+    // method.
+    //
+    // ONE compiled body serves every implementor. Every function the backend
+    // emits has the same C signature and every value is a boxed Value, so a
+    // default needs no specialisation per type: it is lowered once, here,
+    // under `{Trait}$${method}`, and cg's emit_method_table points each
+    // inheriting type's row at it.
+    //
+    // The separator is TWO dollars, and the second one is load-bearing. One
+    // would not do. Every name in the module comes from exactly three places
+    // — this function, lower_synthetic ($INIT, $SCRIPT) and lower_closure,
+    // which names a closure `{enclosing}$fn{N}` — and cg keys fnIdx by that
+    // name alone, last writer winning. A user identifier holds no `$` at
+    // all, so `Trait$method` looks safe; but a trait `Zed` whose default is
+    // spelled `fn1` mints `Zed$fn1`, which is precisely what lower_closure
+    // calls the first closure inside `func Zed`. The two would land in the
+    // same fnIdx slot and one body would silently replace the other — in
+    // EITHER direction, depending on declaration order.
+    //
+    // `$$` separates them, and the reason is the SHAPE of the two names, not
+    // the absence of `$$` from closure names — a closure written inside a
+    // trait default really is `{Trait}$${method}$fn{N}`, which contains one.
+    // The load-bearing fact is that a closure name never ENDS in `$fn{N}`
+    // preceded by `$`: lower_closure appends `$fn{N}` to a base name, and no
+    // base name ends in `$` (identifiers hold no `$`; the other minted forms
+    // are `pkg.Name`, `Type.method`, `$INIT`, `$SCRIPT`, or another closure
+    // name, which ends in a digit). A name minted HERE is `A$$B` with A and B
+    // both `$`-free — exactly two `$`, adjacent, nothing after B — so no
+    // closure name can ever present that shape.
+    //
+    // Two spellings arrive here. A full `{ … }` block is Kids[0] and needs
+    // nothing. The short form `= expr` is Kids[5] and means `{ return expr }`,
+    // so a synthetic RETURN wrapped in a synthetic BLOCK is what gets
+    // lowered. Wrapping a lone statement in a BLOCK so that one path can
+    // serve two spellings is the trick `defer` already plays on its call
+    // form (stmt.voi) — with an EXPRSTMT where this wants a RETURN.
+    //
+    // A method with neither is abstract: there is nothing to lower, and
+    // chk/traits.voi has already insisted every implementor writes it.
+    func lower_trait_default(mut self, tname str, m int) throws LowerError {
+        if self.T.Kind(m) != ast.FUNC { return }
+        let n = self.T.Get(m)
+        var body = self.T.Kid(m, 0)
+        if body == 0 {
+            let dflt = self.T.Kid(m, 5)
+            if dflt == 0 { return }
+            let rs = self.T.Add(ast.RETURN, n.Line, n.Col, 0, 0, "", [dflt])
+            body = self.T.Add(ast.BLOCK, n.Line, n.Col, 0, 0, "", [rs])
+        }
+        self.lower_func_body(tname || "$$" || n.Sval, m, body)
     }
 
     // lower_synthetic lowers $INIT / $SCRIPT, whose top-level bindings are

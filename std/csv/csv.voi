@@ -1,0 +1,450 @@
+// std/csv — comma-separated values, RFC 4180, reading and writing (§13.4).
+//
+// The whole of the format is four rules: fields are separated by commas,
+// records by a line ending, a field may be wrapped in double quotes, and a
+// quote inside a quoted field is written twice. The fourth rule is what makes
+// CSV worth a package rather than a `str.split`: a quoted field may contain
+// commas, quotes AND NEWLINES, so a record is not the same thing as a line
+// and any parser built on `each line in reader` is wrong on real data.
+//
+// That is the invariant this package is organised around. `scan_record`
+// below reports "I ran out of input in the middle of a record", the Reader
+// answers by pulling ANOTHER line and asking again, and a field spanning six
+// lines costs six of those rounds and no special case anywhere else.
+//
+// ------------------------------------------------------------- it streams
+//
+// `csv.reader` takes anything `io.reader` takes — a file, a socket, a
+// net.Conn, os.stdin, another reader — and holds only the record it is
+// building. The buffer is compacted after every record, so a four-gigabyte
+// file costs the memory of its widest record and not a byte more:
+//
+//     var rd = csv.reader(must os.open("prices.csv"))
+//     each rec in rd {
+//         say rec[0], rec[1]
+//     }
+//     rd.close()
+//
+// `each rec in rd` works because `Reader.next(mut self) ?[]str` joins the
+// iteration protocol std/io introduced: the runtime calls `next` and stops at
+// nil. Nothing else is needed, and `rd.next()` may equally be called by hand.
+//
+// ------------------------------------------------------- errors are THROWN
+//
+// This package breaks the value-returning convention std/net and std/io keep
+// (`match f() { Ok(v) => …, Err(e) => … }`), and does so under duress: the
+// iteration protocol reads `next`'s result as either a record or nil, and an
+// error VALUE is neither — it would be handed to the loop body as though it
+// were a row. So `next` throws, and everything else here throws too rather
+// than making one package speak two conventions.
+//
+// It costs one word at the call site to get the other convention back
+// (§8.5): `attempt rd.next()` is a `?[]str!`, and `try { … } catch e` handles
+// a whole loop at once.
+//
+// Two things are thrown: FormatError for input this parser will not guess at
+// (only ever an unterminated quoted field), and whatever std/io throws for a
+// read or write that fails.
+//
+// --------------------------------------------------- what it accepts, exactly
+//
+// Line endings: `\n` and `\r\n` both end a record, and the `\r` of a `\r\n`
+// is not part of the field before it. A LONE `\r` is DATA — the classic-Mac
+// line ending has been gone for twenty years, and treating it as a terminator
+// would silently split a field that legitimately contains one.
+//
+// Blank lines carry no record and are skipped, wherever they appear. A record
+// always has at least one field, so "no fields" is never a record and is used
+// below as the internal signal for "nothing here". Note that a line holding
+// `""` is NOT blank: it is one empty quoted field.
+//
+// A quoted field is preserved BYTE FOR BYTE, `\r\n` included. Normalising the
+// line endings inside quotes would be lossy, and `str.replace(f, "\r\n",
+// "\n")` is one call away for a caller who wants it.
+//
+// Ragged records are returned as they come. Nothing here enforces a field
+// count: real files have short trailing rows and a parser that refuses them
+// is a parser that cannot read the file you have.
+//
+// Text after a closing quote is appended to the field: `"ab"c` reads as
+// `abc`, and a bare quote inside an UNQUOTED field is an ordinary character,
+// so `a"b` reads as `a"b`. RFC 4180 calls both malformed. Refusing them would
+// be defensible and it is not what this does: there is no ambiguity about
+// what the field contains, and the alternative is a parser that dies on data
+// nobody can go back and fix. The only input refused outright is a quoted
+// field with no closing quote before end of input, where the content
+// genuinely is unknown.
+//
+// ------------------------------------------------------------------ writing
+//
+// A field is quoted when it must be — it contains the delimiter, a quote, a
+// CR or an LF — and also when it begins or ends with a space or a tab. That
+// last is not required by RFC 4180, which says surrounding spaces are part of
+// the field; it is here because plenty of readers disagree, and quoting is
+// the only way to say "the space is mine" that all of them understand.
+//
+// Records end with `\n`. Set `w.crlf = true` for the `\r\n` the RFC
+// specifies, which is what a spreadsheet on Windows wants; this reader
+// accepts either.
+//
+// ------------------------------------------------------------ other delimiters
+//
+// `sep` is a public field on both Reader and Writer, so TSV is
+// `rd.sep = '\t'` after construction. It is a field rather than a
+// constructor argument because it is the only knob, and a `reader_sep`
+// alongside every `reader` would double a four-function surface for it.
+// `decode` and `encode` below are comma-only; reach for a Reader or a Writer
+// when the delimiter is not a comma.
+package csv
+
+use "std/str"
+
+// Reader turns a byte stream into records. Make one with `csv.reader`.
+//
+// `buf` holds the text read but not yet consumed and `at` is the position in
+// it; `compact` drops the consumed prefix after every record, which is what
+// bounds the memory to one record rather than one file. `eof` records that
+// the source is spent — it is what tells `scan_record` a trailing quote is a
+// closing quote rather than possibly the first half of an escaped one.
+struct Reader {
+    src io.Reader
+    sep rune
+    buf str
+    at  int
+    eof bool
+    n   int
+}
+
+// Writer renders records onto a byte stream. Make one with `csv.writer`.
+struct Writer {
+    dst  io.Writer
+    sep  rune
+    crlf bool
+}
+
+// ------------------------------------------------------------- constructors
+
+// reader wraps any source `io.reader` accepts: a file, a socket, a net.Conn,
+// os.stdin, or another reader (in which case it is used as it stands, so no
+// buffered bytes are stranded).
+func reader(src) Reader {
+    let r = must io.reader(src)
+    return Reader{src: r, sep: ',', buf: "", at: 0, eof: false, n: 0}
+}
+
+// writer wraps any sink `io.writer` accepts.
+func writer(dst) Writer {
+    let w = must io.writer(dst)
+    return Writer{dst: w, sep: ',', crlf: false}
+}
+
+// decode reads every record out of a string already in memory. It is the
+// convenience for a small document; a large one wants `reader`, which never
+// holds more than one record at a time.
+//
+// `decode`/`encode` rather than `parse`/`format` for two reasons: `parse` is
+// a KEYWORD (§7.4, the REXX template statement) and cannot be an identifier
+// at all, and std/json already spells this pair `json.decode`/`json.encode`.
+func decode(text str) [][]str {
+    var out = []
+    var at = 0
+    var n = 0
+    while true {
+        // `more` is false throughout: the whole document is here, so the end
+        // of the string really is the end of the input.
+        let fields, next, ok = scan_record(text, at, ',', false)
+        if not ok {
+            throw FormatError{msg: "csv: unterminated quoted field after " ||
+                                   "record {n}"}
+        }
+        if len(fields) == 0 { return out }
+        out.append(fields)
+        at = next
+        n += 1
+    }
+    return out
+}
+
+// encode renders records as one CSV document, each ending with `\n`. It is
+// the inverse of `decode` for every input `decode` accepts.
+func encode(recs [][]str) str {
+    var b = str.Builder{}
+    each rec in recs {
+        b.write(render(rec, ',', false))
+    }
+    return b.done()
+}
+
+// ------------------------------------------------------------------ Reader
+
+impl Reader {
+    // next is the next record, or nil at end of input. It is also what makes
+    // `each rec in rd` work — the runtime's iteration protocol is exactly a
+    // `next(mut self) ?T` — so the two spellings are one implementation.
+    //
+    // It throws FormatError on a quoted field with no closing quote, and
+    // whatever the source throws on a failed read.
+    func next(mut self) ?[]str {
+        while true {
+            let fields, at, ok = scan_record(self.buf, self.at, self.sep,
+                                             not self.eof)
+            if ok {
+                self.at = at
+                self.compact()
+                // No fields is not a record — see the header. It means the
+                // buffer held nothing but blank lines, so either the input is
+                // finished or more of it has to be fetched.
+                if len(fields) > 0 {
+                    self.n += 1
+                    return fields
+                }
+                if self.eof { return nil }
+                self.fill()
+                continue
+            }
+            // The scanner ran out mid-record. With the source still open that
+            // is an appetite for more input; with the source spent it is the
+            // one malformed input this package refuses.
+            if self.eof {
+                throw FormatError{msg: "csv: unterminated quoted field after " ||
+                                       "record {self.n}"}
+            }
+            self.fill()
+        }
+        return nil
+    }
+
+    // all reads every remaining record. It holds the whole result in memory
+    // by definition; `each rec in rd` does not, and is what to reach for on
+    // anything large.
+    func all(mut self) [][]str {
+        var out = []
+        while true {
+            let rec = self.next()
+            if rec == nil { return out }
+            out.append(rec)
+        }
+        return out
+    }
+
+    // count is how many records have been returned so far.
+    func count(self) int {
+        return self.n
+    }
+
+    // close closes the underlying reader. Idempotent, as std/io's is.
+    func close(self) {
+        self.src.close()
+    }
+
+    // fill appends one more line of source text, or marks the source spent.
+    // A line at a time is exactly the right granularity: read_line is
+    // buffered (one read per 8 KiB, not one per line), and a record that
+    // spans lines needs precisely one more of them per round.
+    func fill(mut self) {
+        let chunk = must self.src.read_line()
+        if chunk == "" {
+            self.eof = true
+            return
+        }
+        self.buf = self.buf || chunk
+    }
+
+    // compact drops the consumed prefix of the buffer. This is the whole of
+    // the streaming story: without it `buf` would grow to the size of the
+    // file, with it to the size of the widest record.
+    func compact(mut self) {
+        if self.at > 0 {
+            self.buf = self.buf[self.at..len(self.buf)]
+            self.at = 0
+        }
+    }
+}
+
+// ------------------------------------------------------------------ Writer
+
+impl Writer {
+    // write renders one record. Fields are quoted only where they need to be
+    // (see the header), so a plain record costs no quotes at all.
+    func write(self, rec []str) {
+        must self.dst.write_all(render(rec, self.sep, self.crlf))
+    }
+
+    // write_all renders many records.
+    func write_all(self, recs [][]str) {
+        each rec in recs {
+            self.write(rec)
+        }
+    }
+
+    // flush pushes buffered bytes at the operating system. A Writer over a
+    // file is buffered, so nothing is on disk for certain until this returns
+    // — or until `close`, which flushes first.
+    func flush(self) {
+        must self.dst.flush()
+    }
+
+    // close flushes and closes the underlying writer. Idempotent.
+    func close(self) {
+        self.dst.close()
+    }
+}
+
+// ------------------------------------------------------------------ scanning
+
+// scan_record parses ONE record out of `s` starting at `from`. It is the only
+// place that knows the format, and both the Reader and `parse` go through it.
+//
+// It answers with (fields, next, ok):
+//
+//   ok, len(fields) > 0    a record. `next` is the index just past its
+//                          terminator, ready for the following call.
+//   ok, len(fields) == 0   nothing here but blank lines. `next` is past them.
+//                          A record always has at least one field, so this
+//                          cannot be confused with a real one.
+//   not ok                 the input ended in the middle of a record. `next`
+//                          is `from` unchanged, so the caller may add more
+//                          text and ask again with everything still to do.
+//
+// `more` is the caller's promise about the input: true means more text may
+// yet arrive, false means `s` is all there will ever be. It decides two
+// questions that are otherwise unanswerable — whether a record with no
+// terminator is finished, and whether a quote at the very end of `s` closes
+// its field or is the first half of an escaped `""`.
+func scan_record(s str, from int, sep rune, more bool) ([]str, int, bool) {
+    var i = from
+    // Blank lines carry no record. Both spellings of a line ending are
+    // skipped; a lone `\r` is data and stops the loop.
+    while i < len(s) {
+        if s[i] == '\n' { i += 1; continue }
+        if s[i] == '\r' and i + 1 < len(s) and s[i + 1] == '\n' {
+            i += 2
+            continue
+        }
+        break
+    }
+    if i >= len(s) { return ([], i, true) }
+
+    var fields = []
+    while true {
+        var value = ""
+        var quoted = false
+        if s[i] == '"' {
+            quoted = true
+            i += 1                                  // past the opening quote
+            // A quoted field is copied in RUNS: everything between escaped
+            // quotes goes across in one slice, so the common field with no
+            // escape at all costs a single write.
+            var b = str.Builder{}
+            var seg = i
+            var closed = false
+            while not closed {
+                if i >= len(s) { return ([], from, false) }
+                if s[i] != '"' {
+                    i += 1
+                    continue
+                }
+                if i + 1 >= len(s) {
+                    // The last byte we have is a quote. Whether it closes the
+                    // field or opens an escape depends on the byte after it,
+                    // which only `more` can tell us anything about.
+                    if more { return ([], from, false) }
+                    b.write(s[seg..i])
+                    i += 1
+                    closed = true
+                    continue
+                }
+                if s[i + 1] == '"' {
+                    // An escaped quote: take the run up to AND INCLUDING the
+                    // first of the pair, which is the one literal quote, then
+                    // step over the second.
+                    b.write(s[seg..i + 1])
+                    i += 2
+                    seg = i
+                    continue
+                }
+                b.write(s[seg..i])
+                i += 1
+                closed = true
+            }
+            value = b.done()
+        }
+        // The unquoted body of the field, which for a quoted field is the
+        // text after its closing quote — appended rather than refused, as the
+        // header explains.
+        let start = i
+        while i < len(s) and s[i] != sep and s[i] != '\n' { i += 1 }
+        var tail = s[start..i]
+        // A `\r` immediately before the `\n` belongs to the line ending, not
+        // to the field. Only the tail is trimmed: a `\r` inside the quotes is
+        // content and was already copied across verbatim.
+        if i < len(s) and len(tail) > 0 and tail[len(tail) - 1] == '\r' {
+            tail = tail[0..len(tail) - 1]
+        }
+        if quoted {
+            value = value || tail
+        } else {
+            value = tail
+        }
+        fields.append(value)
+
+        if i >= len(s) {
+            // No terminator. The record is finished only if nothing more can
+            // arrive; otherwise the next chunk may continue this very field.
+            if more { return ([], from, false) }
+            return (fields, i, true)
+        }
+        if s[i] == sep {
+            i += 1
+            continue
+        }
+        return (fields, i + 1, true)                // s[i] is '\n'
+    }
+    return ([], from, false)
+}
+
+// ------------------------------------------------------------------ rendering
+
+// render is one record as CSV text, terminator included.
+func render(rec []str, sep rune, crlf bool) str {
+    var b = str.Builder{}
+    var first = true
+    each f in rec {
+        if not first { b.write("{sep}") }
+        first = false
+        b.write(quote(f, sep))
+    }
+    if crlf {
+        b.write("\r\n")
+    } else {
+        b.write("\n")
+    }
+    return b.done()
+}
+
+// quote wraps a field in quotes when it needs them, and doubles any quote
+// inside it. A field that needs nothing is returned unchanged, so ordinary
+// data comes out as ordinary CSV.
+func quote(f str, sep rune) str {
+    if not needs_quotes(f, sep) { return f }
+    return "\"" || str.replace(f, "\"", "\"\"") || "\""
+}
+
+// needs_quotes is the rule stated in the header: the four characters that
+// would otherwise be read as structure, plus surrounding blanks, which are
+// legal unquoted and are lost by enough other readers to be worth protecting.
+func needs_quotes(f str, sep rune) bool {
+    if len(f) == 0 { return false }
+    let first = f[0]
+    let last = f[len(f) - 1]
+    if first == ' ' or first == '\t' or last == ' ' or last == '\t' {
+        return true
+    }
+    var i = 0
+    while i < len(f) {
+        let c = f[i]
+        if c == sep or c == '"' or c == '\n' or c == '\r' { return true }
+        i += 1
+    }
+    return false
+}

@@ -1,0 +1,13 @@
+`time.millis` takes 1 argument, but 0 are given
+`str.replace` takes 3 arguments, but 2 are given
+`fmt.fprintf` takes at least 2 arguments, but 1 is given
+`str.trim_left` takes 1 argument, but 2 are given
+`os.cwd` takes 0 arguments, but 1 is given
+!`upper` takes
+!`str.substr`
+!`str.find_any`
+!`fmt.printf`
+!`substr` takes
+!`to_int`
+!`time.upper`
+!`index` takes

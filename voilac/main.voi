@@ -24,6 +24,7 @@ use "voilac/lex"
 use "voilac/par"
 use "voilac/load"
 use "voilac/chk"
+use "voilac/diag"
 use "voilac/low"
 use "voilac/opt"
 use "voilac/cg"
@@ -35,8 +36,8 @@ use "std/fmt"
 use "std/str"
 
 // MIN_BOOTSTRAP (build.sh) is 0.4.1 — the oldest voila that can build this
-// source; 0.4.2 is built by any voila >= 0.4.1. See BOOTSTRAP.md.
-const VERSION = "0.4.2"
+// source; 0.5.0 is built by any voila >= 0.4.1. See BOOTSTRAP.md.
+const VERSION = "0.5.0"
 
 // CFLAGS is the single home of the C compilation flags. The runtime-archive
 // cache key hashes it; the program compile and the archive build use it.
@@ -63,6 +64,24 @@ func main() {
         say "voila " || VERSION
         return
     }
+    // `voila get` and `voila mod` work on the MODULE, not on a file, so they
+    // are answered before the "a verb needs a file" guard.
+    if len(args) >= 1 and args[0] == "get" {
+        if len(args) != 2 {
+            fmt.eprintf("voila: usage: voila get <module>@<version>\n")
+            os.exit(2)
+        }
+        mod_get(args[1])
+        return
+    }
+    if len(args) >= 1 and args[0] == "mod" {
+        var sub = ""
+        if len(args) >= 2 { sub = args[1] }
+        var rest = ""
+        if len(args) >= 3 { rest = args[2] }
+        mod_verb(sub, rest)
+        return
+    }
     if len(args) < 2 {
         usage()
         os.exit(2)
@@ -70,6 +89,10 @@ func main() {
     var verb = args[0]
     var src = args[1]
     var optLevel = 0
+    // The -W state, resolved from the command line by warn_option below. It
+    // decides which warnings are printed and which of them are fatal; it can
+    // never change the code that is emitted.
+    var pol = diag.NewPolicy()
 
     // `voila build -S x.voi` and `voila build --emit=c x.voi` are the forms the
     // manual documents: -S and --emit=c are options of BUILD, not verbs of
@@ -103,7 +126,7 @@ func main() {
                 gNative = true
             } else if not str.starts_with(a, "-") {
                 src = a
-            } else {
+            } else if not warn_option(a, pol) {
                 fmt.eprintf("voila: unknown build option %s\n", a)
                 usage()
                 os.exit(2)
@@ -119,17 +142,41 @@ func main() {
             i += 1
         }
     }
-    // `voila run -O2 x.voi args…`: the level sits between the verb and the
-    // file; everything after the file is forwarded to the program untouched.
+    // `voila run [-O2] [-Wall …] x.voi args…`: the options sit between the
+    // verb and the FILE, and everything after the file is forwarded to the
+    // program untouched — a script may legitimately take `--strict` itself,
+    // so the scan stops at the first argument that is not a flag.
     var runShift = 0
-    if verb == "run" and len(args) >= 3 {
-        if src == "-O0" { runShift = 1 }
-        if src == "-O1" { optLevel = 1; runShift = 1 }
-        if src == "-O2" { optLevel = 2; runShift = 1 }
-        if src == "-O3" { optLevel = 3; runShift = 1 }
-        if runShift == 1 {
-            src = args[2]
+    if verb == "run" {
+        var i = 1
+        while i < len(args) and str.starts_with(args[i], "-") {
+            let a = args[i]
+            var lv = 0 - 1
+            if a == "-O0" {
+                lv = 0
+            } else if a == "-O1" {
+                lv = 1
+            } else if a == "-O2" {
+                lv = 2
+            } else if a == "-O3" {
+                lv = 3
+            } else if not warn_option(a, pol) {
+                fmt.eprintf("voila: unknown run option %s\n", a)
+                usage()
+                os.exit(2)
+            }
+            if lv >= 0 {
+                if seenO {
+                    fmt.eprintf("voila: more than one -O level given\n")
+                    os.exit(2)
+                }
+                seenO = true
+                optLevel = lv
+            }
+            i += 1
         }
+        if i < len(args) { src = args[i] }
+        runShift = i - 1
     }
     if src == "" or str.starts_with(src, "-") {
         usage()
@@ -160,10 +207,22 @@ func main() {
     }
 
     // Everything else compiles a whole program.
-    var prog = load.Load(src)
-    report(prog.Errs)
+    var prog = load.Load(src, VERSION)
+    // A load ERROR means the tree cannot be trusted, so the checker must not
+    // walk it: report what the loader found and stop right here. WARNINGS
+    // stop nothing — they are merged into the checker's bag below and
+    // rendered WITH it, so one run shows every diagnostic of both stages in
+    // one list sorted by position rather than by which stage found it.
+    if prog.Diags.NErrors() > 0 {
+        report_bag(prog.Diags, pol, src)
+    }
 
     if verb == "load" {
+        // A tree DUMP, not a verdict. `load` takes no options (the guard
+        // above rejects every flag), so a warning printed here could not be
+        // switched off — the one state diag's Code field exists to prevent.
+        // Its errors were reported just above; its advice belongs to the
+        // verbs that can be told what to do with it.
         each line in prog.T.Dump(prog.File) {
             say line
         }
@@ -173,7 +232,10 @@ func main() {
     // Nothing is lowered until the program is verified: the acyclicity rule,
     // the widening lattice, match exhaustiveness, use-after-move and the printf
     // checks all run here (§6, §3.2, §3.5, §13.1).
-    report(chk.Check(prog.T, prog.File, src))
+    var bag = diag.New()
+    bag.merge(prog.Diags)
+    bag.merge(chk.Check(prog.T, prog.File))
+    report_bag(bag, pol, src)
 
     // `check` runs the LOWERER too, then stops: the lowerer catches its own
     // class of errors (unknown identifiers, loop-variable capture,
@@ -220,7 +282,7 @@ func main() {
         return
     }
     if verb == "run" {
-        run(prog, csrc, args, optLevel, runShift)
+        run(prog, csrc, args, optLevel, runShift, pol.Key())
         return
     }
 
@@ -233,12 +295,21 @@ func main() {
 // every source that took part — so editing any file in any package invalidates
 // it, and an unchanged script starts instantly.
 func run(prog load.Program, csrc str, args []str, optLevel int,
-         runShift int) {
+         runShift int, wkey str) {
     // The level is part of the key: `run -O2 x` after `run x` must not
     // execute the cached unoptimized binary.
+    //
+    // So is the -W state (diag.Policy.Key). Today nothing could go wrong
+    // without it — main() reports and exits BEFORE this function is reached,
+    // so `--strict` refuses long before the cache is consulted — but the
+    // invariant belongs where the key is built. A future fast path that
+    // looked the cache up first would otherwise hand a `--strict` run the
+    // lenient binary its previous run left behind, and say nothing.
     var kh = source_key(prog)
     kh = fnv_into(kh, "\u{0}")
     kh = fnv_into(kh, str(optLevel))
+    kh = fnv_into(kh, "\u{0}")
+    kh = fnv_into(kh, wkey)
     let key = fmt.sprintf("%016x", kh)
     let dir = cache_dir()
     ensure_dir(dir)
@@ -356,7 +427,313 @@ func usage() {
     fmt.eprintf("  voila check  <file.voi>           verify only\n")
     fmt.eprintf("  voila build -O1|-O2|-O3 <file>    optimize (also for run)\n")
     fmt.eprintf("  voila version                     print the version\n")
+    fmt.eprintf("\n  voila get <module>@<version>      fetch a dependency " ||
+                "(shells out to git)\n")
+    fmt.eprintf("  voila mod init [modpath]          write a voila.mod\n")
+    fmt.eprintf("  voila mod verify                  re-hash the cached " ||
+                "dependencies against voila.sum\n")
     fmt.eprintf("\n  ast | tokens | load              dump a front-end stage\n")
+    fmt.eprintf("\n  warnings: -W<code> -Wno-<code> -Wall -Werror " ||
+                "-Werror=<code>\n")
+    fmt.eprintf("            --strict (= -Wall -Werror);  codes: %s\n",
+                str.join(diag.Codes(), ", "))
+}
+
+// ------------------------------------------------------------------ modules
+
+// mod_get fetches one dependency into the module cache.
+//
+// THERE IS NO NETWORK CODE IN THE COMPILER, and there never will be: `git`
+// does the fetching, over a channel the user already trusts and already has
+// credentials for. The compiler's part is the four things git cannot do — pick
+// the cache path, check that the clone IS the module it claims to be, hash it,
+// and record the hash in voila.sum.
+//
+// The install is claim-then-move, exactly as the run cache and the runtime
+// archive are: the clone lands in a per-process temporary directory and is
+// renamed into place, so two concurrent fetches cannot leave a half-cloned
+// tree in the cache forever.
+func mod_get(spec str) {
+    let at = str.last_index(spec, "@")
+    if at <= 0 or at == len(spec) - 1 {
+        fmt.eprintf("voila: usage: voila get <module>@<version>\n")
+        os.exit(2)
+    }
+    let mp = spec[0..at]
+    let ver = spec[at + 1..len(spec)]
+    // Both halves land in a PATH under the cache root and in a voila.sum
+    // LINE, so both are checked before either is used. `..` is the one that
+    // matters: `voila get x/../../../etc@v1` would otherwise name a directory
+    // outside the cache, and that directory is the target of an `rm -rf`.
+    // Whitespace matters for the other reason — voila.sum is three
+    // whitespace-separated fields per line, and a fourth would be silently
+    // dropped on the next read and appended again on the next fetch.
+    if not mod_word_ok(mp) or not mod_word_ok(ver) {
+        fmt.eprintf("voila: `%s` is not a module@version: a module path and " ||
+                    "a version may not contain whitespace or a `..` " ||
+                    "segment\n", spec)
+        os.exit(2)
+    }
+    let dest = load.ModCacheDir(mp, ver)
+
+    if os.isdir(dest) {
+        fmt.eprintf("voila: %s %s is already in the module cache\n", mp, ver)
+    } else {
+        ensure_dir(path.Dir(dest))
+        let tmp = dest || ".tmp-" || host_tag() || "-" || str(os.pid())
+        os.run("rm", ["-rf", tmp])
+        let url = "https://" || mp
+        if os.run("git", ["clone", "--depth", "1", "--branch", ver,
+                          url, tmp]) != 0 {
+            os.run("rm", ["-rf", tmp])
+            fmt.eprintf("voila: git clone failed: %s at %s\n", url, ver)
+            os.exit(1)
+        }
+        // The clone must BE the module it is being filed as, or an import
+        // path would mean one thing to the program and another on disk.
+        let sub = load.ReadMod(tmp)
+        if not sub.Found {
+            os.run("rm", ["-rf", tmp])
+            fmt.eprintf("voila: %s at %s has no voila.mod\n", url, ver)
+            os.exit(1)
+        }
+        if sub.Module != mp {
+            os.run("rm", ["-rf", tmp])
+            fmt.eprintf("voila: %s at %s declares module `%s`, not `%s`\n",
+                        url, ver, sub.Module, mp)
+            os.exit(1)
+        }
+        // The cache holds SOURCE, not a working copy; .git would be the
+        // largest part of it and the only mutable part of it.
+        os.run("rm", ["-rf", path.Join(tmp, ".git")])
+        // `mv tmp dest` is NOT the primitive here, for exactly the reason
+        // link_runtime spells out: when dest already exists — a concurrent
+        // `voila get` won the race that the isdir check above cannot close,
+        // because a clone sits between them — mv NESTS tmp inside it and
+        // SUCCEEDS, leaving a whole second copy of the module inside the
+        // winner's cache entry. ModHash walks it, so the hash recorded in
+        // voila.sum would then cover the junk and every later verification of
+        // the clean entry would mismatch for good. The portable atomic claim
+        // is mkdir, which fails if the directory exists; the loser deletes
+        // its clone and uses what the winner installed.
+        // The CONTENTS move into the claimed directory rather than the
+        // directory being renamed onto it: renaming would need the claim
+        // released first, and that reopens the very window mkdir closed. A
+        // failed move tears the claim down again, or an empty entry would
+        // block this module@version forever.
+        let claim = "if mkdir " || shq(dest) || " 2>/dev/null; then " ||
+                    "shopt -s dotglob; mv " || shq(tmp) || "/* " ||
+                    shq(dest) || "/ || rm -rf " || shq(dest) || "; fi; " ||
+                    "rm -rf " || shq(tmp)
+        os.run("bash", ["-c", claim])
+        if not os.isdir(dest) {
+            fmt.eprintf("voila: cannot install %s\n", dest)
+            os.exit(1)
+        }
+        fmt.eprintf("voila: fetched %s %s into %s\n", mp, ver, dest)
+    }
+
+    // Record it in the CURRENT module's voila.sum, if the user is standing in
+    // a module at all.
+    let root = module_here()
+    if root == "" { return }
+    let h = load.ModHash(dest)
+    let sums, present = load.ReadSum(root)
+    let want = load.FindSum(sums, mp, ver)
+    if want != "" {
+        if want != h {
+            fmt.eprintf("voila: checksum mismatch for %s %s: voila.sum " ||
+                        "records %s, the fetched tree hashes to %s\n",
+                        mp, ver, want, h)
+            os.exit(1)
+        }
+        return
+    }
+    var text = ""
+    if present {
+        match os.read(load.SumPath(root)) {
+            Ok(t)  => text = t
+            Err(e) => text = ""
+        }
+        if text != "" and not str.ends_with(text, "\n") { text = text || "\n" }
+    }
+    text = text || mp || " " || ver || " " || h || "\n"
+    // os.write returns a value-carrying IOError, never a bool: a failed
+    // write must not be mistaken for a successful one.
+    match os.write(load.SumPath(root), text) {
+        Ok(u)  => u
+        Err(e) => {
+            fmt.eprintf("voila: cannot write %s: %s\n", load.SumPath(root),
+                        e.message())
+            os.exit(1)
+        }
+    }
+    fmt.eprintf("voila: recorded %s %s in voila.sum\n", mp, ver)
+}
+
+// mod_verb is `voila mod …`. `init` and `verify` are here because they are a
+// dozen lines each; `tidy` is NOT implemented — rewriting a require list means
+// deciding a VERSION for a path the program mentions and nothing pins, which
+// is a fetch policy and not a text edit.
+func mod_verb(sub str, arg str) {
+    if sub == "init" {
+        let dir = cwd_or_dot()
+        let file = path.Join(dir, "voila.mod")
+        if os.exists(file) {
+            fmt.eprintf("voila: %s already exists\n", file)
+            os.exit(1)
+        }
+        var name = arg
+        if name == "" { name = path.Base(dir) }
+        match os.write(file, "module " || name || "\nvoila " || VERSION ||
+                             "\n") {
+            Ok(u)  => u
+            Err(e) => {
+                fmt.eprintf("voila: cannot write %s: %s\n", file,
+                            e.message())
+                os.exit(1)
+            }
+        }
+        say "voila: wrote " || file
+        return
+    }
+    if sub == "verify" {
+        let root = module_here()
+        if root == "" {
+            fmt.eprintf("voila: no voila.mod here or in any parent " ||
+                        "directory\n")
+            os.exit(1)
+        }
+        let mi = load.Modules(root)
+        var bad = 0
+        each e in mi.Mod.Errs {
+            fmt.eprintf("%s:%d: %s\n", mi.Mod.File, e.Line, e.Msg)
+            bad += 1
+        }
+        each d in mi.Deep {
+            fmt.eprintf("%s\n", d)
+            bad += 1
+        }
+        let sums, present = load.ReadSum(root)
+        each p in mi.Paths {
+            let ver = mi.Ver[p]
+            if load.IsLocal(mi, p) {
+                say p || " " || ver || "  replaced by " || mi.Dir[p]
+                continue
+            }
+            let dir = mi.Dir[p]
+            if dir == "" or not os.isdir(dir) {
+                fmt.eprintf("%s %s: not in the module cache — run: " ||
+                            "voila get %s@%s\n", p, ver, p, ver)
+                bad += 1
+                continue
+            }
+            let got = load.ModHash(dir)
+            if not present {
+                say p || " " || ver || "  " || got || "  (no voila.sum)"
+                continue
+            }
+            let want = load.FindSum(sums, p, ver)
+            if want == "" {
+                fmt.eprintf("%s %s: no voila.sum entry — run: " ||
+                            "voila get %s@%s\n", p, ver, p, ver)
+                bad += 1
+            } else if want != got {
+                fmt.eprintf("%s %s: checksum mismatch: voila.sum records " ||
+                            "%s, %s hashes to %s\n", p, ver, want, dir, got)
+                bad += 1
+            } else {
+                say p || " " || ver || "  ok"
+            }
+        }
+        if bad > 0 { os.exit(1) }
+        say "voila: " || str(len(mi.Paths)) || " module(s) verified"
+        return
+    }
+    fmt.eprintf("voila: unknown `voila mod` subcommand `%s`: " ||
+                "init, verify\n", sub)
+    os.exit(2)
+}
+
+// mod_word_ok accepts a module path or a version: no whitespace, no `..`
+// segment, not empty, and not absolute.
+func mod_word_ok(w str) bool {
+    if w == "" { return false }
+    if str.starts_with(w, "/") { return false }
+    each b in bytes(w) {
+        if b <= 32 or b == 127 { return false }
+    }
+    if w == ".." or str.starts_with(w, "../") or str.ends_with(w, "/..") or
+       str.contains(w, "/../") { return false }
+    return true
+}
+
+func cwd_or_dot() str {
+    match os.cwd() {
+        Ok(d)  => return d
+        Err(e) => return "."
+    }
+    return "."
+}
+
+// module_here is the module the user is standing in, or "" when there is
+// none. load.ModuleRoot falls back to the directory it was given, so the
+// voila.mod is checked for explicitly.
+func module_here() str {
+    let root = load.ModuleRoot(cwd_or_dot())
+    if not os.exists(path.Join(root, "voila.mod")) { return "" }
+    return root
+}
+
+// warn_option applies one -W… option to the policy and reports whether the
+// argument WAS one, so each verb's option loop can fall through to its own
+// handling. Every verb that compiles a program routes through here, which is
+// what keeps the spelling of these flags in one place.
+//
+// `-Werror=<code>` also ENABLES the code, as gcc's does: asking for a warning
+// to be fatal and then not being shown it would be a strange thing to mean.
+func warn_option(a str, pol mut diag.Policy) bool {
+    if a == "-Wall" {
+        pol.EnableAll()
+        return true
+    }
+    if a == "--strict" {
+        pol.EnableAll()             // spelled once: --strict IS -Wall -Werror
+        pol.Werror()
+        return true
+    }
+    if a == "-Werror" {
+        pol.Werror()
+        return true
+    }
+    if str.starts_with(a, "-Werror=") {
+        let c = warn_code(a, a[8..len(a)])
+        pol.Enable(c)
+        pol.WerrorCode(c)
+        return true
+    }
+    if str.starts_with(a, "-Wno-") {
+        pol.Disable(warn_code(a, a[5..len(a)]))
+        return true
+    }
+    if str.starts_with(a, "-W") and len(a) > 2 {
+        pol.Enable(warn_code(a, a[2..len(a)]))
+        return true
+    }
+    return false
+}
+
+// warn_code validates one warning code and returns it. A misspelt code is
+// FATAL, not ignored: `-Wno-unusd-import` that silently does nothing is
+// exactly how a warning gets switched off for a whole release without anyone
+// noticing — the same reasoning that makes an -O level on `tokens` an error
+// rather than a shrug.
+func warn_code(flag str, code str) str {
+    if diag.Known(code) { return code }
+    fmt.eprintf("voila: unknown warning `%s` in %s; the warnings are %s\n",
+                code, flag, str.join(diag.Codes(), ", "))
+    os.exit(2)
+    return code
 }
 
 func run_tokens(p str) {
@@ -385,7 +762,13 @@ func run_ast(p str) {
 func build(src str, csrc str, args []str, level int) {
     var out = default_out(src)
     var keep = ""
-    var i = 2
+    // From 1, not 2. args[0] is the verb; starting at 2 assumed the SOURCE
+    // FILE was args[1], so `voila build -o name x.voi` — the flag before the
+    // file, which is how most people write it — skipped straight past the
+    // `-o` and wrote the default name while reporting success. The loop only
+    // reacts to `-o` and `--keep-c`, so passing the source filename through
+    // it costs nothing.
+    var i = 1
     while i < len(args) {
         if args[i] == "-o" and i + 1 < len(args) {
             out = args[i + 1]
@@ -663,7 +1046,11 @@ func find_cc() str {
 
 func ensure_dir(d str) {
     if os.isdir(d) { return }
-    // std/os has no mkdir; the compiler already depends on a cc it can exec.
+    // os.mkdir_all EXISTS now, and this is exactly what it is for — but the
+    // compiler must stay buildable by a bootstrap as old as MIN_BOOTSTRAP
+    // (build.sh), and that binary's runtime has no such native. Calling it
+    // here would make voilac uncompilable by the very compilers it must be
+    // compilable by. The swap belongs one generation after this ships.
     os.run("mkdir", ["-p", d])
 }
 
@@ -686,10 +1073,30 @@ func read(p str) str {
     return ""
 }
 
+// report prints the pre-rendered diagnostics of the two front-end-only verbs
+// (`tokens`, `ast`), which run the lexer or the parser alone and so never see
+// a diag.Bag.
 func report(errs []str) {
     if len(errs) == 0 { return }
     each e in errs {
         fmt.eprintf("%s\n", e)
     }
     os.exit(2)
+}
+
+// report_bag renders a bag under the resolved -W policy and prints it.
+//
+// Every line goes to STDERR and none to stdout. That is not tidiness: stdout
+// is `--emit=c`'s and `-S`'s channel, and a warning printed there would land
+// in the middle of a C translation unit and corrupt it.
+//
+// The exit is driven by the count Render hands back rather than by counting
+// errors here, because -Werror is exactly what moves a diagnostic across that
+// line and only Render has the policy in hand.
+func report_bag(b diag.Bag, pol diag.Policy, srcName str) {
+    let lines, nerr = b.Render(srcName, pol)
+    each l in lines {
+        fmt.eprintf("%s\n", l)
+    }
+    if nerr > 0 { os.exit(2) }
 }

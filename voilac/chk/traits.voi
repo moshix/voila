@@ -1,0 +1,616 @@
+// chk/traits.voi — traits, judged for the first time.
+//
+// `trait` and the `[T: Bound]` on a generic have parsed since 0.1 and been
+// READ by nobody: grep TRAITDEC or GENERIC across chk/, low/ and cg/ before
+// this file and the only hits are the parser that builds them and the loader
+// that keeps trait names in one global namespace. So `impl Describe for
+// Canvas` with no `describe` compiled happily and died at the call, and
+// `[T: Ordish]` accepted a bound that did not exist.
+//
+// THE RULE THAT MUST NOT BE OVER-TIGHTENED. The runtime dispatches through
+// ONE FLAT (typename, method) table — cg.voi's emit_method_table builds it and
+// types.c's vl_find_method searches it — with no notion of which impl block,
+// or which trait, an entry came from. A type whose `show` lives in an inherent
+// `impl Point { … }` therefore genuinely satisfies `Show` when the program
+// runs today. Conformance is judged against the UNION of every impl block on
+// the target (plus an exception's own methods, which emit_method_table
+// registers the same way), never against the `impl X for T` block alone.
+// Rejecting the inherent case would reject working programs; the case is
+// pinned in tests/conformance/07_funcs.voi so it cannot be tightened by
+// accident later.
+//
+// The method-set key is the target's BASE NAME, type arguments ignored —
+// `impl[T] Stack[T]` registers under `Stack`, matching low.named_type_name
+// and emit_method_table exactly. It is the flat name the loader produced
+// (`geom.Box`), so two packages' `Box` never collide.
+//
+// A trait method with a body, or with a `= expr` default (FUNC Kids[5]),
+// counts as SATISFIED: it needs no implementation. The default RUNS —
+// low.lower_trait_default compiles it once as `{Trait}$${method}` and
+// emit_method_table gives each inheriting type a row pointing at that one
+// body — so declining to complain here is not a licence to abort at the call
+// any more.
+//
+// Bounds are two different questions asked in two places. At the DECLARATION,
+// `[T: Bound]` must name a trait that exists — shape only, since there is no
+// actual type there to judge. At an INSTANTIATION, where a real type is
+// written in place of `T`, the argument must SATISFY the bound, and that is
+// decidable with no inference at exactly three sites: a composite literal
+// `Stack[int]{}`, an annotation `var s Stack[int]` (both of which are one
+// TNAMED carrying Kids, so one walk finds them), and an explicit `f[int](x)`.
+// All three are judged against the SAME method union as an impl block, for
+// the same flat-dispatch-table reason.
+//
+// WHAT AN INSTANTIATION DOES NOT JUDGE. Five refusals, and every one of them
+// errs towards saying nothing:
+//
+//   · a BUILTIN bound. The predeclared traits have no method set anybody
+//     wrote down — see typ.BuiltinTraits, which explains why — and
+//     check_impl below already declines `impl Show for T` on the same
+//     grounds. A rule invented here would reject working programs.
+//   · a type argument that is a generic PARAMETER. `Stack[T]{}` inside
+//     `impl[T] Stack[T]` is the DEFINITION site, and deciding it needs
+//     bound-implies-bound reasoning this release does not have.
+//   · a STRUCTURAL argument — a slice, a map, a function type. Nothing
+//     structural has a row in the method table for a lookup to find.
+//   · an argument whose method set this program cannot SEE in full: a trait
+//     (`[]Describe` genuinely satisfies `T: Describe`, §3.6), a std
+//     package's `str.Builder`, a predeclared exception, or a name that
+//     resolves to nothing. See judgeable below for each.
+//
+// Comparing the SIGNATURES rather than the names — `?T` against `?int` —
+// would need Subst and a real notion of type equality; that is still
+// deferred, and a half-done version would produce nonsense.
+//
+// SHADOWING: none to speak of. By the time this runs, every trait name — the
+// TRAITDEC's, the `impl X for T` header's, and a generic bound's — has been
+// flattened to the SAME string by load/rewrite.voi (a package's to
+// `pkg.Name`, a builtin's left bare), and no local scope can introduce one.
+// So a name table keyed by that string is exact here, not conservative.
+package chk
+
+use "voilac/ast"
+use "voilac/typ"
+use "std/str"
+
+impl Checker {
+    func check_traits(mut self) {
+        // ---- the method union, and the duplicates it exposes.
+        //
+        // Built in ONE declaration-ordered pass before anything is judged:
+        // conformance needs every block on a type, and a type's blocks may be
+        // spread over several files of a package.
+        var mset = make(map[str]int)
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            let n = self.T.Get(d)
+            if n.Kind == ast.IMPLDEC {
+                let tn = self.impl_target(d)
+                if tn == "" { continue }
+                self.absorb_methods(tn, self.T.Kid(d, 0), mset, d)
+            } else if n.Kind == ast.EXCDEC {
+                self.absorb_methods(n.Sval, self.T.Kid(d, 1), mset, 0)
+            }
+        }
+
+        // A type also acquires every DEFAULTED method of a trait it
+        // implements. cg.collect_inherited registers exactly those rows in
+        // the method table, so at run time they are as real as a written
+        // one — and a checker that did not know it would reject working
+        // programs: a default inherited from one trait can be what satisfies
+        // a DIFFERENT trait declaring the same method name.
+        //
+        // A SECOND pass, so a method the type wrote itself always wins. That
+        // is the precedence the backend applies (its `written` set bars an
+        // inherited row for a pair the type declared), and the two must not
+        // disagree about which body answers a call.
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            let n = self.T.Get(d)
+            if n.Kind != ast.IMPLDEC or n.Sval == "" { continue }
+            if not (n.Sval in self.traits) { continue }
+            let tn = self.impl_target(d)
+            if tn == "" { continue }
+            each m in self.T.Get(self.T.Kid(self.traits[n.Sval], 0)).Kids {
+                if self.T.Kind(m) != ast.FUNC { continue }
+                // Abstract: nothing to inherit.
+                if self.T.Kid(m, 0) == 0 and self.T.Kid(m, 5) == 0 { continue }
+                let k = tn || "|" || self.T.Get(m).Sval
+                if not (k in mset) { mset[k] = m }
+            }
+        }
+
+        // The union is wanted again long after this pass — check_sigs judges
+        // a bound at every annotation it walks — so it is kept rather than
+        // rebuilt, and rebuilding it would report every duplicate twice.
+        self.mset = mset
+
+        // ---- every impl block, in declaration order.
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            if self.T.Kind(d) != ast.IMPLDEC { continue }
+            self.check_impl(d, mset)
+        }
+
+        // ---- every generic bound, wherever one can be written.
+        self.check_all_bounds()
+
+        // ---- and every place a bound is CASHED IN.
+        self.check_all_instantiations()
+    }
+
+    // absorb_methods records one block's methods under `tn`, reporting a
+    // second (type, method) as it goes. The method table has ONE entry per
+    // pair and vl_find_method returns the first match, so the second
+    // definition is not an override — it is dead code that looks live.
+    //
+    // `owner` is the IMPLDEC the block belongs to (0 for an exception's own
+    // methods, which have no generic list). chk/expr.voi needs it to replace
+    // a method's `T` by the receiver's written type argument: the union
+    // remembers the body, and only the impl block remembers what generic list
+    // that body was written under.
+    func absorb_methods(mut self, tn str, list int, mset mut map[str]int,
+                        owner int) {
+        each m in self.T.Get(list).Kids {
+            if self.T.Kind(m) != ast.FUNC { continue }
+            let mn = self.T.Get(m)
+            let k = tn || "|" || mn.Sval
+            if k in mset {
+                self.report_at(m, "`{tn}.{mn.Sval}` is declared twice; the " ||
+                                  "method table holds one entry per (type, " ||
+                                  "method) and silently keeps the first " ||
+                                  "(§3.6)")
+            } else {
+                mset[k] = m
+                if owner != 0 { self.implOf[k] = owner }
+            }
+        }
+    }
+
+    // impl_target names the type an impl block attaches to: the TNAMED's
+    // base name, type arguments and all left behind. "" when the target is
+    // not a named type at all, which carries no methods and is nobody's
+    // business here.
+    func impl_target(self, d int) str {
+        let te = self.T.Get(d).Ival
+        if te == 0 or self.T.Kind(te) != ast.TNAMED { return "" }
+        return self.T.Get(te).Sval
+    }
+
+    func check_impl(mut self, d int, mset map[str]int) {
+        let n = self.T.Get(d)
+        let te = n.Ival
+
+        // The target must exist. sig.voi's general unknown-type sweep skips
+        // an impl target precisely so this is said once, here, where the
+        // trait checks below also need the answer.
+        let tn = self.impl_target(d)
+        if te != 0 and self.T.Kind(te) == ast.TNAMED {
+            if not self.Ty.Resolves(tn) and not self.ty_param_of(d, tn) {
+                self.report_at(te, "unknown type `{tn}` (§3.1)")
+                return
+            }
+        }
+        if n.Sval == "" { return }              // inherent: no trait to keep
+
+        if not (n.Sval in self.traits) {
+            if is_builtin_trait(n.Sval) { return }
+            self.report_at(d, "no trait `{n.Sval}`: the traits in scope " ||
+                              "are " || self.trait_list() || " (§3.6)")
+            return
+        }
+        if tn == "" { return }
+
+        // Conformance, against the union.
+        let tr = self.traits[n.Sval]
+        each m in self.T.Get(self.T.Kid(tr, 0)).Kids {
+            if self.T.Kind(m) != ast.FUNC { continue }
+            let mn = self.T.Get(m)
+            let k = tn || "|" || mn.Sval
+            if k in mset {
+                self.check_method_shape(n.Sval, tn, m, mset[k])
+            } else if self.T.Kid(m, 0) == 0 and self.T.Kid(m, 5) == 0 {
+                // No body, no default, nobody implemented it.
+                self.report_at(d, "`{tn}` does not implement `{n.Sval}`: " ||
+                                  "method `{mn.Sval}` is missing (§3.6)")
+            }
+        }
+    }
+
+    // ty_param_of reports whether `name` is one of the impl block's own
+    // generic parameters — `impl[T] T { … }` names no declared type and must
+    // not be told it is unknown.
+    func ty_param_of(self, d int, name str) bool {
+        each g in self.T.Get(self.T.Kid(d, 1)).Kids {
+            if str.split(self.T.Get(g).Sval, "|")[0] == name { return true }
+        }
+        return false
+    }
+
+    // ------------------------------------------------------- method shape
+
+    // check_method_shape compares an implementation against the trait's
+    // declaration. SHAPE only: self-ness, self mode, parameter and result
+    // counts, variadicity. Comparing the types themselves needs the
+    // expression typing that is deferred — but a method with the wrong
+    // ARITY is already a call that cannot work, and the runtime would have
+    // dispatched to it anyway.
+    func check_method_shape(mut self, tr str, tn str, want int, got int) {
+        let w = self.T.Get(want)
+        let g = self.T.Get(got)
+        let lead = "`{tn}.{w.Sval}` does not match trait `{tr}`: the trait " ||
+                   "method "
+
+        let ws = (w.Ival2 & 1) != 0
+        let gs = (g.Ival2 & 1) != 0
+        if ws != gs {
+            if ws {
+                self.report_at(got, lead || "takes `self` (§3.6)")
+            } else {
+                self.report_at(got, lead || "takes no `self` (§3.6)")
+            }
+            return
+        }
+        if ws {
+            let wm = self_mode(w.Ival2)
+            let gm = self_mode(g.Ival2)
+            if wm != gm {
+                self.report_at(got, lead || "takes `{wm}`, not `{gm}` (§3.6)")
+            }
+        }
+
+        // `self` is not a PARAM (par.voi's params() diverts it into
+        // selfFlags), so these counts are already self-free.
+        let wp = self.T.NKids(self.T.Kid(want, 1))
+        let gp = self.T.NKids(self.T.Kid(got, 1))
+        if wp != gp {
+            self.report_at(got, lead || "takes {wp}" ||
+                                plural(wp, " parameter", " parameters") ||
+                                ", not {gp} (§3.6)")
+        }
+
+        let wr = self.T.NKids(self.T.Kid(want, 2))
+        let gr = self.T.NKids(self.T.Kid(got, 2))
+        if wr != gr {
+            self.report_at(got, lead || "returns {wr}" ||
+                                plural(wr, " result", " results") ||
+                                ", not {gr} (§3.6)")
+        }
+
+        let wv = self.variadic(want)
+        let gv = self.variadic(got)
+        if wv != gv {
+            if wv {
+                self.report_at(got, lead || "is variadic (§3.6)")
+            } else {
+                self.report_at(got, lead || "is not variadic (§3.6)")
+            }
+        }
+    }
+
+    // variadic reports whether a function's last parameter absorbs the rest.
+    // The flag lives on the PARAM (bit 16), not on the FUNC — the FUNC's
+    // Ival2 carries only self-ness and `nothrow`.
+    func variadic(self, fn int) bool {
+        each p in self.T.Get(self.T.Kid(fn, 1)).Kids {
+            if (self.T.Get(p).Ival2 & 16) != 0 { return true }
+        }
+        return false
+    }
+
+    // ------------------------------------------------------------ bounds
+
+    // check_all_bounds visits every place the grammar allows `[T: Bound]`.
+    // Declaration order throughout — the decl list is a slice, and so is
+    // every generic list inside it.
+    func check_all_bounds(mut self) {
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            let n = self.T.Get(d)
+            if n.Kind == ast.FUNC {
+                self.check_bounds(self.T.Kid(d, 3))
+            } else if n.Kind == ast.STRUCTDEC or n.Kind == ast.ENUMDEC {
+                self.check_bounds(self.T.Kid(d, 1))
+            } else if n.Kind == ast.IMPLDEC {
+                self.check_bounds(self.T.Kid(d, 1))
+                self.check_method_bounds(self.T.Kid(d, 0))
+            } else if n.Kind == ast.EXCDEC {
+                self.check_method_bounds(self.T.Kid(d, 1))
+            } else if n.Kind == ast.TRAITDEC {
+                self.check_method_bounds(self.T.Kid(d, 0))
+            } else if n.Kind == ast.TYPEDEC {
+                let sd = self.T.Kid(d, 0)
+                if sd != 0 { self.check_bounds(self.T.Kid(sd, 1)) }
+            }
+        }
+    }
+
+    func check_method_bounds(mut self, list int) {
+        each m in self.T.Get(list).Kids {
+            if self.T.Kind(m) != ast.FUNC { continue }
+            self.check_bounds(self.T.Kid(m, 3))
+        }
+    }
+
+    // check_bounds judges one generic list. GENERIC.Sval is "name|bound" —
+    // load/rewrite.voi's bind_generics binds parts[0] and throws the bound
+    // away, which is why nothing has ever looked at it.
+    func check_bounds(mut self, list int) {
+        if list == 0 { return }
+        each g in self.T.Get(list).Kids {
+            if self.T.Kind(g) != ast.GENERIC { continue }
+            let parts = str.split(self.T.Get(g).Sval, "|")
+            if len(parts) < 2 { continue }
+            let b = parts[1]
+            if b == "" { continue }
+            if b in self.traits or is_builtin_trait(b) { continue }
+            self.report_at(g, "unknown trait `{b}` bounding `{parts[0]}`: " ||
+                              "the traits in scope are " ||
+                              self.trait_list() || " (§3.7)")
+        }
+    }
+
+    // ------------------------------------------- bounds at the use sites
+
+    // check_one_bound is the whole judgement, in one place, for all three
+    // sites. `spec` is a GENERIC's raw "name|bound"; `owner` is the
+    // declaration the bound is written on, which is what makes the message
+    // point somewhere the reader can go and read it.
+    //
+    // The refusals this file's header lists are here, cheapest first — except
+    // the structural one, which the two CALLERS enforce by only ever handing
+    // over a named type. None of them is a guess: each is a case where the
+    // checker has no basis for an answer, so it gives none.
+    func check_one_bound(mut self, site int, arg str, spec str, owner str) {
+        let parts = str.split(spec, "|")
+        if len(parts) < 2 { return }
+        let b = parts[1]
+        if b == "" { return }
+        if not (b in self.traits) { return }   // builtin, or already reported
+        if self.Ty.IsParam(arg) { return }     // the definition site
+        if not self.judgeable(arg) { return }  // nothing to judge it against
+        let miss = self.missing_for(arg, b)
+        if miss == "" { return }
+        let p = parts[0]
+        self.report_at(site, "`{arg}` does not implement `{b}`, required " ||
+                             "by the bound `{p}: {b}` on `{owner}`: method " ||
+                             "`{miss}` is missing (§3.7)")
+    }
+
+    // judgeable reports whether this program can see the WHOLE method set of
+    // a type — which is the only condition under which "it does not implement
+    // X" is a fact rather than an admission of ignorance.
+    //
+    // Its own structs, enums, `type` declarations and exceptions qualify: the
+    // union above absorbed every impl block on them. A primitive qualifies
+    // too, with typ.PrimitiveMethod standing in for the rows the runtime
+    // provides and the table does not hold.
+    //
+    // NOTHING ELSE DOES, and the misses are the point. A TRAIT resolves and
+    // has no rows — but `[]Describe` genuinely satisfies `T: Describe` (§3.6
+    // dispatches it dynamically), so a verdict there would be exactly wrong.
+    // `str.Builder` resolves through typ.Resolves' std-package escape hatch,
+    // which exists precisely because those types have no Voilà source to
+    // absorb. A predeclared exception is the same story. And a name that
+    // resolves to nothing at all is chk/sig.voi's to report, once, at this
+    // very node.
+    func judgeable(self, name str) bool {
+        if typ.IsPrimitive(name) { return true }
+        if name in self.structs { return true }
+        if name in self.enums { return true }
+        if name in self.excs { return true }
+        return false
+    }
+
+    // missing_for names the FIRST method of trait `tr` that `tn` fails to
+    // provide, or "" when it provides them all.
+    //
+    // THE UNION RULE, unchanged from check_impl above and deliberately not
+    // re-derived: every impl block on the type counts, inherent ones
+    // included, because the dispatch table is flat and does not remember
+    // which block a row came from. A trait method with a body or an `= expr`
+    // default is nobody's obligation.
+    //
+    // A PRIMITIVE has no impl block of its own, so the runtime's own answers
+    // count for it — see typ.PrimitiveMethod, and note that `impl Describe
+    // for int` still registers under `int` and is found by the union like
+    // anything else.
+    func missing_for(self, tn str, tr str) str {
+        let prim = typ.IsPrimitive(tn)
+        each m in self.T.Get(self.T.Kid(self.traits[tr], 0)).Kids {
+            if self.T.Kind(m) != ast.FUNC { continue }
+            if self.T.Kid(m, 0) != 0 or self.T.Kid(m, 5) != 0 { continue }
+            let mn = self.T.Get(m).Sval
+            let k = tn || "|" || mn
+            if k in self.mset { continue }
+            if prim and typ.PrimitiveMethod(mn) { continue }
+            return mn
+        }
+        return ""
+    }
+
+    // ---- site 1 and 2: a composite literal, and an annotation.
+    //
+    // They are ONE site in the tree. `Stack[int]{}` keeps its type in a
+    // TNAMED with Kids (par/expr.voi's expr_to_named builds it) and so does
+    // `var s Stack[int]`, so a single walk over annotations reaches both.
+    // check_type in chk/sig.voi is where it is called from, because that is
+    // the one visitor that already sees EVERY annotation — signature,
+    // field, catch, body — with the enclosing declaration's generic
+    // parameters already pushed.
+
+    // check_type_args descends an annotation looking for instantiations. The
+    // shape of the descent mirrors sig.voi's report_bad_names, for the same
+    // reason: a type's children hang off different slots depending on its
+    // kind, and TSLICE's second child is an EXTENT expression, not a type.
+    func check_type_args(mut self, te int) {
+        if te == 0 { return }
+        let n = self.T.Get(te)
+        let k = n.Kind
+        if k == ast.TNAMED {
+            if len(n.Kids) > 0 { self.check_args_of(n.Sval, n.Kids) }
+            each a in n.Kids {
+                self.check_type_args(a)
+            }
+        } else if k == ast.TFN {
+            each p in self.T.Get(self.T.Kid(te, 0)).Kids {
+                self.check_type_args(p)
+            }
+            self.check_type_args(n.Ival)
+        } else if k == ast.TMAP {
+            self.check_type_args(self.T.Kid(te, 0))
+            self.check_type_args(self.T.Kid(te, 1))
+        } else if k == ast.TTUPLE {
+            each e in n.Kids {
+                self.check_type_args(e)
+            }
+        } else if k == ast.TSLICE or k == ast.TOPTION or k == ast.TRESULT or
+                  k == ast.TSET or k == ast.TCHAN or k == ast.TBOX or
+                  k == ast.TBORROW {
+            self.check_type_args(self.T.Kid(te, 0))
+        }
+    }
+
+    // check_args_of pairs a name's type arguments with the generic list of
+    // the declaration it instantiates, POSITIONALLY. A count mismatch is not
+    // judged here: a surplus argument answers to no bound, and a missing one
+    // is an arity diagnostic this release does not have.
+    func check_args_of(mut self, name str, args []int) {
+        let gl = self.generics_of(name)
+        if gl == 0 { return }
+        let gs = self.T.Get(gl).Kids
+        var i = 0
+        while i < len(args) and i < len(gs) {
+            if self.T.Kind(gs[i]) == ast.GENERIC and
+               self.T.Kind(args[i]) == ast.TNAMED {
+                self.check_one_bound(args[i], self.T.Get(args[i]).Sval,
+                                     self.T.Get(gs[i]).Sval, name)
+            }
+            i += 1
+        }
+    }
+
+    // generics_of finds the generic list of the declaration a nominal name
+    // denotes. `type X { … }` files its struct under the TYPE's name (see
+    // chk.collect), so both spellings arrive here as a STRUCTDEC.
+    func generics_of(self, name str) int {
+        if name in self.structs { return self.T.Kid(self.structs[name], 1) }
+        if name in self.enums { return self.T.Kid(self.enums[name], 1) }
+        return 0
+    }
+
+    // ---- site 3: an explicit function instantiation.
+    //
+    // `f[int](x)` is the one site the annotation walk cannot see: there is no
+    // type node in it at all. The parser leaves an INDEX whose index is an
+    // ordinary expression, and only the lowerer decides it was a type — so
+    // the recognition here mirrors low.generic_func_name exactly (the base
+    // names a declared function, the index names a type), because that is the
+    // spelling that will actually be monomorphised.
+
+    func check_all_instantiations(mut self) {
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            let n = self.T.Get(d)
+            if n.Kind == ast.FUNC {
+                self.insts_in(d)
+            } else if n.Kind == ast.IMPLDEC {
+                // The impl's own generics are in scope for every method in
+                // it, exactly as in chk/sig.voi's sig_fn.
+                self.Ty.PushParams(self.generic_names(self.T.Kid(d, 1)))
+                each m in self.T.Get(self.T.Kid(d, 0)).Kids {
+                    self.insts_in(m)
+                }
+                self.Ty.PopParams()
+            } else if n.Kind == ast.EXCDEC {
+                each m in self.T.Get(self.T.Kid(d, 1)).Kids {
+                    self.insts_in(m)
+                }
+            } else if n.Kind == ast.TRAITDEC {
+                each m in self.T.Get(self.T.Kid(d, 0)).Kids {
+                    self.insts_in(m)
+                }
+            } else if n.Kind == ast.GLOBAL {
+                self.walk_insts(self.T.Kid(d, 0), set([]))
+            }
+        }
+        var sbound = set([])
+        each s in self.T.Get(self.T.Kid(self.file, 2)).Kids {
+            self.collect_bound(s, sbound)
+        }
+        each s in self.T.Get(self.T.Kid(self.file, 2)).Kids {
+            self.walk_insts(s, sbound)
+        }
+    }
+
+    func insts_in(mut self, fn int) {
+        if self.T.Kind(fn) != ast.FUNC { return }
+        if self.T.Kid(fn, 0) == 0 { return }
+        self.Ty.PushParams(self.generic_names(self.T.Kid(fn, 3)))
+        var bound = set([])
+        self.collect_bound(fn, bound)
+        self.walk_insts(self.T.Kid(fn, 0), bound)
+        self.Ty.PopParams()
+    }
+
+    func walk_insts(mut self, node int, bound set[str]) {
+        if node == 0 { return }
+        let n = self.T.Get(node)
+        if n.Kind == ast.INDEX { self.check_inst(node, bound) }
+        each kid in n.Kids {
+            self.walk_insts(kid, bound)
+        }
+    }
+
+    // check_inst judges `f[T]`, called or not — `let g = f[int]` is the same
+    // instantiation with the call postponed, and low.lower_index lowers it
+    // the same way.
+    func check_inst(mut self, ix int, bound set[str]) {
+        let base = self.T.Kid(ix, 0)
+        if self.T.Kind(base) != ast.IDENT { return }
+        let bn = self.T.Get(base).Sval
+        // A local binding legally shadows a module function and a checker
+        // without scope resolution cannot tell which `f` this is, so a
+        // rebound name is skipped — chk/callsite.voi's discipline exactly.
+        if bn in bound { return }
+        if not (bn in self.funcs) { return }
+        let gl = self.T.Kid(self.funcs[bn], 3)
+        if self.T.NKids(gl) == 0 { return }
+        let idx = self.T.Kid(ix, 1)
+        if self.T.Kind(idx) != ast.IDENT { return }
+        let arg = self.T.Get(idx).Sval
+        // The index must NAME A TYPE, or this is a subscript and not an
+        // instantiation at all.
+        if not self.Ty.Resolves(arg) and not self.Ty.IsParam(arg) { return }
+        // `f[int]` writes exactly ONE type argument — index_tail parses a
+        // single expression — so only the first parameter is ever bound.
+        let g = self.T.Kid(gl, 0)
+        if self.T.Kind(g) != ast.GENERIC { return }
+        self.check_one_bound(idx, arg, self.T.Get(g).Sval,
+                             self.T.Get(self.funcs[bn]).Sval)
+    }
+
+    // trait_list spells the traits a bound may name, built rather than
+    // written down so it can never drift: the predeclared ones first, then
+    // the program's own in DECLARATION order (tNames, never the map).
+    func trait_list(self) str {
+        var out = []
+        each t in typ.BuiltinTraits() {
+            out.append(t)
+        }
+        each t in self.tNames {
+            out.append(t)
+        }
+        return str.join(out, ", ")
+    }
+}
+
+// self_mode spells a FUNC's self parameter the way its declaration does.
+func self_mode(flags int) str {
+    if (flags & 2) != 0 { return "mut self" }
+    if (flags & 4) != 0 { return "own self" }
+    return "self"
+}
+
+// is_builtin_trait reports whether a name is one the language predeclares.
+func is_builtin_trait(name str) bool {
+    each t in typ.BuiltinTraits() {
+        if t == name { return true }
+    }
+    return false
+}

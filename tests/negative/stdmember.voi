@@ -1,0 +1,49 @@
+// std/sync is grafted into the program as ordinary Voilà source (KIND_STDSRC),
+// so a misspelled member is decidable at the reference — and it has to be
+// decided there. `check` used to say `ok` and `build` then died in cgen with
+// "no C implementation yet", which is both the check/build split the verb
+// exists to prevent and a message that sends the reader looking for a missing
+// feature instead of at the typo.
+//
+// The `!` lines of the .expect file are the other half of this fixture: every
+// use below that must stay SILENT is asserted to be silent, because a check
+// that fires on a working program is worse than one that misses.
+use "std/sync"
+use "std/path"
+
+// A top-level binding of a package's name is NOT a qualifier: `path.upper()`
+// below is an ordinary method call on a str.
+var path = "/etc/hosts"
+
+func helper(a int, b int) int { return a + b }
+
+func first(xs []str) ?str {
+    if len(xs) > 0 { return xs[0] }
+    return nil
+}
+
+func pick() ?fn(int) int {
+    return fn(x int) int { return x * 2 }
+}
+
+func main() {
+    say sync.nonexistent(1)
+    say sync.mutx()
+    say path.upper()
+    say sync._mutex()
+    // A PATTERN bind is a bind, and it shadows exactly as a `let` does:
+    // `time` here is a str, and `helper` is the closure that was matched, not
+    // the two-argument function above. Neither may draw a diagnostic — and
+    // both did, until collect_pattern_binds stopped looking for an ast.IDENT
+    // that a pattern never contains.
+    if let Some(time) = first(["2026-08-25"]) {
+        say time.upper()
+    }
+    if let Some(helper) = pick() {
+        say helper(3)
+    }
+    match first([]) {
+        Some(net) => say net.upper()
+        nil       => say "none"
+    }
+}

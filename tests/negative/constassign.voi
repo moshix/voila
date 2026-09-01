@@ -1,0 +1,8 @@
+// A `const` is fixed before the program runs, so assigning to one is not
+// even a late decision — it is a contradiction.
+const MAX = 1024
+
+func main() {
+    MAX = 2048
+    say MAX
+}

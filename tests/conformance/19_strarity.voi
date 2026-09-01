@@ -1,0 +1,33 @@
+// 19_strarity.voi — a surplus argument to a str native is refused, loudly.
+//
+// `trim_left(s)` strips whitespace and takes the subject alone; the cutset
+// form is `strip(s, cutset)` (§13.2). `str.trim_left("..x", ".")` used to
+// return "..x" — a trim that silently did nothing — because a native carries
+// no static signature, so nothing counted its arguments and the surplus one
+// was never read.
+//
+// The surplus argument is now spelled as a METHOD, and that is the point of
+// this file rather than an accident of style. chk/native.voi refuses the
+// QUALIFIED spelling at compile time (tests/negative/nativearity.voi records
+// that), but it cannot judge a method call: the receiver is an ordinary
+// expression and its type is what would decide, which is expression typing
+// and does not exist yet. So the method spelling is the one that still
+// reaches runtime/src/str.c's str_check_arity, and it is what keeps the
+// RUNTIME guard tested now that the compile-time one covers the rest.
+//
+// The abort is the point of the test, so it is the LAST thing main does.
+package main
+use "std/str"
+
+func main() {
+    // Correct calls, including the optional-argument forms, still work.
+    say str.trim_left("  x")
+    say str.strip("..x", ".")
+    say str.substr("hello", 2, 3)
+    say str.substr("hello", 2)
+
+    // ...and the surplus one aborts, at run time, through the one spelling
+    // the checker cannot judge.
+    say "..x".trim_left(".")
+    say "NOT REACHED"
+}

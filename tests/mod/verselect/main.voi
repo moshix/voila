@@ -1,0 +1,12 @@
+package main
+
+// Two requirements for `example.com/lib`: v1.0.0 here, v1.2.0 through `top`.
+// Selection takes the MAXIMUM, so BOTH callers see v1.2.0 — one module path
+// is one version in one build, which is what makes the graph make sense.
+use "example.com/lib/greet"
+use "example.com/top/top"
+
+func main() {
+    say greet.Hello()
+    say top.Say()
+}

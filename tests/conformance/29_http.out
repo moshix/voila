@@ -1,0 +1,75 @@
+-- urls --
+  scheme=http host=example.com port=80 path=/index.html query= target=/index.html text=http://example.com/index.html
+  scheme=http host=example.com port=80 path=/ query= target=/ text=http://example.com/
+  scheme=http host=example.com port=8080 path=/a/b query=x=1&y=2 target=/a/b?x=1&y=2 text=http://example.com:8080/a/b?x=1&y=2
+  scheme=http host=example.com port=80 path=/search query=q=voila target=/search?q=voila text=http://example.com/search?q=voila
+  scheme=http host=::1 port=9000 path=/v6 query= target=/v6 text=http://[::1]:9000/v6
+  scheme=http host=example.com port=80 path=/page query= target=/page text=http://example.com/page
+-- urls this package refuses --
+  ERR http: `https://example.com/secret` is https, and this release has no TLS — std/http speaks plaintext HTTP only. It will not fetch an https URL in the clear. Terminate TLS outside the program and use its http:// address.
+  ERR http: unsupported URL scheme `ftp` (std/http speaks http only)
+  ERR http: URL `example.com/no-scheme` has no scheme (want http://host/path)
+  ERR http: URL `http:///no-host` has no host
+  ERR http: userinfo (`user@host`) in a URL is not supported: `http://user:pw@example.com/`
+  ERR http: URL `http://example.com:99999/`: port 99999 out of range (0..65535)
+-- headers are case-insensitive --
+  get: text/plain | text/plain
+  has: true false
+  all: ["a=1", "b=2"]
+  names: ["Content-Type", "Set-Cookie", "set-cookie"]
+  after set: 2 ["Content-Type", "SET-COOKIE"] ["only=1"]
+  after remove: 1 ["SET-COOKIE"]
+-- a header value may not carry a newline --
+  ERR http: header value contains a newline (response splitting is refused)
+-- status codes --
+  OK | Not Found | Service Unavailable | Server Error
+-- client and server, over loopback --
+get status: 200 OK ok=true
+get content-type: text/plain; charset=utf-8
+get CONTENT-TYPE: text/plain; charset=utf-8
+get content-length: 16
+get method seen by the server: GET
+get Host reached the server: true
+get repeated header: ["first", "second"]
+get body: hello who=world
+post: 200 body=sixteen chars!!! len=16 ct=application/octet-stream
+put: 200 body=put body len=8 ct=text/x-voila
+created: 201 Created application/json [1,2,3]
+404: 404 Not Found ok=false 404 not found
+server: every request served
+-- the server API by hand --
+by hand: 200 by hand: GET /by-hand
+server: answered by hand
+-- a chunked request body --
+chunked request: body=wikipedia len=9 ct=text/plain
+server: every request served
+-- the package writes the message length, not the caller --
+  ERR http: Transfer-Encoding is set by the package, not the caller — a request written here always carries a Content-Length
+-- a chunked response body --
+chunked: 200 body=hello, world
+-- responses that must be refused, not guessed at --
+no status line: ERR http: not a status line: `nothing like a response`
+no colon in a header: ERR http: header line with no colon: `BadHeader`
+space before the colon: ERR http: header name `X-Bad ` contains an illegal character
+empty TE: ERR http: Transfer-Encoding `` is not supported (this release decodes `chunked` only)
+1xx then real: 200 body=hi
+only 1xx: ERR http: the server sent only interim (1xx) responses
+folded header: ERR http: obsolete line folding is not accepted: ` more`
+absurd Content-Length: ERR http: Content-Length `99999999999999` exceeds the limit of 33554432
+Content-Length that is not a number: ERR http: Content-Length `twelve` is not a decimal number
+body shorter than Content-Length: ERR http: the stream ended after 5 of 100 body bytes
+Content-Length twice, disagreeing: ERR http: Content-Length given twice with different values (2 and 3)
+Content-Length and chunked together: ERR http: both Content-Length and Transfer-Encoding: chunked — refusing an ambiguous message length
+a Transfer-Encoding this release cannot decode: ERR http: Transfer-Encoding `gzip` is not supported (this release decodes `chunked` only)
+a chunk not followed by CRLF: ERR http: chunk of 5 bytes is not followed by CRLF
+a chunk size that is not hex: ERR http: chunk size `zz` is not a hex number
+a stream that ends mid-chunk: ERR http: the stream ended after 3 of 5 body bytes
+a header line with no end: ERR http: a line longer than 65536 bytes with no end in sight
+nothing at all: ERR http: the server closed the connection without a response
+-- responses that are fine --
+204 carries no body: 204 body=
+no length: the body ends at the close: 200 body=free bytes
+an empty reason phrase: 200 body=hi
+-- `http` is a name before it is a package --
+shadowed: HYPER TEXT
+shadowed: 3

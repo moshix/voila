@@ -1,0 +1,130 @@
+// chk/reach.voi — the `unreachable` warning.
+//
+// A statement written after a `return`, a `throw`, a `break` or a `continue`
+// in the SAME block can never run. It is always a mistake — usually an edit
+// that moved a `return` up and left the old tail behind — and the compiler has
+// until now said nothing about it at all.
+//
+// WHY NOT sig.voi's `terminates`. Because the two analyses want opposite
+// leanings and the same helper cannot have both. `terminates` exists for the
+// missing-return check and is deliberately GENEROUS: every construct it does
+// not fully understand counts as diverting, so `for { … }` with no iterator is
+// "terminates" whether or not the body breaks out. Erring that way loses a
+// missing-return diagnostic, which is cheap. Reused here it would ACCUSE
+//
+//     for { if done { break } }
+//     say "after the loop"
+//
+// of writing dead code, which is both wrong and infuriating. So this check
+// asks a much smaller question — is the preceding statement one of the four
+// keywords that flatly leave the block? — and gets a yes/no it can be sure of.
+// A `match` all of whose arms return is genuinely unreachable-after, and this
+// check will not say so; a warning that is silent too often is a nuisance,
+// and one that is wrong even once is a bug.
+//
+// WHAT IS NOT ENTERED: whatever all_stmts() does not enter — closure bodies,
+// `defer { … }` and `spawn { … }` blocks, and trait-DEFAULT bodies. This
+// check rides on that walk rather than growing a second one, so its reach is
+// exactly that walk's reach; widening it is a change to all_stmts and to
+// every check that shares it, not a change here. stmt_lists is the only
+// place the shape of that walk lives twice — see the note on it below.
+package chk
+
+use "voilac/ast"
+
+impl Checker {
+    func check_unreachable(mut self) {
+        each b in self.stmt_lists() {
+            self.unreach_in(b)
+        }
+    }
+
+    // unreach_in reports the FIRST unreachable statement of one block and
+    // stops. Five statements after a `return` are one mistake, not five, and
+    // the four that follow the first would only bury it.
+    func unreach_in(mut self, b int) {
+        if b == 0 { return }
+        let ks = self.T.Get(b).Kids
+        var i = 0
+        while i + 1 < len(ks) {
+            if diverts(self.T.Kind(ks[i])) {
+                self.warn_at(ks[i + 1], "unreachable",
+                    "unreachable: the `" || ast.KindName(self.T.Kind(ks[i])) ||
+                    "` above it always leaves this block")
+                return
+            }
+            i += 1
+        }
+    }
+
+    // stmt_lists returns every node whose Kids are consecutive statements.
+    //
+    // The DECLARATION half repeats all_stmts()'s decl loop, and the STATEMENT
+    // half repeats walk_stmt()'s slot map — but only the slots, and only once:
+    // the recursion itself is all_stmts(), which is reused rather than
+    // rewritten. A construct added to the language without being added here
+    // loses this warning inside it; it can never gain a false one, which is
+    // the direction a duplicated walk is allowed to drift in.
+    //
+    // A block reached through walk_block (an `if` body, a loop body) is not
+    // itself a statement, so it is named here by its slot. A nested `{ … }`
+    // block IS a statement, so all_stmts() already yields it and it is picked
+    // up by the BLOCK arm — neither route produces it twice.
+    func stmt_lists(self) []int {
+        var out = []
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            let n = self.T.Get(d)
+            if n.Kind == ast.FUNC {
+                out.append(self.T.Kid(d, 0))
+            } else if n.Kind == ast.IMPLDEC {
+                each m in self.T.Get(self.T.Kid(d, 0)).Kids {
+                    out.append(self.T.Kid(m, 0))
+                }
+            } else if n.Kind == ast.EXCDEC {
+                each m in self.T.Get(self.T.Kid(d, 1)).Kids {
+                    out.append(self.T.Kid(m, 0))
+                }
+            }
+        }
+        out.append(self.T.Kid(self.file, 2))          // the script statements
+        each s in self.all_stmts() {
+            let k = self.T.Kind(s)
+            if k == ast.BLOCK {
+                out.append(s)
+            } else if k == ast.IF {
+                out.append(self.T.Kid(s, 1))
+            } else if k == ast.FOR or k == ast.EACH or k == ast.WHILE or
+                      k == ast.GROUP {
+                out.append(self.T.Kid(s, 1))
+            } else if k == ast.SWITCH {
+                each c in self.T.Get(self.T.Kid(s, 1)).Kids {
+                    out.append(self.T.Kid(c, 1))
+                }
+            } else if k == ast.MATCH {
+                each a in self.T.Get(self.T.Kid(s, 1)).Kids {
+                    out.append(self.T.Kid(a, 1))
+                }
+            } else if k == ast.SELECTSTMT {
+                each c in self.T.Get(self.T.Kid(s, 0)).Kids {
+                    out.append(self.T.Kid(c, 2))
+                }
+            } else if k == ast.TRYCATCH {
+                out.append(self.T.Kid(s, 0))
+                each cc in self.T.Get(self.T.Kid(s, 1)).Kids {
+                    out.append(self.T.Kid(cc, 0))
+                }
+                out.append(self.T.Kid(s, 2))
+            }
+        }
+        return out
+    }
+}
+
+// diverts reports whether a statement of this kind flatly leaves the block it
+// is written in. `fallthrough` is NOT here: it leaves the CASE for the next
+// one, and the statements after it in the same case body are as reachable as
+// the ones before.
+func diverts(k int) bool {
+    return k == ast.RETURN or k == ast.THROW or k == ast.BREAK or
+           k == ast.CONTINUE
+}

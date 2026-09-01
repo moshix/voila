@@ -1,0 +1,17 @@
+// A generic bound, unsatisfied at a COMPOSITE LITERAL. `Stack[T: Describe]`
+// promises every element answers `describe`; `Point` answers nothing, and
+// `s.lines()` below would find no method to dispatch to.
+trait Describe {
+    func describe(self) str
+}
+
+struct Point { x int, y int }
+
+struct Stack[T: Describe] {
+    items []T
+}
+
+func main() {
+    let s = Stack[Point]{items: []}
+    say len(s.items)
+}

@@ -1,0 +1,195 @@
+// std/path — file-system paths as text.
+//
+// Every function here is PURELY LEXICAL except `abs`, which needs the working
+// directory. Nothing touches the disk, nothing follows a symlink, and a path
+// that names nothing is handled exactly like one that names a file — so the
+// answers do not change under you between the call and the open. When you do
+// want the disk consulted, that is `os.realpath`.
+//
+// Paths are slash-separated. Voilà is POSIX-only today (§13.4, std/os), and a
+// Windows port would localise the separator to this file and nowhere else.
+//
+// The implementation is lifted from the compiler's own `voilac/path`, which
+// has resolved every import path and every output file since the toolchain
+// became self-hosting. The compiler keeps its private copy for now — see the
+// note at the top of voilac/path/path.voi — so this package is free to grow a
+// friendlier surface than the compiler's needs alone would justify.
+package path
+
+use "std/str"
+use "std/os"
+
+// SEP is the path separator.
+const SEP = "/"
+
+// base is the last element of a path ("a/b/c.voi" → "c.voi"). Trailing
+// separators are ignored, so base("a/b/") is "b".
+//
+// The root has no last element, so base("/") is "" — the same answer Python
+// gives and not the one POSIX basename(1) gives. It is chosen so that
+// `join(dir(p), base(p)) == clean(p)` for EVERY p, the root and the empty
+// path included.
+func base(p str) str {
+    if p == "" { return "" }
+    let parts = str.split(clean_trailing(p), SEP)
+    return parts[len(parts) - 1]
+}
+
+// dir is everything before the last element ("a/b/c.voi" → "a/b"). A path with
+// no separator has directory "."; the root's directory is itself.
+func dir(p str) str {
+    let c = clean_trailing(p)
+    var i = len(c) - 1
+    while i >= 0 {
+        if c[i] == '/' {
+            if i == 0 { return SEP }
+            return c[0..i]
+        }
+        i -= 1
+    }
+    return "."
+}
+
+// split is dir and base together, which is how they are almost always wanted:
+//
+//     let d, b = path.split("src/main.voi")     // "src", "main.voi"
+func split(p str) (str, str) {
+    return dir(p), base(p)
+}
+
+// join glues path pieces together and CLEANS the result, so
+// `path.join(root, "", name)` is `root/name`, `path.join(".", "x")` is `x`,
+// and `path.join("/", "a")` is `/a` rather than `//a`. Empty pieces are
+// skipped, which is what lets a call site pass a possibly-absent component
+// without a special case of its own.
+//
+// Cleaning is what makes `join(dir(p), base(p)) == clean(p)` hold for every
+// path — including "a", whose directory is "." — and it is why the separator
+// bookkeeping below is a plain concatenation: clean collapses "a//b" and
+// "//a" for us. It also means join resolves ".." lexically, so
+// `join(base, untrusted)` cannot climb out by accident more quietly than
+// `has_prefix(base, …)` can detect.
+func join(parts ...str) str {
+    var out = ""
+    each p in parts {
+        if p == "" { continue }
+        if out == "" {
+            out = p
+        } else {
+            out = out || SEP || p
+        }
+    }
+    // Nothing was joined: the answer is the empty path, not clean("") == ".".
+    // Joining no pieces cannot conjure a directory out of nowhere.
+    if out == "" { return "" }
+    return clean(out)
+}
+
+// ext is the extension including the dot ("x.voi" → ".voi"), or "" when the
+// last element has none. A leading dot is a whole name and not an extension
+// boundary in the usual sense, but it IS one here: ext(".bashrc") is
+// ".bashrc", matching every other language's answer.
+func ext(p str) str {
+    let b = base(p)
+    var i = len(b) - 1
+    while i >= 0 {
+        if b[i] == '.' { return b[i..len(b)] }
+        i -= 1
+    }
+    return ""
+}
+
+// stem is the last element with its extension removed ("a/b.voi" → "b").
+func stem(p str) str {
+    let b = base(p)
+    let e = ext(b)
+    return b[0..len(b) - len(e)]
+}
+
+// with_ext replaces the extension ("a/b.voi", ".c" → "a/b.c"). A new extension
+// with no leading dot gets one, and an empty one strips the extension. The
+// result is cleaned, as join's always is.
+func with_ext(p str, e str) str {
+    var suffix = e
+    if suffix != "" and suffix[0] != '.' { suffix = "." || suffix }
+    return join(dir(p), stem(p) || suffix)
+}
+
+// is_abs reports whether the path starts at the root.
+func is_abs(p str) bool {
+    return len(p) > 0 and p[0] == '/'
+}
+
+// abs makes a path absolute against the working directory, and cleans it —
+// join does the cleaning. This is the one function here that asks the
+// operating system anything.
+func abs(p str) str throws IOError {
+    if is_abs(p) { return clean(p) }
+    let cwd = try os.cwd()
+    return join(cwd, p)
+}
+
+// clean removes "." elements and empty elements and resolves ".." lexically —
+// WITHOUT consulting the file system, so "a/link/.." is "a" even when `link`
+// points somewhere else entirely. That is the documented behaviour of every
+// lexical path cleaner; when it matters, use os.realpath.
+//
+// The empty path cleans to ".", and ".." above the root is still the root.
+func clean(p str) str {
+    let rooted = is_abs(p)
+    var out = []
+    each part in str.split(p, SEP) {
+        if part == "" or part == "." { continue }
+        if part == ".." {
+            if len(out) > 0 and out[len(out) - 1] != ".." {
+                out = out[0..len(out) - 1]
+                continue
+            }
+            if rooted { continue }     // ".." above "/" is still "/"
+        }
+        out.append(part)
+    }
+    var joined = str.join(out, SEP)
+    if rooted { return SEP || joined }
+    if joined == "" { return "." }
+    return joined
+}
+
+// rel expresses `target` relative to `base`, or returns target cleaned but
+// otherwise unchanged when it does not sit under base. It does not invent
+// ".." hops: a path outside the base is reported as itself, which is the
+// answer a diagnostic or a listing wants.
+func rel(base str, target str) str {
+    let b = clean(base)
+    let t = clean(target)
+    if b == t { return "." }
+    let prefix = b || SEP
+    if len(t) > len(prefix) and t[0..len(prefix)] == prefix {
+        return t[len(prefix)..len(t)]
+    }
+    return t
+}
+
+// has_prefix reports whether `target` lies at or under `base`. It compares
+// whole ELEMENTS, so "/etc" does not contain "/etcetera" — which is the whole
+// reason to call this instead of str.starts_with.
+func has_prefix(base str, target str) bool {
+    let b = clean(base)
+    let t = clean(target)
+    if b == t { return true }
+    let prefix = b || SEP
+    return len(t) > len(prefix) and t[0..len(prefix)] == prefix
+}
+
+// ------------------------------------------------------------------ helpers
+
+// clean_trailing drops trailing separators, but never the last character: the
+// root is a separator and nothing else, and trimming it away would turn "/"
+// into "", which names no path at all.
+func clean_trailing(p str) str {
+    var e = len(p)
+    while e > 1 and p[e - 1] == '/' {
+        e -= 1
+    }
+    return p[0..e]
+}

@@ -1,0 +1,13 @@
+// A Voilà-source std package reached without importing it.
+//
+// A package qualifier is program-wide, not per-import (low.PackageNames), so
+// `time.now()` on the line below compiles with no `use` at all — it is a C
+// native, and always was. `time.now_utc()` is Voilà source that nothing
+// grafted, so it used to pass `check` and then die in the backend saying the
+// name does not exist, which is not what is wrong with it.
+func main() {
+    say time.now().unix() > 0
+    say time.now_utc().year
+    say net.resolve("localhost")
+    say net.listen(":0")
+}

@@ -20,7 +20,7 @@ diagrams, general rules, and usage notes. Read Chapter 1 first;
 thereafter the manual is designed for random access.
 
 **Note.** Where the behavior of the toolchain deliberately differs from
-the *Voilà Language Specification, Version 0.4.2 (Draft)*, the difference
+the *Voilà Language Specification, Version 0.5.0 (Draft)*, the difference
 is recorded in Appendix D. Programs should be written to this manual.
 
 ---
@@ -657,6 +657,32 @@ A trait is implemented explicitly with an IMPL block. Any type
 implementing a trait may be passed where the trait is expected. SAY and
 string interpolation consult a `Show` implementation when present.
 
+A trait method may supply a DEFAULT implementation, which an implementor
+inherits by not writing the method. `= expr` is shorthand for the block
+`{ return expr }`.
+
+```voila
+trait Titled {
+    func title(self) str                    // abstract: every IMPL owes it
+    func subtitle(self) str = "(none)"      // a default, short form
+    func banner(self) str {                 // a default, block form
+        return "[" || self.title() || " / " || self.subtitle() || "]"
+    }
+}
+
+impl Titled for Page {
+    func title(self) str { return self.name }   // subtitle, banner inherited
+}
+```
+
+The default is compiled once and shared by every implementor; dispatch
+is on the receiver's run-time type, so a default that calls
+`self.title()` reaches the implementor's own `title`. Writing the method
+overrides the default — including in an inherent `impl T { ... }` block,
+which the flat method table cannot tell apart from a trait one. When two
+traits implemented by one type default the same method name, the earlier
+IMPL block wins.
+
 ## 7.4 Generic Declarations
 
 ```voila
@@ -673,6 +699,16 @@ impl[T] Stack[T] {
 Constraints name traits. The translator erases type parameters and the
 runtime checks representations; a later monomorphizing pass will change
 the cost, not the observable behavior.
+
+A constraint is enforced wherever an ACTUAL type is written in place of
+the parameter: a composite literal `Stack[Point]{}`, an annotation
+`var s Stack[Point]`, and an explicit instantiation `max[Point](a, b)`.
+The argument must provide the constraint's methods, and a method counts
+wherever the program writes it — the flat method table does not tell an
+inherent `impl T { ... }` apart from an `impl Trait for T`. The six
+PREDECLARED constraints have no method set of their own, so nothing is
+judged against one. A type argument may itself be an instantiation:
+`Stack[Box[int]]`.
 
 ---
 
@@ -936,6 +972,12 @@ The closure passed to `update` runs under the cell's lock and must not
 allow an exception to escape (the nothrow requirement of Section 9.4);
 a violation is an abort.
 
+A `cell` protects one value it owns. When what needs protecting is not
+inside a cell — an ordinary variable several tasks write, a pair of
+values that must change together, a one-time initialisation — reach for
+`std/sync` (Section 11.7): `Mutex`, `RWLock`, `Atomic`, `Once` and
+`WaitGroup`.
+
 ---
 
 # Chapter 11. The Standard Library
@@ -981,15 +1023,20 @@ is_upper hex unhex b64 unb64`. Efficient building: `str.Builder{}` with
 |---|---|
 | std/os | `read write open create exists remove args env exit stderr stdout on_abort`; File: `lines() records(n) read_all() write() close()` |
 | std/math | `pi e sqrt sin cos tan ln log2 log10 exp pow hypot mod` |
-| std/time | `now since sleep after millis seconds`; `Second`, `Millisecond`, ... durations with integer arithmetic |
+| std/time | two halves. Stopwatch: `now since sleep after millis seconds`; `Second`, `Millisecond`, ... durations with integer arithmetic. Calendar: `DateTime`, `now_utc now_local date utc from_unix from_instant parse_rfc3339 is_leap_year days_in_month`. See 11.8. |
 | std/json | `encode pretty decode decode[T]` — numbers with fractions decode as `dec` |
+| std/csv | RFC 4180 — `decode(text) encode(recs)`, and a streaming `Reader`/`Writer` over any `io` source. A quoted field may contain commas, quotes and NEWLINES, so a record is not a line. See 11.10. |
 | std/log | `info warn error debug` to the standard error stream |
 | std/net | TCP, UDP and Unix-domain sockets — `listen connect listen_udp dial_udp listen_unix dial_unix resolve`; `Listener`, `Conn`, `Udp` methods. See 11.5. |
-| std/regex | RE2 semantics (linear time): `compile matches find find_all replace`; compiled `Regex` methods incl. `groups` |
-| std/http | `get post` returning `Response{status, body, headers}` |
+| std/path | lexical paths — `base dir split join ext stem with_ext clean is_abs abs rel has_prefix`, and the `SEP` constant. `join` cleans its result, so `join(dir(p), base(p))` is `clean(p)` for every p. Nothing here touches the disk except `abs`. |
+| std/sync | `mutex() rwlock() atomic(n) once() wait_group()` — mutual exclusion, read/write locks, atomic integers, run-once and work counting. See 11.7. |
+| std/regex | RE2 semantics (linear time): `compile matches find find_all replace split`; a compiled `Regex` carries the same methods plus `source`. No backreferences and no lookaround — neither is expressible in a finite automaton, and supporting them would forfeit the linear-time guarantee. Note `{n}` inside a Voilà string literal is interpolation: write `\{n\}`. |
+| std/http | HTTP/1.1 client and server — `get(url) post(url, body) request(method, url, headers, body)` returning a `Response{status, reason, proto, headers, body}`; `listen(addr)` and `serve_one(handler)` for a server; `parse_url`, `Headers` (case-insensitive), chunked decoding. **No TLS**: an `https://` URL is refused. See 11.12. |
 | std/conv | the conversion functions, package-qualified |
 | std/sort | `sort sort_by reversed` |
-| std/rand, std/uuid | `rand.int(n) rand.float rand.seed(n)`; `uuid.new()` |
+| std/rand, std/uuid | `rand.int(n) rand.float rand.seed(n)` — a fast, SEEDABLE, reproducible sequence, predictable and **not for secrets**; `uuid.new()`, which draws from std/crypto instead |
+| std/crypto | `sha256 sha512` and the legacy `sha1 md5`, each also as `_raw`; `hmac_sha256 hmac_sha512 hmac_sha1 hmac_md5` (+`_raw`); `random(n) random_int(n) equal(a, b)`. `crypto.random` is the only random source fit for a key or a token. See 11.11. |
+| std/test | assertions and table tests — `suite(name)`, then `eq ne near ok not_ok raises raises_msg fail table run`, and `summary report done`. See 11.9. |
 
 Collections carry methods directly: slices have `append pop first last
 map filter reduce sort sort_by sorted contains index_of reverse join
@@ -1004,7 +1051,7 @@ any all each`; maps have `keys values has get set delete`; sets have
 Unix-domain sockets for local inter-process communication. It is the first
 standard package **written in Voilà**: only the raw system calls are in the C
 runtime, and the interface the program uses is Voilà source that `use
-"std/net"` compiles into the program (11.6, and 12.7 for the pattern).
+"std/net"` compiles into the program (11.6, and 12.8 for the pattern).
 
 ### 11.5.1 The Connection Model
 
@@ -1118,7 +1165,13 @@ package**; the paths beginning `std/` (and the bare names `fmt`, `str`, `os`,
 // voila.mod:  module app
 use "app/geom"            // the directory <root>/geom
 use "app/geom" as g       // ...under another qualifier
+use "std/str" as s        // a standard package takes an alias too
 ```
+
+An alias **adds** a spelling to a standard package rather than replacing one:
+a std qualifier is known program-wide, so `s.upper(x)` and `str.upper(x)` are
+the same call and both compile. A user package has no such second spelling —
+`g.Area(x)` is the only way to reach it once it is aliased.
 
 **General rules.**
 
@@ -1132,14 +1185,606 @@ use "app/geom" as g       // ...under another qualifier
 4. **Import cycles are rejected.** So are two packages with the same name, an
    import path that resolves to nothing, and an import path that escapes the
    module root.
-5. Enumeration VARIANT names and TRAIT names are **global to the program**,
-   because a pattern and a trait bound have no qualified form. Two packages
-   may therefore not both declare a variant `Empty` or a trait `Show`; the
-   translator says so.
+5. Enumeration VARIANT names and TRAIT names are **qualified like every other
+   declaration**: `geom.Circle`, `geom.Named`. Two packages may each declare an
+   `Empty` or a `Named` without colliding. They are also the only names an
+   importer may spell **without** a qualifier — an unqualified variant or trait
+   resolves in the current package, then in exactly one import, and two
+   candidates is an error naming both. The qualified form always works and is
+   how the ambiguity is settled.
+
+   ```voila
+   match s {
+       geom.Circle(r) => …      // always unambiguous
+       Rect(w, h)     => …      // short form: only geom offers it
+   }
+
+   impl geom.Named for Box { … }
+   func show[T: geom.Named](x T) str { return x.Name() }
+   ```
 6. A package file may not contain loose statements; only the entry file may
    (Section 1.2).
 7. Selective (`use … { A, B }`) and wildcard (`use … *`) imports are not
    available for user packages.
+
+**Depending on code you did not write.** `voila.mod` takes four directives and
+nothing else — `module` (exactly one), `voila <version>` (the language version
+the module needs; a version newer than the translator is refused), `require
+<modpath> <version>`, and `replace <modpath> [<version>] => <localpath>` or
+`=> <modpath> <version>`. `require` and `replace` also take a parenthesised
+block. An unknown directive is an **error**, not something quietly skipped.
+
+An import path is resolved in a fixed order: a Voilà-source standard package, a
+C standard package, a `replace` target, the module cache, a directory under the
+module root — and then a refusal that names every one of those places.
+
+```
+   voila get <modpath>@<version>    fetch into the module cache (shells out to git)
+   voila mod init [modpath]         write a voila.mod
+   voila mod verify                 re-hash the cached dependencies
+```
+
+The module cache is `$VOILA_MODCACHE`, defaulting to
+`~/.cache/voila/mod/<modpath>@<version>/`; a cached dependency is loaded and
+flattened from source exactly like a local one. Where two requirements name one
+module path, the **maximum** of the required versions is selected — for a graph
+of exact requirements that is minimum version selection, and it needs no
+backtracking. A `replace` applies **only from the main module**, never
+transitively; that is the one rule that stays predictable as a graph deepens.
+
+`voila.sum` records one `<modpath> <version> <hash>` line per dependency. It is
+a **drift detector, not a security boundary**: the hash is FNV-1a-64, which is
+not cryptographic, and it is written `f1a64:…` so a future real digest can be
+told apart. It catches a cached tree edited or truncated underfoot; it does not
+resist a deliberate collision. A module with no `voila.sum` is not checked; once
+the file exists a missing entry is as much a refusal as a wrong one. A `replace`
+to a local directory is never hashed.
+
+---
+
+## 11.7 The std/sync Package
+
+Tasks are real operating-system threads (Chapter 10), so two of them running
+at once are genuinely running at once. `cell` (10.4) protects one value it
+owns; `std/sync` protects everything else.
+
+```voila
+use "std/sync"
+
+let mu = sync.mutex()
+var total = 0
+
+let bump = fn() {
+    for i in 0..500 {
+        mu.with(fn() { total = total + 1 })
+    }
+}
+group { for t in 0..8 { spawn bump() } }
+say total                      // 4000, exactly, every time
+```
+
+### 11.7.1 The Five Types
+
+| Type | Made by | Methods |
+|---|---|---|
+| `Mutex` | `sync.mutex()` | `lock unlock try_lock with(f)` |
+| `RWLock` | `sync.rwlock()` | `read_lock read_unlock write_lock write_unlock try_read_lock try_write_lock with_read(f) with_write(f)` |
+| `Atomic` | `sync.atomic(n)` | `load store add sub inc dec swap cas` |
+| `Once` | `sync.once()` | `do(f) has_run` |
+| `WaitGroup` | `sync.wait_group()` | `add done wait count` (single-use) |
+
+A `Mutex` is **not recursive**: a task that already holds it and asks again
+gets a `RuntimeError` rather than a deadlock, and so does a task that unlocks
+one it does not hold. An `RWLock` admits any number of readers *or* one
+writer; POSIX makes no such promise about re-entering one, so do not.
+
+`Atomic` holds one integer. Every operation is sequentially consistent, and
+`add` returns the NEW value — which is what makes "was I the one who brought
+it to zero" answerable without a lock.
+
+### 11.7.2 Locks and DEFER
+
+`defer mu.unlock()` on the line after `mu.lock()` is a requirement, not a
+habit. A critical section can be left by `return`, by `break`, and by a throw —
+and the throw need not be one you wrote. Cooperative cancellation (Chapter 10)
+raises `Cancelled` at every loop backedge, at every channel operation, and
+inside `time.sleep`, so a group timeout or a sibling task's failure can unwind
+a task out of the middle of a critical section. Without `defer` the lock is
+then held by a task that no longer exists and every other task waits on it
+forever: a hang, not a diagnostic. The runtime runs a frame's defers on the
+**unwind** path as well as the return path, which is what makes the one line
+enough.
+
+**`defer` is function-scoped, not block-scoped.** Inside a loop body it does
+not unlock at the end of the iteration; it queues an unlock for when the
+*function* returns, so the next turn round the loop asks for a lock this task
+already holds — which a Voilà `Mutex` reports as a `RuntimeError` instead of
+deadlocking. Use `with` for a per-iteration critical section.
+
+`mu.with(f)` is the same thing said once instead of twice, and returns whatever
+`f` returns:
+
+```voila
+let n = mu.with(fn() { return queue.len() })
+```
+
+Going the other way: a task **already blocked** in `lock()` is inside a system
+wait that cooperative cancellation cannot reach, so a group timeout does not
+interrupt it — the same rule `net.accept` follows (11.5.4). `WaitGroup.wait` is
+the deliberate exception: it waits on a channel, and cancellation does reach
+those.
+
+Four calls run a closure with a lock held — `Mutex.with`, `RWLock.with_read`,
+`RWLock.with_write` and `Once.do`. Inside one of them:
+
+- a **throw** is safe; the lock is released on the way out;
+- **re-entering the same Mutex** is a `RuntimeError`, not a hang;
+- **blocking** (a channel receive, an `await`, a socket read) is permitted but
+  holds the lock for as long as it takes — keep critical sections short;
+- **unlocking the lock you are running under** is an error, because the
+  `defer` that follows would then unlock a lock this task no longer holds.
+
+### 11.7.3 Once and WaitGroup
+
+`once.do(f)` runs `f` the first time and never again, and does not return until
+`f` has finished — so a second task waits for the first one's work rather than
+racing past it. If `f` throws, the exception propagates and the `Once` stays
+**unrun**, so a later `do` tries again: initialisation that failed did not
+happen.
+
+`WaitGroup` counts unfinished work down to zero. `add` before spawning, `done`
+when a worker finishes, `wait` to block until the count reaches zero — and
+`wait` observes a group's cancellation and its timeout, because it is built on
+a channel and not on a raw condition variable.
+
+A `WaitGroup` is **single-use**, and the rule that follows from it is: count
+*all* the work with one `add` before any of it can finish. One `add` per item,
+interleaved with the work, lets the count touch zero while items remain, and a
+`WaitGroup` whose count has reached zero is used up — the later `add` is
+refused with a `RuntimeError` rather than quietly not being waited for. Make a
+new one for each round.
+
+```voila
+let wg = sync.wait_group()
+wg.add(len(jobs))
+group {
+    each j in jobs { spawn handle(j, wg) }   // each `handle` ends with wg.done()
+    spawn { wg.wait(); say "all done" }
+}
+```
+
+More `done()` than `add()` drives the count below zero, which is a bug and is
+reported as a `RuntimeError`.
+
+---
+
+## 11.8 The std/time Package
+
+`std/time` has two halves, and they meet only at `instant`.
+
+The **stopwatch** half measures elapsed time. `time.now()` returns an
+`instant` (nanoseconds since the Unix epoch, read from the real-time clock),
+`time.since(i)` returns a `dur`, and `time.sleep` and `time.after` wait. The
+six duration constants — `Nanosecond Microsecond Millisecond Second Minute
+Hour` — multiply by integers, so `40 * time.Millisecond` is a duration and
+`2 * time.Second` is the timeout in `group timeout 2 * time.Second`.
+
+The **calendar** half answers what day it is.
+
+```voila
+use "std/time"
+
+let d = must time.utc(2026, 8, 25, 13, 4, 5)
+say d                                   // 2026-08-25T13:04:05Z
+say d.year, d.month, d.day              // 2026 8 25
+say d.weekday_name(), d.yearday()       // Tuesday 237
+say d.to_offset(19800)                  // 2026-08-25T18:34:05+05:30
+say time.now_utc().date_string()        // today, in UTC
+```
+
+### 11.8.1 DateTime
+
+`DateTime` is a plain struct: `year month day hour minute second nanosecond
+offset`, all `int`. `offset` is **seconds east of UTC**, so 0 is UTC and 19800
+is +05:30. Two DateTimes with different offsets can name the same moment;
+`same_moment`, `before` and `after` compare moments, while `==` compares
+fields and so also asks whether the two were read at the same offset.
+
+| Built by | |
+|---|---|
+| `time.now_utc()` `time.now_local()` | the current moment |
+| `time.date(y, mo, d, h, mi, s, ns, offset)` | every part, checked |
+| `time.utc(y, mo, d, h, mi, s)` | `date` with no fraction, in UTC |
+| `time.from_unix(secs)` `time.from_unix_at(secs, offset)` | a Unix timestamp |
+| `time.from_unix_nanos(ns)` `time.from_unix_nanos_at(ns, offset)` | the same, finer |
+| `time.from_unix_seconds_at(secs, ns, offset)` | a second and its fraction, kept apart |
+| `time.from_instant(i)` `time.from_instant_at(i, offset)` `time.local(i)` | an `instant` |
+| `time.parse_rfc3339(s)` | RFC 3339 text |
+
+| Method | |
+|---|---|
+| `rfc3339() date_string() time_string()` | formatting |
+| `unix() unix_millis() unix_nanos() to_instant()` | back to a timestamp |
+| `to_utc() to_offset(secs) to_local()` | the same moment, read elsewhere |
+| `add(d)` | move by a `dur` |
+| `before(o) after(o) same_moment(o)` | ordering |
+| `weekday() weekday_name() month_name() yearday()` | calendar names and numbers |
+
+`weekday()` is 0 for Sunday through 6 for Saturday. The names are English on
+every machine and in every locale, deliberately: nothing in this package calls
+`strftime`, because `strftime` is locale-dependent and Voilà programs are
+expected to print the same bytes everywhere.
+
+Package functions `time.is_leap_year(y)` and `time.days_in_month(y, m)` answer
+the two calendar questions that need no DateTime.
+
+### 11.8.2 Time Zones: UTC and Fixed Offsets Only
+
+There is **no tzdata**. Named zones do not exist in this package, and a
+`DateTime` carries an offset rather than a zone — so it cannot tell you what
+its own offset will become after the next daylight-saving change. Exactly
+three things are available:
+
+1. **UTC** — offset 0.
+2. **A fixed offset** you supply, in seconds east of Greenwich.
+3. **The process's own offset**, as the C library reports it *for a given
+   instant* (`localtime_r`). `time.now_local()`, `time.local(i)`,
+   `time.local_offset()` and `time.offset_at(i)` are the four ways to ask,
+   and because the instant is passed through, a summer timestamp reads in
+   summer time even when it is January now.
+
+If you need "what is the time in Europe/Berlin", this package is the wrong
+tool, and saying so is better than half-answering it.
+
+### 11.8.3 RFC 3339, Exactly
+
+`rfc3339()` writes `2026-08-25T13:04:05Z`, or `…+05:30` for a non-zero
+offset. The fraction is omitted when the nanosecond is zero and otherwise
+printed to the shortest of 3, 6 or 9 digits that loses nothing — a
+deterministic rule, which matters when the output is compared byte for byte.
+
+`time.parse_rfc3339` accepts `T`, RFC 3339 §5.6's lower-case `t`, and the
+NOTE's space; `Z`, `z`, or `±HH:MM`; and a fraction of any length, truncated
+to nanoseconds. The offset is **not** optional — a timestamp without one does
+not say what moment it means, and guessing UTC is how timestamps drift by
+hours. `-00:00`, to which RFC 3339 §4.3 gives the distinct meaning "offset
+unknown", is read as plain UTC and writes back as `Z`; a `DateTime` has
+nowhere to record "unknown". A leap second (`:60`) is refused: there is no
+leap-second table here and folding it into the next minute would move the
+timestamp.
+
+Three ranges apply, and they are far apart. The calendar itself is seconds
+arithmetic and good to year ±292 billion. Nanoseconds are `int64`, so
+`unix_nanos()`, `to_instant()` and `add()` cover
+1677-09-21T00:12:43.145224192Z to 2262-04-11T23:47:16.854775807Z and overflow
+(which aborts) outside it. RFC 3339 has four year digits and no room for
+offset seconds, so `rfc3339()` is a legal RFC 3339 timestamp for years
+0..9999, and an offset that is not a whole number of minutes renders to its
+whole-minute part — including an offset of −59..−1 seconds, which renders
+`-00:00` and reads back as UTC.
+
+---
+
+## 11.9 The std/test Package
+
+`std/test` is assertions with a tally. It sits between `assert(cond, msg)`,
+which aborts the process on the first disagreement, and comparing a whole
+program's output against a golden file: it runs every check, prints the ones
+that failed with what was expected and what arrived, and reports the count.
+
+```voila
+use "std/test"
+use "std/str"
+
+func main() {
+    var t = test.suite("str")
+    t.eq("upper", str.upper("ab"), "AB")
+    t.ne("case matters", str.upper("ab"), "ab")
+    t.near("thirds", 1.0 / 3.0, 0.3333, 0.0001)
+    t.ok("not empty", len("ab") > 0)
+    t.done()                    // summary, then exit 1 if anything failed
+}
+```
+
+A failure prints one line and carries on:
+
+```
+FAIL str/upper: expected "AB", got "Ab"
+str: 3 passed, 1 failed
+```
+
+Every value in that line goes through `test.repr`, which renders a value the
+way it would appear inside a collection — so a `str` comes out quoted, and
+`expected "ab", got "ab "` names the trailing space that `expected ab, got ab`
+would hide.
+
+### 11.9.1 The assertions
+
+| Call | Passes when |
+|---|---|
+| `t.eq(what, got, want)` | `got == want` — DEEP for lists and structs, so a whole record compares in one call |
+| `t.ne(what, got, want)` | `got != want` |
+| `t.near(what, got, want, tol)` | `abs(got - want) <= tol`; the assertion for `float` and `dec`, where `eq` is a trap. All three must be the same numeric type. |
+| `t.ok(what, cond)` / `t.not_ok(what, cond)` | the condition is true / false |
+| `t.raises(what, f)` | calling `f` THROWS; returns the message so you can go on asserting on it |
+| `t.raises_msg(what, want, f)` | `f` throws and its message contains `want` |
+| `t.fail(what, why)` | never — it records a failure outright |
+
+Each returns a `bool`, so a caller may branch on the verdict. `raises` catches
+exceptions only: a function returning an error value (`T!`) has not thrown, and
+is asserted with `eq` on the `Err` arm or by wrapping the call in `must`.
+
+### 11.9.2 Table tests
+
+`test.row` builds a row whose two values are already computed; `test.Case`
+carries an input for `run` to apply a function to.
+
+```voila
+t.table("base", [test.row("file", path.base("a/b.c"), "b.c"),
+                 test.row("root", path.base("/"),     "")])
+
+t.run("upper", [test.Case{name: "ascii", input: "ab", want: "AB"},
+                test.Case{name: "empty", input: "",   want: ""}],
+      fn(s) { return str.upper(s) })
+```
+
+Both run every row — stopping at the first failure would hide the other
+nineteen — and both name the row in the failure, not just the table.
+
+### 11.9.3 Running a suite
+
+There is no `voila test` verb. A suite is an ordinary program with a `main`,
+built and run like any other, and the exit status is what a shell-driven
+harness reads:
+
+- `t.report()` prints the summary and returns whether everything passed. It
+  does not exit.
+- `t.done()` is `report` plus `os.exit(1)` when anything failed. It is the
+  last line of a suite's `main` and the only thing in the package that ends
+  the process.
+- `t.merge(other)` folds a second suite's tally and failures in; the failure
+  lines already carry the other suite's name, so they stay attributable.
+- `t.failures()` is every failure line, for a caller that wants to print them
+  its own way. `t.verbose = true` prints the passes too.
+
+---
+
+## 11.10 The std/csv Package
+
+`std/csv` reads and writes RFC 4180. The rule that earns it a package rather
+than a `str.split` is that a quoted field may contain commas, quotes AND
+NEWLINES — so **a record is not the same thing as a line**, and a parser built
+on `each line in reader` is wrong on real data.
+
+```voila
+use "std/csv"
+
+func main() {
+    var rd = csv.reader(must os.open("prices.csv"))
+    each rec in rd {
+        say rec[0], rec[1]
+    }
+    rd.close()
+}
+```
+
+`csv.reader` takes anything `io.reader` takes — a file, a socket, a `net.Conn`,
+`os.stdin`, another reader — and holds only the record it is building, so a
+four-gigabyte file costs the memory of its widest record. `each rec in rd`
+works because `Reader.next(mut self) ?[]str` joins the iteration protocol
+(11.4, `std/io`); `rd.next()` may equally be called by hand, and `rd.all()`
+reads the rest into memory at once.
+
+Writing is the mirror:
+
+```voila
+var w = csv.writer(must os.create("out.csv"))
+w.write(["id", "note"])
+w.write_all([["1", "a,b"], ["2", "line\nbreak"]])
+w.close()                               // flushes first
+```
+
+For a document already in memory there is `csv.decode(text) [][]str` and
+`csv.encode(recs) str` — the names `json.encode`/`json.decode` already use,
+and the only ones available since `parse` is a reserved word (Appendix A).
+
+`sep` is a public field on both `Reader` and `Writer`, so TSV is `rd.sep = '\t'`
+after construction; `w.crlf = true` writes the `\r\n` the RFC specifies, which
+the reader accepts either way.
+
+### 11.10.1 What it accepts
+
+Errors are **thrown**, not returned as values — the iteration protocol reads
+`next`'s result as a record or nil, and an error value is neither. `attempt`
+converts a throw back to a value in one word (9.5), and `try { … } catch e`
+handles a whole loop at once. `FormatError` is thrown for malformed input;
+`std/io` errors propagate for a failed read or write.
+
+- **Line endings**: `\n` and `\r\n` both end a record, and the `\r` of a `\r\n`
+  is not part of the field before it. A LONE `\r` is DATA.
+- **Blank lines** carry no record and are skipped. A line holding `""` is not
+  blank: it is one empty quoted field.
+- **A quoted field is preserved byte for byte**, `\r\n` included.
+- **Ragged records** are returned as they come; nothing enforces a field count.
+- **Leniency**: text after a closing quote is appended (`"ab"c` reads as `abc`),
+  and a bare quote inside an unquoted field is an ordinary character. The only
+  input refused is a quoted field with no closing quote before end of input.
+
+On the way out, a field is quoted when it contains the delimiter, a quote, a CR
+or an LF — and also when it begins or ends with a space or a tab, which RFC 4180
+does not require but enough readers mishandle to be worth saying explicitly.
+
+## 11.11 The std/crypto Package
+
+Message digests, HMAC, and the entropy source — written from FIPS 180-4,
+RFC 1321 and RFC 2104 in the runtime's own C, with no OpenSSL and no other
+third-party dependency.
+
+```voila
+use "std/crypto"
+
+crypto.sha256("abc")                // "ba7816bf…f20015ad", lowercase hex
+crypto.sha256(bytes("abc"))         // the same digest from a []byte
+crypto.sha256_raw("abc").b64()      // the same digest, base64
+crypto.hmac_sha256(key, message)    // RFC 2104
+crypto.random(32)                   // 32 bytes fit to be a key
+crypto.random(32).hex()             // …as a 64-character token
+```
+
+| | |
+|---|---|
+| `sha256(m)` `sha512(m)` | lowercase hex digest |
+| `sha1(m)` `md5(m)` | **legacy** — see below |
+| `sha256_raw(m)` and the other three | the same digest as raw bytes |
+| `hmac_sha256(k, m)` `hmac_sha512(k, m)` | RFC 2104, lowercase hex |
+| `hmac_sha1(k, m)` `hmac_md5(k, m)` | the legacy hashes, keyed |
+| `hmac_sha256_raw(k, m)` and the other three | the same MAC as raw bytes |
+| `random(n)` | `n` cryptographically secure random bytes |
+| `random_int(n)` | a uniform integer in `[0, n)`, with no modulo bias |
+| `equal(a, b)` | equality in time independent of *where* they differ |
+
+**Two spellings in, two forms out.** A message or a key may be a `str` — which
+in Voilà is a byte string, which is why `os.read` and `net.recv` return binary
+in one — or a `[]byte`; the two give the same digest, so it never matters how
+the caller happened to be holding the bytes. Output is lowercase hex from the
+plain names and raw digest bytes from the `_raw` names, over which the encoders
+that already exist are the whole encoding layer: `d.hex()`, `d.b64()`,
+`bytes(d)`.
+
+**SHA-1 and MD5 are broken for security.** They are here for checksums and for
+interoperating with formats that already chose them. A practical collision
+costs seconds for MD5 and has existed for SHA-1 since 2017, so neither may
+carry a signature, a certificate, or a content-addressed identity. HMAC repairs
+a great deal — there is no practical forgery against HMAC-MD5 or HMAC-SHA-1 —
+but a new protocol still wants `hmac_sha256`. Nothing in the package picks one
+of them for you; choosing a legacy hash is always something the program said
+out loud.
+
+**`crypto.random` is the only random source in the language fit for a key, a
+token, a nonce, a password-reset link or a session id.** It draws from
+`getrandom(2)` on Linux, `getentropy(2)` on macOS and the BSDs, and
+`/dev/urandom` where neither is reachable, and it aborts rather than falling
+back to a weak source: a CSPRNG that silently degrades keeps minting keys
+that look fine and never says so. That is the *only* fatal case — a negative
+count or a non-positive bound is a catchable `RangeError`, so
+`crypto.random_int(len(xs))` over an empty collection is an error a program
+can handle rather than a process kill.
+
+`std/rand` (11.4) is the other generator and is a different tool: fast,
+seedable, and *reproducible*, which is what makes a test with random input
+worth writing. Its output is predictable from a few hundred samples, so it may
+choose a card or a jitter interval and never a secret. `rand.seed(n)` still
+deals the same sequence every time; what it no longer does is start from the
+clock when nobody seeds it, which used to mean two processes launched in the
+same second dealt identical hands. It is the one place that will fall back to
+the clock, and only where no entropy source exists at all: every program runs
+that seeding, so it must not be able to stop one from starting. `uuid.new()`
+draws from `crypto.random` proper, so two UUIDs cannot collide that way
+either.
+
+**Compare a MAC with `crypto.equal`, not `==`.** `==` stops at the first byte
+that differs, and that timing is enough to recover a MAC one byte at a time
+from any service that will verify a guess.
+
+---
+
+## 11.12 The std/http Package
+
+`std/http` speaks HTTP/1.1 over `std/net`, in both directions, and is written
+in Voilà with no C of its own. The client is three functions:
+
+```voila
+use "std/http"
+
+func main() {
+    match http.get("http://example.com/index.html") {
+        Err(e) => say "failed:", e.message()
+        Ok(r)  => {
+            say r.status, r.reason, r.header("content-type")
+            say r.body
+        }
+    }
+}
+```
+
+`http.post(url, body)` sends one, and `http.request(method, url, headers, body)`
+is the general form. Each opens a connection, sends one request, reads one
+response and closes it: there is no keep-alive, no connection pool, and **no
+automatic redirect following** — a 301 comes back as a 301, with its `Location`
+intact, because a library that silently re-issues your request somewhere else
+can silently re-issue it somewhere you did not authorise. `http.client()`
+returns a `Client` whose `timeout_ms` and `max_body` are ordinary fields.
+
+The server is a listener and a handler:
+
+```voila
+func hello(req http.Request) http.Response {
+    if req.path == "/hello" { return http.text(200, "hi " || req.query || "\n") }
+    return http.not_found()
+}
+
+func main() {
+    var srv = must http.listen("127.0.0.1:8080")
+    while true {
+        match srv.serve_one(hello) {
+            Ok(u)  => u
+            Err(e) => say "http:", e.message()
+        }
+    }
+}
+```
+
+`serve_one` accepts ONE connection, reads ONE request, calls the handler and
+writes what it returns — the loop, and any `spawn` inside it, is the program's,
+because std/net's model is thread-per-connection (11.5) and how many
+connections to take is not a library's decision. `srv.accept()` hands back a
+`Session` for a caller who wants `read_request()` and `respond()` by hand.
+`Content-Length` is written from the body actually sent, so a handler cannot
+declare one length and send another.
+
+### 11.12.1 There is no TLS
+
+This release has no TLS stack, so `https://` is **refused by name** at
+`parse_url` — it is not fetched over port 443 in the clear and it is not
+downgraded to `http://`. Either would hand a program's credentials to anyone
+on the path while its source said `https`. Terminate TLS outside the program
+(a local proxy, a sidecar) and point this at the plaintext side.
+
+### 11.12.2 Headers, URLs and chunked bodies
+
+`Headers` is an ordered LIST of `Name: value` pairs, not a map: a header may
+legally repeat (`Set-Cookie`), and the order is stable across runs. Lookup is
+case-INSENSITIVE throughout — `get has all remove set` all match with
+`str.equal_fold`, so `Content-Length` and `content-length` are one header.
+`add` keeps what is there; `set` replaces it in place.
+
+`http.parse_url` yields `URL{scheme, host, port, path, query}` with the port
+filled in (80 when the URL omits it), the fragment dropped (it is never sent),
+and `userinfo` refused rather than silently discarded.
+
+`Transfer-Encoding: chunked` is decoded on read, on both sides — a real server
+sends it whenever it does not know the length in advance. Chunk extensions are
+parsed and ignored, trailers are read and discarded, and every chunk size is
+checked against the REMAINING budget so the total cannot exceed `max_body`.
+Writing is always `Content-Length`.
+
+### 11.12.3 What it refuses
+
+A message this parser cannot vouch for is an error VALUE, never a guess: no
+status line; a header with no colon, an empty name, or whitespace before the
+colon; obsolete line folding; a `Content-Length` that is not decimal or that
+exceeds `max_body`; two `Content-Length` headers that disagree; a
+`Content-Length` alongside `Transfer-Encoding: chunked`; a body shorter than
+declared; a `Transfer-Encoding` it cannot decode. The last four are how
+request smuggling is built.
+
+None of them can hang or exhaust memory. The length is parsed digit by digit
+against the limit and refused **before** anything is allocated, so
+`Content-Length: 99999999999999` costs a diagnostic and not ninety terabytes;
+a header line is assembled by the package itself and refused at 65536 bytes,
+so a peer that never sends a newline cannot grow the process; and every socket
+carries a timeout, so a peer that says nothing at all is an error and not a
+wedged task.
 
 ---
 
@@ -1158,6 +1803,9 @@ voila build --emit=c <file.voi>     produce the C translation unit
 voila check <file.voi>              translate and verify only
 voila version                       print the toolchain version
 ```
+
+Every command that compiles a whole program — `run`, `build`, `check`, `-S`,
+`--emit=c` — also accepts the warning options of 12.6.
 
 ## 12.2 How a Program Is Compiled
 
@@ -1287,18 +1935,68 @@ compiles its whole conformance suite at every level and compares.
 machine performing the build. The resulting executable may not run on
 older processors of the same family; it is never the default.
 
-## 12.6 Completion Codes
+## 12.6 Warnings
+
+A **warning** is advice: the program is translated, the executable is produced,
+and the exit status is unchanged. Every warning is written to **standard
+error** — never to standard output, which belongs to `-S` and `--emit=c` — and
+carries a stable code in brackets:
+
+```
+prog.voi:4:1: warning[unused-import]: unused import `std/time`: nothing in this file mentions `time`
+```
+
+That code is what the options address it by:
+
+```
+-W<code>            turn the warning on
+-Wno-<code>         turn it off
+-Wall               turn every warning on
+-Werror             every warning that is on becomes an error
+-Werror=<code>      only this one becomes an error (and is turned on)
+--strict            -Wall -Werror
+```
+
+A misspelt code is refused rather than ignored; `voila` with no arguments
+lists the codes it knows. The codes today are:
+
+| Code | What it says |
+|---|---|
+| `unused-import` | A `use` that nothing reaches. The scan is deliberately shy, because deleting an import that *is* reached breaks the program: it spans the whole package rather than the one file (a qualifier resolves against the package's merged imports); it counts a package's trait names and enum variants, which an importer may spell bare; it never reports a package that adds methods to somebody else's type, nor one whose package-level initializer runs its own code, since neither leaves anything in the importing file to find; and `std/str` is exempt, its functions being reachable bare (`s.upper()` *is* `str.upper(s)`). |
+| `unreachable` | A statement written after a `return`, `throw`, `break` or `continue` in the same block. |
+| `type-mismatch` | A value that does not fit the hole it is put in: an initialiser or an assignment against its annotation, an argument against the parameter, a returned value against the declared result, a field a struct does not declare, and the existence and arity of a method on a nominal receiver — which the runtime otherwise resolves by string and answers with an abort. A trait-typed hole takes any implementor and a trait-typed receiver answers the trait's own methods, so `[]Describe` is judged too. It is deliberately partial: it says nothing where it cannot be sure, and generics, `?T`/`T!` payloads, enum payloads, collection literals and most operators are among the things it declines to guess at. |
+
+`unused-import` and `unreachable` are on by default. `type-mismatch` is **off**
+by default — ask for it with `-Wtype-mismatch`, `-Wall` or `--strict`. It is
+the youngest and largest check in the compiler and it reasons about a partial
+inference rather than about a declaration; it fired on nothing in the whole
+repository, but the cost of a mistake in it is a refused build, so it opts in. Warnings never change the code that is emitted — but
+the option state *is* part of the `voila run` cache key, so a `--strict` run is
+never answered with the binary a lenient one left behind.
+
+## 12.7 Completion Codes
 
 See Appendix C.
 
-## 12.7 Authoring a Standard Package in Voilà
+## 12.8 Authoring a Standard Package in Voilà
 
 `std/net` (11.5) is the first standard package written in Voilà rather than
-in C, and the mechanism is the template for the next. A package that a
-program reaches with `use "std/X"` may now be Voilà source carried inside the
-compiler and compiled into the program, exactly as the C runtime is (12.2).
-Only the operations that cross into the operating system — the true system
-calls — remain a thin C shim.
+in C; `std/sync` (11.7), `std/path`, the calendar half of `std/time` (11.8),
+`std/test` (11.9), `std/csv` (11.10) and `std/http` (11.12) are the next six. A package that a program reaches with `use "std/X"` may
+now be Voilà source carried inside the compiler and compiled into the program,
+exactly as the C runtime is (12.2). Only the operations that cross into the
+operating system — the true system calls, the machine-level primitives
+`std/sync` is built on, and `localtime_r` — remain a thin C shim. `std/path`,
+`std/test`, `std/csv` and `std/http` have no shim at all: they are Voilà and
+nothing else, built over what the language and the other packages already
+provide — `std/http` over `std/net` and `std/io`, with no C of its own.
+
+`std/time` is the first HYBRID: its stopwatch half is C natives with no Voilà
+body at all (`time.now`, `time.sleep`, the duration constants), while its
+calendar half is Voilà. That works because a qualified name resolves against
+the grafted declarations first and falls through to the natives — the same
+path that makes the public C name `net.resolve` reachable from a package
+whose other functions are Voilà.
 
 The parts of such a package, and where each lives:
 
@@ -1307,17 +2005,29 @@ The parts of such a package, and where each lives:
    2.  a C shim (optional)  one runtime function per system call, in
                             runtime/src, returning a value or an IOError
    3.  runtime/src/std.c    each shim function entered in the native table
-   4.  voilac/cg/instr.voi  each shim name added to the native allow-list
+   4.  voilac/low/names.voi  each native name added to StdSrcNatives(), which
+                            cg/instr.voi's pkg_natives() splices in and
+                            chk/stdpkg.voi reads to tell a native from a typo
    5.  voilac/low/names.voi  X added to the package-name table
-   6.  voilac/load/load.voi  X registered as a Voilà-source std package
+   6.  voilac/load/load.voi  X registered as a Voilà-source std package — and
+                            REMOVED from std_c_packages() if it was there
    7.  voilac/std/blob.voi  REGENERATED — std/X embedded in the compiler
 ```
+
+Step 4 is why a native of a Voilà-source package is listed apart from every
+other native: once the package is grafted, `X.thing` must resolve to a
+declaration OR to one of these names, and anything else is a misspelling the
+checker reports at the reference rather than a name the backend refuses.
 
 Step 7 is not edited by hand: `voila run tools/build.voi stdblob` regenerates
 it from `std/`, and a full build regenerates it as its first act. After a
 change to the shim or the package, rebuild and reseed as for any compiler
 change — `./build.sh` then `./build.sh reseed` (or `./bootstrap.bash` on a
 machine without a Voilà binary).
+
+A Voilà-source package may export a `const` as well as functions —
+`path.SEP` is one — because the grafted declaration is an ordinary program
+global that the qualified name resolves to before any native is considered.
 
 The division of labour is the point. The package's public functions are
 Voilà, so a call to one of them compiles to a direct call into grafted Voilà
@@ -1368,7 +2078,7 @@ Flags `-` `+` `0` (blank) `#`; width and precision, either literal or
 |---|---|
 | 0 | normal completion |
 | 1 | unhandled exception (with trace), abort, or an error value escaping the main procedure |
-| 2 | translation failed: syntax or static-check diagnostics were issued; also command usage errors |
+| 2 | translation failed: syntax or static-check diagnostics were issued — including a warning that `-Werror` promoted (12.6); also command usage errors |
 | n | the operand of `os.exit(n)` |
 
 # Appendix D. Deviations from the Specification
@@ -1422,9 +2132,12 @@ reach it, so a GROUP timeout does not interrupt it. A socket that must not
 block indefinitely is given a deadline with `set_timeout`, which the
 operating system enforces.
 
-`std/regex` and `std/http` have no C implementation and are therefore
-unavailable; a program that calls them is refused, not silently
-mistranslated. (`std/net`, by contrast, is implemented — Section 11.5.)
+The packages named in the specification's §13.4 that this release does not
+provide — `std/chan`, `std/slices`, `std/maps`, `std/vm`, `std/ffi`,
+`std/xml`, `std/yaml` — are refused at the `use`, not silently mistranslated,
+so a program that names one fails to compile rather than at run time.
+(`std/regex` and `std/http` were in this list until they shipped; see
+Sections 11.12 and 13.)
 
 Values are boxed in the default translation. Under `-O3` (Section 12.5)
 the toolchain converts provably-typed INT, FLOAT, and BOOL registers to
@@ -1447,8 +2160,8 @@ an identifier rather than consulting the Unicode letter tables, so a
 non-letter such as `€` is admitted where the specification would reject
 it. Identifiers in the standard library and in the compiler are ASCII.
 
-**D.9 — Not yet implemented.** `voila get`, `voila fmt/test/doc/bench/repl`,
-`std/vm`, `std/ffi`, `std/csv/xml/yaml`, `std/crypto`, checked `throws`
+**D.9 — Not yet implemented.** `voila mod tidy`, `voila fmt/test/doc/bench/repl`,
+`std/vm`, `std/ffi`, `std/xml/yaml`, signatures in `std/crypto`, checked `throws`
 verification, and the full flow-sensitive borrow checker (a straight-line
 use-after-move analysis is provided). Cross-compilation is by C: `voila build
 --emit=c` produces a translation unit that any C compiler for any target can

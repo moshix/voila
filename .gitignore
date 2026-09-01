@@ -19,6 +19,12 @@
 # ignore the whole NN_* family and re-include the sources.
 /samples/[0-9][0-9]_*
 !/samples/[0-9][0-9]_*.voi
+# A sample's TEST FIXTURES share the binary's name and must survive a
+# fresh clone: selftest feeds NN_name.in on stdin, and without this the
+# samples stage silently reads /dev/null and fails on a new checkout.
+!/samples/[0-9][0-9]_*.in
+!/samples/[0-9][0-9]_*.out
+!/samples/[0-9][0-9]_*.err
 /life
 /hello
 /txnreport

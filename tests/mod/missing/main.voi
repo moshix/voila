@@ -1,0 +1,5 @@
+package main
+
+use "example.com/absent/thing"
+
+func main() { say thing.X() }

@@ -1,0 +1,14 @@
+true true
+mkdir: refused an existing directory
+copy: true
+rename: false true
+realpath: true
+env: set-by-the-test
+environ: true set-by-the-test
+unset: true
+capture: 0 out err
+status: 3
+|lang   hosted  gc|
+|Voila  self    none|
+|C|
+cleaned: false

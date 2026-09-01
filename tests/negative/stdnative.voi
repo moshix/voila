@@ -1,0 +1,82 @@
+// A misspelled member of a C-NATIVE std package.
+//
+// fmt, os, str, math and the rest declare NOTHING in the merged tree, which is
+// why this check used to skip them: `check` printed `ok` and `build` then died
+// with "`str.len` is not a name the runtime provides". But their surface is
+// known here all the same — it is the natives table the backend itself
+// consults, plus the package CONSTANTS the runtime answers by value — so the
+// answer belongs at the reference, with the same near miss a grafted package
+// gets.
+//
+// The `!` lines of the .expect file are the other half of this fixture. The
+// whole UNION has to be accepted, and every part of it below is a working
+// program: a native, a constant that is deliberately absent from the natives
+// table, BOTH halves of std/time, a type in type position, and a qualifier
+// that a binding has taken back.
+use "std/str"
+use "std/time"
+
+func main() {
+    // The four reports. `len` is a PRELUDE name and has never been a member of
+    // std/str; the other three are one letter out in each direction.
+    say str.len("abc")
+    say fmt.printff("%d\n", 1)
+    say str.uper("abc")
+    say os.reed("/etc/hosts")
+
+    // Silent — C natives, in all three spellings a program reaches them by.
+    say str.upper("abc"), str.index("abc", "b")
+    fmt.printf("%d\n", 1)
+    say os.exists("/")
+
+    // Silent — package CONSTANTS. vl_lookup_value answers these and they are
+    // deliberately NOT in the natives table, so a rule that consulted the
+    // table alone would reject every line here.
+    say math.pi > 3.0, math.e > 2.0
+    fmt.fprintf(os.stdout, "%s\n", "to the handle")
+    say time.Second > time.Millisecond
+
+    // Silent — std/time is BOTH halves at once. `now` is C with no Voilà body,
+    // `now_utc` is grafted Voilà with no native, and both are correct: the two
+    // sets are unioned, never chosen between.
+    say time.now().unix() > 0
+    say time.now_utc().year >= 2020
+
+    // Silent — a package TYPE in type position. It is a TNAMED, never a field
+    // access, and it resolves to nothing in expression position, so it is
+    // neither an answer nor an accusation.
+    var b = str.Builder{}
+    b.write("built")
+    say b.done()
+
+    // Silent — and this is the sharp one. `str` is a PRIMITIVE as well as a
+    // package, so an impl block on it is legal and low registers the method
+    // as the ir function `str.blank`; emit_call resolves fnIdx BEFORE the
+    // natives, so both lines below compile and run today. A check that judged
+    // the natives table alone rejected them.
+    say str.blank()
+    say str.shout()
+}
+
+impl str {
+    func blank() str { return "(blank)" }
+}
+
+trait Shouter {
+    // A self-less trait DEFAULT: `str.shout()` is the only spelling there is,
+    // and cg.collect_inherited is what puts the row in the method table. A
+    // checker counting only WRITTEN methods would reject it — the same hazard
+    // R2-A left behind for Y1's conformance check and R2-C's bounds check.
+    func shout() str = "HEY"
+}
+impl Shouter for str {}
+
+// A binding shadows the qualifier, so `fmt.upper()` here is an ordinary method
+// call on a str — exactly as low.is_pkg_qualifier decides it, and a working
+// program a table lookup would otherwise break. It lives in its own function
+// because bindings are collected per DECLARATION: shadowing `fmt` beside the
+// `fmt.printff` above would have silenced the report this fixture is for.
+func shadowed() str {
+    let fmt = "loud"
+    return fmt.upper()
+}

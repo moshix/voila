@@ -1,0 +1,116 @@
+// std/path — lexical path handling. Everything here is a pure function of its
+// arguments, `abs` excepted, so the golden is exact by construction.
+use "std/path"
+use "std/str"
+
+// show prints one call as `input -> output`, which makes a diff against the
+// golden name the case that broke rather than just the line number.
+func show(what str, got str) {
+    say what, "->", got
+}
+
+func main() {
+    // ------------------------------------------------------- base and dir
+    show("base(a/b/c.voi)", path.base("a/b/c.voi"))
+    show("base(c.voi)", path.base("c.voi"))
+    show("base(a/b/)", path.base("a/b/"))
+    show("base(/)", path.base("/"))
+    show("base()", path.base(""))
+
+    show("dir(a/b/c.voi)", path.dir("a/b/c.voi"))
+    show("dir(c.voi)", path.dir("c.voi"))
+    show("dir(/c.voi)", path.dir("/c.voi"))
+    show("dir(a/b/)", path.dir("a/b/"))
+    show("dir(/)", path.dir("/"))
+
+    let d, b = path.split("src/main.voi")
+    say "split ->", d, b
+
+    // ---------------------------------------------------------------- join
+    show("join(a,b)", path.join("a", "b"))
+    show("join(a/,/b)", path.join("a/", "/b"))
+    show("join(/,a)", path.join("/", "a"))
+    show("join(a,,b,c)", path.join("a", "", "b", "c"))
+    show("join(,b)", path.join("", "b"))
+    show("join(a,)", path.join("a", ""))
+    show("join()", path.join())
+    show("join(one)", path.join("one"))
+    // join CLEANS, which is what makes the round trip below hold for a path
+    // whose directory is "." — and what stops an untrusted piece climbing out
+    // of a root without has_prefix noticing.
+    show("join(.,x)", path.join(".", "x"))
+    show("join(a,../b)", path.join("a", "../b"))
+    show("join(/srv,../../etc)", path.join("/srv", "../../etc"))
+    say "escapes", path.has_prefix("/srv/data",
+                                   path.join("/srv/data", "../../etc/passwd"))
+
+    // ------------------------------------------------- ext, stem, with_ext
+    show("ext(x.voi)", path.ext("x.voi"))
+    show("ext(a/b.tar.gz)", path.ext("a/b.tar.gz"))
+    show("ext(noext)", path.ext("noext"))
+    show("ext(.bashrc)", path.ext(".bashrc"))
+    show("ext(a.d/b)", path.ext("a.d/b"))
+
+    show("stem(a/b.voi)", path.stem("a/b.voi"))
+    show("stem(noext)", path.stem("noext"))
+    show("stem(.bashrc)", path.stem(".bashrc"))
+
+    show("with_ext(a/b.voi,.c)", path.with_ext("a/b.voi", ".c"))
+    show("with_ext(a/b.voi,c)", path.with_ext("a/b.voi", "c"))
+    show("with_ext(b.voi,)", path.with_ext("b.voi", ""))
+    show("with_ext(./b.voi,.c)", path.with_ext("./b.voi", ".c"))
+
+    // --------------------------------------------------------------- clean
+    show("clean(a/./b/../c//d)", path.clean("a/./b/../c//d"))
+    show("clean()", path.clean(""))
+    show("clean(.)", path.clean("."))
+    show("clean(/)", path.clean("/"))
+    show("clean(/../x)", path.clean("/../x"))
+    show("clean(../../x)", path.clean("../../x"))
+    show("clean(a/../../x)", path.clean("a/../../x"))
+    show("clean(a/b/../..)", path.clean("a/b/../.."))
+
+    // -------------------------------------------------------- is_abs / abs
+    say "is_abs", path.is_abs("/x"), path.is_abs("x"), path.is_abs("")
+
+    // abs depends on the working directory, so the golden asserts its SHAPE:
+    // it is absolute, it is clean, and it ends in the name we asked for.
+    let here = must path.abs("sub/file.voi")
+    say "abs is_abs", path.is_abs(here)
+    say "abs ends", str.ends_with(here, "/sub/file.voi")
+    say "abs clean", here == path.clean(here)
+    let already = must path.abs("/tmp/../x")
+    show("abs(/tmp/../x)", already)
+
+    // ---------------------------------------------------- rel / has_prefix
+    show("rel(/a,/a/b/c)", path.rel("/a", "/a/b/c"))
+    show("rel(/a,/a)", path.rel("/a", "/a"))
+    show("rel(/a,/b/c)", path.rel("/a", "/b/c"))
+    show("rel(/etc,/etcetera)", path.rel("/etc", "/etcetera"))
+
+    say "has_prefix",
+        path.has_prefix("/a", "/a/b"),
+        path.has_prefix("/a", "/a"),
+        path.has_prefix("/etc", "/etcetera"),
+        path.has_prefix("/a/b", "/a")
+
+    // SEP is a package CONSTANT, not a function — reaching one across a
+    // Voilà-source std package is its own lowering path (low/expr.voi).
+    say "sep", path.SEP
+
+    // Round trip, as a PROPERTY over every shape of path rather than one
+    // example: join(dir(p), base(p)) is clean(p), for all p. The answer for
+    // base("/") and for the empty path are both chosen to make it hold.
+    let corpus = ["", ".", "/", "a", "a/b", "/a/b", "a/b/", "//a//b//", "..",
+                  "../a", "/../a", "a/../b", "./a", "/a", ".bashrc", "x/",
+                  "///", "a/..", "a.b/c"]
+    var broken = 0
+    each q in corpus {
+        if path.join(path.dir(q), path.base(q)) != path.clean(q) { broken += 1 }
+        if path.clean(path.clean(q)) != path.clean(q) { broken += 1 }
+        if (path.stem(q) || path.ext(q)) != path.base(q) { broken += 1 }
+        if path.is_abs(q) != path.is_abs(path.clean(q)) { broken += 1 }
+        if path.rel(q, q) != "." { broken += 1 }
+    }
+    say "properties broken:", broken
+}

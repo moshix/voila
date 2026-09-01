@@ -1,0 +1,92 @@
+// 18_os.voi — the os package's filesystem, environment and subprocess
+// surface, and fmt.table.
+//
+// Every one of these was documented or obviously expected and simply absent:
+// the compiler itself shelled out to `mkdir` for want of os.mkdir, and
+// tools/build.voi still fakes output capture with `bash -c "… > file"`
+// because os.run had no way to hand back what the child said.
+//
+// DETERMINISM. The conformance corpus is re-run at -O1/-O2/-O3 and compared
+// byte for byte, so nothing machine-specific may reach stdout: not the temp
+// directory, not a pid, not a timestamp, not the environment's real contents.
+// Every path printed below is relative, every environment key is one this
+// test sets itself, and the whole scratch tree is removed at the end.
+use "std/fmt"
+use "std/os"
+use "std/str"
+
+// scratch builds a private directory under the system temp dir. The NAME is
+// fixed rather than random: a leftover from a crashed run must be reused and
+// cleaned, not accumulate one directory per failure.
+func scratch() str {
+    let base = os.tempdir() || "/voila-18-os"
+    must os.mkdir_all(base || "/nest/deep")
+    return base
+}
+
+func main() {
+    let dir = scratch()
+
+    // ---- mkdir_all created the whole chain, not just the leaf.
+    say os.isdir(dir || "/nest"), os.isdir(dir || "/nest/deep")
+
+    // ---- mkdir on an existing directory is an error VALUE, not a throw,
+    // so it composes with `match` like every other fallible os call.
+    match os.mkdir(dir || "/nest") {
+        Ok(x)  => say "mkdir: unexpectedly ok"
+        Err(e) => say "mkdir: refused an existing directory"
+    }
+
+    // ---- write, copy, rename, remove.
+    let a = dir || "/a.txt"
+    let b = dir || "/b.txt"
+    let c = dir || "/c.txt"
+    must os.write(a, "hello\n")
+    must os.copy(a, b)
+    say "copy:", must os.read(b) == "hello\n"
+    must os.rename(b, c)
+    say "rename:", os.exists(b), os.exists(c)
+
+    // ---- realpath resolves `..`; compare it to the plain path rather than
+    // printing either, since the temp directory differs per machine.
+    let noisy = dir || "/nest/../a.txt"
+    say "realpath:", must os.realpath(noisy) == must os.realpath(a)
+
+    // ---- environment: set, read back, list, unset.
+    must os.setenv("VOILA_18_KEY", "set-by-the-test")
+    say "env:", os.env("VOILA_18_KEY")
+    let all = os.environ()
+    say "environ:", "VOILA_18_KEY" in all, all["VOILA_18_KEY"]
+    must os.unsetenv("VOILA_18_KEY")
+    // os.env answers nil, NOT "", for a name that is not set — the ?str
+    // convention, so an unset variable and one set to the empty string stay
+    // distinguishable. Pinned here because it is easy to assume otherwise.
+    say "unset:", os.env("VOILA_18_KEY") == nil
+
+    // ---- run_capture hands back what the child SAID, which os.run cannot.
+    let st, out, err = must os.run_capture("sh", ["-c", "echo out; echo err 1>&2"])
+    say "capture:", st, str.trim(out), str.trim(err)
+
+    // A child that fails is a STATUS, not an IOError — the caller judges it.
+    let st2, out2, err2 = must os.run_capture("sh", ["-c", "exit 3"])
+    say "status:", st2
+
+    // ---- fmt.table pads every column to its widest cell. The third row is
+    // deliberately ragged: a short row leaves the rest empty, and no line may
+    // end in padding.
+    let rows = [
+        ["lang", "hosted", "gc"],
+        ["Voila", "self", "none"],
+        ["C"],
+    ]
+    let t = fmt.table(rows)
+    each line in str.lines(t) { say "|" || line || "|" }
+
+    // ---- clean up, innermost first; rmdir refuses a non-empty directory.
+    must os.remove(a)
+    must os.remove(c)
+    must os.rmdir(dir || "/nest/deep")
+    must os.rmdir(dir || "/nest")
+    must os.rmdir(dir)
+    say "cleaned:", os.exists(dir)
+}

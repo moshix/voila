@@ -1,0 +1,19 @@
+calc — reading a script from standard input
+calc>   = 14
+calc>   = 20
+calc>   = 512
+calc>   = -10
+calc>   = 12.5
+calc>   = 1
+calc>   ! division by zero
+calc>   ! unexpected end of expression
+calc>   ! unexpected $ at column 3
+calc>   = 2.5
+calc>   = 19.6349375
+calc>   = 19.6349375
+calc>   radius   = 2.5
+  area     = 19.6349375
+calc>   ! unknown variable nope
+calc>   skipped: oops
+  3 values, total 10
+calc> 

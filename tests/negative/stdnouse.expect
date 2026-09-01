@@ -1,0 +1,4 @@
+package `time` is not imported: `time.now_utc` needs `use "std/time"` (§13.4)
+package `net` is not imported: `net.listen` needs `use "std/net"` (§13.4)
+!`time.now`
+!`net.resolve`

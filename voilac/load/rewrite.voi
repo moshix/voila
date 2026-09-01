@@ -36,7 +36,7 @@ impl Loader {
 
     func rw_error(mut self, t ast.Tree, node int, msg str) {
         let n = t.Get(node)
-        self.Errs.append("{self.rwFile}:{n.Line}:{n.Col}: {msg}")
+        self.D.error(self.rwFile, n.Line, n.Col, "", msg)
     }
 
     // qualify returns the flat name for one of this package's declarations. A
@@ -62,6 +62,175 @@ impl Loader {
         return 0 - 1
     }
 
+    // import_global resolves an UNQUALIFIED enum-variant or trait name that
+    // this package does not declare itself, by searching what its imports
+    // offer bare (Pkg.globalSet — see global_names in load.voi).
+    //
+    // This is what keeps qualification from making programs uglier. A variant
+    // is `geom.Circle` now, but `Circle` still works, resolved in this order:
+    //
+    //   1. the current package  — qualify(), which runs first at every caller
+    //   2. exactly ONE import   — here
+    //
+    // TWO imports offering the name is an ERROR naming both candidates, not a
+    // silent pick: the whole reason for qualifying these names was that an
+    // accidental collision between two libraries must not decide anything.
+    // The caller can always disambiguate by writing `geom.Circle`.
+    //
+    // Determinism: the imports map is iterated, and map order is the fixpoint
+    // hazard TESTING.md §1 names, so the candidates are SORTED before either
+    // the answer or the message is formed. Two qualifiers may name the same
+    // package (`use "app/geom"` and `use "app/geom" as g`), so candidates are
+    // gathered by package NAME and deduplicated — otherwise an alias would
+    // read as an ambiguity with itself.
+    func import_global(mut self, t ast.Tree, node int, name str) str {
+        if name == "" or self.bound(name) { return "" }
+        // A name the LANGUAGE predeclares is never an import's to claim. A
+        // package that happens to declare `enum E { Some(int) }` or `trait
+        // Show` must not silently rebind every `Some(x)` pattern and every
+        // `impl Show for T` in every file that imports it — the option match
+        // would compile and then never fire, because vl_match tests the
+        // builtin arms by BARE name before it looks at any enum.
+        // (This is the CROSS-package rule only. A package that declares
+        // `Some` itself and then writes it bare has always resolved to its
+        // own, through low's variant table before these names were qualified
+        // and through qualify() now; that behaviour is unchanged and is not
+        // widened here.)
+        if is_builtin_global(name) { return "" }
+        // And what a package does not export, it does not offer. member()
+        // refuses `geom.circle` as package-private; without this the BARE
+        // spelling was a way around that check.
+        if not exported(name) { return "" }
+        var imports = self.mainImports
+        if self.rwSelf >= 0 { imports = self.pkgs[self.rwSelf].imports }
+        var hits = []
+        var seen = set([])
+        each q in keys(imports) {
+            let pi = imports[q]
+            if not (name in self.pkgs[pi].globalSet) { continue }
+            let pn = self.pkgs[pi].name
+            if pn in seen { continue }
+            seen.add(pn)
+            hits.append(pn)
+        }
+        if len(hits) == 0 { return "" }
+        hits.sort()
+        if len(hits) > 1 {
+            var qs = []
+            each h in hits { qs.append("`" || h || "." || name || "`") }
+            self.rw_error(t, node,
+                          "`{name}` is offered by more than one import (" ||
+                          str.join(qs, " and ") ||
+                          "); write the qualified name")
+            return ""
+        }
+        return hits[0] || "." || name
+    }
+
+    // global_name is qualify() widened to the short-name rule: this package
+    // first, then the imports. Every site that may see a bare variant or
+    // trait name goes through it.
+    func global_name(mut self, t ast.Tree, node int, name str) str {
+        let here = self.qualify(name)
+        if here != "" { return here }
+        // The ENTRY file is a package of one whose names stay BARE (Load
+        // rewrites it with rwSelf < 0), so qualify() can never answer for it
+        // and step 1 of the short-name rule would be skipped entirely. Its
+        // own declarations must still win over an import's, or `use "geom"`
+        // beside a local `enum Local { Empty }` would silently rebind every
+        // bare `Empty` in the file to geom's — one candidate, so not even an
+        // ambiguity error, and the arm simply never matches at run time.
+        if self.rwSelf < 0 and (name in self.mainDecls) { return "" }
+        return self.import_global(t, node, name)
+    }
+
+    // collect_std_aliases builds THIS FILE's `use "std/…" as q` map.
+    //
+    // The alias was accepted by the parser and then dropped on the floor:
+    // imports_of returns before it records anything for a std import, because
+    // a std package has no Pkg to point at (a C one declares nothing) and its
+    // members must survive as `pkg.member` FIELDs rather than flatten to one
+    // identifier the way a user package's do. So `use "std/str" as s` parsed,
+    // and `s.upper("x")` was an unknown identifier — a promise the parser
+    // makes and nothing kept.
+    //
+    // The map is per FILE and rebuilt on entry to rw_file, which is the scope
+    // a `use` actually has. (A user package's aliases are merged per PACKAGE
+    // in load_pkg, which is wider than it should be; this does not copy that.)
+    //
+    // An alias a top-level name already claims is DROPPED rather than
+    // rewritten, and that is the same precedence low.is_pkg_qualifier applies
+    // one stage later: a global shadows a package qualifier, so `var s = "x"`
+    // followed by `s.upper()` is an ordinary method call on a str — a working
+    // program, which a rewrite would have silently turned into `str.upper()`.
+    // Local bindings are answered by `bound` at the reference instead, since
+    // they are only known once the walk is inside the scope.
+    //
+    // An alias that a USER import in the same file also claims resolves to the
+    // user package, because `member` above runs first and answers before this
+    // map is consulted. That is a contradictory program either way and it is
+    // left as it is rather than diagnosed: user imports are merged per
+    // PACKAGE and these per FILE, so a duplicate-qualifier check spanning both
+    // would have to reconcile two different scopes first.
+    func collect_std_aliases(mut self, t ast.Tree, root int) {
+        self.rwStdAlias = make(map[str]str)
+        // Nothing to do for the overwhelming majority of files, and saying so
+        // first keeps the declaration scan and resolve()'s isdir out of every
+        // build that never writes an `as`.
+        var any = false
+        each u in t.Get(t.Kid(root, 0)).Kids {
+            if not str.ends_with(t.Get(u).Sval, "|") { any = true }
+        }
+        if not any { return }
+
+        var taken = set([])
+        each d in t.Get(t.Kid(root, 1)).Kids {
+            each nm in decl_names(t, d) {
+                if nm != "" { taken.add(nm) }
+            }
+        }
+        // The entry file's loose statements bind in the global scope too.
+        each s in t.Get(t.Kid(root, 2)).Kids {
+            let sn = t.Get(s)
+            if sn.Kind == ast.LET {
+                each nm in str.split(sn.Sval, ",") {
+                    if nm != "" { taken.add(nm) }
+                }
+            } else if sn.Kind == ast.VAR and sn.Sval != "" {
+                taken.add(sn.Sval)
+            }
+        }
+        each u in t.Get(t.Kid(root, 0)).Kids {
+            let un = t.Get(u)
+            // A selective or wildcard import binds NAMES, not a qualifier,
+            // and cannot carry an `as` at all (par/par.voi's use_decl).
+            if un.Ival2 != 0 { continue }
+            // par/par.voi's use_decl stores `path|alias`, so the LAST bar
+            // is the separator — splitting on every bar would read the second
+            // segment of a path that contained one as the alias.
+            let bar = str.last_index(un.Sval, "|")
+            if bar < 0 { continue }
+            let ipath = un.Sval[0..bar]
+            let alias = un.Sval[bar + 1..len(un.Sval)]
+            if alias == "" { continue }
+            let dir, k = self.resolve(ipath)
+            if k != KIND_STD and k != KIND_STDSRC { continue }
+            let base = std_base(ipath)
+            if base == "" or base == alias { continue }
+            if alias in taken { continue }
+            self.rwStdAlias[alias] = base
+        }
+    }
+
+    // std_alias maps an identifier to the std package it aliases, or "" when
+    // it aliases none — or when a local binding shadows it, exactly as one
+    // shadows a user package's qualifier in `member` above.
+    func std_alias(self, q str) str {
+        if self.bound(q) { return "" }
+        if q in self.rwStdAlias { return self.rwStdAlias[q] }
+        return ""
+    }
+
     // member resolves `Q.name` into an imported user package.
     func member(mut self, t ast.Tree, node int, q str, name str) str {
         let pi = self.rw_import(q)
@@ -83,6 +252,7 @@ impl Loader {
     // ------------------------------------------------------------ file
 
     func rw_file(mut self, t mut ast.Tree, root int) {
+        self.collect_std_aliases(t, root)
         let decls = t.Get(t.Kid(root, 1)).Kids
         // Declaration names first, so bodies can be rewritten against them.
         each d in decls {
@@ -101,8 +271,27 @@ impl Loader {
     func decl_name(mut self, t mut ast.Tree, d int) {
         if self.rwSelf < 0 { return }
         let n = t.Get(d)
+        if n.Kind == ast.ENUMDEC {
+            let q = self.qualify(n.Sval)
+            if q != "" { t.Nodes[d].Sval = q }
+            // The VARIANTS are declarations of the package too, so they are
+            // qualified with it: `geom.Circle`. low.collect keeps the SHORT
+            // half to build the runtime tag (`geom.Shape` + `Circle`), and
+            // vl_match compares a qualified pattern name against the enum
+            // type's own package — see the VL_P_VARIANT arm in std.c.
+            each v in t.Get(t.Kid(d, 0)).Kids {
+                let vq = self.qualify(t.Get(v).Sval)
+                if vq != "" { t.Nodes[v].Sval = vq }
+            }
+            return
+        }
+        if n.Kind == ast.TRAITDEC {
+            let q = self.qualify(n.Sval)
+            if q != "" { t.Nodes[d].Sval = q }
+            return
+        }
         if n.Kind == ast.FUNC or n.Kind == ast.STRUCTDEC or
-           n.Kind == ast.ENUMDEC or n.Kind == ast.EXCDEC {
+           n.Kind == ast.EXCDEC {
             let q = self.qualify(n.Sval)
             if q != "" { t.Nodes[d].Sval = q }
             return
@@ -172,6 +361,12 @@ impl Loader {
         } else if n.Kind == ast.IMPLDEC {
             self.push()
             self.bind_generics(t, t.Kid(d, 1))
+            // The trait half of `impl Show for T`. cg.collect_inherited pairs
+            // this string with a TRAITDEC's Sval, so the two must be spelled
+            // the same way — and a BUILTIN trait resolves to nothing here and
+            // correctly stays bare.
+            let tq = self.trait_ref(t, d, n.Sval)
+            if tq != "" { t.Nodes[d].Sval = tq }
             self.typ(t, d, 0 - 1)
             each m in t.Get(t.Kid(d, 0)).Kids {
                 self.fn(t, m)
@@ -196,12 +391,34 @@ impl Loader {
         }
     }
 
+    // trait_ref resolves a written trait name to its flat form. `pkg.Show`
+    // goes through member(); a bare `Show` through the short-name rule. A
+    // name that resolves to nothing is left exactly as written — that is the
+    // builtin traits (Show, Eq, …), which no package declares.
+    func trait_ref(mut self, t ast.Tree, node int, name str) str {
+        if name == "" { return "" }
+        let dot = index_of(name, '.')
+        if dot < 0 { return self.global_name(t, node, name) }
+        let q = name[0..dot]
+        if self.rw_import(q) < 0 { return "" }
+        return self.member(t, node, q, name[dot + 1..len(name)])
+    }
+
     // bind_generics makes a generic parameter shadow a package type of the same
     // name: in `func F[T](x T)`, `T` is the parameter, not the package's `T`.
-    func bind_generics(mut self, t ast.Tree, list int) {
+    //
+    // It also qualifies the BOUND — `[T: Describe]` is stored as "T|Describe"
+    // — because a bound names a trait and trait names are qualified now. The
+    // bound is resolved BEFORE the parameter is bound, so a parameter called
+    // `T` cannot shadow a trait called `T` in its own bound.
+    func bind_generics(mut self, t mut ast.Tree, list int) {
         if list == 0 { return }
         each g in t.Get(list).Kids {
             let parts = str.split(t.Get(g).Sval, "|")
+            if len(parts) > 1 and parts[1] != "" {
+                let bq = self.trait_ref(t, g, parts[1])
+                if bq != "" { t.Nodes[g].Sval = parts[0] || "|" || bq }
+            }
             self.bind(parts[0])
         }
     }
@@ -251,9 +468,21 @@ impl Loader {
                 let q = n.Sval[0..dot]
                 let name = n.Sval[dot + 1..len(n.Sval)]
                 let flat = self.member(t, id, q, name)
-                if flat != "" { t.Nodes[id].Sval = flat }
+                if flat != "" {
+                    t.Nodes[id].Sval = flat
+                } else {
+                    // `b mut s.Builder` under `use "std/str" as s`. A std type
+                    // keeps its qualifier — typ.voi resolves a dotted TNAMED
+                    // whose qualifier is a package name on trust — so only the
+                    // qualifier half is rewritten.
+                    let sq = self.std_alias(q)
+                    if sq != "" { t.Nodes[id].Sval = sq || "." || name }
+                }
             } else {
-                let q = self.qualify(n.Sval)
+                // global_name: a bare TNAMED may be an imported TRAIT used as
+                // a type (`[]Describe`), which is a name an import offers
+                // without a qualifier.
+                let q = self.global_name(t, id, n.Sval)
                 if q != "" { t.Nodes[id].Sval = q }
             }
             each a in t.Get(id).Kids {
@@ -439,13 +668,32 @@ impl Loader {
         }
     }
 
-    // pattern binds a pattern's names; variant names stay global.
+    // pattern binds a pattern's names and qualifies its variant names.
+    //
+    // A PVARIANT's Sval is one of three things and only the first is rewritten:
+    // an enum variant (qualified here), an EXCEPTION type name (already
+    // flattened by decl_name, and reaching this function as a dotted name that
+    // member() re-resolves to itself), or a builtin (`Some`, `Ok`, `Err`),
+    // which no package declares and which therefore resolves to nothing and is
+    // left alone.
     func pattern(mut self, t mut ast.Tree, p int) {
         if p == 0 { return }
         let n = t.Get(p)
         if n.Kind == ast.PBIND {
             self.bind(n.Sval)
         } else if n.Kind == ast.PVARIANT {
+            let dot = index_of(n.Sval, '.')
+            if dot < 0 {
+                let q = self.global_name(t, p, n.Sval)
+                if q != "" { t.Nodes[p].Sval = q }
+            } else {
+                let qual = n.Sval[0..dot]
+                let name = n.Sval[dot + 1..len(n.Sval)]
+                if self.rw_import(qual) >= 0 {
+                    let flat = self.member(t, p, qual, name)
+                    if flat != "" { t.Nodes[p].Sval = flat }
+                }
+            }
             each e in t.Get(p).Kids {
                 self.pattern(t, e)
             }
@@ -465,7 +713,9 @@ impl Loader {
 
         if k == ast.IDENT {
             if self.bound(n.Sval) { return }
-            let q = self.qualify(n.Sval)
+            // global_name, not qualify: a bare `Circle` may be a variant an
+            // IMPORT declares, and that spelling has to keep working.
+            let q = self.global_name(t, e, n.Sval)
             if q != "" { t.Nodes[e].Sval = q }
             return
         }
@@ -480,6 +730,18 @@ impl Loader {
                     t.Nodes[e].Kind = ast.IDENT
                     t.Nodes[e].Sval = flat
                     t.Nodes[e].Kids = []
+                    return
+                }
+                // A std package under an `as` alias. Only the BASE identifier
+                // is renamed: the FIELD must stay a FIELD, because that is
+                // what the lowerer's is_pkg_qualifier reads to form
+                // `str.upper` — a native, not a flat declaration there is any
+                // node for. Renaming it here rather than teaching the lowerer
+                // about aliases is also what keeps chk/stdpkg.voi honest: it
+                // judges the CANONICAL name and never has to follow an alias.
+                let sq = self.std_alias(bn.Sval)
+                if sq != "" {
+                    t.Nodes[base].Sval = sq
                     return
                 }
             }
@@ -498,9 +760,16 @@ impl Loader {
                     if flat != "" {
                         t.Nodes[ty].Sval = flat
                         t.Nodes[e].Sval = flat
+                    } else {
+                        // `s.Builder{}` under `use "std/str" as s` (§13.2).
+                        let sq = self.std_alias(q)
+                        if sq != "" {
+                            t.Nodes[ty].Sval = sq || "." || name
+                            t.Nodes[e].Sval = sq || "." || name
+                        }
                     }
                 } else {
-                    let q = self.qualify(tn.Sval)
+                    let q = self.global_name(t, ty, tn.Sval)
                     if q != "" {
                         t.Nodes[ty].Sval = q
                         t.Nodes[e].Sval = q
@@ -575,4 +844,28 @@ func index_of(s str, c rune) int {
         i += 1
     }
     return -1
+}
+
+// is_builtin_global lists the names the LANGUAGE itself predeclares in the two
+// namespaces short-name resolution searches, and which no import may therefore
+// claim.
+//
+//   the option/result variants — matched by BARE name in vl_match
+//     (runtime/src/std.c), before any enum is consulted, so a qualified
+//     `pkg.Some` would miss that arm entirely and match nothing;
+//   the builtin traits — typ.BuiltinTraits(), which is the source of truth;
+//     `typ` cannot be imported here (it is a far heavier dependency than one
+//     list is worth, and load is the earliest stage), so selftest.bash holds
+//     the two lists equal.
+func is_builtin_global(name str) bool {
+    if name == "Some" or name == "Ok" or name == "Err" { return true }
+    each t in builtin_trait_names() {
+        if t == name { return true }
+    }
+    return false
+}
+
+func builtin_trait_names() []str {
+    return ["Clone", "Copy", "Drop", "Eq", "Error", "Hash", "Ord", "Send",
+            "Show"]
 }

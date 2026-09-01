@@ -313,12 +313,53 @@ Value vl_callm(Value recv, const char *method, Value *argv, int argc) {
   if (tn && tn[0]) {
     const VlMethod *m = vl_find_method(tn, method);
     if (m) {
-      Value *args = (Value *)vl_alloc(sizeof(Value) * (size_t)(argc + 1));
+      /* The argument vector is pure scratch: nothing here retains and nothing
+       * releases, it only puts `self` in front of the caller's own arguments.
+       *
+       * It used to be calloc'd and freed after the call, and m->fn is USER
+       * CODE THAT MAY THROW — vl_throw longjmps straight past that free, and
+       * the block was then unreachable by anything. `leaks --atExit` over
+       * tests/conformance/20_sync.voi found it: that file exists to prove a
+       * throw out of a critical section unwinds cleanly, so it throws through
+       * a method call several times over.
+       *
+       * The common case is now the STACK, which a longjmp reclaims by itself
+       * and which is faster besides — eight slots is self plus seven
+       * arguments, more than any method in the corpus takes. A wider call
+       * still needs the heap, and installs a handler that frees the block and
+       * then lets the exception carry on exactly as it was. */
+      enum { CALLM_INLINE_ARGS = 8 };
+      Value inlined[CALLM_INLINE_ARGS];
+      Value *heap = NULL;
+      Value *args = inlined;
+      if (argc + 1 > CALLM_INLINE_ARGS) {
+        heap = (Value *)vl_alloc(sizeof(Value) * (size_t)(argc + 1));
+        args = heap;
+      }
       int n = 0;
       if (m->has_self) args[n++] = target;
       for (int i = 0; i < argc; i++) args[n++] = argv[i];
+      if (!heap) return m->fn(args, n, NULL);
+
+      VlHandler h;
+      if (VL_TRY(h)) {
+        /* The throw landed here rather than at the free below. Release the
+         * block, then put the exception back on its way: vl_throw retains
+         * ctx->pending into ctx->pending, which leaves the refcount exactly
+         * as the thrower left it. */
+        free(heap);
+        vl_rethrow(vl_ctx()->pending);
+        /* vl_rethrow longjmps — but vl_throw HAS one path that returns, the
+         * `vl_task_fail` arm taken when no handler is left. It cannot be
+         * reached from here (a handler is what got us here, and vl_task_fail
+         * returns false unconditionally today), and if that ever changes,
+         * falling through would re-enter m->fn with `args` already freed.
+         * Say so out loud instead of letting it be discovered. */
+        vl_abort("unreachable: vl_rethrow returned in vl_callm");
+      }
       Value r = m->fn(args, n, NULL);
-      free(args);
+      vl_eh_pop();
+      free(heap);
       return r;
     }
   }
@@ -417,8 +458,20 @@ Value vl_callm(Value recv, const char *method, Value *argv, int argc) {
       if (eq(method, "done")) return vl_builder_done(target);
       if (eq(method, "len")) return vl_int(vl_builder_len(target));
       break;
+    case O_REGEX:
+      out = vl_regex_method(target, method, argv, argc, &ok);
+      if (ok) return out;
+      break;
     case O_FILE:
       out = vl_file_method(target, method, argv, argc, &ok);
+      if (ok) return out;
+      break;
+    case O_READER:
+      out = vl_reader_method(target, method, argv, argc, &ok);
+      if (ok) return out;
+      break;
+    case O_WRITER:
+      out = vl_writer_method(target, method, argv, argc, &ok);
       if (ok) return out;
       break;
     case O_DEC: {
@@ -454,8 +507,17 @@ Value vl_callm(Value recv, const char *method, Value *argv, int argc) {
   }
   if (target.t == VL_INSTANT) {
     int64_t ns = target.u.i;
-    if (eq(method, "unix")) return vl_int(ns / 1000000000);
-    if (eq(method, "unix_millis")) return vl_int(ns / 1000000);
+    /* FLOOR, not truncate. These used to be plain C division, which rounds
+     * toward zero: an instant half a second before the epoch answered `unix`
+     * with 0 rather than -1. std/time's DateTime.unix floors and says so, and
+     * the exact `unix_nanos` below makes the disagreement visible — the same
+     * moment cannot read as second -1 on the calendar and second 0 here. */
+    if (eq(method, "unix")) return vl_int(vl_ifloordiv(ns, 1000000000));
+    if (eq(method, "unix_millis")) return vl_int(vl_ifloordiv(ns, 1000000));
+    /* The unrounded reading. std/time's calendar half needs it to decompose
+     * an instant without losing the sub-second part, and it completes a pair
+     * that was otherwise missing its finest unit. */
+    if (eq(method, "unix_nanos")) return vl_int(ns);
   }
 
   /* 4. a struct field holding a callable */

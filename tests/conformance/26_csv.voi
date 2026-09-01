@@ -1,0 +1,153 @@
+// 26_csv.voi — std/csv: RFC 4180 reading and writing (§13.4).
+//
+// The case that earns the package is the QUOTED FIELD CONTAINING A NEWLINE: a
+// record is then not a line, and a parser built on `each line in reader` gets
+// it wrong. It is pinned twice below — once through `decode`, where the whole
+// document is already in memory, and once through a streaming `Reader`, where
+// the field arrives one `read_line` at a time and the scanner has to ask for
+// more input in the middle of a record.
+//
+// The scratch file is keyed on the pid and its name is never printed, so the
+// golden is byte-identical at every -O level.
+package main
+
+use "std/csv"
+use "std/str"
+
+func tmp(tag str) str {
+    return "/tmp/voila-csv-" || str(os.pid()) || "-" || tag || ".csv"
+}
+
+// show renders a list of records one per line, with every field quoted by the
+// language's own collection rendering — which is what makes an embedded
+// newline or a stray CR visible in the golden instead of reformatting it.
+func show(label str, recs [][]str) {
+    say label
+    each r in recs {
+        say "   ", r
+    }
+}
+
+func main() {
+    say "-- the four rules --"
+    show("plain", csv.decode("a,b,c\nd,e,f\n"))
+    show("quoted comma", csv.decode("a,\"b,c\",d\n"))
+    show("escaped quote", csv.decode("a,\"he said \"\"hi\"\"\",z\n"))
+    show("newline in a quoted field",
+         csv.decode("a,\"line1\nline2\",c\nnext,row,here\n"))
+
+    say "-- shapes a real file has --"
+    show("ragged", csv.decode("a,b,c\nd\ne,f\n"))
+    show("blank lines carry no record", csv.decode("a,b\n\n\nc,d\n"))
+    show("crlf", csv.decode("a,b\r\nc,d\r\n"))
+    show("crlf blank line", csv.decode("a,b\r\n\r\nc,d\r\n"))
+    show("no trailing newline", csv.decode("a,b"))
+    show("empty quoted field", csv.decode("\"\",x\n"))
+    show("trailing empty field", csv.decode("a,\n"))
+    show("empty document", csv.decode(""))
+    show("newlines only", csv.decode("\n\n"))
+
+    say "-- documented leniency --"
+    // A lone \r is DATA: the classic-Mac line ending is gone and splitting on
+    // it would quietly cut a field in half.
+    show("lone cr is data", csv.decode("a\rb,c\n"))
+    // Text after a closing quote is appended rather than refused.
+    show("text after the closing quote", csv.decode("\"ab\"c,d\n"))
+    // A quote inside an unquoted field is an ordinary character.
+    show("bare quote", csv.decode("a\"b,c\n"))
+
+    say "-- the one refusal --"
+    match attempt csv.decode("a,\"unclosed\n") {
+        Ok(v)  => say "unexpected:", v
+        Err(e) => say e.message()
+    }
+
+    say "-- encode quotes only what needs it --"
+    let doc = csv.encode([["a", "b,c"],
+                          ["he said \"hi\"", "x\ny"],
+                          [" pad ", "z"],
+                          ["", "plain"]])
+    say "{[doc]}"
+
+    say "-- round trip: encode then decode --"
+    let rows = [["a", "b,c"], ["he said \"hi\"", "x\ny"], [" pad ", "z"],
+                ["", "plain"]]
+    show("back", csv.decode(doc))
+    say "identical:", csv.decode(doc) == rows
+
+    say "-- streaming: each rec in a Reader --"
+    // The file is written through a Writer, so the round trip goes over the
+    // disk and not just through memory. The multi-line field is the point:
+    // reading it takes three read_line calls and one record.
+    let path = tmp("stream")
+    var w = csv.writer(must os.create(path))
+    w.write(["id", "note", "qty"])
+    w.write_all([["1", "a,b", "7"],
+                 ["2", "multi\nline\nfield", "8"],
+                 ["3", "say \"hi\"", "9"]])
+    w.write(["4", "short"])                       // ragged, on purpose
+    w.close()
+
+    var rd = csv.reader(must os.open(path))
+    each rec in rd {
+        say len(rec), rec
+    }
+    say "records:", rd.count()
+    rd.close()
+
+    say "-- the same file through all() --"
+    var rd2 = csv.reader(must os.open(path))
+    say rd2.all() == csv.decode(must os.read(path))
+    rd2.close()
+
+    say "-- next() by hand, and the end --"
+    var rd3 = csv.reader(must os.open(path))
+    say rd3.next()
+    say rd3.next()
+    say rd3.next()
+    say rd3.next()
+    say rd3.next()
+    say "past the end:", rd3.next()
+    rd3.close()
+
+    say "-- a malformed file is refused at the record, not at the end --"
+    let bad = tmp("bad")
+    var wb = must io.writer(must os.create(bad))
+    wb.write_all("ok,row\nb,\"never closed\nstill going\n")
+    wb.close()
+    try {
+        var rb = csv.reader(must os.open(bad))
+        each rec in rb {
+            say "got:", rec
+        }
+        say "unexpected: no throw"
+    } catch e: FormatError {
+        say "caught:", e.message()
+    }
+
+    say "-- crlf on the way out --"
+    let crlf = tmp("crlf")
+    var wc = csv.writer(must os.create(crlf))
+    wc.crlf = true
+    wc.write_all([["a", "b"], ["c", "d"]])
+    wc.close()
+    say "{[must os.read(crlf)]}"
+    show("read back", csv.decode(must os.read(crlf)))
+
+    say "-- another delimiter --"
+    let tsv = tmp("tsv")
+    var wt = csv.writer(must os.create(tsv))
+    wt.sep = '\t'
+    wt.write_all([["a", "b,c"], ["d\te", "f"]])
+    wt.close()
+    say "{[must os.read(tsv)]}"
+    var rt = csv.reader(must os.open(tsv))
+    rt.sep = '\t'
+    show("read back", rt.all())
+    rt.close()
+
+    os.remove(path)
+    os.remove(bad)
+    os.remove(crlf)
+    os.remove(tsv)
+}

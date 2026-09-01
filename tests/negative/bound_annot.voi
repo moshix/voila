@@ -1,0 +1,17 @@
+// The same bound, unsatisfied at an ANNOTATION. No literal is written here
+// at all — the type argument is spelled in the declaration of `s`, which is
+// the second of the three places a bound can be cashed in.
+trait Describe {
+    func describe(self) str
+}
+
+struct Point { x int, y int }
+
+struct Stack[T: Describe] {
+    items []T
+}
+
+func main() {
+    var s Stack[Point]
+    say len(s.items)
+}

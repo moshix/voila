@@ -1,0 +1,24 @@
+// The same bound, unsatisfied at an EXPLICIT INSTANTIATION. `label[Point]`
+// names the type argument outright, so no inference is needed to know that
+// `x.describe()` inside the body has nothing to reach.
+//
+// `Ticket` is here to prove the check is not simply refusing everything: it
+// carries `describe` in an INHERENT impl block, which the flat dispatch
+// table makes indistinguishable from `impl Describe for Ticket`.
+trait Describe {
+    func describe(self) str
+}
+
+struct Point { x int, y int }
+
+struct Ticket { n int }
+impl Ticket {
+    func describe(self) str { return "ticket#{self.n}" }
+}
+
+func label[T: Describe](x T) str { return "<" || x.describe() || ">" }
+
+func main() {
+    say label[Ticket](Ticket{n: 1})
+    say label[Point](Point{x: 1, y: 2})
+}

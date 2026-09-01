@@ -1,0 +1,50 @@
+// The other half of the unreachable warning, and the more important half: a
+// warning that fires on working code gets the whole warning switched off by
+// the first project it annoys. Nothing in this file may produce one.
+//
+// This is the same doctrine tests/negative/noreturn.voi applies one severity
+// up — record the cases that must stay LEGAL beside the ones that must not,
+// or the check will be tightened until it rejects working programs.
+use "std/fmt"
+
+// A `for` with no iterator never finishes on its own, which is why the
+// missing-return analysis in chk/sig.voi treats it as diverting. Control
+// still arrives after it when the body breaks, so reusing that analysis here
+// would accuse this function of writing dead code.
+func after_for() {
+    for {
+        break
+    }
+    say "reached"
+}
+
+// `fallthrough` leaves the CASE for the next one, not the block: what follows
+// it in the same case body is as reachable as what came before.
+func after_fallthrough(n int) str {
+    switch n {
+    case 1:
+        fallthrough
+    case 2:
+        return "low"
+    default:
+        return "high"
+    }
+    return "a human can see this is dead; this check deliberately cannot"
+}
+
+// Every arm of this match returns, so nothing after it can run — and the
+// check says nothing, on purpose. It asks only about the four keywords it can
+// be certain of; a match is judged by exhaustiveness, which is a different
+// question with a different answer for every subject type.
+func after_match(n int) str {
+    match n {
+        0 => return "zero"
+        _ => return "some"
+    }
+    return "not reported"
+}
+
+func main() {
+    after_for()
+    fmt.printf("%s %s\n", after_fallthrough(1), after_match(0))
+}

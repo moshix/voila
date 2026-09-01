@@ -1,0 +1,9 @@
+package `test` has no member `rpr`; did you mean `test.repr`? (§13.4)
+package `csv` has no member `decoed`; did you mean `csv.decode`? (§13.4)
+package `csv` has no member `nonexistent` (§13.4)
+package `http` has no member `reson_phrase`; did you mean `http.reason_phrase`? (§13.4)
+!`test.suite`
+!`test.eq`
+!`csv.encode`
+!has no member `upper`
+!has no member `reason_phrase`

@@ -3,7 +3,6 @@
 // `~/` is the dedicated floor-division operator (spacing never matters). `//`
 // is always a line comment — it never divides — so the classic `a // b`
 // spacing footgun cannot occur.
-use "std/fmt"
 
 func divmod(a int, b int) (int, int) {
     return a ~/ b, a % b

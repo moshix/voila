@@ -1,0 +1,29 @@
+package one
+
+// `Empty`, `Node` and `Named` are all declared by package `two` as well.
+// Before variant and trait names were qualified this program was REFUSED —
+// tests/multipkg-bad/variantclash asserted the refusal — because those two
+// namespaces spanned the whole program. They are ordinary declarations now:
+// `one.Empty` and `two.Empty` are different names.
+enum L { Empty, Node(v int) }
+
+trait Named { func Name(self) str }
+
+struct Tag { }
+
+impl Named for Tag {
+    func Name(self) str { return "one" }
+}
+
+func Mk() L { return Node(7) }
+
+func Zero() L { return Empty }
+
+// A bare `Empty` inside the package resolves to this package's, which is the
+// first step of the short-name rule.
+func Show(l L) str {
+    match l {
+        Empty   => return "one:empty"
+        Node(v) => return "one:node {v}"
+    }
+}

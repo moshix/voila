@@ -1,0 +1,2 @@
+error[unreachable]: unreachable: the `return`
+!warning[unreachable]

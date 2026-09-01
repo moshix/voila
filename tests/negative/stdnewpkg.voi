@@ -1,0 +1,36 @@
+// std/csv, std/test and std/http are Voilà source grafted into the program
+// (KIND_STDSRC), so a misspelled member of any of them is decidable at the
+// reference and must be decided there — otherwise `check` says `ok` and the
+// backend dies on a name it cannot resolve, which is the check/build split
+// the verb exists to prevent.
+//
+// The `!` lines of the .expect file are the other half of this fixture: the
+// CORRECT calls, and a name shadowed by a local binding, are asserted to draw
+// no diagnostic at all. A check that fires on a working program is worse than
+// one that misses.
+use "std/csv"
+use "std/test"
+use "std/http"
+
+// A local binding of a package's name shadows it for that scope: `test` here
+// is a str and `csv` a list, and both lines below are ordinary method calls.
+func shadowed() {
+    let test = "shout"
+    say test.upper()
+    let csv = ["a", "b"]
+    say len(csv)
+}
+
+func main() {
+    var t = test.suite("fixture")
+    t.eq("decode", csv.decode("a,b\n"), [["a", "b"]])
+    say test.repr(1)
+    say csv.encode([["a"]])
+    say http.reason_phrase(404)
+
+    say test.rpr(1)
+    say csv.decoed("a\n")
+    say csv.nonexistent(1)
+    say http.reson_phrase(404)
+    shadowed()
+}

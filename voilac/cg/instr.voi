@@ -6,6 +6,7 @@
 package cg
 
 use "voilac/ir"
+use "voilac/low"
 use "std/str"
 use "std/fmt"
 
@@ -26,49 +27,23 @@ func prelude_natives() []str {
 
 // str_natives are std/str's functions, reachable bare (the method-call
 // duality s.upper() == str.upper(s)) and as `str.NAME`.
-func str_natives() []str {
-    return ["find_any", "skip_any",
-            "upper", "lower", "title", "trim", "trim_left", "trim_right",
-            "strip", "pad", "pad_left", "center", "contains", "index",
-            "last_index", "starts_with", "ends_with", "count", "equal_fold",
-            "substr", "left", "right", "split", "split_n", "lines", "fields",
-            "word", "words", "subword", "delword", "join", "replace",
-            "replace_n", "repeat", "reverse", "translate", "overlay",
-            "insert", "delstr", "bytes", "from_bytes", "runes", "from_runes",
-            "rune_len", "is_digit", "is_alpha", "is_space", "is_upper", "hex",
-            "unhex", "b64", "unb64"]
-}
+func str_natives() []str { return low.StrMethodNames() }
 
-// pkg_natives are the package-qualified names the C runtime provides.
+// pkg_natives are the package-qualified names the C runtime provides. Both
+// halves are spliced in from low/names.voi rather than written here — the C
+// packages' from low.StdCNatives, the VOILÀ-SOURCE packages' (net, sync,
+// time) from low.StdSrcNatives. chk needs each sublist on its own to tell a
+// native from a typo and must not import cg, so this is the splice and not a
+// second copy.
 func pkg_natives() []str {
-    return ["fmt.printf", "fmt.sprintf", "fmt.eprintf", "fmt.fprintf",
-            "fmt.print", "fmt.println", "fmt.comma", "fmt.bytes", "fmt.pad",
-            "fmt.pad_left", "fmt.center",
-            "os.read", "os.write", "os.open", "os.create", "os.exists",
-            "os.remove", "os.args", "os.env", "os.exit", "os.on_abort",
-            "os.isdir", "os.listdir", "os.run", "os.cwd", "os.pid",
-            "os.hostname",
-            "os.exe", "os.mtime", "os.size",
-            "os.stderr", "os.stdout",
-            "net._listen_tcp", "net._connect_tcp", "net._accept",
-            "net._send", "net._recv", "net._local_addr", "net._remote_addr",
-            "net._udp", "net._dial_udp",
-            "net._sendto", "net._recvfrom",
-            "net._listen_unix", "net._connect_unix", "net._close",
-            "net._set_timeout", "net.resolve",
-            "math.sqrt", "math.sin", "math.cos", "math.tan", "math.asin",
-            "math.acos", "math.atan", "math.ln", "math.log2", "math.log10",
-            "math.exp", "math.pow", "math.hypot", "math.mod", "math.pi",
-            "math.e",
-            "time.now", "time.since", "time.sleep", "time.after",
-            "time.millis", "time.seconds", "time.Nanosecond",
-            "time.Microsecond", "time.Millisecond", "time.Second",
-            "time.Minute", "time.Hour",
-            "log.info", "log.warn", "log.error", "log.debug", "log.flush",
-            "sort.sort", "sort.sort_by", "sort.reversed",
-            "json.encode", "json.pretty", "json.decode",
-            "rand.int", "rand.float", "rand.seed", "uuid.new",
-            "conv.to_int", "conv.to_float", "conv.to_dec"]
+    var out = []
+    each n in low.StdCNatives() {
+        out.append(n)
+    }
+    each n in low.StdSrcNatives() {
+        out.append(n)
+    }
+    return out
 }
 
 // known_native_names is the full set: prelude, std/str (bare and qualified),
@@ -90,12 +65,10 @@ func known_native_names() []str {
 
 // pkg_constant_names are package CONSTANTS rather than functions: LOADFN of
 // one of these yields a value, not a callable, so it must NOT be registered in
-// the natives table (which the runtime resolves as function pointers).
-func pkg_constant_names() []str {
-    return ["time.Nanosecond", "time.Microsecond", "time.Millisecond",
-            "time.Second", "time.Minute", "time.Hour",
-            "math.pi", "math.e", "os.stderr", "os.stdout"]
-}
+// the natives table (which the runtime resolves as function pointers). The one
+// copy is low.PkgConstantNames, for the same reason as pkg_natives above:
+// chk/stdpkg.voi accepts `os.stdout` on the strength of it.
+func pkg_constant_names() []str { return low.PkgConstantNames() }
 
 func bin_op_fns() map[str]str {
     var m = make(map[str]str)

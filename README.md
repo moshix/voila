@@ -2,26 +2,44 @@
 
 # ✨ Voilà
 
-**A statically typed, memory-safe, concurrent language —<br>
-that compiles itself.**
+**A small, fast, safe language that compiles itself.**
 
-![language](https://img.shields.io/badge/language-Voil%C3%A0%200.4.2-blueviolet?style=for-the-badge)
+![language](https://img.shields.io/badge/language-Voil%C3%A0%200.5.0-blueviolet?style=for-the-badge)
 ![gc](https://img.shields.io/badge/GC-none-orange?style=for-the-badge)
 
 </div>
 
 ---
 
-## What the language borrows — and from whom
+## What is it?
 
-| From | Voilà takes |
+Voilà is a compiled programming language. You write a `.voi` file, run
+`voila build`, and get a normal native executable that depends on nothing but
+the C library.
+
+Three things make it unusual:
+
+- **It frees memory for you, without a garbage collector.** Nothing pauses
+  your program to go looking for garbage. Memory is released the moment the
+  last thing using it goes away.
+- **Money arithmetic is exact.** `19.99 * 3` is `59.97`, not
+  `59.96999999999999`.
+- **It is written in itself.** The Voilà compiler is a Voilà program. It
+  compiles its own source code.
+
+## Where the ideas come from
+
+| From | What Voilà borrows |
 |---|---|
-| **Go** | braces, packages, channels, `select`, familiar `func` |
-| **Rust** | ownership + moves + deterministic destruction — **without lifetime annotations** |
-| **REXX** | `say`, `parse`, exact decimal arithmetic, learn-it-in-an-afternoon |
-| **C** | the `printf` verbs everyone already knows |
+| **Go** | curly braces, packages, and its approach to doing many things at once |
+| **Rust** | memory safety without a garbage collector — but without Rust's difficult lifetime annotations |
+| **REXX** | `say` for printing, `parse` for pulling apart text, exact decimal maths, and the goal of being learnable in an afternoon |
+| **C** | the `printf` formatting codes you already know |
 
 ## Thirty seconds of syntax
+
+This reads a file of pipe-separated records, adds up the amounts, and skips
+bad lines instead of crashing:
 
 ```go
 package main
@@ -34,21 +52,21 @@ exception BadRecord { line int, why str }
 struct Txn { acct int, holder str, amount dec }
 
 func parse_txn(n int, line str) Txn {
-    parse line "|" acct "|" holder "|" amount        // REXX-style templates
+    parse line "|" acct "|" holder "|" amount        // pull the fields apart
     if trim(acct) == "" { throw BadRecord{line: n, why: "empty account"} }
     return Txn{
-        acct:   int(trim(acct)),                     // throws ConvError on junk
+        acct:   int(trim(acct)),                     // fails loudly on junk
         holder: title(trim(holder)),
         amount: dec(trim(amount)),                   // exact decimal, always
     }
 }
 
 func main() {
-    numeric digits 31                                // REXX heritage: exact money
+    numeric digits 31                                // 31 digits of precision
     var total = 0d
 
-    let f = must os.open("TXN.DAT")                  // error value → exception
-    defer f.close()                                  // runs on every exit path
+    let f = must os.open("TXN.DAT")
+    defer f.close()                                  // always runs, even on error
 
     each i, line in f.lines() {
         try {
@@ -59,90 +77,102 @@ func main() {
             fmt.eprintf("skipping line %d: %s\n", e.line, e.why)
         }
     }
-    fmt.printf("%-24s %14.2f\n", "TOTAL", total)     // exact to 31 digits
+    fmt.printf("%-24s %14.2f\n", "TOTAL", total)
 }
 ```
 
-## The guarantees
+## What the language promises
 
-- **No leaks.** The type graph must be acyclic through owning edges;
-  back-edges are `weak[T]`. Refcounts always reach zero:
+**Your program will not leak memory.**
 
-  ```text
-  error: type `Node` forms an ownership cycle through field `parent`
-    --> tree.voi:4:5
-     |
-   4 |     parent shared[Node]
-     |            ^^^^^^^^^^^^ owning edge back to `Node`
-     = note: owning cycles can leak; Voilà forbids them
-     = help: use `weak[Node]` for a back-edge
-  ```
+Voilà frees a value as soon as nothing refers to it any more. That works
+perfectly until data points back at itself — a tree where each child also
+points at its parent, for example. Then the parent is keeping the child
+alive, the child is keeping the parent alive, and neither is ever freed.
 
-- **No dangling.** Borrows can't be stored in structs, channels, or
-  escaping closures — so they can't dangle, and nobody writes `'a`.
-- **No orphaned tasks.** `spawn` lives inside `group { }`; the group
-  joins **all** of its tasks before it exits. A failing task cancels its
-  siblings and the failure rethrows at the boundary.
-- **No silent precision loss.** `u16 → int` is free; `i64 → float`
-  is a compile error until you write `float(x)`. Overflow **traps**.
-- **No 59.96999999999999.** `19.99d * 3d == 59.97d`. Exactly.
+So Voilà refuses to compile that shape, and tells you the fix:
 
-## Concurrency that can't leak threads
+```text
+error: type `Node` forms an ownership cycle through field `parent`
+  --> tree.voi:4:5
+   |
+ 4 |     parent shared[Node]
+   |            ^^^^^^^^^^^^ this points back at `Node`
+   = note: two values that keep each other alive are never freed
+   = help: use `weak[Node]` for a link back to a parent
+```
+
+A `weak` link lets you point at something without keeping it alive — exactly
+what a "back to my parent" link should do.
+
+**You will not get a dangling pointer.** When you lend a value to a function,
+Voilà stops that borrowed reference from being squirrelled away somewhere
+that outlives it. You never write lifetime annotations to get this.
+
+**No task is left running behind your back.** Background work lives inside a
+`group`, and the group waits for everything it started before it finishes. If
+one task fails, its siblings are cancelled and the error surfaces where you
+started them.
+
+**Numbers do not lose precision quietly.** Converting a small integer type to
+a bigger one is free. Anything that could lose information — a large integer
+to a floating-point number, say — is a compile error until you ask for it
+explicitly. Arithmetic that overflows stops the program rather than silently
+wrapping around.
+
+## Doing several things at once
 
 ```go
 try group {
     spawn fetch("https://a.example")
-    spawn fetch("https://b.example")     // throws? siblings get cancelled,
-}                                        // everyone is joined, error surfaces here
+    spawn fetch("https://b.example")     // if one fails, the other is cancelled,
+}                                        // both are waited for, and the error
+                                         // is reported right here
 ```
 
-Channels **move** their payloads (`ch <- v` kills `v` in the sender), so
-data races are unrepresentable. A million tasks is a normal Tuesday.
+When you send a value down a channel, it *moves* — the sender no longer has
+it. That means two tasks can never be looking at the same value at the same
+time, so a whole category of concurrency bug simply cannot be written.
 
-## Errors: values *and* exceptions — pick per call site
+## Errors: pick the style at each call
 
 ```go
-let p = try parse_port(s)          // propagate the error value
-let p = parse_port(s) else 8080    // or default it
-let p = must parse_port(s)         // or promote it to an exception
-let r = attempt risky()            // or demote an exception to a value
+let p = try parse_port(s)          // pass the failure up to my caller
+let p = parse_port(s) else 8080    // or just use a default
+let p = must parse_port(s)         // or treat failure as fatal
+let r = attempt risky()            // or turn a crash into a value I can inspect
 ```
 
-## What's in the box
+## What is in the box
 
 | | |
 |---|---|
-| `voilac/` | **the compiler, written in Voilà** — `lex` · `par` · `load` · `chk` · `low` · `cg` |
-| `voilac/lex` `par` | full grammar: interpolation, nested comments, semicolon insertion, the arena AST |
-| `voilac/chk` | acyclicity rule, widening lattice, exhaustive `match`, use-after-move, compile-time `printf` checking |
-| `voilac/cg` | **C backend**: IR → C → `cc`. Real native binaries; zero leaks under `leaks` |
-|  `runtime/` | **libvoila**: the C runtime — refcounted values (no GC), exact decimals, exceptions, tasks/channels/select |
-| 📚 stdlib | `fmt` `str` `os` `math` `time` `json` `log` `conv` `sort` `rand` `uuid` |
-| `voila build -S` | register-IR **assembly listings** in HLASM style — location counter, constant pool, DSECTs, ≤79 columns |
-| `bootstrap/voilac.c` | the seed: the C the compiler emits **for itself** — the portability fallback so `cc` alone can bootstrap a fresh machine (`./bootstrap.bash`) |
-| tests | goldens, negative fixtures, and the **fixpoint**: the compiler compiled by itself emits identical C ([TESTING.md](TESTING.md)) |
+| `voilac/` | **the compiler, written in Voilà** |
+| `runtime/` | the small C library every compiled program links against |
+| `std/` | the standard library: `fmt` `str` `os` `io` `net` `http` `math` `time` `json` `csv` `regex` `crypto` `log` `conv` `sort` `path` `sync` `test` `rand` `uuid` |
+| `bootstrap/` | one generation of the compiler's own C output, so a machine with only a C compiler can get started |
+| `tests/` | the test suite (see [TESTING.md](TESTING.md)) |
 
 ## Quick start
 
-Voilà builds itself. If you already have a Voilà binary (≥ 0.4.1), `./build.sh`
-uses it to build the compiler — the self-hosted path:
+If you already have a Voilà binary, `./build.sh` uses it to build the
+compiler — Voilà compiling Voilà:
 
 ```console
-$ ./build.sh                          # Voilà builds Voilà
+$ ./build.sh
 ==> bootstrap: prebuilt binary  bin/voila  (0.4.1)
   ✓ fixpoint: C(voilac-1) == C(voilac-2)
   ✓ optimized fixpoint: C(-O3, gen1) == C(-O3, gen2)
-  ✓ bin/voila-0.4.2
+  ✓ bin/voila-0.5.0
 ```
 
-On a fresh machine with only a C compiler and no Voilà yet, `./bootstrap.bash`
-compiles the checked-in C seed into the first binary, then builds:
+On a machine with no Voilà at all, `./bootstrap.bash` compiles the checked-in
+C file into a first working compiler, then uses that:
 
 ```console
-$ ./bootstrap.bash                    # cc the seed → the first voila, then build
+$ ./bootstrap.bash
   ✓ build/voila-seed
-  ✓ fixpoint: C(voilac-1) == C(voilac-2)
-  ✓ bin/voila-0.4.2
+  ✓ bin/voila-0.5.0
 ```
 
 Then:
@@ -151,92 +181,94 @@ Then:
 $ bin/voila run samples/04_calculator.voi
 $ bin/voila check samples/07_orgchart.voi
 $ bin/voila build samples/10_life.voi -o life && ./life
-$ leaks --atExit -- ./life             # refcounting: 0 leaks, 0 bytes
-
-$ ./selftest.bash                     # the toolchain reproduces every golden
+$ ./selftest.bash                     # run everything
 ```
 
-See **[TESTING.md](TESTING.md)** for the full procedure and
-**[BOOTSTRAP.md](BOOTSTRAP.md)** for how the compiler compiles itself.
+**About that "fixpoint" line.** The build compiles the compiler with the
+compiler — twice — and checks that both rounds produce byte-for-byte
+identical output. If the compiler had a bug that mistranslated its own source,
+the second round would differ. It is one cheap check that covers an enormous
+amount of ground, and it has caught real bugs nothing else did.
 
-## Fourteen sample programs (none of them trivial)
-
-This distro supplies 14 sample programs which are also used in the Programming Handbook. 
+## Fifteen sample programs
 
 | Sample | Shows off |
 |---|---|
-| `01_worker_pool.voi` | 8-worker prime-counting pool: `group`/`spawn`/channels/join |
-| `02_accounts.voi` | fixed-width mainframe records, column `parse`, exact `dec` totals |
-| `03_txnreport.voi` | exceptions + error values cooperating; typed `catch`; `defer` |
-| `04_calculator.voi` | a full recursive-descent evaluator in ~200 lines: enums, `match`, `T!` |
-| `05_pipeline.voi` | channel pipeline stages, `select`, group `timeout`, cancellation |
-| `06_wordfreq.voi` | text analytics: `translate`, `fields`, ordered maps, `sort_by` |
-| `07_orgchart.voi` | `shared`/`weak` trees — the acyclicity rule in action |
-| `08_shapes.voi` | traits + dynamic dispatch + generic `Stack[T]` |
-| `09_jsonreport.voi` | typed & dynamic JSON, `dec`-safe money round-trips |
-| `10_life.voi` | Conway's Life on a torus: 2-D slices, `str.Builder` frames |
-| `11_echo.voi` | a TCP echo service with `std/net`: `listen`/`accept`, thread-per-connection |
-| `12_udp.voi` | connectionless UDP messaging: `send_to`/`recv_from` |
-| `13_http.voi` | a minimal HTTP/1.0 client and server on raw sockets |
-| `14_unix.voi` | local IPC over a Unix-domain socket: a tiny command service |
+| `01_worker_pool.voi` | eight workers counting primes in parallel |
+| `02_accounts.voi` | fixed-width records and exact money totals |
+| `03_txnreport.voi` | the two error styles working together |
+| `04_calculator.voi` | a complete expression evaluator in ~200 lines |
+| `05_pipeline.voi` | stages connected by channels, with a timeout |
+| `06_wordfreq.voi` | counting words in text |
+| `07_orgchart.voi` | a tree with parent links — the `weak` rule in action |
+| `08_shapes.voi` | traits, and a generic `Stack[T]` |
+| `09_jsonreport.voi` | JSON in and out, without losing decimal precision |
+| `10_life.voi` | Conway's Life on a wrapping grid |
+| `11_echo.voi` | a TCP echo server |
+| `12_udp.voi` | UDP messaging |
+| `13_http.voi` | an HTTP client and server with `std/http` |
+| `14_unix.voi` | local inter-process communication |
+| `15_calc.voi` | the calculator again, reading from standard input |
 
-## It compiles itself
-Voilà is completely self-hosted: the compiler is written in Voilà, and the
-normal way to build it (`./build.sh`) is to have a prior Voilà binary
-(≥ 0.4.1) compile `voilac/*.voi`, then have *that* compile it again, and assert
-the two emit **byte-identical C** — the self-hosting fixpoint. Building 0.4.2
-needs a 0.4.1 (or newer) Voilà; that is the minimum.
+## Performance
 
-To bring Voilà up on a machine that has no Voilà binary at all, one generation
-of the compiler's own C output is checked in as `bootstrap/voilac.c` — a
-fossil, not a source. `./bootstrap.bash` compiles it with `cc` into the first
-native binary, which then drives the same self-hosted build. (`cc` is still the
-backend inside every `voila build` either way — Voilà emits C.) It originally
-bootstrapped from a Go compiler that no longer exists; every stage of the Voilà
-one was diffed against it, byte for byte, over every file in this repository —
-and then it was deleted.
+The optimizer is opt-in. Without `-O`, output is unchanged from 0.3. With it
+(measured on an Apple silicon Mac; Linux gains are similar or better):
 
-## Performance (0.4)
-
-The optimizer is **opt-in**: without `-O`, the output is byte-identical to
-0.3. With it (darwin/arm64, best-of-N; Linux/amd64 gains are similar or
-larger):
-
-| benchmark | what it stresses | default | `-O3` | delta |
+| benchmark | what it stresses | default | `-O3` | change |
 |---|---|---|---|---|
-| `bench/b2_life.voi` | int arithmetic in loops | 1181 ms | 710 ms | **−40 %** |
-| `bench/b6_partasks.voi` | tasks + channels | 851 ms | 716 ms | −16 % |
-| `bench/b1_queens.voi` | recursion via parameters | 4153 ms | 3589 ms | −14 % |
-| `bench/b5_churn.voi` | struct allocation | 810 ms | 742 ms | −8 % |
-| `bench/b4_ledger.voi` | `dec` money arithmetic | 987 ms | 971 ms | −2 % (by design: `dec` is exact, never unboxed) |
+| `b2_life.voi` | integer arithmetic in loops | 1181 ms | 710 ms | **−40 %** |
+| `b6_partasks.voi` | tasks and channels | 851 ms | 716 ms | −16 % |
+| `b1_queens.voi` | recursion | 4153 ms | 3589 ms | −14 % |
+| `b5_churn.voi` | allocating lots of structs | 810 ms | 742 ms | −8 % |
+| `b4_ledger.voi` | exact decimal money | 987 ms | 971 ms | −2 % (by design) |
 
-Compile time (10-kline self-compile): `load` 2.26 s → **1.0 s**; a small
-program's `voila build` 0.9 s → **~0.12 s** (the runtime library is now
-compiled once and cached). Full tables: `bench/BASELINE.md`,
-`bench/RESULTS.md`.
+Full tables in `bench/BASELINE.md` and `bench/RESULTS.md`.
 
-## Roadmap
+## What works today
 
-- ✅ **Self-hosted** — the compiler is written in Voilà; the fixpoint holds
-- ✅ Native binaries, multi-file packages, the full checker, `run`/`build`/`check`
-- ✅ **An optimizing backend** (0.4): `-O1` scalar cleanup, `-O2` frame
-  elision, `-O3` typed unboxing + `cc -O3`, opt-in `--native` — same
-  outputs, same trap messages, byte-for-byte, at every level
-- ✅ **`std/net`** (0.4.1): TCP, UDP and Unix-domain sockets — and the
-  first standard package **written in Voilà** on a thin C syscall shim, the
-  template for Voilà-authored std packages to come
-- ⬜ interprocedural unboxing (parameters are still boxed) and native
-  `for`-range counters — the next performance frontier
-- ⬜ green threads (tasks are OS threads today: right semantics, wrong cost model)
-- ⬜ `std/regex`, `std/http`; `voila fmt/test/repl`; the flow-sensitive
-  borrow checker
+- Native executables, multi-file packages, `run` / `build` / `check`
+- An optimizing backend (`-O1` to `-O3`) that never changes what your program
+  does, only how fast it does it
+- Reading standard input, buffered file and network I/O (`std/io`)
+- Real concurrency primitives — mutexes, read/write locks, atomics, `Once`
+  and wait groups (`std/sync`) — and lexical path handling (`std/path`)
+- Calendar dates and RFC 3339 (`std/time`), in UTC or a fixed offset
+- CSV that streams and gets quoting right (`std/csv`), and assertions with
+  table tests for testing your own code (`std/test`)
+- An HTTP/1.1 client and server (`std/http`) — `get`, `post`, `request`, a
+  handler-based server, URL parsing and chunked bodies, written in Voilà over
+  `std/net`. Plaintext only: there is no TLS, and an `https://` URL is refused
+  rather than fetched in the clear
+- Checks that catch mistakes before you run: unimplemented trait methods,
+  generic constraints, assigning to a `let`, unknown type names, missing
+  `return`s, wrong numbers of arguments
+- Warnings you can tune or promote to errors (`-Wall`, `-Werror`, `--strict`)
 
-📕 **Docs:** start with **[Getting Started](GettingStartedWithVoila.md)** — a
-tutorial from `hello.voi` through a parallel eight-queens solver to a network
-service, every program tested on every build. Then the [Programming Manual](programming_manual.md),
-the reference — written in the house style of the IBM mainframe language
-references, syntax diagrams included — and the
-[Language Specification](voila_specification.md).
+## What is still missing
+
+- **Type checking is partial.** Declared types are verified in many places,
+  but not everywhere — the compiler does not yet check every expression.
+- **No package manager.** You can only use code inside your own project;
+  there is no way to depend on someone else's library yet.
+- **Some standard library gaps**: no named time zones (`std/time` knows UTC,
+  a fixed offset, and the machine's own offset — there is no tzdata).
+  `std/crypto` has hashes, HMAC and a cryptographically secure random source,
+  but no signatures — and there is **no TLS at all**, so `std/http` speaks
+  plaintext HTTP and refuses an `https://` URL rather than fetching it in the
+  clear. No XML or YAML.
+- **No editor support, formatter, debugger, or `voila test` runner.**
+  `std/test` gives you assertions and a pass/fail tally; a suite is an
+  ordinary program you run yourself.
+- **Background tasks are real operating-system threads.** They behave
+  correctly, but a million of them is expensive.
+
+## Documentation
+
+Start with **[Getting Started](GettingStartedWithVoila.md)**, a tutorial that
+runs from `hello.voi` to a network service. Then the
+[Programming Manual](programming_manual.md) for the details, and the
+[Language Specification](voila_specification.md) for the fine print.
 
 ## License
 
@@ -247,6 +279,6 @@ see [LICENSE](LICENSE).
 
 <div align="center">
 
-*Voilà: Rust's guarantees, Go's plumbing, REXX's manners.*
+*Safety without a garbage collector. Exact arithmetic. Compiles itself.*
 
 </div>

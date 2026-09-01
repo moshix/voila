@@ -1,0 +1,88 @@
+utc(2026,8,25,13,4,5) -> 2026-08-25T13:04:05Z
+fields -> 2026 8 25 13 4 5 0 0
+show -> 2026-08-25T13:04:05Z
+date_string -> 2026-08-25
+time_string -> 13:04:05
+weekday_name -> Tuesday
+month_name -> August
+weekday -> 2
+yearday -> 237
+unix -> 1787663045
+unix_millis -> 1787663045000
+unix_nanos -> 1787663045000000000
+date(...123456789ns) -> 1999-12-31T23:59:59.123456789Z
+millisecond only -> 2000-01-01T00:00:00.005Z
+microsecond only -> 2000-01-01T00:00:00.000005Z
+from_unix(0) -> 1970-01-01T00:00:00Z
+from_unix(-1) -> 1969-12-31T23:59:59Z
+from_unix(1787663045) -> 2026-08-25T13:04:05Z
+from_unix_nanos(-1) -> 1969-12-31T23:59:59.999999999Z
+from_unix_nanos(1) -> 1970-01-01T00:00:00.000000001Z
+from_unix(-2208988800) -> 1900-01-01T00:00:00Z
+leap 1900 -> false
+leap 2000 -> true
+leap 2023 -> false
+leap 2024 -> true
+days_in_month(2024,2) -> 29
+days_in_month(2023,2) -> 28
+days_in_month(1900,2) -> 28
+days_in_month(2000,2) -> 29
+days_in_month(2024,4) -> 30
+2024-02-29 exists -> 2024-02-29T00:00:00Z
+2024-12-31 yearday -> 366
+2023-12-31 yearday -> 365
+2023-02-29 -> day 29 out of range (1..28) for 2023-02
+2024-02-28 + 24h -> 2024-02-29T12:00:00Z
+2024-02-28 + 48h -> 2024-03-01T12:00:00Z
+2023-02-28 + 24h -> 2023-03-01T12:00:00Z
+2025-12-31T23:59:59 + 1s -> 2026-01-01T00:00:00Z
+2025-01-01T00:00:00 - 1s -> 2024-12-31T23:59:59Z
+2024-01-31T23:59:59.75 + 500ms -> 2024-02-01T00:00:00.250Z
+date(+05:30) -> 2026-08-25T18:34:05+05:30
+same moment as UTC reading -> true
+unix agrees -> true
+to_utc -> 2026-08-25T13:04:05Z
+to_offset(-05:00) -> 2026-08-25T08:04:05-05:00
+to_offset(-00:01) -> 2026-08-25T13:03:05-00:01
+UTC reading to +05:30 -> 2026-08-25T18:34:05+05:30
++14:00 reading -> 2026-08-25T14:30:00+14:00
+-11:00 reading -> 2026-08-24T13:30:00-11:00
+still one moment -> true
+before -> true
+after -> true
+not before itself -> false
+parse 2026-08-25T13:04:05Z -> 2026-08-25T13:04:05Z 1787663045 0
+parse 2026-08-25T13:04:05.25+02:00 -> 2026-08-25T13:04:05.250+02:00 1787655845 7200
+parse 1970-01-01T00:00:00Z -> 1970-01-01T00:00:00Z 0 0
+parse 1969-12-31T23:59:59.999999999Z -> 1969-12-31T23:59:59.999999999Z -1 0
+parse 2024-02-29T00:00:00+05:30 -> 2024-02-29T00:00:00+05:30 1709145000 19800
+parse 2026-08-25t13:04:05z -> 2026-08-25T13:04:05Z 1787663045 0
+parse 2026-08-25 13:04:05Z -> 2026-08-25T13:04:05Z 1787663045 0
+parse 0001-01-01T00:00:00Z -> 0001-01-01T00:00:00Z -62135596800 0
+parse 9999-12-31T23:59:59.000001Z -> 9999-12-31T23:59:59.000001Z 253402300799 0
+round trip exact -> true true true
+refused -> `` is too short for an RFC 3339 timestamp (want at least YYYY-MM-DDTHH:MM:SSZ)
+refused -> `2026-08-25` is too short for an RFC 3339 timestamp (want at least YYYY-MM-DDTHH:MM:SSZ)
+refused -> `2026-08-25T13:04:05` has no time zone; RFC 3339 requires `Z` or ±HH:MM
+refused -> `2026-13-25T13:04:05Z`: month 13 out of range (1..12)
+refused -> `2026-08-32T13:04:05Z`: day 32 out of range (1..31) for 2026-08
+refused -> `2026-08-25T24:04:05Z`: hour 24 out of range (0..23)
+refused -> `2026-08-25T13:60:05Z`: minute 60 out of range (0..59)
+refused -> `2026-08-25T13:04:60Z`: second 60 out of range (0..59); leap seconds are not represented
+refused -> expected `T` between the date and the time at offset 10 of `2026-08-25X13:04:05Z`
+refused -> `.` at offset 19 of `2026-08-25T13:04:05.Z` is not followed by a fraction
+refused -> truncated time zone in `2026-08-25T13:04:05+0200` (want ±HH:MM)
+refused -> trailing text `xyz` after the timestamp in `2026-08-25T13:04:05+02:00xyz`
+refused -> `20260825T130405Z` is too short for an RFC 3339 timestamp (want at least YYYY-MM-DDTHH:MM:SSZ)
+refused -> time zone hour 99 out of range (0..23) in `2026-08-25T13:04:05+99:00`
+to_instant unix -> 1787663045
+to_instant unix_nanos -> 1787663045000000000
+instant round trip -> true
+instant at offset -> 2026-08-25T18:34:05+05:30
+now_utc is sane -> true
+now_local is a real date -> true
+local reading is the same moment -> true
+local reading carries the offset it was read at -> true
+instant survives the round trip -> true
+to_local keeps the moment -> true
+instant.unix floors -> -1 -1 -500

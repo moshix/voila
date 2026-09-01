@@ -1,0 +1,435 @@
+// chk/bind.voi — binding discipline: what may be assigned to, and what may
+// not.
+//
+// §4 says it in one line — "`let` bindings cannot be reassigned" — and until
+// now nothing enforced it. `let x = 1; x = 2` compiled, ran, and did what the
+// programmer wrote instead of what the specification says. So did writing
+// through a BORROWED parameter, which is the one mode §6.1 gives no
+// permission to write at all, and so did `self.x = …` in a method that never
+// asked for `mut self`.
+//
+// THE RULE IS REBINDING, NOT DEEP IMMUTABILITY. This distinction is the whole
+// design, and getting it wrong would reject working programs by the dozen:
+//
+//     let e = shared(Employee{…}); e.boss = weak(b)   // legal — 07_orgchart
+//     let m = make(map[str]int);   m["b"] = 2         // legal — collections
+//     let x = 1;                   x = 2              // REJECTED
+//
+// A bare identifier on the left is a rebinding; anything reached THROUGH one
+// — a field, an index — is a mutation of the value, which `let` never
+// promised anything about. The borrow check is the same distinction seen from
+// the other side: it looks at the ROOT of a selection, because `p.x = 1`
+// writes into a value the caller only LENT — but `p = q` merely points a
+// local name elsewhere, which the caller cannot observe and §6.1 does not
+// forbid.
+//
+// SHADOWING, and why this file is a scope STACK rather than a set of names.
+// A conservative name set would be wrong in BOTH directions here. `var x`
+// inside a block genuinely shadows an outer `let x` and IS assignable, so a
+// set would produce false positives; and commit 003acd4 records the converse
+// mistake in the call-site check, where a binding collected from the wrong
+// scope suppressed real diagnostics. So every construct that binds — `let`,
+// `var`, parameters, `for`/`each` variables, `match`/`if let` patterns,
+// `select` and `catch` names, `parse` targets, closure parameters — enters
+// the innermost scope, and a scope is COPIED on entry exactly as
+// checks.voi's lattice_block copies its own. The copy walks map keys, whose
+// order is nondeterministic; that is safe because the copy is content-only
+// and NO DIAGNOSTIC IS EVER PRODUCED FROM A MAP WALK.
+//
+// What is NOT bound is deliberate: a name we have never seen is B_UNKNOWN and
+// is judged by nobody. Losing a diagnostic is a bug report; inventing one is
+// a broken build.
+package chk
+
+use "voilac/ast"
+use "std/str"
+
+// How a name is bound. The values are the answer to "may this be assigned
+// to", not a classification of syntax.
+const B_UNKNOWN = 0 - 1
+const B_VAR     = 0   // `var`, `mut`/`own` parameter, loop and pattern binds
+const B_LET     = 1
+const B_CONST   = 2
+const B_BORROW  = 3   // a borrowed parameter — §6.1's read-only mode
+
+impl Checker {
+    func check_bindings(mut self) {
+        // The module scope first, and WHOLE: a function body may assign to a
+        // global declared after it, so every module binding must be known
+        // before any body is walked.
+        var mscope = make(map[str]int)
+        let decls = self.T.Get(self.T.Kid(self.file, 1)).Kids
+        each d in decls {
+            if self.T.Kind(d) == ast.GLOBAL {
+                self.bind_names_of(self.T.Kid(d, 0), mscope)
+            }
+        }
+        each s in self.T.Get(self.T.Kid(self.file, 2)).Kids {
+            self.bind_names_of(s, mscope)
+        }
+
+        each d in decls {
+            let n = self.T.Get(d)
+            if n.Kind == ast.FUNC {
+                self.bind_fn(d, mscope)
+            } else if n.Kind == ast.IMPLDEC or n.Kind == ast.TRAITDEC {
+                each m in self.T.Get(self.T.Kid(d, 0)).Kids {
+                    self.bind_fn(m, mscope)
+                }
+            } else if n.Kind == ast.EXCDEC {
+                each m in self.T.Get(self.T.Kid(d, 1)).Kids {
+                    self.bind_fn(m, mscope)
+                }
+            } else if n.Kind == ast.GLOBAL {
+                self.leave_method()
+                self.bind_exprs(self.T.Kid(self.T.Kid(d, 0), 0), mscope)
+            }
+        }
+        // The script statements share the module scope — they ARE the module
+        // scope — so they are walked in it rather than in a copy.
+        self.leave_method()
+        each s in self.T.Get(self.T.Kid(self.file, 2)).Kids {
+            self.bind_stmt(s, mscope)
+        }
+    }
+
+    // bind_fn walks one function or method body. The self-mode is recorded on
+    // the checker rather than threaded through every recursion, so a closure
+    // written INSIDE a method still knows whose `self` it captured.
+    func bind_fn(mut self, fn int, outer map[str]int) {
+        if self.T.Kind(fn) != ast.FUNC { return }
+        let body = self.T.Kid(fn, 0)
+        if body == 0 { return }               // a signature, or a default
+        let n = self.T.Get(fn)
+        self.bFn = n.Sval
+        self.bSelfMut = (n.Ival2 & 6) != 0    // bit 2 = mut self, bit 4 = own
+        var scope = make(map[str]int)
+        each k in keys(outer) {
+            scope[k] = outer[k]
+        }
+        self.bind_params(self.T.Kid(fn, 1), scope)
+        each s in self.T.Get(body).Kids {
+            self.bind_stmt(s, scope)
+        }
+    }
+
+    // leave_method clears the self-mode before walking something that is not
+    // inside a method. No `self` can appear there, so nothing depends on it
+    // today — but a stale flag left over from the last method walked is the
+    // kind of state that is wrong exactly once, silently, much later.
+    func leave_method(mut self) {
+        self.bFn = ""
+        self.bSelfMut = false
+    }
+
+    // bind_params enters a parameter list. The MODE is the whole point: the
+    // low two bits of Ival2 are the mode (bit 16 is variadic and is not part
+    // of it), and only MODE_BORROW is unwritable.
+    func bind_params(mut self, list int, scope mut map[str]int) {
+        if list == 0 { return }
+        each p in self.T.Get(list).Kids {
+            if self.T.Kind(p) != ast.PARAM { continue }
+            let pn = self.T.Get(p)
+            var how = B_VAR
+            if (pn.Ival2 & 3) == ast.MODE_BORROW { how = B_BORROW }
+            enter(scope, pn.Sval, how)
+        }
+    }
+
+    // ------------------------------------------------------------ the check
+
+    // bind_assign is the whole point of the file.
+    func bind_assign(mut self, s int, scope map[str]int) {
+        let lhs = self.T.Kid(s, 0)
+        if lhs == 0 { return }
+        let root = self.lhs_root(lhs)
+        let rk = self.T.Kind(root)
+
+        if rk == ast.SELF {
+            if not self.bSelfMut {
+                self.report_at(lhs, "cannot assign to `" ||
+                    self.lhs_text(lhs) || "`: `" || self.bFn ||
+                    "` does not take `mut self` (§6.1)")
+            }
+            return
+        }
+        if rk != ast.IDENT { return }
+        let name = self.T.Get(root).Sval
+        let how = how_bound(scope, name)
+
+        // The borrow check reads the ROOT: a borrowed value is lent for the
+        // call, so writing to a FIELD of it is a write the lender never
+        // agreed to. Rebinding the bare name is not — `n = 0 - n` on a
+        // borrowed `n` points the local name somewhere else and the caller
+        // cannot tell; §6.1 forbids writing THROUGH a borrow, not naming one
+        // again. Hence `root != lhs`.
+        if how == B_BORROW and root != lhs {
+            self.report_at(lhs, "cannot assign to `" || self.lhs_text(lhs) ||
+                "`: `" || name || "` is borrowed; declare the parameter " ||
+                "`mut` to write through it (§6.1)")
+            return
+        }
+
+        // Everything below is REBINDING, so it applies to a bare name only.
+        if root != lhs { return }
+        if how == B_LET {
+            self.report_at(lhs, "cannot assign to `" || name ||
+                "`: a `let` binding cannot be reassigned; use `var` (§4)")
+        } else if how == B_CONST {
+            self.report_at(lhs, "cannot assign to `" || name ||
+                "`: a `const` is fixed at compile time; use `var` (§4)")
+        }
+    }
+
+    // lhs_root peels field and index selections down to the thing being
+    // written through: the base of `a.b[0].c` is `a`.
+    func lhs_root(self, e int) int {
+        var x = e
+        var k = self.T.Kind(x)
+        while k == ast.FIELD or k == ast.INDEX {
+            x = self.T.Kid(x, 0)
+            k = self.T.Kind(x)
+        }
+        return x
+    }
+
+    // lhs_text spells an assignment target the way the source did, as far as
+    // the shapes an assignment can take go. An index is rendered `[…]`
+    // rather than re-printing the expression: the position already points at
+    // the statement, and the diagnostic is about the ROOT.
+    func lhs_text(self, e int) str {
+        let n = self.T.Get(e)
+        if n.Kind == ast.IDENT { return n.Sval }
+        if n.Kind == ast.SELF  { return "self" }
+        if n.Kind == ast.FIELD {
+            return self.lhs_text(self.T.Kid(e, 0)) || "." || n.Sval
+        }
+        if n.Kind == ast.INDEX {
+            return self.lhs_text(self.T.Kid(e, 0)) || "[…]"
+        }
+        return "?"
+    }
+
+    // ------------------------------------------------------------ walking
+
+    // bind_block walks a nested block. Copy-on-enter is what makes shadowing
+    // exact: a `var x` declared inside cannot leak out and un-protect an
+    // outer `let x`.
+    func bind_block(mut self, b int, scope map[str]int) {
+        if b == 0 { return }
+        var inner = make(map[str]int)
+        each k in keys(scope) {
+            inner[k] = scope[k]
+        }
+        each s in self.T.Get(b).Kids {
+            self.bind_stmt(s, inner)
+        }
+    }
+
+    func bind_stmt(mut self, s int, scope mut map[str]int) {
+        if s == 0 { return }
+        let n = self.T.Get(s)
+        let k = n.Kind
+
+        if k == ast.ASSIGN {
+            self.bind_assign(s, scope)
+            self.bind_exprs(self.T.Kid(s, 0), scope)
+            self.bind_exprs(self.T.Kid(s, 1), scope)
+        } else if k == ast.LET or k == ast.VAR {
+            // The value is walked BEFORE the names enter scope: `let x = x`
+            // reads the outer `x`.
+            self.bind_exprs(self.T.Kid(s, 0), scope)
+            self.bind_names_of(s, scope)
+        } else if k == ast.BLOCK {
+            self.bind_block(s, scope)
+        } else if k == ast.EXPRSTMT {
+            self.bind_exprs(self.T.Kid(s, 0), scope)
+        } else if k == ast.IF {
+            self.bind_exprs(self.T.Kid(s, 0), scope)
+            // `if let` binds into the THEN branch only, so the pattern's
+            // names go in a copy that the else branch never sees.
+            var inner = make(map[str]int)
+            each key in keys(scope) {
+                inner[key] = scope[key]
+            }
+            self.bind_pattern(n.Ival, inner)
+            self.bind_block(self.T.Kid(s, 1), inner)
+            self.bind_stmt(self.T.Kid(s, 2), scope)
+        } else if k == ast.FOR or k == ast.EACH {
+            self.bind_exprs(self.T.Kid(s, 0), scope)
+            var inner = make(map[str]int)
+            each key in keys(scope) {
+                inner[key] = scope[key]
+            }
+            // Sval is "names|label"; only the names half binds.
+            each nm in str.split(str.split(n.Sval, "|")[0], ",") {
+                enter(inner, nm, B_VAR)
+            }
+            self.bind_block(self.T.Kid(s, 1), inner)
+        } else if k == ast.WHILE or k == ast.GROUP {
+            self.bind_exprs(self.T.Kid(s, 0), scope)
+            self.bind_block(self.T.Kid(s, 1), scope)
+        } else if k == ast.SWITCH {
+            self.bind_exprs(self.T.Kid(s, 0), scope)
+            each c in self.T.Get(self.T.Kid(s, 1)).Kids {
+                each v in self.T.Get(self.T.Kid(c, 0)).Kids {
+                    self.bind_exprs(v, scope)
+                }
+                self.bind_case(self.T.Kid(c, 1), scope)
+            }
+        } else if k == ast.MATCH {
+            self.bind_exprs(self.T.Kid(s, 0), scope)
+            each a in self.T.Get(self.T.Kid(s, 1)).Kids {
+                var inner = make(map[str]int)
+                each key in keys(scope) {
+                    inner[key] = scope[key]
+                }
+                self.bind_pattern(self.T.Get(a).Ival, inner)
+                self.bind_exprs(self.T.Kid(a, 0), inner)   // the guard
+                each b in self.T.Get(self.T.Kid(a, 1)).Kids {
+                    self.bind_stmt(b, inner)
+                }
+            }
+        } else if k == ast.SELECTSTMT {
+            each c in self.T.Get(self.T.Kid(s, 0)).Kids {
+                self.bind_exprs(self.T.Kid(c, 0), scope)
+                self.bind_exprs(self.T.Kid(c, 1), scope)
+                var inner = make(map[str]int)
+                each key in keys(scope) {
+                    inner[key] = scope[key]
+                }
+                // "bind,bindok", with a trailing comma when there is no
+                // ok-name (see callsite.voi's collect_bound).
+                each nm in str.split(self.T.Get(c).Sval, ",") {
+                    enter(inner, nm, B_VAR)
+                }
+                each b in self.T.Get(self.T.Kid(c, 2)).Kids {
+                    self.bind_stmt(b, inner)
+                }
+            }
+        } else if k == ast.PARSESTMT {
+            self.bind_exprs(self.T.Kid(s, 0), scope)
+            // A capture term WRITES its target. Treated as a binding, not an
+            // assignment: `parse` introduces the name when it does not exist,
+            // and the loader has already qualified the case where it names a
+            // module global.
+            each term in self.T.Get(self.T.Kid(s, 1)).Kids {
+                let tn = self.T.Get(term)
+                if tn.Ival == 0 { enter(scope, tn.Sval, B_VAR) }
+            }
+        } else if k == ast.SAY or k == ast.RETURN {
+            each a in n.Kids {
+                self.bind_exprs(a, scope)
+            }
+        } else if k == ast.THROW {
+            self.bind_exprs(self.T.Kid(s, 0), scope)
+            self.bind_exprs(self.T.Kid(s, 1), scope)
+        } else if k == ast.DEFERSTMT {
+            if n.Ival2 == 1 {
+                self.bind_block(self.T.Kid(s, 0), scope)
+            } else {
+                self.bind_exprs(self.T.Kid(s, 0), scope)
+            }
+        } else if k == ast.TRYCATCH {
+            self.bind_block(self.T.Kid(s, 0), scope)
+            each cc in self.T.Get(self.T.Kid(s, 1)).Kids {
+                var inner = make(map[str]int)
+                each key in keys(scope) {
+                    inner[key] = scope[key]
+                }
+                enter(inner, self.T.Get(cc).Sval, B_VAR)
+                self.bind_block(self.T.Kid(cc, 0), inner)
+            }
+            self.bind_block(self.T.Kid(s, 2), scope)
+        }
+    }
+
+    // bind_case walks a switch case's bare statement LIST — a list, not a
+    // BLOCK node, which is why bind_block cannot be used — in its own scope.
+    func bind_case(mut self, list int, scope map[str]int) {
+        if list == 0 { return }
+        var inner = make(map[str]int)
+        each key in keys(scope) {
+            inner[key] = scope[key]
+        }
+        each b in self.T.Get(list).Kids {
+            self.bind_stmt(b, inner)
+        }
+    }
+
+    // bind_names_of enters the names a LET or VAR introduces.
+    func bind_names_of(mut self, s int, scope mut map[str]int) {
+        if s == 0 { return }
+        let n = self.T.Get(s)
+        if n.Kind == ast.LET {
+            var how = B_LET
+            if n.Ival2 == 1 { how = B_CONST }
+            each nm in str.split(n.Sval, ",") {
+                enter(scope, nm, how)
+            }
+        } else if n.Kind == ast.VAR {
+            enter(scope, n.Sval, B_VAR)
+        }
+    }
+
+    // bind_pattern enters a pattern's binds. Only PBIND binds — a bare name
+    // that is a VARIANT is a PVARIANT node, so there is no over-collection to
+    // apologise for here.
+    func bind_pattern(mut self, p int, scope mut map[str]int) {
+        if p == 0 { return }
+        let n = self.T.Get(p)
+        if n.Kind == ast.PBIND {
+            enter(scope, n.Sval, B_VAR)
+            return
+        }
+        each sub in n.Kids {
+            self.bind_pattern(sub, scope)
+        }
+    }
+
+    // bind_exprs looks inside an expression for the STATEMENTS hiding in it.
+    // Assignment is a statement in Voilà, so the only reason to walk an
+    // expression at all is to reach a closure body or a `spawn { … }` block —
+    // and to bind the closure's own parameters before doing so.
+    func bind_exprs(mut self, e int, scope map[str]int) {
+        if e == 0 { return }
+        let n = self.T.Get(e)
+        let k = n.Kind
+        if k == ast.CLOSURE {
+            var inner = make(map[str]int)
+            each key in keys(scope) {
+                inner[key] = scope[key]
+            }
+            self.bind_params(self.T.Kid(e, 1), inner)
+            each s in self.T.Get(self.T.Kid(e, 0)).Kids {
+                self.bind_stmt(s, inner)
+            }
+            return
+        }
+        if k == ast.SPAWNEXPR and n.Ival2 == 1 {
+            self.bind_block(self.T.Kid(e, 0), scope)
+            return
+        }
+        if (k == ast.ARM or k == ast.IF) and n.Ival != 0 {
+            self.bind_exprs(n.Ival, scope)
+        }
+        each c in n.Kids {
+            self.bind_exprs(c, scope)
+        }
+    }
+}
+
+// enter records one binding, ignoring the names that are not bindings: the
+// blank `_`, and the empty half of a "bind,bindok" pair.
+func enter(scope mut map[str]int, name str, how int) {
+    if name == "" or name == "_" { return }
+    scope[name] = how
+}
+
+// how_bound answers what a name is, or B_UNKNOWN when this file has never
+// seen it bound — a native, a module function, an enum variant. Unknown is
+// judged by nobody.
+func how_bound(scope map[str]int, name str) int {
+    if name in scope { return scope[name] }
+    return B_UNKNOWN
+}

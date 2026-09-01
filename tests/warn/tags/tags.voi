@@ -1,0 +1,8 @@
+// Exports an ENUM. Its VARIANT names may be spelled bare for the same reason a
+// trait name may, so `Red` alone is a use of this package.
+package tags
+
+enum Tag {
+    Red,
+    Blue
+}

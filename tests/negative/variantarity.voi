@@ -1,0 +1,19 @@
+// Enum-variant arity, in construction and in patterns alike. The runtime pads
+// a short payload with nil and drops a long one, both in silence — so
+// `Circle()` used to build a circle whose radius was nil.
+enum Shape {
+    Circle(radius float)
+    Rect(w float, h float)
+}
+
+func area(s Shape) float {
+    match s {
+        Circle(r, extra) => return r
+        Rect(w)          => return w
+    }
+}
+
+func main() {
+    say area(Circle())
+    say area(Rect(1.0, 2.0, 3.0))
+}

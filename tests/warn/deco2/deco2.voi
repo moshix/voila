@@ -1,0 +1,12 @@
+// The same channel as deco/, in its more dangerous spelling: an INHERENT impl
+// on somebody else's type. There is no trait here for a scan to catch — the
+// impl's Sval is "" — so a rule that asked "is this a trait impl?" would let
+// this package be reported, and taking that advice COMPILES and then aborts
+// at run time with "geom.Point has no method `tall`".
+package deco2
+
+use "geom"
+
+impl geom.Point {
+    func tall(self) bool { return self.Y > 3 }
+}

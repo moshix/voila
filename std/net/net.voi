@@ -17,7 +17,6 @@
 package net
 
 use "std/str"
-use "std/fmt"
 
 // Sock is an opaque handle to the OS socket the C shim owns. It is never
 // constructed in Voilà; it only names the type of the field that carries the
@@ -32,8 +31,16 @@ struct Listener {
 }
 
 // Conn is a connected stream: from `connect`, `dial_unix`, or `accept`.
+//
+// `r` is the buffered reader every read on this Conn goes through. It is made
+// on first use and then KEPT: a fresh reader per call would strand whatever
+// the previous one had read ahead in a buffer nobody can reach again — the
+// one-byte-at-a-time read_line this replaced had no such hazard, and trading
+// it for a silent data loss would be no bargain. Nil until the first read, so
+// `Conn{h: s}` still builds a whole Conn.
 struct Conn {
     h Sock
+    r ?io.Reader
 }
 
 // Udp is a bound datagram socket.
@@ -125,35 +132,38 @@ impl Listener {
 // -------------------------------------------------------------------- Conn
 
 impl Conn {
+    // reader is this Conn's buffered reader, made on first use (see the `r`
+    // field). Every read below goes through it, so read, read_line and
+    // read_all share ONE position in the stream: mixing them cannot lose
+    // bytes to a buffer the next call knows nothing about.
+    func reader(mut self) io.Reader throws IOError {
+        if self.r == nil {
+            self.r = try io.reader(self.h)
+        }
+        return self.r
+    }
+
     // read returns up to `max` bytes. An empty result means the peer closed
     // the connection (end of stream).
-    func read(self, max int) str throws IOError {
-        return try net._recv(self.h, max)
+    func read(mut self, max int) str throws IOError {
+        let r = try self.reader()
+        return try r.read(max)
     }
 
     // read_line reads up to and including the next newline, or to end of
-    // stream. It reads a byte at a time so it never consumes past the line;
-    // wrap a Conn in your own buffering for high-throughput line protocols.
-    func read_line(self) str throws IOError {
-        var b = str.Builder{}
-        while true {
-            let ch = try net._recv(self.h, 1)
-            if len(ch) == 0 { break }        // end of stream
-            b.write(ch)
-            if ch == "\n" { break }
-        }
-        return b.done()
+    // stream. It is buffered: one recv per 8 KiB rather than one per byte,
+    // and it never consumes past the line as far as the CALLER can tell —
+    // read-ahead lands in the Conn's own buffer, which every other read here
+    // consults first.
+    func read_line(mut self) str throws IOError {
+        let r = try self.reader()
+        return try r.read_line()
     }
 
     // read_all reads until the peer closes the connection.
-    func read_all(self) str throws IOError {
-        var b = str.Builder{}
-        while true {
-            let chunk = try net._recv(self.h, 65536)
-            if len(chunk) == 0 { break }
-            b.write(chunk)
-        }
-        return b.done()
+    func read_all(mut self) str throws IOError {
+        let r = try self.reader()
+        return try r.read_all()
     }
 
     // write sends `data`, looping over partial writes, and returns the number
@@ -170,11 +180,20 @@ impl Conn {
     }
 
     // write_all sends every byte of `data`, or fails with an IOError.
-    func write_all(self, data str) throws IOError {
+    //
+    // The result is `unit!`, not nothing and not bare `unit`: a short write is
+    // reported as an error VALUE, the same convention as every other method
+    // here, so the function genuinely returns one value — unit, or the error.
+    // Bare `unit` is the EMPTY type (§3.1), i.e. no result at all, and a
+    // function with no result cannot return one. (It used to say it returned
+    // nothing and then `return errf(…)` anyway — the callers'
+    // `match … { Err(e) => … }` worked by accident of the lowering.)
+    func write_all(self, data str) unit! {
         let n = try self.write(data)
         if n < len(data) {
             return errf("short write: {n} of {len(data)} bytes")
         }
+        return ()
     }
 
     // local_addr / remote_addr are this end's and the peer's "host:port".

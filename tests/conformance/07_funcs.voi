@@ -13,6 +13,16 @@ impl[T] Stack[T] {
     func pop(mut self) ?T { return self.items.pop() }
     func depth(self) int { return len(self.items) }
 }
+// A trait method may live in an INHERENT impl block. The runtime dispatches
+// through ONE flat (type, method) table with no notion of which block an
+// entry came from, so `Marker` satisfies `Tag` when the program runs — and
+// the checker judges conformance against the union of every impl on a type.
+// This case is here so that union rule can never silently tighten.
+trait Tag { func tag(self) str }
+struct Marker { n int }
+impl Marker { func tag(self) str { return "marker#{self.n}" } }
+impl Tag for Marker { }
+
 func divmod(a, b int) (int, int) { return a~/b, a % b }
 func greet(name str, greeting str = "Hello") str { return "{greeting}, {name}!" }
 func total(nums ...int) int {
@@ -21,6 +31,19 @@ func total(nums ...int) int {
     return t
 }
 func make_const(n int) fn() int { return fn() int { return n } }
+
+// `unit` is the EMPTY type (§3.1) — the result type of a function with no
+// result — so a `unit` function may fall off its end and may `return` bare,
+// exactly like one that declares nothing at all. A checker that counted the
+// annotation as an owed result would reject all three of these.
+func announce(s str) unit { say "unit: " || s }
+
+func classify(n int) unit {
+    if n < 0 { return }
+    say "unit: nonneg"
+}
+
+func nothing() () { }
 
 func main() {
     let p = Point{x: 1.5, y: 2.5}
@@ -53,4 +76,10 @@ func main() {
     var got = []
     each f in fs { got.append(f()) }
     say fs.len(), got
+    let mk = Marker{n: 7}
+    say mk.tag()
+    announce("fell off the end")
+    classify(-1)
+    classify(0)
+    nothing()
 }

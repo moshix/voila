@@ -2,6 +2,12 @@
 // under 200 lines: a tokenizer built on enums with payloads (§3.5), an
 // exhaustive-match parser, and error values (T!) threaded with `try` (§8.1).
 // This is a scale model of the self-hosted compiler in selfhost/.
+//
+// The eleven hardcoded expressions in main() are a fossil: when this sample
+// was written Voilà could not read standard input at all. It keeps them —
+// they are what makes its golden a compact record of the evaluator's whole
+// behaviour. For the same evaluator driven by a prompt, see 15_calc.voi
+// (§13, std/io).
 package main
 
 use "std/fmt"

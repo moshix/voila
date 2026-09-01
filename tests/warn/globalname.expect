@@ -1,0 +1,4 @@
+warning[unused-import]: unused import `spare`
+!unused import `shapes`
+!unused import `tags`
+!unused import `std/fmt`

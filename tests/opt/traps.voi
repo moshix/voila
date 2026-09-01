@@ -2,7 +2,6 @@
 // at -O0 and every -O level (the messages live in the goldens; at -O3 the
 // arithmetic becomes native and the messages must come from the SAME
 // runtime strings).
-use "std/fmt"
 
 func main() {
     let big = 9223372036854775807

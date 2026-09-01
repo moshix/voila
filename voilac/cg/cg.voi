@@ -77,6 +77,12 @@ struct Gen {
     patSeq   int
     errs     []str
 
+    // Trait-default rows: the (type, method) pairs an `impl Trait for T`
+    // inherits rather than writes. Computed once, up front, because BOTH
+    // consumers need it and one of them runs before any body is emitted —
+    // see collect_inherited.
+    inherited []Method
+
     // Name tables (see instr.voi).
     known    set[str]      // names the C runtime provides
     pkgConst set[str]      // package constants: values, not callables
@@ -90,7 +96,7 @@ func new_gen(t ast.Tree, file int, m ir.Module) Gen {
         fnIdx: make(map[str]int), natIdx: make(map[str]int), nats: [],
         globals: make(map[str]int), gnames: [],
         defaults: make(map[str][]FieldDefault),
-        selCases: [], patSeq: 0, errs: [],
+        selCases: [], patSeq: 0, errs: [], inherited: [],
         known: set(), pkgConst: set(),
         binOp: bin_op_fns(), unOp: un_op_fns(),
     }
@@ -105,6 +111,7 @@ func Compile(t ast.Tree, file int, m ir.Module) str throws CGenError {
     each i, f in m.Funcs {
         g.fnIdx[f.Name] = i
     }
+    g.collect_inherited()
     g.collect_globals()
     g.collect_defaults()
 
@@ -245,11 +252,19 @@ impl Gen {
     }
 
     // native registers a runtime function and returns its NAT[] index.
+    //
+    // Reaching the refusal means the name does not EXIST, not that it is
+    // waiting on an implementation: every name low/names.voi can lower has a
+    // native (selftest cross-checks the two tables), so the wording must send
+    // the reader to the spelling rather than to a missing feature. For a
+    // Voilà-source std package chk/stdpkg.voi has already said so, at the
+    // reference, with a near miss.
     func native(mut self, name str) int {
         if name in self.natIdx { return self.natIdx[name] }
         if not (name in self.known) {
-            self.failf(fmt.sprintf("cgen: `%s` is not available in native " ||
-                                   "builds (no C implementation yet)", name))
+            self.failf(fmt.sprintf("cgen: `%s` is not a name the runtime " ||
+                                   "provides — check the spelling (§13.4)",
+                                   name))
         }
         let i = len(self.nats)
         self.natIdx[name] = i
@@ -333,7 +348,12 @@ impl Gen {
             } else if n.Kind == ast.ENUMDEC {
                 each v in self.T.Get(self.T.Kid(d, 0)).Kids {
                     let vn = self.T.Get(v)
-                    var vd = VarInfo{Typ: n.Sval, Variant: vn.Sval, Fields: []}
+                    // Both halves are package-qualified in the tree
+                    // (`geom.Shape`, `geom.Circle`), but a VlVariant pairs the
+                    // qualified TYPE with the SHORT variant name — that is the
+                    // shape vl_enum_new and vl_match both expect.
+                    let vpkg, vshort = split_variant(vn.Sval)
+                    var vd = VarInfo{Typ: n.Sval, Variant: vshort, Fields: []}
                     each f in self.T.Get(self.T.Kid(v, 0)).Kids {
                         vd.Fields.append(self.T.Get(f).Sval)
                     }
@@ -646,16 +666,124 @@ impl Gen {
 
     // ------------------------------------------------------------ table
 
+    // collect_inherited works out which trait defaults each implementor
+    // inherits, and it runs BEFORE a single body is emitted. That timing is
+    // the point: a method reaches its body by two roads, and only one of them
+    // is the method table. `p.subtitle()` becomes a CALLM the runtime resolves
+    // through vl_find_method, but `Page.subtitle()` — the spelling a self-less
+    // default has no alternative to — lowers to a CALL naming `Page.subtitle`,
+    // which instr.voi resolves through fnIdx and nowhere else. So an inherited
+    // default is registered in BOTH: a row here, and an fnIdx entry pointing
+    // the written-out name at the one shared body. Deferring this to
+    // emit_method_table would leave every static call unresolved and the
+    // backend refusing a program `check` had already passed.
+    func collect_inherited(mut self) {
+        // Trait declarations by their FLAT name. The loader has already
+        // flattened both sides — a TRAITDEC's Sval and the `impl X for T`
+        // header's — to the same string (§11.2.1), so the two match without
+        // this stage knowing anything about packages. A trait may be declared
+        // AFTER the impl block naming it, so the index is built first, in one
+        // pass of its own. Last writer wins, as it does in chk.collect and in
+        // fnIdx.
+        var traits = make(map[str]int)
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            let n = self.T.Get(d)
+            if n.Kind == ast.TRAITDEC { traits[n.Sval] = d }
+        }
+        if len(traits) == 0 { return }
+
+        // `written` holds every (type, method) the program SPELLS OUT, taken
+        // from the declaration rather than from anything downstream of it: a
+        // method the program writes is the implementor's own, and a trait
+        // default must never shadow it. Inherent impls and an exception's own
+        // methods count — the table is flat, so they satisfy a trait exactly
+        // as chk/traits.voi's union rule says they do.
+        var written = set([])
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            let n = self.T.Get(d)
+            if n.Kind == ast.IMPLDEC {
+                let tn = self.impl_target(d)
+                each m in self.T.Get(self.T.Kid(d, 0)).Kids {
+                    written.add(tn || "|" || self.T.Get(m).Sval)
+                }
+            } else if n.Kind == ast.EXCDEC {
+                each m in self.T.Get(self.T.Kid(d, 1)).Kids {
+                    written.add(n.Sval || "|" || self.T.Get(m).Sval)
+                }
+            }
+        }
+
+        // One row per `impl Trait for T` method T did not write. An inherent
+        // `impl T { … }` (Sval "") introduces no trait and inherits nothing.
+        //
+        // `written` also settles the case where one type implements two
+        // traits that default the SAME method name: the first `impl` block in
+        // declaration order claims the pair, and the second finds it taken.
+        // That is the rule vl_find_method already applies when it searches
+        // the finished table and returns the first match — decided here
+        // instead, so the table carries one row rather than two.
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            let n = self.T.Get(d)
+            if n.Kind != ast.IMPLDEC or n.Sval == "" { continue }
+            if not (n.Sval in traits) { continue }   // builtin: no method list
+            let tn = self.impl_target(d)
+            if tn == "" { continue }
+            each m in self.T.Get(self.T.Kid(traits[n.Sval], 0)).Kids {
+                if self.T.Kind(m) != ast.FUNC { continue }
+                // No body and no `= expr`: abstract, nothing to inherit.
+                if self.T.Kid(m, 0) == 0 and self.T.Kid(m, 5) == 0 { continue }
+                let mn = self.T.Get(m)
+                let key = tn || "|" || mn.Sval
+                let full = n.Sval || "$$" || mn.Sval
+                if key in written or not (full in self.fnIdx) { continue }
+                written.add(key)
+                let fi = self.fnIdx[full]
+                // The alias lets `T.m()` — a STATIC call, resolved through
+                // fnIdx rather than the method table — reach the shared
+                // body. It must never overwrite an existing entry: fnIdx is
+                // one flat namespace where methods (`Type.method`) and
+                // package-qualified functions (`pkg.Func`) both live, minted
+                // with a dot by flattening. `written` already proves this
+                // type declared no such method, so a key ALREADY here
+                // belongs to something else — a package function `Box.Area`
+                // beside a `Box` inheriting a default `Area` — and
+                // clobbering it would silently redirect that call: the very
+                // last-writer-wins failure `$$` was chosen to avoid.
+                // ...and `known` as well as `fnIdx`. They are two DIFFERENT
+                // namespaces and emit_call consults fnIdx FIRST, so an alias
+                // that shadows a C native silently redirects every call to
+                // it in the whole program — `impl Shouty for str { }`, an
+                // empty block writing no method at all, rerouted every
+                // `str.upper` while `"x".upper()` still reached the native,
+                // so the two roads disagreed. `written` proves only that the
+                // TYPE declared no such method; it knows nothing about the
+                // runtime's own names.
+                let alias = tn || "." || mn.Sval
+                if not (alias in self.fnIdx) and not (alias in self.known) {
+                    self.fnIdx[alias] = fi
+                }
+                self.inherited.append(Method{Typ: tn, Name: mn.Sval, Fn: fi,
+                                             HasSelf: (mn.Ival2 & 1) != 0})
+            }
+        }
+    }
+
+    // impl_target names the type an impl block attaches to — the TNAMED's
+    // name, or "" for a target that is not a named type and so carries no
+    // methods. The same answer chk/traits.voi's impl_target gives.
+    func impl_target(self, d int) str {
+        let te = self.T.Get(d).Ival
+        if te == 0 or self.T.Kind(te) != ast.TNAMED { return "" }
+        return self.T.Get(te).Sval
+    }
+
     func emit_method_table(mut self) {
         var ms = []
         each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
             let n = self.T.Get(d)
             if n.Kind == ast.IMPLDEC {
                 // The impl target: only a named type carries methods.
-                var tn = ""
-                if n.Ival != 0 and self.T.Kind(n.Ival) == ast.TNAMED {
-                    tn = self.T.Get(n.Ival).Sval
-                }
+                let tn = self.impl_target(d)
                 each m in self.T.Get(self.T.Kid(d, 0)).Kids {
                     let mn = self.T.Get(m)
                     let full = tn || "." || mn.Sval
@@ -677,6 +805,11 @@ impl Gen {
                 }
             }
         }
+        // Inherited trait defaults, AFTER every explicit method: one compiled
+        // body — low.lower_trait_default emitted it once under
+        // `{Trait}$${method}` — serves every implementor that did not write
+        // the method itself. collect_inherited decided which those are.
+        each x in self.inherited { ms.append(x) }
         let sorted = sort_methods(ms)
         self.p("static const VlMethod g_methods[] = \{")
         each x in sorted {

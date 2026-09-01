@@ -1,0 +1,81 @@
+package main
+
+// Two independent packages declaring the same variant names and the same
+// trait name. Every spelling below has to keep them apart.
+use "shared/one"
+use "shared/two"
+use "shared/three"
+
+// A trait name may be QUALIFIED wherever a trait name appears: an `impl`
+// header, a generic bound, and annotation position. Both packages declare a
+// `Named`, so the qualifier is the only thing that says which.
+struct Pair { }
+
+impl one.Named for Pair {
+    func Name(self) str { return "pair" }
+}
+
+func label[T: one.Named](x T) str { return x.Name() }
+
+func many(xs []two.Named) int { return len(xs) }
+
+func maybe(n int) ?int {
+    if n > 0 { return n }
+    return nil
+}
+
+// The entry file's OWN declarations win over an import's. `one` and `two`
+// both offer a bare `Empty`, which would be an ambiguity — but this file
+// declares one, and its own name is step 1 of the short-name rule even though
+// the entry file has no package to be qualified by.
+enum Local { Empty, Full(n int) }
+
+// `three` declares a `Show` of its own; this is the BUILTIN one, and the
+// language's names are never an import's to claim.
+struct Plain { }
+
+impl Show for Plain {
+    func show(self) str { return "plain" }
+}
+
+func main() {
+    say one.Show(one.Mk()), one.Show(one.Zero())
+    say two.Show(two.Mk()), two.Show(two.Zero())
+
+    // The trait `Named` is declared by both packages; dispatch is by method
+    // name, and each implementor keeps its own.
+    let a = one.Tag{}
+    let b = two.Tag{}
+    say a.Name(), b.Name()
+    say label(Pair{}), many([])
+
+    // Step 1 for the entry file: `Empty` is Local's, not one's or two's.
+    var loc = Empty
+    match loc {
+        Empty  => say "local empty"
+        Full(n) => say "local full", n
+    }
+
+    // A package may declare `Some` and `Show`; neither reaches this file.
+    let opt = maybe(3)
+    match opt {
+        Some(v) => say "builtin Some", v
+        nil     => say "builtin nil"
+    }
+    say Plain{}.show()
+    say three.Name(three.Wrapped()), three.Hidden()
+
+    // A qualified variant in PATTERN position.
+    match one.Mk() {
+        one.Node(v) => say "one node", v
+        _           => say "unexpected"
+    }
+
+    // The variant of the OTHER package's enum shares a short name with this
+    // subject's, and must not match it. Without the qualifier check in
+    // vl_match this printed "wrong".
+    match one.Zero() {
+        two.Empty => say "wrong"
+        _         => say "right"
+    }
+}

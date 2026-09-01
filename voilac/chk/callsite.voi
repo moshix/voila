@@ -36,10 +36,17 @@ impl Checker {
             let n = self.T.Get(d)
             if n.Kind == ast.FUNC and self.T.Kid(d, 0) != 0 {
                 self.check_calls_in(d)
-            } else if n.Kind == ast.IMPLDEC {
+            } else if n.Kind == ast.IMPLDEC or n.Kind == ast.TRAITDEC {
+                // TRAITDEC for the same reason all_stmts walks it: a default
+                // body is compiled and run, so its call sites are real. Kid 0
+                // is the method list for both kinds.
                 each m in self.T.Get(self.T.Kid(d, 0)).Kids {
-                    if self.T.Kind(m) == ast.FUNC and self.T.Kid(m, 0) != 0 {
+                    if self.T.Kind(m) != ast.FUNC { continue }
+                    if self.T.Kid(m, 0) != 0 {
                         self.check_calls_in(m)
+                    } else if self.T.Kid(m, 5) != 0 {
+                        // The `= expr` default: its code hangs off Kids[5].
+                        self.check_calls_under(m, self.T.Kid(m, 5))
                     }
                 }
             }
@@ -54,9 +61,20 @@ impl Checker {
     }
 
     func check_calls_in(mut self, fnode int) {
+        self.check_calls_under(fnode, self.T.Kid(fnode, 0))
+    }
+
+    // check_calls_under judges the calls in ONE subtree of a function, with
+    // that function's own bindings collected. It exists for the trait-default
+    // short form: `func m(self) int = helper(1)` keeps its body in Kids[5]
+    // rather than Kids[0], so a walker that only ever looked at Kids[0] saw
+    // no code at all and the call went unchecked — `check` said ok and the
+    // program died with a nil argument.
+    func check_calls_under(mut self, fnode int, sub int) {
+        if sub == 0 { return }
         var bound = set([])
         self.collect_bound(fnode, bound)
-        self.walk_calls(self.T.Kid(fnode, 0), bound)
+        self.walk_calls(sub, bound)
     }
 
     // collect_bound gathers every name the subtree binds. Over-collection
@@ -83,10 +101,11 @@ impl Checker {
                 }
             }
         }
-        // Patterns live behind Ival on ARM and `if let`. Inside a PATTERN,
-        // a bare IDENT is a bind — but only there: an IDENT anywhere else
-        // is a USE, and treating uses as binds would suppress every check
-        // (the callee itself is an IDENT).
+        // Patterns live behind Ival on ARM and `if let`, and have their own
+        // node kinds rather than sharing IDENT — which is exactly why they
+        // need their own collector rather than a recursion that looks for
+        // identifiers (an IDENT anywhere else is a USE, and treating uses as
+        // binds would suppress every check: the callee itself is an IDENT).
         if (k == ast.ARM or k == ast.IF) and n.Ival != 0 {
             self.collect_pattern_binds(n.Ival, bound)
         }
@@ -95,11 +114,25 @@ impl Checker {
         }
     }
 
+    // collect_pattern_binds gathers the names a pattern introduces. PBIND is
+    // the bind; PVARIANT's own Sval is a variant NAME and is collected too,
+    // because over-collection can only suppress a check while MISSING a bind
+    // invents a wrong one.
+    //
+    // This used to test ast.IDENT, which a pattern never contains — the
+    // parser emits PWILD/PNIL/PLIT/PBIND/PVARIANT and nothing else (see
+    // par/stmt.voi, and rewrite.voi's `pattern` and bind.voi's
+    // `bind_pattern`, both of which had it right). So it collected NOTHING,
+    // ever, and every check reading this set judged a pattern's name as if it
+    // were the module-level thing of the same name: `if let Some(helper) = …`
+    // was checked against the arity of a function `helper`, and (once
+    // stdpkg.voi arrived) `if let Some(path) = …` followed by `path.upper()`
+    // was accused of missing an import.
     func collect_pattern_binds(self, node int, bound mut set[str]) {
         if node == 0 { return }
         let n = self.T.Get(node)
-        if n.Kind == ast.IDENT and n.Sval != "" {
-            bound.add(n.Sval)      // may be a variant name: over-collection
+        if (n.Kind == ast.PBIND or n.Kind == ast.PVARIANT) and n.Sval != "" {
+            bound.add(n.Sval)
         }
         each kid in n.Kids {
             self.collect_pattern_binds(kid, bound)

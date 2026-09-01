@@ -87,7 +87,13 @@ typedef enum {
   O_TYPE,
   O_FRAME,
   O_ITER,
-  O_SOCKET      /* a network socket (std/net); owns an OS file descriptor */
+  O_SOCKET,     /* a network socket (std/net); owns an OS file descriptor */
+  O_READER,     /* std/io: a buffered byte source (os.stdin, io.reader) */
+  O_WRITER,     /* std/io: a byte sink (os.stdout, io.writer) */
+  O_MUTEX,      /* std/sync: a pthread mutex (sync.Mutex) */
+  O_RWLOCK,     /* std/sync: a pthread rwlock (sync.RWLock) */
+  O_ATOMIC,     /* std/sync: one atomically-updated int64 (sync.Atomic) */
+  O_REGEX       /* std/regex: a compiled pattern (its NFA program) */
 } VlKind;
 
 struct VlObj {

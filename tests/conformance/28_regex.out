@@ -1,0 +1,48 @@
+^a+b$ / aaab           true
+^a+b$ / aaac           false
+^a*$ / (empty)         true
+^a?b$ / b              true
+<(.+)>                 ["<a><b>", "a><b"]
+<(.+?)>                ["<a>", "a"]
+^a{3}$ / aaa           true
+^a{3}$ / aa            false
+^a{2,4}$ / aaa         true
+^a{2,4}$ / aaaaa       false
+a{2,}? / aaaa          ["aa", "aa"]
+(\d+)-(\d+)            ["12-34", "12", "34"]
+(a)|(b) / b            ["b", "", "b"]
+(ab|abc)               ["ab", "ab"]
+[a-z]+                 [["one"], ["three"]]
+[^aeiou]+              ["XYZ"]
+\w+@\w+                true
+\s                     true
+\D+                    ["abc"]
+a* / bab               [[""], ["a"], [""], [""]]
+replace $2/$1          corp/joe
+replace $$             $
+split                  ["a", "b", "c"]
+compiled / 42          true
+compiled / 4x          false
+source                 ^[0-9]+$
+utf8 .                 [["h"], ["é"], ["l"], ["l"], ["o"]]
+utf8 h(.)l             ["hél", "é"]
+utf8 [^l]              [["h"], ["é"], ["o"]]
+utf8 literal           true
+(unbalanced            regex: unbalanced `(` in /(unbalanced/
+trailing\              regex: trailing backslash in /trailing\/
+a{2,1}                 regex: repetition range is out of order in /a{2,1}/
+[z-a]                  regex: character class range is out of order in /[z-a]/
+*nothing               regex: a quantifier has nothing to repeat in /*nothing/
+back\1ref              regex: backreferences are not supported: they cannot be matched in linear time in /back\1ref/
+(?=look)               regex: only the non-capturing group `(?:` is supported; lookaround is not in /(?=look)/
+40-node literal        ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+(a*)*      true
+(a?)+      true
+(\s*)*     true
+(a|b|)*    true
+()*        true
+^*         true
+$*         true
+\b refused
+bomb matches           true
+bomb fails             false

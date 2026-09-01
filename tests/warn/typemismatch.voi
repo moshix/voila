@@ -1,0 +1,63 @@
+// Every diagnostic chk/expr.voi can produce, once each. The code defaults
+// OFF (diag.DefaultOff), so the .flags file beside this one asks for it.
+package main
+
+struct Point { x int; y int }
+
+impl Point {
+    func norm(self) int { return self.x + self.y }
+}
+
+trait Describe {
+    func describe(self) str
+}
+
+impl Describe for Point {
+    func describe(self) str { return "a point" }
+}
+
+struct Stack[T] { items []T }
+
+impl[T] Stack[T] {
+    func push(mut self, v T) { self.items.append(v) }
+}
+
+func greet(who str) str { return "hi " || who }
+
+func addup(a int, b int) int { return a + b }
+
+// 4. a returned value against the declared result
+func wrong_result() int { return greet("x") }
+
+// 1. an initialiser against its annotation
+var n int = greet("a")
+
+// 2. an assignment against the target's type
+var m int = 1
+m = greet("b")
+
+// 3. an argument against the parameter
+var sum = addup(1, greet("c"))
+
+// … and through a generic receiver, where the parameter is `T` and the
+// receiver's own type argument is what says `T` is `int` (typ.Subst).
+var st = Stack[int]{items: []}
+
+// 5. a field the struct does not declare
+var p = Point{x: 1, y: 2}
+
+// 6. a method the receiver does not have, and one called with the wrong
+//    number of arguments. On a TRAIT-typed receiver only a name NO
+//    declaration in the program spells can be reported — see typesilent.voi.
+var d Describe = p
+
+func main_checks() {
+    st.push("not an int")
+    say p.z
+    say p.frobnicate()
+    say p.norm(1)
+    say d.no_such_method()
+    say wrong_result(), n, m, sum, d.describe()
+}
+
+main_checks()

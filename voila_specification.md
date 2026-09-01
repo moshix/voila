@@ -1,6 +1,6 @@
 # Voilà — Language Specification
 
-**Version 0.4.2 (Draft)** — 0.4.2 makes a prebuilt Voilà binary (>= 0.4.1) the primary way to build the compiler (BOOTSTRAP.md); the C seed is a portability fallback. 0.4.1 added `std/net` (TCP/UDP/Unix sockets; manual §11.5), the first Voilà-authored std package. 0.4 added the optimizing backend (`voila build -O1|-O2|-O3`; manual §12.5). Floor division is spelled `~/`; `//` is a comment only (§5.1). Version 0.2 added exceptions (§8), implicit numeric conversions (§3.2), and the core library (§13).
+**Version 0.5.0 (Draft)** — 0.5.0 grows the Voilà-authored standard library (`std/csv`, `std/http`, `std/path`, `std/sync`, `std/test`, `std/time`) on new runtime support for I/O, regular expressions, hashing and synchronization. 0.4.2 made a prebuilt Voilà binary (>= 0.4.1) the primary way to build the compiler (BOOTSTRAP.md); the C seed is a portability fallback. 0.4.1 added `std/net` (TCP/UDP/Unix sockets; manual §11.5), the first Voilà-authored std package. 0.4 added the optimizing backend (`voila build -O1|-O2|-O3`; manual §12.5). Floor division is spelled `~/`; `//` is a comment only (§5.1). Version 0.2 added exceptions (§8), implicit numeric conversions (§3.2), and the core library (§13).
 File extension: `.voi` · Module file: `voila.mod` · Toolchain: `voila`
 
 ---
@@ -295,6 +295,24 @@ func print_all(items []Show) {      // dynamic dispatch
 
 Any type implementing `Show` may be passed where `Show` is expected. `say` uses `Show` if present, else the derived structural form.
 
+A trait method may carry a **default implementation**, which an implementor inherits by not writing the method. Two spellings; `= expr` is shorthand for `{ return expr }`:
+
+```voila
+trait Titled {
+    func title(self) str                    // abstract: every impl owes it
+    func subtitle(self) str = "(none)"      // a default, short form
+    func banner(self) str {                 // a default, block form
+        return "[" || self.title() || " / " || self.subtitle() || "]"
+    }
+}
+
+impl Titled for Page {
+    func title(self) str { return self.name }   // subtitle, banner inherited
+}
+```
+
+A default is compiled ONCE and shared by every implementor — dispatch is by the receiver's run-time type, so a default calling `self.title()` reaches the implementor's own `title`. An implementor that writes the method overrides the default; a method written in an inherent `impl T { … }` block counts as written. Where two traits implemented by one type default the same method name, the earlier `impl` block wins.
+
 ### 3.7 Generics
 
 ```voila
@@ -314,6 +332,10 @@ impl[T] Stack[T] {
 ```
 
 Constraints are traits: `Ord`, `Eq`, `Hash`, `Show`, `Copy`, `Send`, or any user trait. Generics are monomorphised in compiled mode and type-erased in the interpreter — identical observable behaviour.
+
+A constraint is **checked wherever a real type is written in place of the parameter**: in a composite literal (`Stack[Point]{}`), in an annotation (`var s Stack[Point]`), and in an explicit instantiation (`max[Point](a, b)`). The argument must provide the constraint's methods, and a method counts wherever it is written — dispatch is by name and does not distinguish an inherent `impl T { … }` from an `impl Trait for T`, so both satisfy. The six predeclared constraints above have no method set of their own and nothing is judged against one. Checking a parameter against its own bound from *inside* a generic body is not yet performed.
+
+A type argument may itself be an instantiation — `Stack[Box[int]]`, in an annotation and in a composite literal alike.
 
 ### 3.8 Type declarations
 
@@ -857,15 +879,35 @@ Go's model, essentially unchanged, because it works.
 ### 11.1 `voila.mod`
 ```
 module github.com/moshix/voila-bbs
-voila 0.1
+voila 0.5.0
 
 require (
     github.com/moshix/go3270  v1.4.2
     codenotary.com/immudb-voi v0.9.0
-    std                        0.1
 )
+
+replace codenotary.com/immudb-voi => ../immudb-voi
 ```
-`voila.sum` pins content hashes. Resolution is **minimum version selection** — reproducible, no lockfile drift, no solver surprises.
+Directives, and nothing else:
+
+| Directive | Form | Rule |
+|---|---|---|
+| `module` | `module <modpath>` | **exactly one** per file |
+| `voila` | `voila <version>` | the language version the module needs; a version **newer** than the compiler is refused, and the error names both |
+| `require` | `require <modpath> <version>`, or a parenthesised block of the same | a duplicate `require` for one path is an error unless the versions agree |
+| `replace` | `replace <modpath> [<version>] => <localpath>` or `=> <modpath> <version>`, single or block | applies **only from the main module**, never transitively |
+
+An **unknown directive is an error**, not something quietly skipped.
+
+**Resolution order** for an import path, in full: a Voilà-source std package, a C std package, a `replace` target, the module cache, a directory under the module root — and then a refusal that names every one of those places it looked.
+
+**Version selection** is the maximum of the required versions per module path. For a graph of exact requirements that *is* minimum version selection, and it needs no backtracking.
+
+The **module cache** is `$VOILA_MODCACHE`, defaulting to `~/.cache/voila/mod/<modpath>@<version>/`. A cached dependency is loaded and flattened from source exactly like any other package, so nothing downstream of the loader knows where it came from.
+
+`voila.sum` holds one `<modpath> <version> <hash>` line per dependency. **It is a drift detector, not a security boundary**: the hash is FNV-1a-64, which is not cryptographic. It catches a cached tree edited or truncated underfoot; it does not resist a deliberate collision. (`std/crypto` has a real SHA-256, and this deliberately does not use it yet: the compiler must stay buildable by a bootstrap compiler whose runtime has no `crypto.*` natives at all. The `f1a64:` prefix on every hash exists so the swap can be told apart when it happens.) A module with no `voila.sum` is not checked; once the file exists it is authoritative, and a missing entry is as much a refusal as a wrong one. A `replace` to a local directory is never hashed — it is source you are editing.
+
+`voila get <modpath>@<version>` **shells out to `git clone --depth 1 --branch <version>`**. There is no network code in the compiler and there will not be: git owns the transport, the credentials and the trust. The compiler checks that the clone declares the module it is being filed as, hashes it, records or verifies the hash in `voila.sum`, and moves it into the cache under a claim-then-move rename.
 
 ### 11.2 `use`
 ```voila
@@ -877,6 +919,27 @@ use "std/math" *                             // wildcard (discouraged; allowed i
 ```
 Import path == repository path == directory. One directory = one package. Unused imports are a **warning**, not an error (a deliberate softening of Go, for REPL/script comfort).
 
+### 11.2.1 Name qualification
+
+**Every** exported declaration of a package is qualified by it — functions, types, exceptions, *enum variants* and *trait names* alike. `Circle` declared in `geom` is `geom.Circle`; `Named` declared in `geom` is `geom.Named`. Two independent packages may therefore each declare an `Empty` or a `Named` without colliding, which is what makes an ecosystem possible at all.
+
+Variants and traits are also the only names an importer may spell **without** a qualifier, because patterns, `impl` headers and generic bounds read better bare. An unqualified name resolves in this order:
+
+1. the current package;
+2. exactly **one** import.
+
+Two imports offering the same bare name is an error naming both candidates — never a silent pick. The qualified spelling always works and is how the ambiguity is resolved:
+
+```voila
+match s {
+    geom.Circle(r) => …          // always unambiguous
+    Rect(w, h)     => …          // short form: geom is the only import with it
+}
+
+impl geom.Named for Box { … }    // a trait may be qualified too
+func show[T: geom.Named](x T) str { return x.Name() }
+```
+
 ### 11.3 Commands
 ```
 voila run main.voi        # interpret (bytecode VM)
@@ -886,7 +949,9 @@ voila build --target=linux/arm64 .
 voila test ./...          # tests are funcs named Test* in *_test.voi
 voila bench ./...
 voila fmt ./...           # canonical formatter, no options (gofmt doctrine)
-voila get github.com/x/y@v1.2.0
+voila get github.com/x/y@v1.2.0   # fetch into the module cache (via git)
+voila mod init [modpath]  # write a voila.mod
+voila mod verify          # re-hash the cached dependencies against voila.sum
 voila doc ./pkg
 voila repl                # interactive, with full type checking
 voila check .             # type + borrow + acyclicity check, no codegen
@@ -1084,17 +1149,71 @@ Bonus, because they earn their place: `range(a, b)`, `zip(a, b)`, `enumerate(v)`
 | `std/os` | files, processes, env, args, signals |
 | `std/math` | numerics, `std/math/dec` for decimal contexts |
 | `std/conv` | the conversion functions of §3.2 |
-| `std/time` | instants, durations, timers, tickers |
+| `std/time` | instants, durations, timers, tickers; calendar dates and RFC 3339 (UTC and fixed offsets — no tzdata) |
+| `std/path` | lexical file-system paths |
 | `std/sync` | `Mutex`, `RWLock`, `WaitGroup`, atomics, `Once` |
 | `std/chan` | fan-in, fan-out, pipelines, rate limiters |
 | `std/sort` `std/slices` `std/maps` | collection algorithms |
 | `std/regex` | RE2 — linear time, no catastrophic backtracking |
 | `std/json` `std/csv` `std/xml` `std/yaml` | encodings |
-| `std/http` `std/net` `std/crypto` | networking, TLS, hashes, signatures |
+| `std/http` `std/net` | networking: TCP, UDP and Unix sockets; an HTTP/1.1 client and server. Plaintext only — there is no TLS in this release, and an `https://` URL is refused rather than fetched in the clear |
+| `std/crypto` | SHA-256/512, SHA-1 and MD5 (legacy), HMAC, and a cryptographically secure random source (§13.5); signatures are not yet implemented |
 | `std/log` | structured logging |
 | `std/test` | assertions, table tests, fuzzing, benchmarks |
 | `std/vm` | embed the interpreter: `eval`, `compile` |
 | `std/ffi` | C interop |
+
+### 13.5 `std/crypto` — digests, HMAC, and randomness
+
+Written from FIPS 180-4, RFC 1321 and RFC 2104 in the runtime's own C. There
+is no OpenSSL and no other third-party dependency.
+
+| | |
+|---|---|
+| `crypto.sha256(m)` `crypto.sha512(m)` | lowercase hex digest |
+| `crypto.sha1(m)` `crypto.md5(m)` | **legacy** — see below |
+| `crypto.<alg>_raw(m)` | the same digest as raw bytes |
+| `crypto.hmac_sha256(k, m)` `crypto.hmac_sha512(k, m)` | RFC 2104, hex |
+| `crypto.hmac_sha1(k, m)` `crypto.hmac_md5(k, m)` | legacy hashes, keyed |
+| `crypto.hmac_<alg>_raw(k, m)` | the same MAC as raw bytes |
+| `crypto.random(n)` | `n` cryptographically secure random bytes |
+| `crypto.random_int(n)` | a uniform integer in `[0, n)`, no modulo bias |
+| `crypto.equal(a, b)` | equality in time independent of where they differ |
+
+A message and a key may each be spelled as a `str` (which is a byte string —
+`os.read` and `net.recv` already carry binary in one) or as a `[]byte`; the
+two produce the same digest. Digests come back as lowercase hex, or as raw
+bytes from the `_raw` names, over which `str.hex`, `str.b64` and `bytes` are
+the whole encoding layer:
+
+```voila
+crypto.sha256("abc")                     // "ba7816bf…f20015ad"
+crypto.sha256_raw("abc").b64()           // "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0="
+bytes(crypto.sha256_raw("abc"))          // []byte, 32 long
+crypto.random(32).hex()                  // a 256-bit token
+```
+
+**SHA-1 and MD5 are broken for security** and are provided for checksums and
+for interoperating with formats that already chose them. Practical collisions
+exist for both, so neither may carry a signature, a certificate, or a
+content-addressed identity. HMAC over either has no practical forgery, but a
+new protocol wants `crypto.hmac_sha256`.
+
+**`crypto.random` is the only random source fit for a key, a token, a nonce
+or a session id.** It draws from `getrandom(2)` on Linux, `getentropy(2)` on
+macOS and the BSDs, and `/dev/urandom` where neither is reachable, and it
+aborts rather than falling back to a weak source. A bad *count* is an
+ordinary catchable `RangeError`, as everywhere else in the language; only a
+missing entropy source is fatal. `std/rand` is a different thing: a fast,
+seedable, *reproducible* sequence for simulations and tests, whose output is
+predictable from a few hundred samples. `uuid.new()` draws from
+`crypto.random`; `std/rand`'s default seed does too, falling back to the
+clock only on a machine with no entropy source at all — a program that never
+draws a random number must still be able to start.
+
+Compare a MAC with `crypto.equal`, not `==`. `==` stops at the first byte
+that differs, and that timing is enough to recover a MAC one byte at a time
+from a service that will verify a guess.
 
 ---
 
@@ -1116,7 +1235,9 @@ func fetch(url str) Result! {
 }
 
 func main() {
-    let urls = ["https://moshix.tech", "https://codenotary.com", "https://example.com"]
+    // http:// and not https://: this release has no TLS, and std/http refuses
+    // an https URL rather than fetching it in the clear (§13.4).
+    let urls = ["http://moshix.tech", "http://codenotary.com", "http://example.com"]
     let jobs    = chan[str](len(urls))
     let results = chan[Result](len(urls))
 
@@ -1360,4 +1481,4 @@ voila run f.voi | voila build   // same source, same semantics
 
 ---
 
-*Voilà 0.4.2 draft specification. Designed for review — the acyclicity rule (§6.3), the structured-concurrency guarantee (§9.1), and the two-mechanism error story (§8) are the three claims most worth attacking first.*
+*Voilà 0.5.0 draft specification. Designed for review — the acyclicity rule (§6.3), the structured-concurrency guarantee (§9.1), and the two-mechanism error story (§8) are the three claims most worth attacking first.*

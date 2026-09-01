@@ -2,6 +2,14 @@
 //
 // Paths are slash-separated. The toolchain runs on POSIX systems; a Windows
 // port would localise the separator here and nowhere else.
+//
+// THIS IS A PRIVATE COPY, and std/path is the public one it was lifted into.
+// The compiler does NOT `use "std/path"` and must not until the bootstrap
+// floor moves: build.sh accepts a bootstrap compiler as old as MIN_BOOTSTRAP
+// (0.4.1), which has no std/path to graft, so a compiler that imported it
+// could not be built by the compiler that is allowed to build it. Delete this
+// file and switch the callers over one generation after std/path ships —
+// exactly the rule the mkdir/run shell-outs follow.
 package path
 
 use "std/str"

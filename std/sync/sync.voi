@@ -1,0 +1,391 @@
+// std/sync — the primitives that make shared state between tasks safe:
+// Mutex, RWLock, Atomic, Once and WaitGroup (§13.4).
+//
+// Voilà's tasks are real OS threads (§9), so two of them running at once are
+// genuinely running at once. Until this package the language had exactly one
+// way to protect shared state — `cell`, which runs a closure under a lock it
+// owns and never lends out — and no way at all to protect state that is not
+// inside a cell, to let many readers share, to count workers down, or to
+// initialise something exactly once. This is that missing floor.
+//
+// Like std/net, only the irreducible machine-level surface is C: the `sync._*`
+// natives, one pthread or one atomic instruction each. Everything a program
+// touches is this file.
+//
+// -------------------------------------------------------------- unlocking
+//
+// `defer mu.unlock()` on the line after `mu.lock()` is not a matter of taste.
+// A critical section can be left by `return`, by `break`, and by a THROW, and
+// the throw does not have to be one you wrote: cooperative cancellation
+// (§10) raises `Cancelled` inside a task at every loop backedge, at every
+// channel operation, and inside `time.sleep`, so a group timeout or a
+// sibling's failure can unwind a task from the middle of a critical section.
+// Without `defer` the lock is then held by a task that no longer exists and
+// every other task blocks on it forever — a hang, not a diagnostic. The
+// runtime runs a frame's defers on the unwind path as well as the return
+// path, which is what makes the one line enough.
+//
+// `defer` is FUNCTION-scoped, not block-scoped. Inside a loop body it does
+// NOT unlock at the end of the iteration — it queues an unlock for when the
+// function returns, so the second turn round the loop asks for a lock this
+// task already holds. Use `with` for a per-iteration critical section, or
+// lock and unlock in the loop body without `defer`:
+//
+//     each item in work {
+//         mu.with(fn() { total = total + item })      // right
+//     }
+//
+// Going the other way: a task ALREADY BLOCKED in `lock()` is inside a pthread
+// wait, where the language's cooperative cancellation cannot reach it, so a
+// group timeout does not interrupt it — the same rule `net.accept` follows
+// (§10, Appendix D). `WaitGroup.wait` is the exception, and deliberately so:
+// it waits on a channel, which cancellation does reach.
+//
+// ------------------------------------------------------------- the closure
+//
+// Four calls here take a closure and run it with a lock held: `Mutex.with`,
+// `RWLock.with_read`, `RWLock.with_write` and `Once.do`. Holding a lock across
+// code you did not write is the hazard that wedged std/io's reader mutex
+// during development, so the rules are written down rather than assumed:
+//
+//   - A THROW is safe. `defer` releases the lock, and the runtime runs a
+//     frame's defers on the unwind path as well as the return path, so the
+//     exception leaves an unlocked mutex behind it and keeps travelling.
+//   - RE-ENTERING THE SAME MUTEX IS AN ERROR, not a hang. A Mutex is
+//     PTHREAD_MUTEX_ERRORCHECK, so `mu.with(fn() { mu.lock() })` throws
+//     RuntimeError instead of deadlocking against itself. An RWLock has no
+//     such guarantee from POSIX — re-entering one may genuinely hang — so do
+//     not take the same RWLock twice in one task, in either mode.
+//   - BLOCKING IS ALLOWED but blocks everyone: a channel receive, an
+//     `await`, or a read from a socket inside a critical section holds the
+//     lock for as long as it takes. Keep critical sections short and do I/O
+//     outside them.
+//   - UNLOCKING FROM INSIDE is an error. The closure must not call `unlock`
+//     on the lock it is running under; the `defer` that follows it would then
+//     unlock a lock this task no longer holds, and throw.
+//   - The lock is NOT re-entered by the runtime on your behalf. No native in
+//     sync.c calls back into Voilà, so nothing but your own closure runs
+//     inside the critical section.
+//
+// ---------------------------------------------------------------- ordering
+//
+// Every atomic operation is sequentially consistent. There is one order, every
+// task sees it, and `a.load()` after `a.store(v)` in another task means what it
+// looks like it means. Weaker orders are not offered: they would need a memory
+// model this specification does not have.
+package sync
+
+// Handle is an opaque handle to the pthread object or atomic word the C shim
+// owns. It is never constructed in Voilà; it only names the type of the field
+// that carries the shim's object, which is destroyed automatically when the
+// last reference to it is dropped.
+struct Handle {}
+
+// Mutex is mutual exclusion: at most one task inside the critical section.
+// It is NOT recursive — a task that already holds it and asks again gets a
+// RuntimeError rather than a deadlock.
+struct Mutex {
+    h Handle
+}
+
+// RWLock admits either any number of readers or exactly one writer. Use it
+// when reads greatly outnumber writes; a plain Mutex is faster otherwise, and
+// is the one to reach for when in doubt.
+struct RWLock {
+    h Handle
+}
+
+// Atomic is one integer that many tasks may update at once without a lock.
+struct Atomic {
+    h Handle
+}
+
+// Once runs one piece of work exactly once, however many tasks ask.
+struct Once {
+    mu   Mutex
+    done Atomic
+}
+
+// WaitGroup counts unfinished work down to zero, and `wait` blocks until it
+// gets there.
+//
+// `gate` is a channel that is never sent to — it is CLOSED when the count
+// reaches zero, and a receive on a closed channel returns at once for every
+// waiter, so closing it is a broadcast. Building the wake-up out of a channel
+// rather than a condition variable is what makes `wait` cancellable: a channel
+// receive observes a group's cancellation and its timeout (§10), and a raw
+// pthread wait would sit through both.
+//
+// A closed channel cannot be reopened, so a WaitGroup is SINGLE-USE, and
+// `shut` records that it has been used up. Without that flag the group is not
+// merely limited but WRONG: `wg.add(1)` per item, interleaved with the work,
+// lets a transient zero close the gate while items remain, after which every
+// `wait` returns at once and the caller silently proceeds over unfinished
+// work. `shut` turns that into a thrown RuntimeError at the `add` — the count
+// going back up is the thing that cannot be honoured, so that is where it is
+// refused. Count all the work FIRST (`wg.add(len(jobs))`), then spawn it.
+struct WaitGroup {
+    n    Atomic
+    shut Atomic
+    gate chan[int]
+}
+
+// ------------------------------------------------------------- constructors
+
+// mutex makes a new unlocked Mutex.
+func mutex() Mutex {
+    return Mutex{h: sync._mutex()}
+}
+
+// rwlock makes a new unheld RWLock.
+func rwlock() RWLock {
+    return RWLock{h: sync._rwlock()}
+}
+
+// atomic makes a new Atomic holding `v`.
+func atomic(v int) Atomic {
+    return Atomic{h: sync._atomic(v)}
+}
+
+// once makes a Once that has not yet run.
+func once() Once {
+    return Once{mu: mutex(), done: atomic(0)}
+}
+
+// wait_group makes a WaitGroup with a count of zero.
+func wait_group() WaitGroup {
+    return WaitGroup{n: atomic(0), shut: atomic(0), gate: chan[int](1)}
+}
+
+// ------------------------------------------------------------------- Mutex
+
+impl Mutex {
+    // lock blocks until this task holds the mutex.
+    //
+    // Pair it with `defer mu.unlock()` on the very next line, or use `with` —
+    // and read the "unlocking" section of the package header first, which
+    // says why that is a requirement rather than a habit, and why `defer` is
+    // the WRONG tool inside a loop body.
+    func lock(self) {
+        sync._lock(self.h)
+    }
+
+    // unlock releases the mutex. It throws RuntimeError if this task does not
+    // hold it — a mutex is owned by the task that locked it, and handing that
+    // ownership to another task is not a thing Voilà lets you express.
+    func unlock(self) {
+        sync._unlock(self.h)
+    }
+
+    // try_lock takes the mutex if it is free and reports whether it did. It
+    // never blocks. A false result is an ANSWER, not a failure: nothing is
+    // locked, and there is nothing to unlock.
+    func try_lock(self) bool {
+        return sync._try_lock(self.h)
+    }
+
+    // with runs `f` with the mutex held and returns whatever `f` returns.
+    // Read the package header before putting anything surprising in `f`.
+    func with[T](self, f) T {
+        self.lock()
+        defer self.unlock()
+        return f()
+    }
+}
+
+// ------------------------------------------------------------------ RWLock
+
+impl RWLock {
+    // read_lock blocks until no writer holds the lock, then admits this task
+    // alongside every other reader.
+    func read_lock(self) {
+        sync._rlock(self.h)
+    }
+
+    // write_lock blocks until the lock is completely free.
+    func write_lock(self) {
+        sync._wlock(self.h)
+    }
+
+    // read_unlock and write_unlock both release this task's hold. They are
+    // one call underneath — pthread_rwlock_unlock releases whichever kind of
+    // hold the caller has and there is no portable way to ask which — but
+    // they are spelled apart so that lock and unlock read as a pair.
+    func read_unlock(self) {
+        sync._rwunlock(self.h)
+    }
+
+    func write_unlock(self) {
+        sync._rwunlock(self.h)
+    }
+
+    // try_read_lock / try_write_lock take the lock if they can, and report.
+    func try_read_lock(self) bool {
+        return sync._try_rlock(self.h)
+    }
+
+    func try_write_lock(self) bool {
+        return sync._try_wlock(self.h)
+    }
+
+    // with_read runs `f` with the lock held for reading — `f` may run
+    // concurrently with other readers, so it must not mutate what it reads.
+    func with_read[T](self, f) T {
+        self.read_lock()
+        defer self.read_unlock()
+        return f()
+    }
+
+    // with_write runs `f` as the only task holding the lock.
+    func with_write[T](self, f) T {
+        self.write_lock()
+        defer self.write_unlock()
+        return f()
+    }
+}
+
+// ------------------------------------------------------------------ Atomic
+
+impl Atomic {
+    // load reads the current value.
+    func load(self) int {
+        return sync._load(self.h)
+    }
+
+    // store replaces it.
+    func store(self, v int) {
+        sync._store(self.h, v)
+    }
+
+    // add adds `delta` and returns the NEW value. Returning the new value is
+    // what makes "was I the one who brought it to zero" answerable without a
+    // lock — `if a.add(-1) == 0` is true in exactly one task.
+    func add(self, delta int) int {
+        return sync._add(self.h, delta)
+    }
+
+    func sub(self, delta int) int {
+        return sync._add(self.h, -delta)
+    }
+
+    func inc(self) int {
+        return sync._add(self.h, 1)
+    }
+
+    func dec(self) int {
+        return sync._add(self.h, -1)
+    }
+
+    // swap stores `v` and returns the value that was there before.
+    func swap(self, v int) int {
+        return sync._swap(self.h, v)
+    }
+
+    // cas stores `want` if the current value is `expect`, and reports whether
+    // it did. It is strong: it never fails when the values match, so
+    //
+    //     var old = a.load()
+    //     while not a.cas(old, old * 2) { old = a.load() }
+    //
+    // ends for the right reason.
+    func cas(self, expect int, want int) bool {
+        return sync._cas(self.h, expect, want)
+    }
+}
+
+// -------------------------------------------------------------------- Once
+
+impl Once {
+    // do runs `f` the first time it is called and never again, and does not
+    // return until `f` has finished — so a second task calling `do` waits for
+    // the first one's `f` rather than racing past it with the work half done.
+    //
+    // If `f` throws, the exception propagates and the Once stays UNRUN: a
+    // later `do` will try again. Initialisation that failed did not happen,
+    // and marking it done would leave every later caller using a half-built
+    // thing with no way to find out.
+    //
+    // `f` must not call `do` on the same Once — that is the re-entry the
+    // package header forbids, and it throws RuntimeError.
+    func do(self, f) {
+        // The fast path after the first call is one atomic load and no lock
+        // at all. The load inside the lock is the second half of the
+        // double-check: two tasks can both miss the fast path, and only one
+        // of them may run `f`.
+        if self.done.load() == 1 { return }
+        self.mu.lock()
+        defer self.mu.unlock()
+        if self.done.load() == 1 { return }
+        f()
+        self.done.store(1)
+    }
+
+    // has_run reports whether `f` has run to completion.
+    func has_run(self) bool {
+        return self.done.load() == 1
+    }
+}
+
+// --------------------------------------------------------------- WaitGroup
+
+impl WaitGroup {
+    // add raises the count by `delta` (which may be negative). Count ALL the
+    // work before any of it can finish — `wg.add(len(jobs))` and then spawn —
+    // rather than one `add` per item: a group whose count reaches zero is
+    // used up (see the struct comment), and an item added after that is
+    // refused rather than quietly not waited for.
+    func add(self, delta int) {
+        if delta > 0 and self.shut.load() == 1 {
+            throw RuntimeError{msg: "sync.WaitGroup: reused after its count " ||
+                                    "reached zero; count all the work with " ||
+                                    "one add() before spawning it, or make a " ||
+                                    "new WaitGroup per round"}
+        }
+        let now = self.n.add(delta)
+        if now < 0 {
+            throw RuntimeError{msg: "sync.WaitGroup: count went negative " ||
+                                    "(more done() than add())"}
+        }
+        // Exactly one task can see a downward step land on zero, because
+        // `add` is atomic and hands back the value it produced. The cas is
+        // belt to that braces, and it is what makes `close` safe: closing an
+        // already-closed channel throws, and it would throw inside a worker
+        // task naming a channel the program never created.
+        if now == 0 and delta < 0 {
+            if self.shut.cas(0, 1) {
+                close(self.gate)
+            }
+        }
+    }
+
+    // done records one finished piece of work.
+    func done(self) {
+        self.add(-1)
+    }
+
+    // wait blocks until the count reaches zero. It returns at once if the
+    // count is already zero, and every waiting task is released together.
+    //
+    // Because it waits on a channel, it is CANCELLABLE: a group timeout or a
+    // sibling's failure makes it throw `Cancelled` rather than sit there, the
+    // same as any other channel receive (§10). That is the reason it is built
+    // this way and not on a condition variable, which nothing could interrupt.
+    //
+    // A WaitGroup is SINGLE-USE: once the count has reached zero the gate is
+    // closed for good, and `add` refuses to raise the count again. Make a new
+    // one per round of work.
+    func wait(self) {
+        // `<= 0`, not `== 0`: a count driven NEGATIVE by more done() than
+        // add() has already thrown from add, and the gate may never have been
+        // closed. Waiting for a count that is past zero to come back to it
+        // would turn one loud error into a silent hang.
+        if self.n.load() <= 0 { return }
+        <-self.gate
+    }
+
+    // count is the number of pieces of work still outstanding. It is a
+    // snapshot: by the time you read it, it may have changed.
+    func count(self) int {
+        return self.n.load()
+    }
+}

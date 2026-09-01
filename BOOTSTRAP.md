@@ -19,7 +19,7 @@ The first compiler comes from one of two places, and there is a script for each:
 
 - **`./build.sh`** is the everyday, self-hosted path: an existing Voilà binary
   (≥ `MIN_BOOTSTRAP` = **0.4.1**) compiles the compiler, then the result
-  compiles it again and the two emissions must match. **Building 0.4.2 needs a
+  compiles it again and the two emissions must match. **Building 0.5.0 needs a
   0.4.1-or-newer Voilà** — that is the minimum. If no usable binary is found,
   `build.sh` stops and points you at `bootstrap.bash`; it never silently
   reaches for `cc`.

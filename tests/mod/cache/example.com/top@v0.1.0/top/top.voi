@@ -1,0 +1,7 @@
+package top
+
+// A dependency that itself has a dependency: `top` reaches `lib` through its
+// OWN voila.mod, which the main module never mentions.
+use "example.com/lib/greet"
+
+func Say() str { return "top -> " || greet.Hello() }

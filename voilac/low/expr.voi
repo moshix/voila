@@ -301,10 +301,9 @@ impl Lowerer {
             let vi = self.variants[name]
             let rv = self.new_reg()
             if not vi.payload {
-                self.emit(n.Line, "NEWENUM",
-                          [rv, vi.owner || "." || name, "()"])
+                self.emit(n.Line, "NEWENUM", [rv, vi.tag, "()"])
             } else {
-                self.emit(n.Line, "LOADFN", [rv, vi.owner || "." || name])
+                self.emit(n.Line, "LOADFN", [rv, vi.tag])
             }
             return rv
         }
@@ -445,10 +444,11 @@ impl Lowerer {
             let base = self.T.Kid(fun, 0)
             if self.T.Kind(base) == ast.IDENT {
                 let bn = self.T.Get(base).Sval
-                // A name bound in any enclosing scope shadows the package and
-                // type tables, so it is a receiver, not a qualifier.
+                // A name bound in any enclosing scope — or at top level —
+                // shadows the package and type tables, so it is a receiver,
+                // not a qualifier (see is_pkg_qualifier).
                 let bound = self.lookup(bn)
-                if bound == "" and bn in self.packages {
+                if self.is_pkg_qualifier(bn) {
                     let pargs = self.lower_args(x)
                     let rp = self.new_reg()
                     self.emit(line, "CALL",
@@ -504,8 +504,7 @@ impl Lowerer {
                 let vi = self.variants[name]
                 let vargs = self.lower_args(x)
                 let rv = self.new_reg()
-                self.emit(line, "NEWENUM",
-                          [rv, vi.owner || "." || name, vargs])
+                self.emit(line, "NEWENUM", [rv, vi.tag, vargs])
                 return rv
             }
 
@@ -691,7 +690,7 @@ impl Lowerer {
             let pkg = self.T.Kid(base, 0)
             if self.T.Kind(pkg) == ast.IDENT {
                 let pn = self.T.Get(pkg).Sval
-                if self.lookup(pn) == "" and pn in self.packages {
+                if self.is_pkg_qualifier(pn) {
                     return pn || "." || self.T.Get(base).Sval || "[" ||
                            iname || "]", true
                 }
@@ -725,15 +724,50 @@ impl Lowerer {
         return rd
     }
 
+    // is_pkg_qualifier reports whether a bare identifier in the base position
+    // of `X.name` is a PACKAGE qualifier rather than a value to take a field
+    // or a method from.
+    //
+    // Both shadowing tests matter, and the second one is the one that bites.
+    // A local binding shadowing a package name is obvious. A top-level GLOBAL
+    // is not: `var path = "/etc"` followed by `path.upper()` is an ordinary
+    // method call on a str, and it WAS one until `path` joined PackageNames —
+    // after which it lowered to a package call and died in the backend, which
+    // is a working program broken by a table entry. Globals are resolved
+    // separately from the scope chain (lower_ident_value consults
+    // self.globals AFTER lookup and BEFORE the package table), so `lookup`
+    // does not see them and they have to be asked about here by name. This is
+    // that same precedence applied to the qualified form.
+    func is_pkg_qualifier(mut self, bn str) bool {
+        if self.lookup(bn) != "" { return false }
+        if bn in self.globals { return false }
+        return bn in self.packages
+    }
+
     func lower_field(mut self, x int) str throws LowerError {
         let n = self.T.Get(x)
         let base = self.T.Kid(x, 0)
         // A package member as a value: fmt.printf passed around.
         if self.T.Kind(base) == ast.IDENT {
             let bn = self.T.Get(base).Sval
-            if self.lookup(bn) == "" and bn in self.packages {
+            if self.is_pkg_qualifier(bn) {
+                // A Voilà-SOURCE std package (std/csv, std/net, std/path,
+                // std/sync, std/test) is grafted into the program, so its
+                // declarations are ordinary globals carrying the dotted name.
+                // A CONSTANT is reachable no other way: the call path already
+                // resolves `path.base(…)` against the grafted function, but a
+                // bare `path.SEP` would become a LOADFN of a native the
+                // runtime has never heard of — a program that passed
+                // `check` and died in cgen, which is the one inconsistency
+                // the `check` verb exists to prevent.
+                let dotted = bn || "." || n.Sval
+                if dotted in self.globals {
+                    let rg = self.new_reg()
+                    self.emit(n.Line, "GETGLB", [rg, dotted])
+                    return rg
+                }
                 let rp = self.new_reg()
-                self.emit(n.Line, "LOADFN", [rp, bn || "." || n.Sval])
+                self.emit(n.Line, "LOADFN", [rp, dotted])
                 return rp
             }
         }
@@ -804,7 +838,7 @@ impl Lowerer {
                 let base = self.T.Kid(fun, 0)
                 if self.T.Kind(base) == ast.IDENT {
                     let bn = self.T.Get(base).Sval
-                    if self.lookup(bn) == "" and bn in self.packages {
+                    if self.is_pkg_qualifier(bn) {
                         let args = self.lower_args(payload)
                         let rd = self.new_reg()
                         self.emit(line, "SPAWN",

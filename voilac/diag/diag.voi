@@ -1,0 +1,302 @@
+// Package diag — diagnostics with a SEVERITY, and the -W policy that resolves
+// what each severity means for this invocation.
+//
+// Until now a diagnostic was a string and every string was fatal: chk.Check
+// returned []str and main.report() exited 2 on any non-empty list. That is a
+// perfectly good design for a compiler that only ever says no — and a dead end
+// for everything the specification wants said as advice. "Unused imports are a
+// warning" (§11.3) was literally unimplementable.
+//
+// So a diagnostic here carries four things a string cannot: WHERE (file, line,
+// column), HOW BAD (Sev), WHICH CHECK (Code), and WHAT (Msg). Code is the
+// load-bearing addition: a stable kebab-case identifier is what makes
+// `-Wno-unused-import` and `-Werror=unreachable` possible at all, and what
+// lets a warning be turned off by the one project it is wrong for instead of
+// being deleted for everybody.
+//
+// TWO BOUNDARY RULES, and they are not stylistic.
+//
+//  1. NEVER ITERATE `enabled` or `werrorCodes`. Map and set iteration order is
+//     nondeterministic, and TESTING.md names it as *the* self-hosting fixpoint
+//     hazard. Both are LOOKUP-ONLY; every walk that can reach output goes over
+//     Codes(), which is a declaration-ordered slice.
+//
+//  2. Ordering is by POSITION and nothing else — not by severity, not by the
+//     order the checks ran. Render sorts on (file, line, col) with a STABLE
+//     insertion sort, so two diagnostics at one position keep the order the
+//     checks produced them in. That is the rule chk.render has always used and
+//     the reason a multi-package program's diagnostics group by file instead
+//     of interleaving by line number across files.
+package diag
+
+const SEV_ERROR = 0
+const SEV_WARN  = 1
+
+// Diag is one diagnostic: where, how bad, which check, and what.
+//
+// File matters — a program is many packages flattened into one arena, and a
+// diagnostic in an imported package reported against the entry file points at
+// a line that may not exist there. "" means the entry file, which is the only
+// name the renderer's caller can supply.
+//
+// Code is "" for an error. Errors are not suppressible, so they need no name
+// to be suppressed by; a warning without a Code could never be switched off
+// and has no business existing.
+struct Diag {
+    File str
+    Line int
+    Col  int
+    Sev  int
+    Code str
+    Msg  str
+}
+
+// Bag collects diagnostics in the order the checks produce them. It does NOT
+// sort as it goes: the checks run in a fixed order that has nothing to do with
+// source position, and sorting once at the end is what keeps the result stable
+// under a reordering of the checks.
+struct Bag {
+    Items []Diag
+}
+
+func New() Bag { return Bag{Items: []} }
+
+impl Bag {
+    // error records a hard refusal. The program will not be built.
+    func error(mut self, file str, line int, col int, code str, msg str) {
+        self.Items.append(Diag{File: file, Line: line, Col: col,
+                               Sev: SEV_ERROR, Code: code, Msg: msg})
+    }
+
+    // warn records advice. Whether it is printed at all — and whether it is
+    // fatal — is the Policy's business, resolved in Render.
+    func warn(mut self, file str, line int, col int, code str, msg str) {
+        self.Items.append(Diag{File: file, Line: line, Col: col,
+                               Sev: SEV_WARN, Code: code, Msg: msg})
+    }
+
+    // raw carries a diagnostic somebody else already rendered: the lexer and
+    // the parser hand the loader finished "file:line:col: message" lines, and
+    // splitting one back apart to recover a position would be guesswork on a
+    // string that may itself contain colons.
+    //
+    // A NEGATIVE LINE IS THE MARKER, and it has to be negative rather than 0.
+    // Zero looks like the obvious choice — source lines are 1-based — but the
+    // AST mints LIST nodes and the nil node with Line 0 (ast.List), so a
+    // check that reported against a positionless node would land on exactly
+    // that value and have its message printed bare. -1 is a coordinate
+    // nothing in the compiler can produce by accident.
+    //
+    // File is still recorded, so a raw diagnostic sorts WITH the rest of its
+    // file rather than drifting to the top of the program.
+    func raw(mut self, file str, msg str) {
+        self.Items.append(Diag{File: file, Line: 0 - 1, Col: 0,
+                               Sev: SEV_ERROR, Code: "", Msg: msg})
+    }
+
+    // merge appends another bag's diagnostics, each stage keeping the order
+    // it produced them in. Render sorts the result, so a loader warning at
+    // line 8 and a checker warning at line 5 come out in SOURCE order rather
+    // than in stage order — which is the whole reason main.voi renders one
+    // merged bag instead of one bag per stage.
+    func merge(mut self, other Bag) {
+        each d in other.Items {
+            self.Items.append(d)
+        }
+    }
+
+    func NErrors(self) int {
+        var n = 0
+        each d in self.Items {
+            if d.Sev == SEV_ERROR { n += 1 }
+        }
+        return n
+    }
+
+    // Render sorts the diagnostics by position and formats them, DROPPING the
+    // warnings the policy silences and PROMOTING the ones it makes fatal.
+    //
+    // It returns the lines AND the number of them that count as errors. The
+    // caller cannot work that out for itself by counting SEV_ERROR, because
+    // -Werror is exactly the thing that moves the line — which is the whole
+    // reason this returns a count rather than leaving the caller to tally.
+    func Render(self, srcName str, pol Policy) ([]str, int) {
+        var ds = []
+        each d in self.Items {
+            if d.Sev == SEV_WARN and not pol.On(d.Code) { continue }
+            ds.append(d)
+        }
+        // An INSERTION sort because it must be STABLE — see rule 2 above.
+        var i = 1
+        while i < len(ds) {
+            let cur = ds[i]
+            var j = i - 1
+            while j >= 0 and after(ds[j], cur) {
+                ds[j + 1] = ds[j]
+                j -= 1
+            }
+            ds[j + 1] = cur
+            i += 1
+        }
+        var out = []
+        var nerr = 0
+        each d in ds {
+            if d.Line < 0 {
+                out.append(d.Msg)          // pre-rendered — see raw()
+                nerr += 1
+                continue
+            }
+            var f = d.File
+            if f == "" { f = srcName }
+            if d.Sev == SEV_ERROR {
+                out.append("{f}:{d.Line}:{d.Col}: {d.Msg}")
+                nerr += 1
+            } else if pol.Fatal(d.Code) {
+                // -Werror says "error", not "warning". A line that still read
+                // `warning` while the build failed would be a small lie the
+                // reader has to decode; gcc has said `error` here for thirty
+                // years and it is the right call.
+                out.append("{f}:{d.Line}:{d.Col}: error[{d.Code}]: {d.Msg}")
+                nerr += 1
+            } else {
+                out.append("{f}:{d.Line}:{d.Col}: warning[{d.Code}]: {d.Msg}")
+            }
+        }
+        return out, nerr
+    }
+}
+
+// after reports whether a sorts after b by (file, line, col) — the key that
+// groups a multi-package program's diagnostics by file.
+func after(a Diag, b Diag) bool {
+    if a.File != b.File { return a.File > b.File }
+    if a.Line != b.Line { return a.Line > b.Line }
+    return a.Col > b.Col
+}
+
+// ------------------------------------------------------------------ codes
+
+// Codes lists every warning code the compiler can emit. It is the ONE place a
+// code is spelled: -W, -Wno- and -Werror= validate against it, Key walks it to
+// build the run-cache token, and Default answers what a code does when the
+// command line says nothing.
+//
+// A slice, not a set, and never the `enabled` map — see rule 1.
+func Codes() []str {
+    return ["type-mismatch", "unreachable", "unused-import"]
+}
+
+// DefaultOff lists the codes that stay silent until -W<code> or -Wall asks
+// for them.
+//
+// `unreachable` and `unused-import` are NOT here, and that is a measurement
+// rather than an oversight. Both were swept across every entry point in the
+// repository (voilac, tools, std, samples, samples/guide, tests, bench — 88
+// programs) before this list was written: `unreachable` fired 0 times and
+// `unused-import` fired 6, every one of them a genuinely unused `use` that
+// was then removed. See TESTING.md §9.
+//
+// `type-mismatch` IS here, and the reason is not that it fires on correct
+// code — the same sweep drove it to zero across the whole corpus. It is that
+// it is the youngest and by far the largest check in the compiler, it reasons
+// about a partial inference rather than about a declaration, and the failure
+// mode of getting it wrong is REFUSING A WORKING PROGRAM. Default-off means a
+// false positive discovered in the field costs a puzzled user nothing until
+// they ask for it with -Wall or --strict. Promote it once it has been carried
+// through a release without a report. See chk/expr.voi's header.
+func DefaultOff() []str {
+    return ["type-mismatch"]
+}
+
+// Default is whether a code is on when the command line says nothing.
+func Default(code str) bool {
+    each c in DefaultOff() {
+        if c == code { return false }
+    }
+    return Known(code)
+}
+
+// Known rejects a misspelt code. `-Wno-unusd-import` that silently does
+// nothing is precisely how a warning gets ignored for a whole release, so the
+// driver refuses it instead — the same rule main.voi already applies to an -O
+// level on a verb that cannot use one.
+func Known(code str) bool {
+    each c in Codes() {
+        if c == code { return true }
+    }
+    return false
+}
+
+// ----------------------------------------------------------------- policy
+
+// Policy is the resolved -W/-Werror state for one invocation: which warnings
+// are printed, and which of them are fatal.
+struct Policy {
+    enabled     map[str]bool   // LOOKUP ONLY — never iterated (rule 1)
+    werror      bool           // -Werror
+    werrorCodes set[str]       // -Werror=<code>  — LOOKUP ONLY
+}
+
+func NewPolicy() Policy {
+    var p = Policy{enabled: make(map[str]bool), werror: false,
+                   werrorCodes: set([])}
+    each c in Codes() {
+        p.enabled[c] = Default(c)
+    }
+    return p
+}
+
+impl Policy {
+    func Enable(mut self, code str)  { self.enabled[code] = true }
+
+    func Disable(mut self, code str) { self.enabled[code] = false }
+
+    // EnableAll is -Wall: every code on, including the ones that default off.
+    func EnableAll(mut self) {
+        each c in Codes() {
+            self.enabled[c] = true
+        }
+    }
+
+    func Werror(mut self) { self.werror = true }
+
+    func WerrorCode(mut self, code str) { self.werrorCodes.add(code) }
+
+    // On answers for a code Codes() lists. Anything else is off, and that is
+    // the invariant rather than a fallback: a code outside the registry
+    // cannot be addressed by -Wno-, so it must not be printable either — a
+    // warning nobody can switch off is exactly what the Code field exists to
+    // prevent. The cost is that a check emitting a MISSPELT code says nothing
+    // at all; registering the code in Codes() is the one step that cannot be
+    // skipped when a warning is added.
+    func On(self, code str) bool {
+        if code in self.enabled { return self.enabled[code] }
+        return false
+    }
+
+    func Fatal(self, code str) bool {
+        if self.werror { return true }
+        return code in self.werrorCodes
+    }
+
+    // Key renders the resolved policy as a short, stable token for the `voila
+    // run` cache key. It walks Codes() and never the maps: an order that
+    // varied between processes would give the same command line two different
+    // cache entries, which is the nondeterminism of rule 1 wearing a hat.
+    //
+    // Today the -W state cannot change the emitted C — main.voi checks and
+    // reports BEFORE it ever looks at the cache, so `--strict` refuses long
+    // before a cached binary could be served. The key carries it anyway,
+    // because the invariant belongs where the key is built: a future fast path
+    // that consults the cache first would otherwise hand a `--strict` run the
+    // lenient binary its previous run left behind, silently.
+    func Key(self) str {
+        var b = "W"
+        if self.werror { b = b || "E" } else { b = b || "-" }
+        each c in Codes() {
+            if self.On(c) { b = b || "1" } else { b = b || "0" }
+            if c in self.werrorCodes { b = b || "e" } else { b = b || "-" }
+        }
+        return b
+    }
+}

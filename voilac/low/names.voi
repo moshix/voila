@@ -24,13 +24,319 @@ func PreludeNames() []str {
             "wrap_mul", "wrap_u16", "wrap_u32", "wrap_u64", "wrap_u8", "zip"]
 }
 
+// StrMethodNames are std/str's functions, which are reachable BOTH as
+// `str.NAME(s)` and as a method `s.NAME()` — the method-call duality. This is
+// the one canonical copy: cg/instr.voi's str_natives returns it, and
+// typ.PrimitiveMethod judges a bound against it. They used to be two lists
+// and they drifted: fifteen names (trim_left, last_index, count, split_n and
+// the rest) were reachable as methods but absent from the list the bound
+// check consulted, so a bound `str` genuinely satisfied was reported missing.
+func StrMethodNames() []str {
+    return ["find_any", "skip_any",
+            "upper", "lower", "title", "trim", "trim_left", "trim_right",
+            "strip", "pad", "pad_left", "center", "contains", "index",
+            "last_index", "starts_with", "ends_with", "count", "equal_fold",
+            "substr", "left", "right", "split", "split_n", "lines", "fields",
+            "word", "words", "subword", "delword", "join", "replace",
+            "replace_n", "repeat", "reverse", "translate", "overlay",
+            "insert", "delstr", "bytes", "from_bytes", "runes", "from_runes",
+            "rune_len", "is_digit", "is_alpha", "is_space", "is_upper", "hex",
+            "unhex", "b64", "unb64"]
+}
+
+// StdCNatives are the package-qualified names the C runtime provides for the
+// std packages that have NO Voilà source (load.std_c_packages: conv, crypto,
+// fmt, io, json, log, math, os, rand, sort, str, uuid). They live here rather
+// than in cg/instr.voi because two stages need them and this is the one
+// canonical copy: cg's pkg_natives splices them into the natives table, and
+// chk/stdpkg.voi judges `fmt.printf` against them — for a C package the
+// natives table IS the whole declared surface, so it is the only thing that
+// can tell `str.upper` from `str.len`.
+//
+// std/str's own functions are NOT here: they carry the method-call duality
+// and so live in StrMethodNames, which both stages register under the `str.`
+// spelling as well as bare.
+func StdCNatives() []str {
+    return ["regex.compile", "regex.matches", "regex.find",
+            "regex.find_all", "regex.replace", "regex.split",
+            "fmt.printf", "fmt.sprintf", "fmt.eprintf", "fmt.fprintf",
+            "fmt.print", "fmt.println", "fmt.comma", "fmt.bytes", "fmt.pad",
+            "fmt.pad_left", "fmt.center", "fmt.table",
+            "os.read", "os.write", "os.open", "os.create", "os.exists",
+            "os.remove", "os.args", "os.env", "os.exit", "os.on_abort",
+            "os.isdir", "os.listdir", "os.run", "os.run_capture",
+            "os.cwd", "os.pid",
+            "os.hostname",
+            "os.exe", "os.mtime", "os.size",
+            "os.input", "os.isatty",
+            "os.mkdir", "os.mkdir_all", "os.rmdir", "os.rename", "os.copy",
+            "os.tempdir", "os.realpath",
+            "os.setenv", "os.unsetenv", "os.environ",
+            "os.stderr", "os.stdout", "os.stdin",
+            "io.reader", "io.writer", "io.buffered", "io.copy", "io.pipe",
+            "io.read_all", "io.discard",
+            "math.sqrt", "math.sin", "math.cos", "math.tan", "math.asin",
+            "math.acos", "math.atan", "math.ln", "math.log2", "math.log10",
+            "math.exp", "math.pow", "math.hypot", "math.mod", "math.pi",
+            "math.e",
+            "log.info", "log.warn", "log.error", "log.debug", "log.flush",
+            "sort.sort", "sort.sort_by", "sort.reversed",
+            "json.encode", "json.pretty", "json.decode",
+            "rand.int", "rand.float", "rand.seed", "uuid.new",
+            "crypto.md5", "crypto.md5_raw",
+            "crypto.sha1", "crypto.sha1_raw",
+            "crypto.sha256", "crypto.sha256_raw",
+            "crypto.sha512", "crypto.sha512_raw",
+            "crypto.hmac_md5", "crypto.hmac_md5_raw",
+            "crypto.hmac_sha1", "crypto.hmac_sha1_raw",
+            "crypto.hmac_sha256", "crypto.hmac_sha256_raw",
+            "crypto.hmac_sha512", "crypto.hmac_sha512_raw",
+            "crypto.random", "crypto.random_int", "crypto.equal",
+            "conv.to_int", "conv.to_float", "conv.to_dec"]
+}
+
+// PkgConstantNames are the package CONSTANTS: `os.stdout`, `math.pi`, the six
+// duration units. They are values, not callables — the runtime answers them in
+// vl_lookup_value and they must NOT be registered in its function table — so
+// cg/instr.voi's pkg_constant_names hands them to emit_loadfn, which resolves
+// one as a value instead of registering it in NAT, and selftest subtracts them
+// before comparing against table[]. chk/stdpkg.voi ADDS them, because a
+// constant is a member a program may legitimately name and no natives table
+// will ever hold it.
+func PkgConstantNames() []str {
+    return ["time.Nanosecond", "time.Microsecond", "time.Millisecond",
+            "time.Second", "time.Minute", "time.Hour",
+            "math.pi", "math.e", "os.stderr", "os.stdout", "os.stdin"]
+}
+
+// StdSrcNatives are the natives of the std packages that have VOILÀ SOURCE —
+// net, sync and time (std/csv, std/path and std/test have none, being pure
+// Voilà over what already exists). They are listed apart from
+// StdCNatives because the two halves answer different questions: a member of
+// a C package is a native or it does not exist, while a member of a grafted
+// package may be either a native or a declaration. cg splices both into the
+// natives table; chk/stdpkg.voi adds this one to the surface it judges `net.x`
+// against — those packages ARE grafted into the tree, so every member that is
+// NOT a native must be a declaration the checker can point at.
+//
+// Most are package-private shims (`net._send`), one syscall or one machine
+// instruction each. The public names among them — `net.resolve`, and the
+// whole of std/time's stopwatch half — are C with no Voilà body, which is
+// exactly why they cannot be found by looking at the grafted declarations.
+//
+// The six time CONSTANTS are here too. They are not functions; listing them in
+// PkgConstantNames above is what keeps them out of the runtime's function
+// table.
+func StdSrcNatives() []str {
+    return ["time.now", "time.since", "time.sleep", "time.after",
+            "time.millis", "time.seconds", "time.Nanosecond",
+            "time.Microsecond", "time.Millisecond", "time.Second",
+            "time.Minute", "time.Hour",
+            "time._instant", "time._local_offset",
+            "net._listen_tcp", "net._connect_tcp", "net._accept",
+            "net._send", "net._recv", "net._local_addr", "net._remote_addr",
+            "net._udp", "net._dial_udp",
+            "net._sendto", "net._recvfrom",
+            "net._listen_unix", "net._connect_unix", "net._close",
+            "net._set_timeout", "net.resolve",
+            "sync._mutex", "sync._lock", "sync._unlock", "sync._try_lock",
+            "sync._rwlock", "sync._rlock", "sync._wlock", "sync._rwunlock",
+            "sync._try_rlock", "sync._try_wlock",
+            "sync._atomic", "sync._load", "sync._store", "sync._add",
+            "sync._swap", "sync._cas"]
+}
+
+// PackageNames are the qualifiers a dotted name may carry. Only packages this
+// release PROVIDES belong here: a name listed but unimplemented lowers to a
+// LOADFN and dies in the backend, where there is no `use` to point at — so
+// `xml` and `yaml` are absent, and `xml.decode(…)` is an unknown identifier.
+//
+// chk/stdpkg.voi subtracts std.Packages() from this to get the C-only
+// packages, so a qualifier admitted here is one that check will judge.
 func PackageNames() []str {
-    return ["conv", "fmt", "http", "json", "log", "math", "net", "os", "rand",
-            "regex", "sort", "str", "time", "uuid"]
+    return ["conv", "crypto", "csv", "fmt", "http", "io", "json", "log",
+            "math", "net", "os", "path", "rand", "regex", "sort", "str",
+            "sync", "test", "time", "uuid"]
 }
 
 func BuiltinExceptions() []str {
     return ["ConvError", "RangeError", "OverflowError", "FormatError",
             "ValueError", "RuntimeError", "IOError", "KeyError", "Timeout",
             "Cancelled"]
+}
+
+// NativeArities is every native's argument count, as `name|min|max` with -1
+// for "no maximum". It is the one thing the natives tables above do NOT say,
+// and its absence was a whole class of crash: a native carries no static
+// signature — the code generator knows only a bare name — so nothing anywhere
+// counted arguments, and `time.millis()` reached a body that reads argv[0]
+// the caller never provided. SIGSEGV, after `voila check` said ok.
+//
+// chk/native.voi is the reader. It is a compile-time check on purpose: the
+// invariant main.voi guards is that `check` and `build` agree, and a runtime
+// guard would leave `check` still saying ok.
+//
+// THE NUMBERS ARE NOT DERIVED FROM argv[N] USAGE. That was tried and it is
+// wrong: several bodies in runtime/src/str.c share code across a grouped
+// condition (`index` with `last_index`, `pad` with `pad_left` and `center`),
+// so the highest index a NAME reaches is not the highest index its BLOCK
+// contains, and four functions came out as zero-argument. Each entry below is
+// the documented signature — the specification's §13.1/§13.2 tables and the
+// os/io/math/time sections — cross-checked against the C body it dispatches
+// to.
+//
+// The two bounds answer different questions and are read from different
+// evidence:
+//
+//   max  the highest argument the implementation can read. Anything past it
+//        is an argument no path looks at, which is how
+//        `str.trim_left("..x", ".")` read as a trim that silently did nothing.
+//        runtime/src/str.c's str_arity enforces the same maxima at run time
+//        for the str half; selftest holds the two equal.
+//
+//   min  the arguments the implementation REQUIRES — those it reads with
+//        neither an `argc` guard nor a default. Where a trailing argument is
+//        genuinely optional the minimum drops to say so: `str.substr(s, 2)`
+//        and `str.substr(s, 2, 3)` are both correct, and rejecting the first
+//        would be a worse bug than the one this table fixes. `find_any` and
+//        `skip_any` take an optional start offset, `subword` and `delword` an
+//        optional length, `io.buffered` an optional capacity, `os.input` an
+//        optional prompt, `os.isatty` an optional handle, `os.exit` an
+//        optional status, `to_int` and its family an optional base.
+//
+// A DEFENSIVE guard is not an optional argument, and the difference decides
+// several entries here. runtime/src/str.c reads its subject as
+// `argc > 0 ? S(argv[0], &n) : ""` and fmt.table returns "" for argc == 0 —
+// both exist so a wrong call cannot read wild memory, not to make the subject
+// optional, and §13.2 spells every one of those functions with a subject. So
+// their minimum is 1, and `str.upper()` is reported rather than quietly
+// answering "".
+//
+// Package CONSTANTS are absent: `os.stdout` and `math.pi` are values, not
+// callables (see PkgConstantNames). Everything else in the four tables above
+// is here exactly once — selftest compares the two name sets, so a native
+// added without an arity is a red test rather than a silent gap.
+func NativeArities() []str {
+    return [// std/regex — a pattern argument may be a compiled regex or a
+            // string, so every one of these takes the pattern first.
+            "regex.compile|1|1", "regex.matches|2|2", "regex.find|2|2",
+            "regex.find_all|2|2", "regex.replace|3|3", "regex.split|2|2",
+            // prelude (runtime/src/std.c's table[], the section above fmt)
+            "len|1|1", "append|1|-1", "close|1|1", "err|0|1", "errf|1|-1",
+            "assert|1|2", "min|1|-1", "max|1|-1", "abs|1|1", "sum|1|1",
+            "avg|1|1", "round|1|1", "floor|1|1", "ceil|1|1", "trunc|1|1",
+            "round_to|2|2", "range|1|3", "zip|2|2", "enumerate|1|1",
+            "keys|1|1", "values|1|1", "shared|1|1", "cell|1|1", "weak|1|1",
+            "set|0|-1", "printf|1|-1", "sprintf|1|-1",
+            "to_int|1|2", "to_i8|1|2", "to_i16|1|2", "to_i32|1|2",
+            "to_i64|1|2", "to_u8|1|2", "to_u16|1|2", "to_u32|1|2",
+            "to_u64|1|2", "to_byte|1|2", "to_float|1|2", "to_dec|1|2",
+            "to_rune|1|2",
+            "wrap_i8|1|1", "wrap_i16|1|1", "wrap_i32|1|1", "wrap_i64|1|1",
+            "wrap_u8|1|1", "wrap_u16|1|1", "wrap_u32|1|1", "wrap_u64|1|1",
+            "sat_i8|1|1", "sat_i16|1|1", "sat_i32|1|1", "sat_i64|1|1",
+            "sat_u8|1|1", "sat_u16|1|1", "sat_u32|1|1", "sat_u64|1|1",
+            "wrap_add|2|2", "wrap_mul|2|2",
+
+            // std/str (runtime/src/str.c). Every one is reachable bare and as
+            // `str.NAME`; chk registers both spellings from this one entry.
+            "upper|1|1", "lower|1|1", "title|1|1", "trim|1|1",
+            "trim_left|1|1", "trim_right|1|1", "strip|2|2", "pad|2|2",
+            "pad_left|2|2", "center|2|2", "contains|2|2", "index|2|2",
+            "last_index|2|2", "starts_with|2|2", "ends_with|2|2",
+            "count|2|2", "equal_fold|2|2", "substr|2|3", "left|2|2",
+            "right|2|2", "split|2|2", "split_n|3|3", "lines|1|1",
+            "fields|1|1", "word|2|2", "words|1|1", "subword|2|3",
+            "delword|2|3", "join|2|2", "replace|3|3", "replace_n|4|4",
+            "repeat|2|2", "reverse|1|1", "translate|3|3", "overlay|3|3",
+            "insert|3|3", "delstr|3|3", "bytes|1|1", "from_bytes|1|1",
+            "runes|1|1", "from_runes|1|1", "rune_len|1|1", "is_digit|1|1",
+            "is_alpha|1|1", "is_space|1|1", "is_upper|1|1", "hex|1|1",
+            "unhex|1|1", "b64|1|1", "unb64|1|1", "find_any|2|3",
+            "skip_any|2|3",
+
+            // std/fmt. The printf family is variadic after its format; pad,
+            // pad_left and center are std/str's, under a second name.
+            "fmt.printf|1|-1", "fmt.sprintf|1|-1", "fmt.eprintf|1|-1",
+            "fmt.fprintf|2|-1", "fmt.print|0|-1", "fmt.println|0|-1",
+            "fmt.comma|1|1", "fmt.bytes|1|1", "fmt.pad|2|2",
+            "fmt.pad_left|2|2", "fmt.center|2|2", "fmt.table|1|1",
+
+            // std/os
+            "os.read|1|1", "os.write|2|2", "os.open|1|1", "os.create|1|1",
+            "os.exists|1|1", "os.remove|1|1", "os.args|0|0", "os.env|1|1",
+            "os.exit|0|1", "os.on_abort|1|1", "os.isdir|1|1",
+            "os.listdir|1|1", "os.run|2|2", "os.run_capture|2|2",
+            "os.cwd|0|0", "os.pid|0|0", "os.hostname|0|0", "os.exe|0|0",
+            "os.mtime|1|1", "os.size|1|1", "os.input|0|1", "os.isatty|0|1",
+            "os.mkdir|1|1", "os.mkdir_all|1|1", "os.rmdir|1|1",
+            "os.rename|2|2", "os.copy|2|2", "os.tempdir|0|0",
+            "os.realpath|1|1", "os.setenv|2|2", "os.unsetenv|1|1",
+            "os.environ|0|0",
+
+            // std/io
+            "io.reader|1|1", "io.writer|1|1", "io.buffered|1|2",
+            "io.copy|2|2", "io.pipe|0|0", "io.read_all|1|1",
+            "io.discard|0|0",
+
+            // std/math
+            "math.sqrt|1|1", "math.sin|1|1", "math.cos|1|1", "math.tan|1|1",
+            "math.asin|1|1", "math.acos|1|1", "math.atan|1|1", "math.ln|1|1",
+            "math.log2|1|1", "math.log10|1|1", "math.exp|1|1",
+            "math.pow|2|2", "math.hypot|2|2", "math.mod|2|2",
+
+            // std/log
+            "log.info|0|-1", "log.warn|0|-1", "log.error|0|-1",
+            "log.debug|0|-1", "log.flush|0|0",
+
+            // std/sort, std/json, std/rand, std/uuid, std/conv.
+            // json.decode's GENERIC form passes the type name as a hidden
+            // first argument, but it is written `json.decode[T](s)` — an
+            // INDEX callee, which the check does not judge — so the bound
+            // here is the plain form's.
+            "sort.sort|1|1", "sort.sort_by|2|2", "sort.reversed|1|1",
+            "json.encode|1|1", "json.pretty|1|1", "json.decode|1|1",
+            "rand.int|1|1", "rand.float|0|0", "rand.seed|1|1",
+            "uuid.new|0|0",
+            "conv.to_int|1|2", "conv.to_float|1|2", "conv.to_dec|1|2",
+
+            // std/crypto (runtime/src/crypto.c). A digest takes ONE message,
+            // an HMAC a key and a message, and neither has an optional
+            // argument: there is no default key, and an algorithm chosen by a
+            // trailing string would be the one call in the package a typo
+            // could turn into a weaker hash at run time.
+            "crypto.md5|1|1", "crypto.md5_raw|1|1",
+            "crypto.sha1|1|1", "crypto.sha1_raw|1|1",
+            "crypto.sha256|1|1", "crypto.sha256_raw|1|1",
+            "crypto.sha512|1|1", "crypto.sha512_raw|1|1",
+            "crypto.hmac_md5|2|2", "crypto.hmac_md5_raw|2|2",
+            "crypto.hmac_sha1|2|2", "crypto.hmac_sha1_raw|2|2",
+            "crypto.hmac_sha256|2|2", "crypto.hmac_sha256_raw|2|2",
+            "crypto.hmac_sha512|2|2", "crypto.hmac_sha512_raw|2|2",
+            "crypto.random|1|1", "crypto.random_int|1|1",
+            "crypto.equal|2|2",
+
+            // std/time's stopwatch half: C with no Voilà body.
+            "time.now|0|0", "time.since|1|1", "time.sleep|1|1",
+            "time.after|1|1", "time.millis|1|1", "time.seconds|1|1",
+            "time._instant|1|1", "time._local_offset|1|1",
+
+            // std/net's syscall shim. Package-private but callable — `net` is
+            // a qualifier program-wide — which is why they are bounded too.
+            "net._listen_tcp|3|3", "net._connect_tcp|2|2", "net._accept|1|1",
+            "net._send|2|2", "net._recv|2|2", "net._local_addr|1|1",
+            "net._remote_addr|1|1", "net._udp|2|2", "net._dial_udp|2|2",
+            "net._sendto|4|4", "net._recvfrom|2|2", "net._listen_unix|2|2",
+            "net._connect_unix|1|1", "net._close|1|1",
+            "net._set_timeout|2|2", "net.resolve|1|1",
+
+            // std/sync's shim. runtime/src/sync.c already refuses a missing
+            // handle at run time (want_mutex and friends); these move the
+            // same refusal to compile time.
+            "sync._mutex|0|0", "sync._lock|1|1", "sync._unlock|1|1",
+            "sync._try_lock|1|1", "sync._rwlock|0|0", "sync._rlock|1|1",
+            "sync._wlock|1|1", "sync._rwunlock|1|1", "sync._try_rlock|1|1",
+            "sync._try_wlock|1|1", "sync._atomic|0|1", "sync._load|1|1",
+            "sync._store|2|2", "sync._add|2|2", "sync._swap|2|2",
+            "sync._cas|3|3"]
 }

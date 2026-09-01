@@ -1,0 +1,600 @@
+// load/mod.voi — `voila.mod`, `voila.sum`, and the module cache.
+//
+// A program may depend on code it did not write. `voila.mod` names the module,
+// pins the language version, and lists what the module REQUIRES; `voila.sum`
+// records what each requirement hashed to when it was fetched; the module
+// cache is where a fetched dependency lives on disk. Everything below is
+// FILESYSTEM and TEXT only — the compiler never opens a socket, and `voila
+// get` shells out to git (see mod_get in main.voi).
+//
+// Two rules keep this small enough to reason about:
+//
+//   · A dependency is loaded and flattened from SOURCE, exactly like a package
+//     under the module root. Nothing downstream of the loader knows a package
+//     came from the cache.
+//   · `replace` applies only from the MAIN module, never transitively. It is
+//     the one rule that stays predictable when a graph gets deep.
+//
+// Version selection is the MAXIMUM of the required versions per module path.
+// For a graph of exact requirements that IS minimum-version selection, and it
+// needs no backtracking: a version can only be raised, and the set of paths
+// can only grow, so the walk below terminates.
+package load
+
+use "std/os"
+use "std/str"
+use "std/fmt"
+use "voilac/path"
+
+// ---------------------------------------------------------------- the file
+
+struct Require {
+    Path str
+    Ver  str
+    Line int
+}
+
+// Replace redirects a module path. `To` is a LOCAL directory when ToVer is
+// empty, and another module path (served from the cache) when it is not.
+struct Replace {
+    Path  str
+    Ver   str     // "" — every version of Path
+    To    str
+    ToVer str     // "" — To is a local path
+    Line  int
+}
+
+struct ModErr {
+    Line int
+    Msg  str
+}
+
+struct ModFile {
+    Root   str
+    File   str
+    Found  bool
+    Module str
+    Lang   str
+    Reqs   []Require
+    Reps   []Replace
+    Errs   []ModErr
+}
+
+// ReadMod parses one voila.mod. It never throws and never exits: a malformed
+// file yields a ModFile whose Errs the caller renders as diagnostics, because
+// a dependency's voila.mod must be able to be wrong without taking the
+// compiler down.
+//
+// The grammar, in full:
+//
+//     module <modpath>
+//     voila  <version>
+//     require <modpath> <version>
+//     require ( <modpath> <version> … )
+//     replace <modpath> [<version>] => <localpath>
+//     replace <modpath> [<version>] => <modpath> <version>
+//     replace ( … )
+//
+// An UNKNOWN directive is an error, not a shrug. Silently ignoring what it
+// did not understand is exactly how `require` came to mean nothing at all.
+func ReadMod(root str) ModFile {
+    let file = path.Join(root, "voila.mod")
+    var mf = ModFile{Root: root, File: file, Found: false, Module: "",
+                     Lang: "", Reqs: [], Reps: [], Errs: []}
+    var data = ""
+    match os.read(file) {
+        Ok(d)  => data = d
+        Err(e) => return mf
+    }
+    mf.Found = true
+
+    var nmodule = 0
+    var nlang = 0
+    var block = ""                  // "", "require" or "replace"
+    var blockLine = 0
+    var seenReq = make(map[str]str)
+    var seenRep = make(map[str]str)
+    var ln = 0
+    each raw in str.lines(data) {
+        ln += 1
+        let line = strip_comment(raw)
+        if line == "" { continue }
+        let f = fields(line)
+        if block != "" {
+            if f[0] == ")" {
+                if len(f) > 1 {
+                    mf.Errs.append(ModErr{Line: ln,
+                        Msg: "nothing may follow the closing `)`"})
+                }
+                block = ""
+                continue
+            }
+            mod_entry(mf, block, f, ln, seenReq, seenRep)
+            continue
+        }
+        let kw = f[0]
+        if kw == "module" {
+            nmodule += 1
+            if len(f) != 2 {
+                mf.Errs.append(ModErr{Line: ln,
+                    Msg: "`module` takes exactly one module path"})
+            } else {
+                mf.Module = f[1]
+            }
+        } else if kw == "voila" {
+            nlang += 1
+            if nlang > 1 {
+                mf.Errs.append(ModErr{Line: ln,
+                    Msg: "duplicate `voila` directive"})
+            } else if len(f) != 2 {
+                mf.Errs.append(ModErr{Line: ln,
+                    Msg: "`voila` takes exactly one version"})
+            } else {
+                mf.Lang = f[1]
+            }
+        } else if kw == "require" or kw == "replace" {
+            if len(f) == 2 and f[1] == "(" {
+                block = kw
+                blockLine = ln
+                continue
+            }
+            mod_entry(mf, kw, f[1..len(f)], ln, seenReq, seenRep)
+        } else {
+            mf.Errs.append(ModErr{Line: ln,
+                Msg: "unknown directive `" || kw || "`: voila.mod takes " ||
+                     "`module`, `voila`, `require` and `replace`"})
+        }
+    }
+    if block != "" {
+        mf.Errs.append(ModErr{Line: blockLine,
+            Msg: "unclosed `" || block || " (`"})
+    }
+    if nmodule == 0 {
+        mf.Errs.append(ModErr{Line: 1,
+            Msg: "voila.mod has no `module` line"})
+    } else if nmodule > 1 {
+        mf.Errs.append(ModErr{Line: 1,
+            Msg: "voila.mod has more than one `module` line"})
+    }
+    return mf
+}
+
+// mod_entry parses one `require`/`replace` body — the words AFTER the keyword,
+// which is the same shape inside a parenthesised block and out.
+func mod_entry(mf mut ModFile, kind str, f []str, ln int,
+               seenReq mut map[str]str, seenRep mut map[str]str) {
+    if kind == "require" {
+        if len(f) != 2 {
+            mf.Errs.append(ModErr{Line: ln,
+                Msg: "`require` takes a module path and a version"})
+            return
+        }
+        let p = f[0]
+        let v = f[1]
+        // A duplicate is an error unless the two agree: a module path with
+        // two different versions in ONE file is a contradiction its author
+        // must settle, not something selection should quietly win.
+        if p in seenReq {
+            if seenReq[p] != v {
+                mf.Errs.append(ModErr{Line: ln,
+                    Msg: "duplicate `require` for `" || p || "`: " ||
+                         seenReq[p] || " and " || v})
+            }
+            return
+        }
+        seenReq[p] = v
+        mf.Reqs.append(Require{Path: p, Ver: v, Line: ln})
+        return
+    }
+
+    var arrow = 0 - 1
+    var i = 0
+    while i < len(f) {
+        if f[i] == "=>" { arrow = i }
+        i += 1
+    }
+    if arrow < 1 or arrow > 2 or arrow == len(f) - 1 {
+        mf.Errs.append(ModErr{Line: ln,
+            Msg: "`replace` reads `<module> [version] => " ||
+                 "<localpath|module version>`"})
+        return
+    }
+    var pv = ""
+    if arrow == 2 { pv = f[1] }
+    let rest = f[arrow + 1..len(f)]
+    if len(rest) > 2 {
+        mf.Errs.append(ModErr{Line: ln,
+            Msg: "`replace` target takes a path, or a module and a version"})
+        return
+    }
+    var tov = ""
+    if len(rest) == 2 { tov = rest[1] }
+    // Two `replace` lines for the same path AND the same version are a
+    // contradiction, and the second one would simply never be consulted. The
+    // key carries the version, so a versioned line beside an unversioned one
+    // is still legal — that pair is resolved by specificity in mod_serve_dir.
+    let key = f[0] || "@" || pv
+    if key in seenRep {
+        mf.Errs.append(ModErr{Line: ln,
+            Msg: "duplicate `replace` for `" || f[0] || "`" ||
+                 rep_ver_phrase(pv) || "; the first is at line " ||
+                 seenRep[key]})
+        return
+    }
+    seenRep[key] = str(ln)
+    mf.Reps.append(Replace{Path: f[0], Ver: pv, To: rest[0], ToVer: tov,
+                           Line: ln})
+}
+
+func rep_ver_phrase(v str) str {
+    if v == "" { return "" }
+    return " " || v
+}
+
+// strip_comment removes a `//` comment and surrounding blank space. A `//`
+// cannot appear inside a module path or a version, so no quoting rule is
+// needed and none is offered.
+func strip_comment(line str) str {
+    let c = str.index(line, "//")
+    var out = line
+    if c >= 0 { out = line[0..c] }
+    return str.trim(out)
+}
+
+// ---------------------------------------------------------------- versions
+
+// VerCmp orders two versions: -1, 0 or 1. Dotted numeric segments compare as
+// NUMBERS (so 0.10.0 is newer than 0.9.0, which a string comparison gets
+// backwards); anything else compares as text. A leading `v` is ignored, so
+// `v1.2.0` and `1.2.0` are the same version.
+func VerCmp(a str, b str) int {
+    let av = str.split(trim_v(a), ".")
+    let bv = str.split(trim_v(b), ".")
+    var i = 0
+    while i < len(av) or i < len(bv) {
+        var x = "0"
+        var y = "0"
+        if i < len(av) { x = av[i] }
+        if i < len(bv) { y = bv[i] }
+        let xn = ver_num(x)
+        let yn = ver_num(y)
+        if xn >= 0 and yn >= 0 {
+            if xn < yn { return 0 - 1 }
+            if xn > yn { return 1 }
+        } else {
+            if x < y { return 0 - 1 }
+            if x > y { return 1 }
+        }
+        i += 1
+    }
+    return 0
+}
+
+func trim_v(v str) str {
+    if str.starts_with(v, "v") { return v[1..len(v)] }
+    return v
+}
+
+// ver_num is the segment as a number, or -1 when it is not all digits. A
+// hand-rolled parse rather than to_int: a segment like `2-rc1` must FALL BACK
+// to a text comparison, not throw.
+func ver_num(s str) int {
+    if s == "" { return 0 - 1 }
+    var n = 0
+    each b in bytes(s) {
+        if b < 48 or b > 57 { return 0 - 1 }
+        n = n * 10 + (b - 48)
+    }
+    return n
+}
+
+// ---------------------------------------------------------------- the cache
+
+// ModCacheRoot is $VOILA_MODCACHE, or ~/.cache/voila/mod. Per-user and never
+// world-shared, for the same reason the run cache is: a common /tmp cache
+// would let any local user pre-plant a dependency.
+func ModCacheRoot() str {
+    let e = os.env("VOILA_MODCACHE")
+    if e != nil and str(e) != "" { return str(e) }
+    let home = os.env("HOME")
+    if home == nil { return "/tmp/voila-modcache" }
+    return path.Join(str(home), ".cache/voila/mod")
+}
+
+// ModCacheDir is where one (module, version) lives: <root>/<modpath>@<ver>.
+// The module path keeps its slashes, so the cache mirrors the import paths.
+func ModCacheDir(modpath str, ver str) str {
+    return path.Join(ModCacheRoot(), modpath || "@" || ver)
+}
+
+// ---------------------------------------------------------------- selection
+
+// ModInfo is the resolved dependency graph: one selected version and one
+// serving directory per module path.
+//
+// Paths is SORTED and is the only thing that may be iterated. Ver and Dir are
+// lookup tables — map order is nondeterministic and TESTING.md §1 names it as
+// the fixpoint hazard, so nothing walks them.
+struct ModInfo {
+    Root  str
+    Mod   ModFile
+    Paths []str
+    Ver   map[str]str
+    Dir   map[str]str
+    // Whether each path is served by a `replace` to a LOCAL directory. A map
+    // and not a set, because the answer can CHANGE: a versioned replace stops
+    // applying the moment selection raises that path's version, and a set
+    // could only ever accumulate — leaving a cache-served dependency marked
+    // local, which switches its checksum verification off for the whole build.
+    Local map[str]bool
+    // Errors about a DEPENDENCY's own voila.mod, already rendered with a file
+    // and a line. The main module's are in Mod.Errs, which the caller anchors
+    // to voila.mod itself.
+    Deep  []str
+}
+
+// Modules resolves the whole dependency graph of the module rooted at `root`.
+func Modules(root str) ModInfo {
+    let mf = ReadMod(root)
+    return ModulesOf(root, mf)
+}
+
+func ModulesOf(root str, mf ModFile) ModInfo {
+    var mi = ModInfo{Root: root, Mod: mf, Paths: [], Ver: make(map[str]str),
+                     Dir: make(map[str]str), Local: make(map[str]bool),
+                     Deep: []}
+    each r in mf.Reqs {
+        mod_bump(mi, r.Path, r.Ver)
+    }
+    // A `replace` that carries a version for a path nothing requires still
+    // names a module; without this it could never be selected at all.
+    each rp in mf.Reps {
+        if not (rp.Path in mi.Ver) and rp.Ver != "" {
+            mod_bump(mi, rp.Path, rp.Ver)
+        }
+    }
+
+    // Walk to a fixpoint. A round re-reads only the modules whose selected
+    // version changed (or that are new), so the work is linear in the graph.
+    var expanded = make(map[str]str)
+    var again = true
+    var rounds = 0
+    while again {
+        again = false
+        rounds += 1
+        if rounds > 256 {
+            mi.Deep.append("dependency selection did not settle after 256 " ||
+                           "rounds; the require graph is unreasonably deep")
+            break
+        }
+        var todo = []
+        each p in mi.Paths {
+            if p in expanded and expanded[p] == mi.Ver[p] { continue }
+            todo.append(p)
+        }
+        each p in todo {
+            expanded[p] = mi.Ver[p]
+            let d, isLocal = mod_serve_dir(mi.Mod, mi.Root, p, mod_ver(mi, p))
+            mi.Dir[p] = d
+            mi.Local[p] = isLocal
+            if d == "" or not os.isdir(d) { continue }
+            let sub = ReadMod(d)
+            each e in sub.Errs {
+                mi.Deep.append(sub.File || ":" || str(e.Line) || ": " || e.Msg)
+            }
+            // The clone must BE the module it is served as, or an import path
+            // means one thing to the program and another on disk.
+            if sub.Found and sub.Module != "" and sub.Module != p {
+                mi.Deep.append(sub.File || ":1: module `" || sub.Module ||
+                    "` is being served as `" || p ||
+                    "`; the `module` line must match the require path")
+            }
+            // A dependency's own `replace` is IGNORED — only the main
+            // module's applies (§11.1). Its `require`s are honoured.
+            each r in sub.Reqs {
+                if mod_bump(mi, r.Path, r.Ver) { again = true }
+            }
+        }
+    }
+    // Directories for anything added in the final round.
+    each p in mi.Paths {
+        if p in mi.Dir { continue }
+        let d, isLocal = mod_serve_dir(mi.Mod, mi.Root, p, mod_ver(mi, p))
+        mi.Dir[p] = d
+        mi.Local[p] = isLocal
+    }
+    return mi
+}
+
+// mod_bump raises the selected version of `p`, and reports whether anything
+// changed — which is what tells the walk above it has more to do.
+func mod_bump(mi mut ModInfo, p str, v str) bool {
+    if p == "" or v == "" { return false }
+    if not (p in mi.Ver) {
+        mi.Ver[p] = v
+        mi.Paths.append(p)
+        mi.Paths.sort()
+        return true
+    }
+    if VerCmp(v, mi.Ver[p]) > 0 {
+        mi.Ver[p] = v
+        return true
+    }
+    return false
+}
+
+// IsLocal reports whether a module path is served by a `replace` to a local
+// directory — which is the one case that is never hashed against voila.sum.
+func IsLocal(mi ModInfo, p str) bool {
+    if not (p in mi.Local) { return false }
+    return mi.Local[p]
+}
+
+func mod_ver(mi ModInfo, p str) str {
+    if p in mi.Ver { return mi.Ver[p] }
+    return ""
+}
+
+// mod_serve_dir answers where one module path is served from: the MAIN
+// module's `replace` first, then the module cache. It returns the directory
+// and whether it came from a LOCAL replace — the directory is returned
+// whether or not it exists, so the caller can report an absent one with the
+// command that would create it.
+//
+// Only the MAIN module's replaces are ever passed in. That is the whole rule:
+// a `replace` is not transitive, because a dependency silently redirecting
+// another dependency is the one thing that makes a deep graph unpredictable.
+func mod_serve_dir(mf ModFile, root str, p str, ver str) (str, bool) {
+    // Two passes, so the answer does not depend on the order the lines were
+    // written: a replace naming THIS version is more specific than one naming
+    // every version, and must win wherever it sits in the file.
+    var pass = 0
+    while pass < 2 {
+        each rp in mf.Reps {
+            if rp.Path != p { continue }
+            if pass == 0 {
+                if rp.Ver == "" { continue }
+                if ver == "" or VerCmp(rp.Ver, ver) != 0 { continue }
+            } else if rp.Ver != "" {
+                continue
+            }
+            if rp.ToVer == "" {
+                var d = rp.To
+                if not path.IsAbs(d) { d = path.Clean(path.Join(root, d)) }
+                return d, true
+            }
+            return ModCacheDir(rp.To, rp.ToVer), false
+        }
+        pass += 1
+    }
+    if ver == "" { return "", false }
+    return ModCacheDir(p, ver), false
+}
+
+// Match returns the LONGEST selected module path that prefixes an import
+// path on a segment boundary, or "". Two candidates of the same length that
+// both prefix `p` would have to be the same string, so the answer does not
+// depend on the order the paths are visited.
+func ModMatch(mi ModInfo, p str) str {
+    var best = ""
+    each mp in mi.Paths {
+        if p == mp or str.starts_with(p, mp || "/") {
+            if len(mp) > len(best) { best = mp }
+        }
+    }
+    return best
+}
+
+// ModDirFor maps an import path to the directory that should hold it: the
+// module's serving directory plus whatever of the import path was left over.
+func ModDirFor(mi ModInfo, p str) str {
+    let mp = ModMatch(mi, p)
+    if mp == "" { return "" }
+    var base = ""
+    if mp in mi.Dir { base = mi.Dir[mp] }
+    if base == "" { return "" }
+    if len(p) == len(mp) { return base }
+    return path.Clean(path.Join(base, p[len(mp) + 1..len(p)]))
+}
+
+// ---------------------------------------------------------------- voila.sum
+
+struct SumEntry {
+    Path str
+    Ver  str
+    Hash str
+}
+
+func SumPath(root str) str { return path.Join(root, "voila.sum") }
+
+// ReadSum reads voila.sum. A missing file is not an error: a module that has
+// never fetched anything has nothing to record, and the second return says
+// which of the two happened.
+func ReadSum(root str) ([]SumEntry, bool) {
+    var out = []
+    var data = ""
+    match os.read(SumPath(root)) {
+        Ok(d)  => data = d
+        Err(e) => return out, false
+    }
+    each raw in str.lines(data) {
+        let line = strip_comment(raw)
+        if line == "" { continue }
+        let f = fields(line)
+        if len(f) != 3 { continue }
+        out.append(SumEntry{Path: f[0], Ver: f[1], Hash: f[2]})
+    }
+    return out, true
+}
+
+func FindSum(sums []SumEntry, p str, v str) str {
+    each s in sums {
+        if s.Path == p and s.Ver == v { return s.Hash }
+    }
+    return ""
+}
+
+// ModHash is a DRIFT DETECTOR, not a security boundary. Say so out loud:
+// FNV-1a-64 is a non-cryptographic hash, and an attacker who can write to the
+// module cache can produce a collision with modest effort. It catches the
+// thing that actually happens — a cached dependency edited or truncated
+// underfoot — and it must NOT be described as anything more.
+//
+// std/crypto has a real SHA-256 and this deliberately does not use it. The
+// bootstrap floor is why: build.sh accepts a compiler as old as MIN_BOOTSTRAP
+// (0.4.1), whose runtime has no `crypto.*` natives at all, so calling one here
+// would make voilac uncompilable by the very compilers it must be compilable
+// by. The swap belongs one generation after crypto shipped — the same reason
+// main.ensure_dir still shells out to `mkdir -p`. The `f1a64:` prefix exists
+// so a voila.sum written then can be told apart from one written now.
+//
+// The hash covers every `.voi` file and every voila.mod in the tree, by
+// sorted relative path, with the path folded in as well as the content: two
+// files whose contents were swapped must not hash the same.
+func ModHash(dir str) str {
+    var files = []
+    collect_mod_files(dir, "", files)
+    files.sort()
+    var h = -3750763034362895579           // the FNV-1a 64-bit offset basis
+    each rel in files {
+        h = mod_fnv(h, rel)
+        h = mod_fnv(h, "\u{0}")
+        match os.read(path.Join(dir, rel)) {
+            Ok(t)  => h = mod_fnv(h, t)
+            Err(e) => h = mod_fnv(h, "\u{1}")
+        }
+        h = mod_fnv(h, "\u{0}")
+    }
+    return "f1a64:" || fmt.sprintf("%016x", h)
+}
+
+func collect_mod_files(root str, rel str, out mut []str) {
+    var d = root
+    if rel != "" { d = path.Join(root, rel) }
+    var entries = []
+    match os.listdir(d) {
+        Ok(es) => entries = es
+        Err(e) => return
+    }
+    entries.sort()
+    each e in entries {
+        // A dot directory (.git above all) is working data, not the module.
+        if str.starts_with(e, ".") { continue }
+        var r = e
+        if rel != "" { r = rel || "/" || e }
+        if os.isdir(path.Join(root, r)) {
+            collect_mod_files(root, r, out)
+        } else if str.ends_with(e, ".voi") or e == "voila.mod" {
+            out.append(r)
+        }
+    }
+}
+
+func mod_fnv(h0 int, s str) int {
+    var h = h0
+    each b in bytes(s) {
+        h = h ^ b
+        h = wrap_mul(h, 1099511628211)
+    }
+    return h
+}

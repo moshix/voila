@@ -1,0 +1,269 @@
+// chk/native.voi — argument counts for calls to a NATIVE.
+//
+// A native carries no static signature. The lowerer emits `CALL time.millis`
+// and the backend emits `vl_lookup_fn("time.millis")`; neither knows nor can
+// know how many arguments the C body reads. So nothing counted them, anywhere,
+// and the whole class went unreported in both directions:
+//
+//     say time.millis()                  // reads argv[0] — SIGSEGV
+//     say str.trim_left("..x", ".")      // argv[1] read by no path — ignored
+//     say fmt.table("hello")             // argv[0] cast to Value* — SIGSEGV
+//
+// Each of those was previously answered one function at a time, in C, at run
+// time: a type guard in bi_table, a maximum-arity table in runtime/src/str.c.
+// This is the same judgement made ONCE, for every native, at COMPILE time.
+// That placement is the point. `voila check` exists to promise that `build`
+// will not refuse and the program will not die of something decidable, and
+// main.voi calls the split "check said ok, build refused" the thing the verb
+// exists to prevent. A runtime guard leaves `check` saying ok.
+//
+// The bounds come from low.NativeArities, which is the one table, beside the
+// name lists it must agree with; selftest compares the two name sets, so a
+// native added without an arity is a red test.
+//
+// WHAT IS AND IS NOT JUDGED. Only a call whose callee resolves to a native
+// UNAMBIGUOUSLY is counted, and every ambiguity is answered with silence:
+//
+//   * a BARE name is judged only when low.PreludeNames would lower it as a
+//     prelude call — so `trim_left("x")` is not (it is not in that list and is
+//     an unknown identifier), and neither is a name a local binding, a module
+//     function, a type or an enum variant claims, because the lowerer resolves
+//     every one of those before it looks at the prelude (low/expr.voi's call
+//     path, in that order).
+//
+//   * a `pkg.member` callee is judged only when `pkg` really is a package
+//     qualifier here — the same two-part test low.is_pkg_qualifier applies (no
+//     local binding, no global of that name) — and only when nothing in the
+//     backend's fnIdx claims the dotted name first. `self.funcs` and the
+//     method union `self.mset` are the checker's mirror of exactly those rows,
+//     which is what lets `impl str { func blank() str { … } }` keep working.
+//
+//   * a method call `s.upper()` is NOT judged. Its receiver is an ordinary
+//     expression and the subject's type is what would decide, which is
+//     expression typing and does not exist yet. This check sees only the
+//     spellings whose callee is a name.
+//
+//   * a spread (`f(xs...)`) or a named argument is not a plain count, so the
+//     call is skipped exactly as chk/callsite.voi skips it.
+//
+//   * a GENERIC callee — `json.decode[Point](s)` — is an INDEX node, not a
+//     FIELD, and falls outside the walk. That is deliberate: the generator
+//     passes the type name as a hidden first argument, so the source count and
+//     the runtime count legitimately differ by one.
+//
+// SHADOWING is collected per declaration exactly as chk/callsite.voi does it,
+// and for the same reason: over-collecting can only lose a diagnostic, while
+// missing a bind would invent a wrong one.
+package chk
+
+use "voilac/ast"
+use "voilac/low"
+use "std/str"
+
+impl Checker {
+    // check_native_calls runs LAST among the call-shaped checks because it
+    // reads two tables other passes fill: chk/stdpkg.voi's std surface (which
+    // qualifiers are packages, which globals stop one from being read as one)
+    // and chk/traits.voi's method union.
+    func check_native_calls(mut self) {
+        self.collect_native_arity()
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            let n = self.T.Get(d)
+            if n.Kind == ast.IMPLDEC or n.Kind == ast.TRAITDEC {
+                // One bound set per METHOD: sibling methods are separate
+                // scopes, and sharing one would suppress a check in the
+                // second because the first bound the name.
+                each m in self.T.Get(self.T.Kid(d, 0)).Kids {
+                    self.native_scope(m)
+                }
+            } else {
+                self.native_scope(d)
+            }
+        }
+        // The script is one scope, as the sibling checks treat it.
+        var sbound = set([])
+        each s in self.T.Get(self.T.Kid(self.file, 2)).Kids {
+            self.collect_bound(s, sbound)
+        }
+        each s in self.T.Get(self.T.Kid(self.file, 2)).Kids {
+            self.walk_native_calls(s, sbound)
+        }
+    }
+
+    func native_scope(mut self, d int) {
+        if d == 0 { return }
+        var bound = set([])
+        self.collect_bound(d, bound)
+        self.walk_native_calls(d, bound)
+    }
+
+    // collect_native_arity reads low.NativeArities into the two lookup maps.
+    //
+    // A std/str function is registered under BOTH spellings from one entry —
+    // bare and `str.NAME` — which is what cg's known_native_names does with
+    // the same list, and what the runtime's vl_lookup_fn does by stripping a
+    // "str." prefix before it searches str_table.
+    func collect_native_arity(mut self) {
+        var strm = set([])
+        each n in low.StrMethodNames() {
+            strm.add(n)
+        }
+        each e in low.NativeArities() {
+            let parts = str.split(e, "|")
+            if len(parts) != 3 { continue }
+            let mn, okmn = arity_num(parts[1])
+            let mx, okmx = arity_num(parts[2])
+            // A malformed entry is DROPPED, never guessed at: an invented
+            // bound would reject a working call, which is the one direction
+            // this check may not err in.
+            if not okmn or not okmx { continue }
+            self.natMin[parts[0]] = mn
+            self.natMax[parts[0]] = mx
+            if parts[0] in strm {
+                self.natMin["str." || parts[0]] = mn
+                self.natMax["str." || parts[0]] = mx
+            }
+        }
+        // The bare names the LOWERER will read as a prelude call. It is a
+        // narrower set than the natives: fifteen std/str functions (trim_left,
+        // last_index, split_n and the rest) are reachable as `str.NAME` and as
+        // a method, but not bare, so a bare `trim_left(s)` is an unknown
+        // identifier and not this check's business.
+        each n in low.PreludeNames() {
+            if n in self.natMax { self.natBare.add(n) }
+        }
+        // The declared names that resolve ahead of the prelude and that no
+        // other table on the Checker holds.
+        //
+        // An enum VARIANT shadows a native of the same name, so
+        // `enum E { set(int) }` makes `set(1)` a construction. The names are
+        // package-qualified now, and a qualified one cannot collide with a
+        // bare native at all — adding it costs nothing and keeps this table
+        // matching the tree exactly.
+        each en in self.eNames {
+            each v in self.T.Get(self.T.Kid(self.enums[en], 0)).Kids {
+                let vn = self.T.Get(v).Sval
+                if vn != "" { self.natShadow.add(vn) }
+            }
+        }
+        // TYPE declarations, because `type index = int` makes `index(5)` a
+        // CONVERSION — low/expr.voi resolves conv_type and its own `aliases`
+        // set before it looks at the prelude. collect() files only the
+        // struct-carrying kind under `structs` (a bare alias has no STRUCTDEC
+        // child), so the alias was in no table this check consulted and
+        // `index(5)` was reported as a one-argument call to std/str's
+        // two-argument `index`. A conversion is not a call to a native and has
+        // no business being counted as one.
+        //
+        // The PRIMITIVE conversion names (`int`, `str`, `rune`, …) need no
+        // entry: low.conv_type's set and low.PreludeNames are disjoint, so a
+        // bare `int(x)` never reaches natBare in the first place.
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            let n = self.T.Get(d)
+            if n.Kind == ast.TYPEDEC and n.Sval != "" {
+                self.natShadow.add(n.Sval)
+            }
+        }
+    }
+
+    func walk_native_calls(mut self, node int, bound set[str]) {
+        if node == 0 { return }
+        let n = self.T.Get(node)
+        if n.Kind == ast.CALL {
+            self.check_native_call(node, bound)
+        }
+        if (n.Kind == ast.ARM or n.Kind == ast.IF) and n.Ival != 0 {
+            self.walk_native_calls(n.Ival, bound)
+        }
+        each kid in n.Kids {
+            self.walk_native_calls(kid, bound)
+        }
+    }
+
+    func check_native_call(mut self, call int, bound set[str]) {
+        let callee = self.T.Kid(call, 0)
+        let name = self.native_callee(callee, bound)
+        if name == "" { return }
+        if not (name in self.natMax) { return }
+
+        var given = 0
+        each a in self.T.Get(self.T.Kid(call, 1)).Kids {
+            let an = self.T.Get(a)
+            if an.Ival == 1 { return }              // spread: uncountable
+            if an.Sval != "" { return }             // named args: not counted
+            given += 1
+        }
+
+        let mn = self.natMin[name]
+        let mx = self.natMax[name]
+        if given >= mn and (mx < 0 or given <= mx) { return }
+
+        if mx < 0 {
+            self.report_at(callee, "`" || name || "` takes at least " ||
+                str(mn) || plural(mn, " argument", " arguments") ||
+                ", but " || str(given) || plural(given, " is", " are") ||
+                " given")
+            return
+        }
+        var wants = str(mx)
+        if mn != mx { wants = str(mn) || " to " || str(mx) }
+        self.report_at(callee, "`" || name || "` takes " || wants ||
+            plural(mx, " argument", " arguments") || ", but " ||
+            str(given) || plural(given, " is", " are") || " given")
+    }
+
+    // native_callee names the native a callee resolves to, or "" when the
+    // answer is not certain. Every `return ""` below mirrors a step the
+    // lowerer takes BEFORE it reaches the natives; getting the order wrong
+    // here would accuse a program that works.
+    func native_callee(self, callee int, bound set[str]) str {
+        if callee == 0 { return "" }
+        let k = self.T.Kind(callee)
+        if k == ast.IDENT {
+            let nm = self.T.Get(callee).Sval
+            if nm in bound { return "" }            // possibly shadowed
+            if not (nm in self.natBare) { return "" }
+            // low/expr.voi's bare-call path, in its own order: a module
+            // function, a conversion or type alias, an enum variant and a
+            // type name all resolve ahead of the prelude. A wrong-arity call
+            // to a module function is chk/callsite.voi's to report, from the
+            // declaration itself; a conversion has no arity to report.
+            if nm in self.funcs or nm in self.natShadow { return "" }
+            if nm in self.structs or nm in self.enums or nm in self.excs {
+                return ""
+            }
+            return nm
+        }
+        if k != ast.FIELD { return "" }
+        let base = self.T.Kid(callee, 0)
+        if base == 0 or self.T.Kind(base) != ast.IDENT { return "" }
+        let q = self.T.Get(base).Sval
+        // low.is_pkg_qualifier's two tests: a local binding, then a GLOBAL of
+        // that name. The second is the one that bites — a top-level
+        // `var path = "/etc"` followed by `path.upper()` is an ordinary method
+        // call on a str, and a table lookup alone would have misread it.
+        if q in bound or q in self.sdGlobals { return "" }
+        if not self.std_qualifier(q) { return "" }
+        // A USER package flattened to the same qualifier (see stdpkg.voi).
+        if q in self.sdUser { return "" }
+        let m = self.T.Get(callee).Sval
+        if m == "" { return "" }
+        let dotted = q || "." || m
+        // cg's emit_call resolves fnIdx BEFORE the natives, so anything the
+        // program itself declares under the dotted name wins: a grafted
+        // std-source function (`time.now_utc`), and a METHOD on a type of that
+        // name — `str` is a primitive as well as a package, so
+        // `impl str { … }` really does put `str.<method>` in fnIdx. mset is
+        // the checker's mirror of exactly those rows.
+        if dotted in self.funcs { return "" }
+        if (q || "|" || m) in self.mset { return "" }
+        return dotted
+    }
+}
+
+// arity_num reads one bound out of a NativeArities entry. ok is false when the
+// text is not a number, which can only mean the table itself is malformed.
+func arity_num(s str) (int, bool) {
+    let v = attempt int(s) else return 0, false
+    return v, true
+}

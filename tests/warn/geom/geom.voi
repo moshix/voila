@@ -1,0 +1,12 @@
+// A tiny user package, so the unused-import fixture can exercise the case
+// that matters most: an ALIASED user import. The rewriter flattens `g.Point`
+// into one identifier spelled `geom.Point`, so the loader is the only stage
+// that ever sees the letter the user actually typed.
+package geom
+
+struct Point {
+    X int
+    Y int
+}
+
+func Sum(p Point) int { return p.X + p.Y }

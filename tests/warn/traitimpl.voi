@@ -1,0 +1,24 @@
+// The third channel a package can be reached through: an impl on a type
+// somebody else declared. `p.wide()` and `p.tall()` below depend on `deco`
+// and `deco2` and mention nothing of either — no qualifier, no trait name,
+// nothing a scan of this file could find. Delete a `use` on a warning's
+// advice and the program COMPILES and then aborts at run time with
+// "geom.Point has no method ...".
+//
+// Both spellings are here, because they fail differently: `deco` writes
+// `impl Wide for geom.Point`, and `deco2` writes a bare `impl geom.Point`
+// with no trait at all. A rule that asked "is this a trait impl?" catches the
+// first and misses the second.
+//
+// `spare` is the control: it really is unused, so this fixture cannot pass by
+// the warning having been switched off.
+use "geom"
+use "deco"
+use "deco2"
+use "spare"
+use "std/fmt"
+
+func main() {
+    let p = geom.Point{X: 9, Y: 1}
+    fmt.printf("%t %t\n", p.wide(), p.tall())
+}

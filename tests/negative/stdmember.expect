@@ -1,0 +1,7 @@
+package `sync` has no member `nonexistent` (§13.4)
+package `sync` has no member `mutx`; did you mean `sync.mutex`? (§13.4)
+!package `path`
+!package `time`
+!package `net`
+!_mutex
+!takes 2 arguments

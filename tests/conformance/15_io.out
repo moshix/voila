@@ -1,0 +1,47 @@
+-- a reader outliving the file it came from --
+true
+true
+true
+true
+true
+at_eof: true
+read_byte past the end: -1
+after close: reader is closed
+-- peek, read, read_all, records --
+peek: alpha
+peek again: alpha
+read: alpha
+byte: 10
+rest: beta||gamma|
+records: ["alpha ", "beta  ", "      ", "gamma "]
+-- io.copy and io.read_all --
+alpha
+beta
+
+gamma
+copied: 18
+read_all: alpha|beta||gamma|
+-- the unifier --
+io.reader is idempotent: true
+bad source: io.reader: cannot read from int
+bad sink: io.writer: cannot write to str
+-- writers --
+written with spaces
+exact bytes, no newline of its own
+discard swallowed it: true
+-- io.pipe --
+true
+pipe at eof: true
+-- a user type that defines next(mut self) ?T --
+count: 3
+count: 2
+count: 1
+-- os.stdin --
+isatty: false
+first: true
+each: two (len 3)
+each:  (len 0)
+each: four (len 4)
+at_eof: true
+past the end: true
+prompt> input at end: end of input

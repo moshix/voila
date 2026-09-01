@@ -1,0 +1,5 @@
+package one
+
+enum Vis { Public, secret }
+
+func Get() Vis { return secret }

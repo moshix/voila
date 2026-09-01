@@ -1,0 +1,9 @@
+// --strict is -Wall -Werror: every warning on, every warning fatal. It is
+// also the fixture the run-cache check uses, so it must RUN cleanly when the
+// policy is the default one — see the `voila run` stage in selftest.bash.
+use "std/fmt"
+use "std/time"
+
+func main() {
+    fmt.printf("strict\n")
+}

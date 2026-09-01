@@ -1,0 +1,15 @@
+// std/xml is in the specification's package list (§13.4) and in no release
+// yet. The refusal must land HERE, at the `use`, and not in the backend: a
+// program that passes `check` and then fails `build` is the one inconsistency
+// the `check` verb exists to prevent.
+//
+// This fixture named std/regex until regex shipped, and std/http until http
+// shipped — each time it went green by accident, because the package it was
+// testing had become real. If xml ever ships, move this to another name from
+// std_planned() rather than deleting it; the behaviour it pins is the
+// `use`-site refusal, not the particular package.
+use "std/xml"
+
+func main() {
+    say xml.decode("<a/>")
+}

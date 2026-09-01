@@ -1,0 +1,9 @@
+// This file WRITES the `use` and never mentions the qualifier; b.voi beside
+// it is the one that does. The loader resolves a qualifier against the
+// package's merged import map, so b.voi compiles — and reporting this line
+// as unused would advise a removal that stops b.voi compiling.
+package sib
+
+use "geom"
+
+func Origin() int { return 0 }

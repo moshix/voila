@@ -1,0 +1,23 @@
+3:1 KW let
+3:5 IDENT x
+3:7 OP =
+3:9 INT 1
+3:10 SEMI
+4:1 KW let
+4:5 IDENT y
+4:7 OP =
+4:9 INT 2
+4:10 SEMI
+5:1 KW say
+5:5 ISTR
+5:30 SEMI
+6:1 KW say
+6:5 ISTR
+6:13 SEMI
+7:1 KW say
+7:5 ISTR
+7:16 SEMI
+8:1 KW say
+8:5 ISTR
+8:32 SEMI
+9:1 EOF

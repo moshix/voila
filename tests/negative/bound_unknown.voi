@@ -1,0 +1,11 @@
+// A generic bound naming a trait that does not exist. The bound was parsed
+// into "T|Ordish" and then discarded by the one place that read it
+// (load/rewrite.voi binds the name and throws the bound away).
+func biggest[T: Ordish](a T, b T) T {
+    if a > b { return a }
+    return b
+}
+
+func main() {
+    say biggest(3, 7)
+}

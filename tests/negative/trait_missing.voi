@@ -1,0 +1,15 @@
+// An impl block that promises a trait and provides nothing. The method table
+// would carry no `describe` entry at all, and the call below would find
+// nothing to dispatch to.
+trait Describe {
+    func describe(self) str
+}
+
+struct Canvas { name str }
+
+impl Describe for Canvas { }
+
+func main() {
+    let c = Canvas{name: "test"}
+    say c.describe()
+}

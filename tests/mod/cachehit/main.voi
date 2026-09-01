@@ -1,0 +1,7 @@
+package main
+
+// The package lives in the module cache, not under this module's root. The
+// loader flattens it from source exactly like a local one.
+use "example.com/lib/greet"
+
+func main() { say greet.Hello() }

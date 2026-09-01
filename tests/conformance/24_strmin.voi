@@ -1,0 +1,32 @@
+// 24_strmin.voi — a MISSING argument to a str native is refused, loudly.
+//
+// The mirror of 19_strarity, and the more dangerous half. A surplus argument
+// was silently ignored; a missing one was read anyway: `"hello".substr()`
+// reached `I(argv[1])` and dereferenced past the end of the caller's argv —
+// SIGSEGV, with nothing to catch and nothing to read.
+//
+// voilac/chk/native.voi now refuses every NAMED spelling of that call at
+// compile time (tests/negative/nativearity.voi), but a METHOD call is a call
+// on an ordinary expression whose type is what would decide — expression
+// typing, which does not exist yet — so the method spelling is the one that
+// reaches str_arity[] in runtime/src/str.c. This file is the proof that it
+// still does.
+//
+// The abort is the point of the test, so it is the LAST thing main does.
+package main
+use "std/str"
+
+func main() {
+    // The optional trailing argument is real, and both forms must keep
+    // working: a minimum that rejected `substr(s, 2)` would be a worse bug
+    // than the crash.
+    let s = "hello"
+    say s.substr(2)
+    say s.substr(2, 3)
+    say s.find_any("l")
+    say s.find_any("l", 4)
+
+    // ...and the missing one aborts instead of reading wild memory.
+    say s.substr()
+    say "NOT REACHED"
+}

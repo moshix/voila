@@ -1,0 +1,8 @@
+package Box
+
+// A package function whose flattened name is `Box.Area` — the same key a
+// method named `Area` on a TYPE named `Box` would mint. fnIdx is one flat
+// namespace, so this file exists to prove that a trait DEFAULT inherited by
+// such a type cannot quietly take this function's slot: adding the trait in
+// main.voi must not change what `Box.Area()` calls.
+func Area() int { return 42 }

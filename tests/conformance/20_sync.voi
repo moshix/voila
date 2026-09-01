@@ -1,0 +1,215 @@
+// std/sync — mutexes, read/write locks, atomics, Once and WaitGroup.
+//
+// Every number this prints is EXACT. A concurrency test whose golden said
+// "about four thousand" would be testing nothing at all, and the corpus is
+// re-run at -O1/-O2/-O3 and compared byte for byte besides: the whole claim
+// of the package is that concurrency stops being a source of uncertainty.
+use "std/sync"
+use "std/time"
+
+// hold_and_sleep takes the lock and then blocks for far longer than the group
+// below is given. Cancellation raises `Cancelled` inside time.sleep, so this
+// task is unwound from the MIDDLE of its critical section — and the `defer`
+// is the only thing that stops the lock being stranded on a task that no
+// longer exists. If it ever were stranded the suite would hang here, which is
+// the same failure mode 08_concurrency's `blocker()` already relies on.
+func hold_and_sleep(mu sync.Mutex) {
+    mu.lock()
+    defer mu.unlock()
+    time.sleep(10 * time.Second)
+}
+
+// count is spawned as a call rather than written as a closure inside the
+// loop, because a closure that captured the loop variable is a documented
+// backend refusal (tests/negative-native/loopcapture.voi).
+func count(a sync.Atomic, n int) {
+    for i in 0..n {
+        a.inc()
+    }
+}
+
+// reader takes the lock in READ mode, alongside every other reader, while the
+// writers below are taking it exclusively.
+func reader(rw sync.RWLock, seen sync.Atomic, n int) {
+    for i in 0..n {
+        rw.with_read(fn() { seen.inc() })
+    }
+}
+
+func worker(wg sync.WaitGroup, done sync.Atomic) {
+    done.inc()
+    wg.done()
+}
+
+// watcher cannot see anything but the finished total: wg.wait() returns only
+// once every worker has called done().
+func watcher(wg sync.WaitGroup, done sync.Atomic, out sync.Atomic) {
+    wg.wait()
+    out.store(done.load())
+}
+
+func main() {
+    // ------------------------------------------------------------- Mutex
+    // `total` is an ordinary variable captured by a closure. Eight tasks
+    // incrementing it 500 times each is 4000 and nothing else — without the
+    // lock, some of those read-modify-writes would land on top of each other.
+    let mu = sync.mutex()
+    var total = 0
+    let bump = fn() {
+        for i in 0..500 {
+            mu.lock()
+            total = total + 1
+            mu.unlock()
+        }
+    }
+    group {
+        for t in 0..8 { spawn bump() }
+    }
+    say total
+
+    // with() is the same critical section written once instead of twice.
+    say mu.with(fn() { return total ~/ 1000 })
+
+    // A throw out of a critical section leaves the mutex UNLOCKED: `defer`
+    // runs on the unwind path, so try_lock below succeeds. This is the case
+    // that wedged std/io's reader mutex during development, and it is why it
+    // is pinned here.
+    try {
+        mu.with(fn() { throw RuntimeError{msg: "inside"} })
+    } catch e: RuntimeError {
+        say "threw:", e.msg
+    }
+    say mu.try_lock()
+    mu.unlock()
+
+    // And a Mutex is not recursive: it says so rather than hanging.
+    mu.lock()
+    try {
+        mu.lock()
+    } catch e: RuntimeError {
+        say "not recursive"
+    }
+    mu.unlock()
+    try {
+        mu.unlock()
+    } catch e: RuntimeError {
+        say "not held"
+    }
+
+    // A task CANCELLED inside a critical section still unlocks on its way
+    // out. try_lock afterwards is the proof: the group has joined, so the
+    // holder is finished, and the lock is free only if its defer ran.
+    let cmu = sync.mutex()
+    try {
+        group timeout 40 * time.Millisecond {
+            spawn hold_and_sleep(cmu)
+        }
+    } catch e: Timeout {
+        say "cancelled mid-section"
+    }
+    say cmu.try_lock()
+    cmu.unlock()
+
+    // ------------------------------------------------------------ Atomic
+    let a = sync.atomic(0)
+    group {
+        for t in 0..8 { spawn count(a, 500) }
+    }
+    say a.load()
+
+    // Each result is bound before it is printed: `say f(), g()` would make the
+    // golden depend on argument evaluation order, which is not what this file
+    // is here to pin.
+    let b = sync.atomic(7)
+    let added = b.add(3)
+    let subbed = b.sub(4)
+    let upped = b.inc()
+    let downed = b.dec()
+    let swapped = b.swap(20)
+    say added, subbed, upped, downed, swapped, b.load()
+    let hit = b.cas(20, 21)
+    let miss = b.cas(20, 99)
+    say hit, miss, b.load()
+
+    // ------------------------------------------------------------ RWLock
+    // Readers share; a writer is alone. try_write_lock is the observable
+    // half of that: it fails while a reader is in and succeeds once it goes.
+    let rw = sync.rwlock()
+    rw.read_lock()
+    say rw.try_write_lock()
+    rw.read_unlock()
+    say rw.try_write_lock()
+    rw.write_unlock()
+
+    // `guarded` is again an ordinary captured variable: four tasks raise it
+    // 250 times each under the WRITE lock while four more read under the
+    // read lock, and 1000 is the only total the write lock permits.
+    var guarded = 0
+    let seen = sync.atomic(0)
+    let write_some = fn() {
+        for i in 0..250 {
+            rw.with_write(fn() { guarded = guarded + 1 })
+        }
+    }
+    group {
+        for t in 0..4 { spawn write_some() }
+        for t in 0..4 { spawn reader(rw, seen, 250) }
+    }
+    say guarded, seen.load()
+
+    // -------------------------------------------------------------- Once
+    let o = sync.once()
+    let runs = sync.atomic(0)
+    let initer = fn() { runs.inc() }
+    let do_it = fn() { o.do(initer) }
+    group {
+        for t in 0..8 { spawn do_it() }
+    }
+    say runs.load(), o.has_run()
+
+    // A Once whose work THROWS stays unrun, so a later caller retries.
+    let o2 = sync.once()
+    try {
+        o2.do(fn() { throw RuntimeError{msg: "init failed"} })
+    } catch e: RuntimeError {
+        say "once threw:", e.msg, o2.has_run()
+    }
+    o2.do(fn() { say "retried" })
+    say o2.has_run()
+
+    // --------------------------------------------------------- WaitGroup
+    let wg = sync.wait_group()
+    let done = sync.atomic(0)
+    let out = sync.atomic(-1)
+    wg.add(6)
+    group {
+        for t in 0..6 { spawn worker(wg, done) }
+        spawn watcher(wg, done, out)
+    }
+    say out.load(), wg.count()
+
+    // A WaitGroup whose count has reached zero is USED UP, and says so at the
+    // `add` — the count going back up is the thing that cannot be honoured.
+    // It used to close its gate a second time (a RuntimeError naming a
+    // channel the program never made), and worse: a transient zero, which one
+    // `add` per item makes easy, closed the gate for good and let every later
+    // `wait` return at once over work that was still running.
+    try {
+        wg.add(1)
+    } catch e: RuntimeError {
+        say "reused:", e.msg
+    }
+
+    // wait() on a group that never counted anything returns at once.
+    let empty = sync.wait_group()
+    empty.wait()
+    say "empty wait returned"
+
+    // More done() than add() is a bug, and is reported as one.
+    let wrong = sync.wait_group()
+    try {
+        wrong.done()
+    } catch e: RuntimeError {
+        say "negative:", e.msg
+    }
+}

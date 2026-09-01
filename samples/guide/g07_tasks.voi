@@ -3,7 +3,6 @@
 // A GROUP is a region. Tasks may be SPAWNed only inside one, and the
 // group does not end until every task it started has ended. There is no
 // way to leak a task: the brace that closes the group joins them all.
-use "std/fmt"
 use "std/time"
 
 func worker(id int, jobs chan[int], results chan[int]) {

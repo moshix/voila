@@ -1,0 +1,108 @@
+// 25_test.voi — std/test: assertions, table tests and the tally (§13.4).
+//
+// A test library has to be tested in both directions, and the failing
+// direction is the one that matters: an assertion that cannot fail is worse
+// than no assertion at all. So every check below is run twice, once with
+// arguments that agree and once with arguments that do not, and the FAILURE
+// MESSAGE is part of the golden — that is the whole product.
+//
+// The suite deliberately ends on `report`, not `done`. `done` is what a real
+// suite's `main` calls and it exits 1 when anything failed, which this
+// harness would read as a crashed program; `report` prints the same summary
+// and returns the verdict as a bool. `done` is still exercised, on a suite
+// that passes, because its OTHER path — returning normally — is the one a
+// green run takes.
+package main
+
+use "std/test"
+use "std/str"
+
+exception Boom { why str }
+
+func main() {
+    var t = test.suite("demo")
+
+    say "-- eq and ne --"
+    t.eq("int", 1 + 1, 2)
+    t.eq("int wrong", 1 + 1, 3)
+    // A str is printed QUOTED in a failure, which is the only way the
+    // trailing space below is visible at all.
+    t.eq("str", str.upper("ab"), "AB")
+    t.eq("str wrong", "ab ", "ab")
+    // == is deep, so a whole list compares in one call.
+    t.eq("list", [1, 2, 3], [1, 2, 3])
+    t.eq("list wrong", [1, 2], [1, 3])
+    t.ne("differs", "a", "b")
+    t.ne("differs wrong", "a", "a")
+
+    say "-- ok and not_ok --"
+    t.ok("true", 2 > 1)
+    t.ok("true wrong", 2 < 1)
+    t.not_ok("false", 2 < 1)
+    t.not_ok("false wrong", 2 > 1)
+
+    say "-- near, for float and for dec --"
+    t.near("float", 0.1 + 0.2, 0.3, 0.000001)
+    t.near("float wrong", 1.0, 2.0, 0.25)
+    t.near("dec", 1.10d, 1.11d, 0.05d)
+    t.near("dec wrong", 1.10d, 1.50d, 0.05d)
+
+    say "-- raises --"
+    // raises hands back the message, so a caller can keep asserting on it.
+    let msg = t.raises("throws", fn() { throw Boom{why: "on purpose"} })
+    say "message:", msg
+    t.raises("raises wrong", fn() { return 41 })
+    t.raises_msg("message matches", "purpose",
+                 fn() { throw Boom{why: "on purpose"} })
+    t.raises_msg("message wrong", "banana",
+                 fn() { throw Boom{why: "on purpose"} })
+    t.raises_msg("nothing thrown", "banana", fn() { return 41 })
+
+    say "-- fail --"
+    t.fail("outright", "no assertion fits this one")
+
+    say "-- a table of finished rows --"
+    t.table("len", [test.row("empty", len(""), 0),
+                    test.row("abc", len("abc"), 3),
+                    test.row("wrong", len("ab"), 9)])
+
+    say "-- a table applied to a function --"
+    t.run("upper", [test.Case{name: "ascii", input: "ab", want: "AB"},
+                    test.Case{name: "empty", input: "", want: ""},
+                    test.Case{name: "wrong", input: "ab", want: "ab"}],
+          fn(s) { return str.upper(s) })
+
+    say "-- verbose prints the passes too --"
+    t.verbose = true
+    t.eq("seen", 1, 1)
+    t.verbose = false
+
+    say "-- merge folds another suite in, names intact --"
+    var u = test.suite("other")
+    u.eq("agrees", "x", "x")
+    u.eq("disagrees", "x", "y")
+    t.merge(u)
+
+    say "-- what was collected --"
+    say "failures:", len(t.failures())
+    say "first:", t.failures()[0]
+    say "summary:", t.summary()
+    // report prints the summary itself and hands back the verdict, so it is
+    // bound first: printing it inline would put its own line above the label.
+    let green = t.report()
+    say "report:", green
+
+    // repr is the rendering every failure above went through: a str comes out
+    // quoted and escaped, everything else bare.
+    say "-- repr --"
+    say test.repr(" x "), test.repr(3), test.repr([1, "a"]), test.repr(nil)
+
+    // done on a suite that PASSED returns normally — the only path a green
+    // run takes. The other path is os.exit(1), which is how a suite tells a
+    // shell it failed and is why `main` needs nothing else.
+    say "-- done on a green suite --"
+    var g = test.suite("green")
+    g.eq("fine", 2, 2)
+    g.done()
+    say "still here"
+}

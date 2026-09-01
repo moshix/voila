@@ -36,6 +36,7 @@ func main() {
     // or bootstrap.bash's cc-compiled seed — both exported as $VOILA).
     let voila = tool()
 
+    // (os.mkdir_all exists now; see emit_c for why this still shells out.)
     sh("mkdir", ["-p", BUILD, "bin", "voilac/std"])
 
     // ---- 0. the runtime the compiler carries
@@ -275,6 +276,11 @@ func listing(dir str) []str {
 
 // emit_c captures a compiler's C output for the compiler's own source. os.run
 // inherits stdout, so the redirection goes through the shell.
+//
+// os.run_capture and os.mkdir_all now exist and would retire every shell-out
+// in this file — but build.sh runs THIS program with a bootstrap compiler as
+// old as MIN_BOOTSTRAP, whose runtime does not have them. The migration waits
+// until that floor rises past the release that added them.
 func emit_c(compiler str, out str) {
     let rc = os.run("bash", ["-c", compiler || " --emit=c voilac/main.voi > " || out])
     if rc != 0 {

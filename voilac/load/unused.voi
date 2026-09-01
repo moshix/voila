@@ -1,0 +1,246 @@
+// load/unused.voi — the `unused-import` warning.
+//
+// This belongs to the LOADER and can live nowhere else. Flattening throws away
+// exactly what the check needs: after the merge only the entry file's std
+// `use`s survive into the tree (see the `uses` filter in Load), a package
+// file's imports are gone entirely, and every `Q.name` has become one flat
+// identifier that no longer records which qualifier — or which ALIAS — the
+// user actually wrote. The loader is the last stage that still holds one tree
+// per file with its `use` list attached, so the question can only be asked
+// here.
+//
+// HOW A USE IS RECOGNISED. A linear sweep of the node arena, taken BEFORE the
+// rewriter runs. One file is one tree at this point, so every node in a tree
+// belongs to that file and no structural walk is needed — which matters,
+// because a structural walk would be a third copy of rewrite.voi's descent to
+// keep in step for no gain.
+//
+// It must run before rw_file for two reasons: the rewriter rewrites `g.Point`
+// into a single ident spelled `geom.Point`, losing the alias `g`; and Graft
+// then consumes the tree outright.
+//
+// A PACKAGE IS NOT REACHED ONLY THROUGH ITS QUALIFIER, and getting that wrong
+// is how this warning breaks a build. Four channels, all of them handled —
+// and note where each is ANSWERED, because that is the part that is easy to
+// get wrong twice:
+//
+//  1. `Q.name`. The qualifier appears as an IDENT (the base of `os.exit`, of
+//     `geom.Point`) or as the prefix of a dotted type name. This is the easy
+//     one and the only one the first cut had.
+//
+//  2. A GLOBAL name. Trait names and enum VARIANTS are package-qualified
+//     like every other declaration, but they are the only ones an importer
+//     may still spell BARE (the rewriter's short-name rule resolves them),
+//     so
+//
+//         use "shapes"                    ← the qualifier appears NOWHERE
+//         impl Describe for Box { … }
+//
+//     is a genuine use of `shapes`, and deleting the `use` on this warning's
+//     advice costs you "no trait `Describe`". So the bare spellings are
+//     collected too (IMPLDEC's trait, a generic BOUND, a variant pattern, an
+//     undotted type name) and matched against the names the package actually
+//     declares globally (Pkg.globals).
+//
+//  3. An impl on somebody else's type. `impl geom.Point { … }` in package P
+//     makes `p.wide()` work in a file that names nothing of P's at all,
+//     because the method arrives by DISPATCH.
+//
+//  4. An initializer's EFFECT. `var Ready = announce()` at package level runs
+//     when the program starts; the importer may want nothing else from the
+//     package at all.
+//
+// CHANNELS 1 AND 2 LEAVE A NODE IN THE IMPORTING FILE. Channels 3 AND 4 LEAVE
+// NOTHING — not a qualifier, not a trait name, not one token. No widening of
+// add_qualifiers can ever reach them, and adding a sixth node kind to it is
+// wasted work: they are answered on the EXPORTING side, by asking the
+// imported package what it declares (Pkg.foreignImpl, Pkg.hasInit), and a
+// package that has either is never reported, full stop.
+//
+// Channels 3 and 4 are the difference between a warning that is merely wrong
+// and one that is dangerous. Taking channel 3's advice compiles and then
+// aborts at RUN TIME with "geom.Point has no method `wide`"; taking channel
+// 4's says nothing at all and quietly does less.
+//
+// THE SCAN SPANS THE WHOLE PACKAGE, not the one file the `use` is written in,
+// and that is not sloppiness — it is the only answer that is SAFE. The
+// rewriter resolves a qualifier against the package's MERGED import map
+// (rw_import in rewrite.voi), so a file may legally reach `geom.Point`
+// through a sibling file's `use`, and does:
+//
+//     lib/a.voi:  use "geom"                  ← never mentions geom
+//     lib/b.voi:  func Go() int { return geom.Area() }
+//
+// A per-file answer would tell you a.voi's import is unused. Take that advice
+// and b.voi stops compiling. Advice that breaks the build is worse than
+// silence, so a `use` is reported only when NO file of its package mentions
+// the qualifier — exactly the condition under which deleting it is safe. It
+// costs the case where two files import the same package and only one uses
+// it; if the loader is ever tightened to per-file imports (§11.3), this can
+// be tightened with it and the two will still agree.
+//
+// THE SCAN IS ALSO DELIBERATELY GENEROUS. It knows nothing about scopes, so a
+// local variable named `os` counts as a mention of the package `os`. That
+// loses a diagnostic and can never invent one — the only direction an
+// unused-import warning is allowed to err in, because the cost of a wrong one
+// is that a project turns the whole warning off.
+package load
+
+use "voilac/ast"
+use "voilac/path"
+use "std/str"
+
+impl Loader {
+    // warn_unused_imports reports every `use` in one file whose qualifier
+    // `used` — the mentions of the whole package, see the note above — does
+    // not contain. `self.at` must already name the file; `where` names the
+    // scope that was searched, so the message never claims more than it
+    // checked ("this file" for the entry, "package `lib`" for a package).
+    func warn_unused_imports(mut self, t ast.Tree, root int, used set[str],
+                             where str) {
+        each u in t.Get(t.Kid(root, 0)).Kids {
+            let un = t.Get(u)
+            let parts = str.split(un.Sval, "|")
+            let ipath = parts[0]
+            var alias = ""
+            if len(parts) > 1 { alias = parts[1] }
+
+            // A selective or wildcard import binds NAMES, not a qualifier, so
+            // there is no qualifier to look for. Judging one would need the
+            // imported package's declarations, which is a different check.
+            if un.Ival2 != 0 { continue }
+
+            let dir, k = self.resolve(ipath)
+            // An import that did not resolve is already an ERROR against this
+            // very line; a second complaint about it helps nobody.
+            if k == KIND_BAD or k == KIND_NOSTD { continue }
+
+            // Channels 3 and 4: nothing in this file could show them, so
+            // the question is put to the imported package instead. Silence is
+            // the only safe answer to either.
+            let pi = self.pkg_of(ipath, dir, k)
+            if pi >= 0 and self.pkgs[pi].foreignImpl { continue }
+            if pi >= 0 and self.pkgs[pi].hasInit { continue }
+            // Channel 2: the package's globally-namespaced declarations.
+            if pi >= 0 and self.mentions_global(pi, used) { continue }
+
+            let base = path.Base(ipath)
+            // std/str is EXEMPT, and this is not laziness. Its functions are
+            // reachable bare through the method-call duality — `s.upper()` IS
+            // `str.upper(s)`, see str_natives() in voilac/cg/instr.voi — so a
+            // file can lean on this import from end to end without the word
+            // `str` ever appearing in it. Until the checker can tell a bare
+            // `upper` from an ordinary method call, warning here would be
+            // wrong far more often than right.
+            if k == KIND_STD and base == "str" { continue }
+
+            var q = alias
+            if q == "" { q = base }
+            if q in used { continue }
+            // BOTH spellings count for a std package, and that is not
+            // laziness. A qualifier is program-wide (low.PackageNames), not
+            // per-import, so `use "std/os" as o` leaves `os.getenv()` working
+            // beside `o.getenv()` — the alias adds a spelling rather than
+            // replacing one. Accusing the file that used the original would
+            // be advice that breaks a program that works.
+            if k != KIND_USER and base in used { continue }
+
+            self.warn(un.Line, un.Col, "unused-import",
+                      "unused import `{ipath}`: nothing in {where} " ||
+                      "mentions `{q}`")
+        }
+    }
+
+    // pkg_of maps a resolved import back to its entry in self.pkgs, or -1 for
+    // a C std package, which has no Pkg at all.
+    //
+    // -1 is SAFE for a C std package, and that rests on a real property
+    // rather than on luck: such a package's entire surface is the natives
+    // table in voilac/cg/instr.voi, every entry of which is spelled
+    // `pkg.name`. None of them declares a trait or an enum (channel 2), none
+    // writes an impl (channel 3), and none has an initializer to run (channel
+    // 4) — so channel 1 is the whole story and the qualifier scan is
+    // complete. The single exception is std/str's bare method-call duality,
+    // which is why `str` is exempted outright above.
+    func pkg_of(self, ipath str, dir str, k int) int {
+        if k == KIND_USER {
+            if dir in self.byDir { return self.byDir[dir] }
+            return 0 - 1
+        }
+        if k == KIND_STDSRC {
+            // load_std_pkg keys an embedded package by `std/<name>`, which
+            // cannot collide with any user directory.
+            let ident = "std/" || std_src_base(ipath)
+            if ident in self.byDir { return self.byDir[ident] }
+        }
+        return 0 - 1
+    }
+
+    // mentions_global reports whether the scan saw one of this package's
+    // globally-namespaced declarations. The walk is over Pkg.globals, a
+    // declaration-ordered SLICE; `used` is only ever looked up in, never
+    // iterated.
+    func mentions_global(self, pi int, used set[str]) bool {
+        each g in self.pkgs[pi].globals {
+            if g in used { return true }
+        }
+        return false
+    }
+}
+
+// add_qualifiers adds every name this tree could be reaching a package
+// through to `used` — both channels 1 and 2 of the note at the top of the
+// file, because a bare trait name and a qualifier are told apart later, by
+// what the imported package turns out to declare.
+//
+// The five node kinds are the five places a package-provided name can be
+// spelled. Adding a kind here can only ever SILENCE a warning, never invent
+// one, which is the direction this list is allowed to be incomplete in.
+//
+//   IDENT     `os` in `os.exit`, `g` in `g.Point`, a bare variant `Empty`
+//   TNAMED    dotted → the qualifier; undotted → a bare type or TRAIT name
+//   IMPLDEC   the trait of `impl Describe for Box` ("" when inherent)
+//   GENERIC   the bound of `[T: Describe]`, stored as "T|Describe"
+//   PVARIANT  a variant in pattern position, `Circle(r) =>`
+//
+// It ACCUMULATES rather than returning a set of its own so that a package's
+// files can be unioned without iterating one — the sets in this compiler are
+// lookup-only, because iteration order is the fixpoint hazard TESTING.md §1
+// names.
+func add_qualifiers(t ast.Tree, used mut set[str]) {
+    var i = 1                       // node 0 is the nil node
+    while i < len(t.Nodes) {
+        let n = t.Nodes[i]
+        if n.Kind == ast.IDENT {
+            used.add(n.Sval)
+        } else if n.Kind == ast.PVARIANT or n.Kind == ast.IMPLDEC {
+            // These two may now be QUALIFIED — `geom.Circle(r) =>`, `impl
+            // geom.Named for Box` — so the qualifier half has to be added as
+            // well, or an import reached only that way reads as unused and
+            // the warning's advice breaks the program.
+            add_bare_or_qualified(n.Sval, used)
+        } else if n.Kind == ast.TNAMED {
+            let dot = index_of(n.Sval, '.')
+            if dot > 0 {
+                used.add(n.Sval[0..dot])
+            } else {
+                used.add(n.Sval)
+            }
+        } else if n.Kind == ast.GENERIC {
+            let parts = str.split(n.Sval, "|")
+            if len(parts) > 1 { add_bare_or_qualified(parts[1], used) }
+        }
+        i += 1
+    }
+}
+
+// add_bare_or_qualified records both readings of a name that may or may not
+// carry a qualifier: the whole name (a bare global, which is matched against
+// Pkg.globals) and, when it is dotted, the qualifier alone. Both are only ever
+// able to SILENCE the warning, which is the direction this may err in.
+func add_bare_or_qualified(name str, used mut set[str]) {
+    if name == "" { return }
+    used.add(name)
+    let dot = index_of(name, '.')
+    if dot > 0 { used.add(name[0..dot]) }
+}

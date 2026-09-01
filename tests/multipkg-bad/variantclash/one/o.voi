@@ -1,3 +1,0 @@
-package one
-enum L { Empty, Node(v int) }
-func Mk() L { return Node(7) }

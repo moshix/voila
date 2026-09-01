@@ -1,0 +1,45 @@
+use "std/os"
+
+// A function that declares a result must not be able to fall out of the
+// bottom of its body: the runtime returned whatever happened to be there.
+// The `else if` chain has no final `else`, so zero falls through.
+func classify(n int) str {
+    if n > 0 {
+        return "positive"
+    } else if n < 0 {
+        return "negative"
+    }
+}
+
+// These two are fine and must stay fine. Every case of the switch diverts —
+// and `fallthrough` counts as diverting, because it leaves its case for the
+// next one, which is judged separately. Every arm of the match diverts too.
+func sign(n int) int {
+    switch n {
+        case 0: fallthrough
+        case 1: return 0
+        default: return 1
+    }
+}
+
+func first(xs []int) int {
+    each x in xs { return x }
+    while true {
+        if len(xs) == 0 { return 0 }
+    }
+}
+
+// Also fine: a `return` inside a task group returns from the enclosing
+// function, and `os.exit` never comes back at all.
+func doubled(n int) int {
+    group { return n * 2 }
+}
+
+func demand(n int) int {
+    if n > 0 { return n }
+    os.exit(2)
+}
+
+func main() {
+    say classify(0), sign(3), first([]), doubled(2), demand(1)
+}

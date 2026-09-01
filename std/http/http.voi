@@ -1,0 +1,1291 @@
+// std/http — HTTP/1.1 over std/net (§13.3, §13.4): a client, a server, and
+// URL parsing.
+//
+// Like std/csv this is pure Voilà: it needs no C of its own, because the
+// syscalls it wants are already std/net's and the buffering is already
+// std/io's. What is left is the protocol, and the protocol is text.
+//
+// ------------------------------------------------------------------ client
+//
+//     let resp = try http.get("http://example.com/index.html")
+//     say resp.status, resp.header("content-type")
+//     say resp.body
+//
+// `get`, `post` and `request` are the three §13.3 promises. `request` is the
+// general one — method, URL, headers and body — and the other two are one
+// line each on top of it. Each opens a connection, sends one request, reads
+// one response and closes: no keep-alive, no connection pool, no automatic
+// redirect following. A 301 is returned to the caller as a 301, with its
+// Location header intact, because a library that silently re-issues a request
+// somewhere else is a library that can silently re-issue it to somewhere you
+// did not authorise.
+//
+// ------------------------------------------------------------------ server
+//
+//     var srv = try http.listen("127.0.0.1:8080")
+//     while true {
+//         match srv.serve_one(hello) { Ok(u) => u, Err(e) => say e.message() }
+//     }
+//
+// where `hello` is `fn(http.Request) http.Response`. `serve_one` accepts ONE
+// connection, reads ONE request, calls the handler and writes what it returns.
+// The loop, and any `spawn` inside it, belongs to the program: std/net's model
+// is thread-per-connection (§10) and this package does not take that decision
+// away. `accept` hands back a Session for a caller who wants the request and
+// the response in their own hands.
+//
+// ------------------------------------------------------------------- NO TLS
+//
+// There is no TLS in this release, so there is no `https`. An https:// URL is
+// REFUSED, by name, at `parse_url`. It is not quietly fetched over port 443 in
+// the clear and it is not downgraded to http:// — either would hand a
+// program's credentials to anyone on the path while its source code says
+// `https`, which is the worst outcome available. Terminate TLS outside the
+// program (a local proxy, a sidecar) and point this at the plaintext side.
+//
+// -------------------------------------------------------- what it refuses
+//
+// A response this parser cannot vouch for is an ERROR, never a guess:
+//
+//   * no status line, or one that is not `HTTP/x.y CODE [reason]`
+//   * a header line with no colon, an empty name, or whitespace before the
+//     colon (the shape request smuggling is built from)
+//   * obsolete line folding — a header continued on an indented line
+//   * `Content-Length` that is not a plain decimal, or that exceeds
+//     `max_body`; TWO Content-Length headers that disagree; a Content-Length
+//     alongside `Transfer-Encoding: chunked` (again, smuggling)
+//   * a body shorter than the length declared for it
+//   * a Transfer-Encoding this release does not implement
+//
+// None of those can hang: every read is bounded by `max_body`, every line by
+// MAX_LINE, every header block by MAX_HEADERS, and every socket carries a
+// timeout (`Client.timeout_ms`, `Server.set_timeout`) so a peer that says
+// nothing at all is an error rather than a wedged task.
+//
+// The Content-Length limit is the one worth spelling out: the length is read
+// digit by digit against the limit and the read is refused BEFORE anything is
+// allocated, so `Content-Length: 99999999999999` costs a diagnostic and not
+// ninety terabytes.
+//
+// --------------------------------------------------------------- chunked
+//
+// `Transfer-Encoding: chunked` is decoded on read — it has to be, because a
+// real server sends it whenever it does not know the length in advance, and a
+// client that only understood Content-Length would fail on exactly the
+// responses that are generated rather than served from a file. Chunk
+// extensions (`1a;name=value`) are parsed and ignored, and trailers after the
+// final chunk are read and discarded.
+//
+// WRITING is always Content-Length — this package knows the length of
+// everything it sends — and that length is taken from the body actually being
+// written, never from a caller's header. A declared length that disagrees with
+// the bytes on the wire leaves the extra ones to be read as the start of the
+// next message, so a caller's Content-Length is discarded and a caller's
+// Transfer-Encoding is refused outright.
+//
+// ------------------------------------------------------------------ errors
+//
+// Value-returning throughout, as std/net and std/io are: every fallible call
+// yields a result or an IOError VALUE, so `match`, `try`, `else` and `must`
+// all compose (§8.5, §9.1). Nothing here throws.
+//
+// ------------------------------------------------------- deliberately absent
+//
+// No TLS (above), no keep-alive, no redirects, no cookies, no multipart, no
+// percent-encoding helpers, no proxy support, no HTTP/2. Each is a package's
+// worth of decisions on its own; none is needed to speak the protocol.
+package http
+
+use "std/net"
+use "std/str"
+
+// The knobs, and the reason each has a number rather than being unbounded.
+const DEFAULT_PORT       = 80
+const DEFAULT_TIMEOUT_MS = 30000     // a silent peer must not wedge a task
+const DEFAULT_MAX_BODY   = 33554432  // 32 MiB: a body, not a memory exhaustion
+const MAX_LINE           = 65536     // one status/header/chunk-size line
+const MAX_HEADERS        = 200       // header lines in one block, or trailers
+const READ_CHUNK         = 65536     // bytes asked of the socket at a time
+
+// ------------------------------------------------------------------ headers
+
+// Header is one `Name: value` line. Both halves are kept exactly as they were
+// written or read — the name's case is preserved, because a header is not
+// only read by this program, and some peers still care.
+struct Header {
+    name  str
+    value str
+}
+
+// Headers is an ORDERED LIST of them, not a map, and the order is the order
+// they were added. Two reasons: a header may legally appear more than once
+// (Set-Cookie is the famous one) and a map would silently keep one of them;
+// and a list renders identically on every run, which a map's iteration order
+// does not promise.
+//
+// Lookup is case-INSENSITIVE throughout, because the protocol says field
+// names are: `Content-Length` and `content-length` are one header, and every
+// method below matches with str.equal_fold rather than `==`.
+struct Headers {
+    items []Header
+}
+
+// headers makes an empty set. `Headers{}` would leave `items` nil, which
+// nothing here could append to, so this is the constructor to reach for.
+func headers() Headers {
+    return Headers{items: []}
+}
+
+impl Headers {
+    // count is how many header lines there are — not how many distinct names.
+    func count(self) int {
+        return len(self.items)
+    }
+
+    // get is the FIRST value stored under `name`, or "" when there is none. A
+    // header that is genuinely present with an empty value answers "" too,
+    // which is what `has` is for.
+    func get(self, name str) str {
+        each h in self.items {
+            if str.equal_fold(h.name, name) { return h.value }
+        }
+        return ""
+    }
+
+    // has reports whether the name appears at all.
+    func has(self, name str) bool {
+        each h in self.items {
+            if str.equal_fold(h.name, name) { return true }
+        }
+        return false
+    }
+
+    // all is every value stored under `name`, in order. This is the one to
+    // use for a header that repeats.
+    func all(self, name str) []str {
+        var out = []
+        each h in self.items {
+            if str.equal_fold(h.name, name) { out.append(h.value) }
+        }
+        return out
+    }
+
+    // names is each header's name, in order, duplicates and all.
+    func names(self) []str {
+        var out = []
+        each h in self.items { out.append(h.name) }
+        return out
+    }
+
+    // add appends a value, keeping any that are already there — the spelling
+    // for a header that may repeat.
+    func add(mut self, name str, value str) {
+        self.items.append(Header{name: name, value: value})
+    }
+
+    // set replaces every value under `name` with this one, in the position
+    // the first of them occupied, or appends when there was none. Holding the
+    // position is what keeps a rendered header block stable across a `set`.
+    func set(mut self, name str, value str) {
+        var out = []
+        var placed = false
+        each h in self.items {
+            if str.equal_fold(h.name, name) {
+                if not placed {
+                    out.append(Header{name: name, value: value})
+                    placed = true
+                }
+                continue
+            }
+            out.append(h)
+        }
+        if not placed { out.append(Header{name: name, value: value}) }
+        self.items = out
+    }
+
+    // remove drops every value under `name`.
+    func remove(mut self, name str) {
+        var out = []
+        each h in self.items {
+            if str.equal_fold(h.name, name) { continue }
+            out.append(h)
+        }
+        self.items = out
+    }
+
+    // copy is an independent set with the same contents. The client copies
+    // the caller's headers before adding Host and Content-Length to them: a
+    // request must not mutate the Headers value its caller still holds.
+    func copy(self) Headers {
+        var out = headers()
+        each h in self.items { out.add(h.name, h.value) }
+        return out
+    }
+
+    // render writes the block, one `Name: value\r\n` per header, WITHOUT the
+    // blank line that ends it (the callers add that after their own lines).
+    // Every name and value is validated first: a value carrying a CR or LF
+    // would end the header block early and let the rest of the string be read
+    // as headers — or as a whole second response — which is response
+    // splitting, and it is refused here rather than trusted to the peer.
+    func render(self) str throws IOError {
+        var b = str.Builder{}
+        each h in self.items {
+            try check_header(h.name, h.value)
+            b.write(h.name || ": " || h.value || "\r\n")
+        }
+        return b.done()
+    }
+}
+
+// ---------------------------------------------------------------------- URL
+
+// URL is a parsed absolute URL. `port` is always filled in — 80 when the URL
+// left it out — so `addr` never has to guess, and `query` is the raw text
+// after `?` with no percent-decoding and no splitting into parameters.
+struct URL {
+    scheme str
+    host   str
+    port   int
+    path   str
+    query  str
+}
+
+impl URL {
+    // addr is "host:port" for net.connect, with an IPv6 literal bracketed.
+    func addr(self) str {
+        return net.format_hostport(self.host, self.port)
+    }
+
+    // authority is what the Host header carries: the port is written only
+    // when it is not the default, which is what every other client does and
+    // what virtual-host routing on the far side expects.
+    func authority(self) str {
+        if self.port == DEFAULT_PORT {
+            if str.contains(self.host, ":") { return "[" || self.host || "]" }
+            return self.host
+        }
+        return net.format_hostport(self.host, self.port)
+    }
+
+    // target is the request target — the path, plus "?query" when there is
+    // one. Never empty: a URL with no path targets "/".
+    func target(self) str {
+        if self.query == "" { return self.path }
+        return self.path || "?" || self.query
+    }
+
+    // text renders the URL back to a string. It round-trips through
+    // parse_url, though it is not byte-identical to the input: a default port
+    // that was written out is dropped, and a fragment is gone (see parse_url).
+    func text(self) str {
+        return self.scheme || "://" || self.authority() || self.target()
+    }
+}
+
+// parse_url splits an absolute URL into scheme, host, port, path and query.
+//
+// The fragment is DROPPED rather than kept: it is a client-side anchor that
+// is never sent to the server, and carrying it in a struct whose whole job is
+// to be turned back into a request would invite someone to send it.
+//
+// https is refused here, once, so that every entry point refuses it: see the
+// NO TLS note at the top of this file.
+func parse_url(raw str) URL throws IOError {
+    if len(raw) == 0 {
+        return errf("http: empty URL")
+    }
+    let sep = str.index(raw, "://")
+    if sep <= 0 {
+        return errf("http: URL {brief(raw)} has no scheme " ||
+                    "(want http://host/path)")
+    }
+    let scheme = str.lower(raw[0..sep])
+    if scheme == "https" {
+        return errf("http: {brief(raw)} is https, and this release has no TLS " ||
+                    "— std/http speaks plaintext HTTP only. It will not fetch " ||
+                    "an https URL in the clear. Terminate TLS outside the " ||
+                    "program and use its http:// address.")
+    }
+    if scheme != "http" {
+        return errf("http: unsupported URL scheme `{scheme}` " ||
+                    "(std/http speaks http only)")
+    }
+
+    var rest = raw[sep + 3..len(raw)]
+    let hash = str.index(rest, "#")
+    if hash >= 0 { rest = rest[0..hash] }
+
+    // The authority runs to the first `/` or `?`; everything after is the
+    // path and query.
+    var auth = rest
+    var tail = ""
+    let cut = str.find_any(rest, "/?")
+    if cut >= 0 {
+        auth = rest[0..cut]
+        tail = rest[cut..len(rest)]
+    }
+    if len(auth) == 0 {
+        return errf("http: URL {brief(raw)} has no host")
+    }
+    // `user:password@host` is refused rather than ignored: dropping the
+    // credentials silently would send an UNAUTHENTICATED request that looks
+    // like the authenticated one the caller wrote.
+    if str.contains(auth, "@") {
+        return errf("http: userinfo (`user@host`) in a URL is not supported: " ||
+                    "{brief(raw)}")
+    }
+
+    var host = auth
+    var port = DEFAULT_PORT
+    if auth[0] == '[' {
+        // An IPv6 literal: the colons inside the brackets are the address's,
+        // not a port separator.
+        let end = str.index(auth, "]")
+        if end < 0 {
+            return errf("http: URL {brief(raw)}: unbalanced '[' in the host")
+        }
+        host = auth[1..end]
+        let after = auth[end + 1..len(auth)]
+        if len(after) > 0 {
+            if after[0] != ':' {
+                return errf("http: URL {brief(raw)}: want [host]:port")
+            }
+            port = try port_of(after[1..len(after)], raw)
+        }
+    } else {
+        let colon = str.last_index(auth, ":")
+        if colon >= 0 {
+            host = auth[0..colon]
+            port = try port_of(auth[colon + 1..len(auth)], raw)
+        }
+    }
+    if len(host) == 0 {
+        return errf("http: URL {brief(raw)} has no host")
+    }
+
+    var path = "/"
+    var query = ""
+    if len(tail) > 0 {
+        let q = str.index(tail, "?")
+        if q >= 0 {
+            path = tail[0..q]
+            query = tail[q + 1..len(tail)]
+        } else {
+            path = tail
+        }
+        if len(path) == 0 { path = "/" }
+    }
+    return URL{scheme: scheme, host: host, port: port, path: path,
+               query: query}
+}
+
+// ------------------------------------------------------- request & response
+
+// Request is one request, as a server read it. `target` is the raw request
+// target off the wire; `path` and `query` are that target split at the first
+// `?`, neither of them percent-decoded.
+struct Request {
+    method  str
+    target  str
+    path    str
+    query   str
+    proto   str
+    headers Headers
+    body    str
+}
+
+impl Request {
+    // header is a header of this request, matched without regard to case.
+    func header(self, name str) str {
+        return self.headers.get(name)
+    }
+}
+
+// Response is one response, as a client read it — or as a handler wants one
+// written. `reason` may be empty: HTTP/1.1 allows an empty reason phrase, and
+// `respond` fills a standard one in when a handler leaves it blank.
+struct Response {
+    status  int
+    reason  str
+    proto   str
+    headers Headers
+    body    str
+}
+
+impl Response {
+    // header is a header of this response, matched without regard to case.
+    func header(self, name str) str {
+        return self.headers.get(name)
+    }
+
+    // ok is the usual 2xx test.
+    func ok(self) bool {
+        return self.status >= 200 and self.status < 300
+    }
+}
+
+// response builds one with a Content-Type. Content-Length is added by
+// `respond` at the moment of writing, from the body it actually sends, so it
+// cannot disagree with it.
+func response(status int, content_type str, body str) Response {
+    var hs = headers()
+    if content_type != "" { hs.set("Content-Type", content_type) }
+    return Response{status: status, reason: "", proto: "HTTP/1.1",
+                    headers: hs, body: body}
+}
+
+// text is a plain-text response, the one a handler usually wants.
+func text(status int, body str) Response {
+    return response(status, "text/plain; charset=utf-8", body)
+}
+
+// html is the other common one.
+func html(status int, body str) Response {
+    return response(status, "text/html; charset=utf-8", body)
+}
+
+// not_found is the 404 every server needs and nobody enjoys writing.
+func not_found() Response {
+    return text(404, "404 not found\n")
+}
+
+// reason_phrase is the standard text for a status code. An unrecognised code
+// gets its CLASS rather than a wrong name — a status line needs something
+// after the number, and "Client Error" is honest where "OK" would not be.
+func reason_phrase(status int) str {
+    if status == 100 { return "Continue" }
+    if status == 200 { return "OK" }
+    if status == 201 { return "Created" }
+    if status == 202 { return "Accepted" }
+    if status == 204 { return "No Content" }
+    if status == 301 { return "Moved Permanently" }
+    if status == 302 { return "Found" }
+    if status == 303 { return "See Other" }
+    if status == 304 { return "Not Modified" }
+    if status == 307 { return "Temporary Redirect" }
+    if status == 308 { return "Permanent Redirect" }
+    if status == 400 { return "Bad Request" }
+    if status == 401 { return "Unauthorized" }
+    if status == 403 { return "Forbidden" }
+    if status == 404 { return "Not Found" }
+    if status == 405 { return "Method Not Allowed" }
+    if status == 408 { return "Request Timeout" }
+    if status == 409 { return "Conflict" }
+    if status == 413 { return "Content Too Large" }
+    if status == 414 { return "URI Too Long" }
+    if status == 415 { return "Unsupported Media Type" }
+    if status == 429 { return "Too Many Requests" }
+    if status == 500 { return "Internal Server Error" }
+    if status == 501 { return "Not Implemented" }
+    if status == 502 { return "Bad Gateway" }
+    if status == 503 { return "Service Unavailable" }
+    if status == 504 { return "Gateway Timeout" }
+    if status < 200 { return "Informational" }
+    if status < 300 { return "Success" }
+    if status < 400 { return "Redirection" }
+    if status < 500 { return "Client Error" }
+    return "Server Error"
+}
+
+// --------------------------------------------------------------------- client
+
+// Client is a set of limits, not a connection: every request opens its own.
+// `timeout_ms` bounds each read and write on the socket, and `max_body` the
+// response body it will hold. Both are ordinary fields, so
+// `var c = http.client() ; c.timeout_ms = 2000` is the way to change them.
+struct Client {
+    timeout_ms int
+    max_body   int
+}
+
+// client makes one with the defaults.
+func client() Client {
+    return Client{timeout_ms: DEFAULT_TIMEOUT_MS, max_body: DEFAULT_MAX_BODY}
+}
+
+impl Client {
+    // get fetches a URL.
+    func get(self, url str) Response throws IOError {
+        return try self.request("GET", url, headers(), "")
+    }
+
+    // post sends a body. The Content-Type is application/octet-stream unless
+    // the caller sets one — a deliberately unhelpful default, because
+    // guessing (`text/plain`? `application/json`?) would be wrong about half
+    // the time and wrong quietly. `request` is the spelling that lets you say.
+    func post(self, url str, body str) Response throws IOError {
+        var hs = headers()
+        hs.set("Content-Type", "application/octet-stream")
+        return try self.request("POST", url, hs, body)
+    }
+
+    // request is the general one: any method, any headers, any body.
+    //
+    // Host is added when the caller did not supply one (HTTP/1.1 requires
+    // it), as are Content-Length and `Connection: close`. The method is used
+    // EXACTLY as written — HTTP methods are case-sensitive, so "get" is not
+    // "GET" and this will not quietly make it one.
+    func request(self, method str, url str, hdrs Headers,
+                 body str) Response throws IOError {
+        try check_token(method, "method")
+        let u = try parse_url(url)
+
+        var hs = hdrs.copy()
+        if hs.has("transfer-encoding") {
+            return errf("http: Transfer-Encoding is set by the package, not " ||
+                        "the caller — a request written here always carries a " ||
+                        "Content-Length")
+        }
+        if not hs.has("host") { hs.set("Host", u.authority()) }
+        // Content-Length is written from the body ACTUALLY being sent, and a
+        // caller's is discarded rather than trusted: a declared length that
+        // disagrees with the bytes on the wire leaves the extra ones to be
+        // read as the start of the next request, which is request smuggling.
+        // A method that carries no body carries no length either — a stray
+        // `Content-Length: 5` on a bodiless GET is a server waiting forever.
+        hs.remove("Content-Length")
+        if len(body) > 0 or sends_body(method) {
+            hs.set("Content-Length", str(len(body)))
+        }
+        if not hs.has("connection") { hs.set("Connection", "close") }
+
+        var conn = try net.connect(u.addr())
+        try conn.set_timeout(self.timeout_ms)
+
+        var b = str.Builder{}
+        b.write(method || " " || u.target() || " HTTP/1.1\r\n")
+        b.write(try hs.render())
+        b.write("\r\n")
+        try conn.write_all(b.done())
+        if len(body) > 0 { try conn.write_all(body) }
+
+        // A HEAD response carries the headers of the body it would have sent
+        // and none of the bytes, so reading one would block until the timeout.
+        let resp = try recv_response(stream(conn), self.max_body,
+                                     method != "HEAD")
+        conn.close()
+        return resp
+    }
+}
+
+// get, post and request are §13.3's three, each one line over a default
+// Client. Reach for `client()` when the limits need changing.
+func get(url str) Response throws IOError {
+    return try client().get(url)
+}
+
+func post(url str, body str) Response throws IOError {
+    return try client().post(url, body)
+}
+
+func request(method str, url str, hdrs Headers, body str) Response throws IOError {
+    return try client().request(method, url, hdrs, body)
+}
+
+// --------------------------------------------------------------------- server
+
+// Server is a listening socket plus the limits it hands to each connection.
+struct Server {
+    lis        net.Listener
+    timeout_ms int
+    max_body   int
+}
+
+// listen binds a TCP listener, exactly as net.listen does — ":8080" for every
+// interface, "127.0.0.1:0" for an OS-chosen port on loopback.
+func listen(addr str) Server throws IOError {
+    let lis = try net.listen(addr)
+    return Server{lis: lis, timeout_ms: DEFAULT_TIMEOUT_MS,
+                  max_body: DEFAULT_MAX_BODY}
+}
+
+impl Server {
+    // addr is the bound address, "host:port", with the real port after
+    // binding port 0.
+    func addr(self) str {
+        return self.lis.addr()
+    }
+
+    // set_timeout bounds accept AND every read and write on the connections
+    // accepted after it, in milliseconds (0 clears the deadline). A server
+    // with no deadline is one connection away from a task that never returns.
+    func set_timeout(mut self, ms int) throws IOError {
+        self.timeout_ms = ms
+        try self.lis.set_timeout(ms)
+    }
+
+    // accept blocks for one connection and returns the Session over it. Use
+    // this when the request and the response want handling by hand; use
+    // serve_one when a `fn(Request) Response` will do.
+    func accept(self) Session throws IOError {
+        let conn = try self.lis.accept()
+        try conn.set_timeout(self.timeout_ms)
+        return Session{conn: conn, st: stream(conn), max_body: self.max_body}
+    }
+
+    // serve_one accepts one connection, reads one request, calls `handler`
+    // and writes what it returns. The connection is closed either way.
+    //
+    // A request this package will not parse gets a 400 carrying the reason
+    // AND is reported to the caller: a client that sent something malformed
+    // needs to be told, and a server operator needs to know it happened.
+    func serve_one(self, handler fn(Request) Response) unit! {
+        var s = try self.accept()
+        match s.read_request() {
+            Err(e) => {
+                match s.respond(text(400, "400 " || e.message() || "\n")) {
+                    Ok(u)   => u
+                    Err(e2) => e2       // the client is already gone; `e` is
+                }                       // the interesting half either way
+                s.close()
+                return e
+            }
+            Ok(req) => {
+                let resp = handler(req)
+                match s.respond(resp) {
+                    Ok(u)   => u
+                    Err(e3) => { s.close() ; return e3 }
+                }
+                s.close()
+            }
+        }
+        return ()
+    }
+
+    // close stops listening. Idempotent.
+    func close(self) {
+        self.lis.close()
+    }
+}
+
+// Session is one accepted connection: read a Request from it, write a
+// Response back, close it. It is not a keep-alive channel — this package
+// answers one request per connection — so `read_request` is called once.
+struct Session {
+    conn     net.Conn
+    st       Stream
+    max_body int
+}
+
+impl Session {
+    // read_request reads and parses the request. See the refusal list at the
+    // top of this file for what it will not accept.
+    func read_request(self) Request throws IOError {
+        return try recv_request(self.st, self.max_body)
+    }
+
+    // respond writes the status line, the headers and the body.
+    //
+    // Content-Length is set HERE, from the body actually being written, so a
+    // handler cannot declare one length and send another — which is a
+    // response-splitting primitive when the peer is a proxy. A handler that
+    // has already set one has it overwritten.
+    func respond(self, r Response) unit! {
+        if r.status < 100 or r.status > 599 {
+            return errf("http: status {r.status} is not a status code")
+        }
+        var reason = r.reason
+        if reason == "" { reason = reason_phrase(r.status) }
+        try check_value(reason, "reason phrase")
+
+        var hs = r.headers.copy()
+        if hs.has("transfer-encoding") {
+            return errf("http: Transfer-Encoding is set by the package, not " ||
+                        "the handler — a response written here always carries " ||
+                        "a Content-Length")
+        }
+        hs.set("Content-Length", str(len(r.body)))
+        if not hs.has("connection") { hs.set("Connection", "close") }
+
+        var b = str.Builder{}
+        b.write("HTTP/1.1 " || str(r.status) || " " || reason || "\r\n")
+        b.write(try hs.render())
+        b.write("\r\n")
+        try self.conn.write_all(b.done())
+        if len(r.body) > 0 { try self.conn.write_all(r.body) }
+        return ()
+    }
+
+    // remote_addr is the client's "host:port".
+    func remote_addr(self) str throws IOError {
+        return try self.conn.remote_addr()
+    }
+
+    // close ends the connection. Idempotent.
+    func close(self) {
+        self.conn.close()
+    }
+}
+
+// ------------------------------------------------------------------ the wire
+//
+// Everything below reads or writes bytes. It is the package's private half:
+// one Stream per connection, threaded through every reader, so there is
+// exactly one position in the byte stream and no two of them can disagree
+// about where it is.
+//
+// Stream exists rather than net.Conn's own read_line for ONE reason: a line
+// has to be BOUNDED. std/io grows its buffer until it finds a newline, which
+// is right for a file and wrong for a socket a stranger is on the other end
+// of — a peer that sends a gigabyte with no newline in it would be answered
+// with a gigabyte of memory. Here the line is assembled from `read` calls
+// this package makes itself, so it can refuse at MAX_LINE, before the
+// allocation rather than after it.
+
+// Stream is a bounded, buffered view of one connection. `buf` holds what has
+// been read and not yet consumed, `at` is the position in it, and `compact`
+// drops the consumed prefix — so the memory is one line (or one chunk of a
+// body), never one message.
+struct Stream {
+    conn net.Conn
+    buf  str
+    at   int
+    eof  bool
+}
+
+// stream wraps a connection. Make ONE per connection and pass it everywhere:
+// a second Stream over the same socket would strand whatever the first had
+// read ahead into a buffer nobody can reach again.
+func stream(conn net.Conn) Stream {
+    return Stream{conn: conn, buf: "", at: 0, eof: false}
+}
+
+impl Stream {
+    // fill appends one read's worth of bytes, or marks the source spent.
+    func fill(mut self) unit! {
+        if self.eof { return () }
+        let chunk = try self.conn.read(READ_CHUNK)
+        if len(chunk) == 0 {
+            self.eof = true
+            return ()
+        }
+        self.buf = self.buf || chunk
+        return ()
+    }
+
+    // compact drops the consumed prefix of the buffer. Without it `buf` would
+    // grow to the size of the whole message.
+    func compact(mut self) {
+        if self.at > 0 {
+            self.buf = self.buf[self.at..len(self.buf)]
+            self.at = 0
+        }
+    }
+
+    // line reads up to the next newline and strips the terminator (`\r\n` or
+    // a bare `\n`), answering (line, ok). `ok` is false at end of stream —
+    // which is what tells a blank line ("", true) apart from a closed
+    // connection ("", false), the distinction the whole header loop turns on.
+    //
+    // A line that reaches MAX_LINE with no newline in sight is refused HERE,
+    // while the buffer is still one line long.
+    func line(mut self) (str, bool) throws IOError {
+        while true {
+            let nl = str.find_any(self.buf, "\n", self.at)
+            if nl >= 0 {
+                let raw = self.buf[self.at..nl]
+                self.at = nl + 1
+                self.compact()
+                return (strip_cr(raw), true)
+            }
+            if len(self.buf) - self.at > MAX_LINE {
+                return errf("http: a line longer than {MAX_LINE} bytes with " ||
+                            "no end in sight")
+            }
+            if self.eof {
+                // Whatever is left is the last, unterminated line — and
+                // nothing left is the end marker.
+                let raw = self.buf[self.at..len(self.buf)]
+                self.at = len(self.buf)
+                self.compact()
+                if len(raw) == 0 { return ("", false) }
+                return (strip_cr(raw), true)
+            }
+            try self.fill()
+        }
+        return ("", false)
+    }
+
+    // exact reads exactly `n` bytes: what is buffered first, then straight
+    // from the socket. A stream that ends early is an error naming BOTH
+    // numbers — "the body was shorter than it said" is a diagnosis, where a
+    // silently truncated body is a bug three layers up.
+    func exact(mut self, n int) str throws IOError {
+        if n <= 0 { return "" }
+        var b = str.Builder{}
+        var got = 0
+        let have = len(self.buf) - self.at
+        if have > 0 {
+            var take = have
+            if take > n { take = n }
+            b.write(self.buf[self.at..self.at + take])
+            self.at += take
+            got = take
+            self.compact()
+        }
+        while got < n {
+            if self.eof {
+                return errf("http: the stream ended after {got} of {n} " ||
+                            "body bytes")
+            }
+            let chunk = try self.conn.read(n - got)
+            if len(chunk) == 0 {
+                self.eof = true
+                return errf("http: the stream ended after {got} of {n} " ||
+                            "body bytes")
+            }
+            b.write(chunk)
+            got += len(chunk)
+        }
+        return b.done()
+    }
+
+    // to_eof reads until the peer closes, which is how a response with
+    // neither Content-Length nor chunked encoding delimits its body. Bounded
+    // by `max`: a server that never closes is an error, not a growing
+    // process.
+    func to_eof(mut self, max int) str throws IOError {
+        var b = str.Builder{}
+        var total = 0
+        let have = len(self.buf) - self.at
+        if have > 0 {
+            b.write(self.buf[self.at..len(self.buf)])
+            total = have
+            self.at = len(self.buf)
+            self.compact()
+        }
+        while not self.eof {
+            if total > max {
+                return errf("http: body exceeds the {max}-byte limit")
+            }
+            let chunk = try self.conn.read(READ_CHUNK)
+            if len(chunk) == 0 {
+                self.eof = true
+                break
+            }
+            total += len(chunk)
+            b.write(chunk)
+        }
+        if total > max {
+            return errf("http: body exceeds the {max}-byte limit")
+        }
+        return b.done()
+    }
+}
+
+// strip_cr drops the `\r` of a `\r\n` line ending. A bare `\n` is accepted
+// too: the protocol says CRLF, and every server that has ever been written
+// has met a client that sent LF alone.
+func strip_cr(line str) str {
+    if str.ends_with(line, "\r") { return line[0..len(line) - 1] }
+    return line
+}
+
+// recv_response reads a whole response. `want_body` is false for a HEAD,
+// whose response describes a body it does not send.
+func recv_response(st Stream, max int, want_body bool) Response throws IOError {
+    let line, ok = try st.line()
+    if not ok {
+        return errf("http: the server closed the connection without a response")
+    }
+    // A 1xx is INTERIM: the real response follows it. RFC 7230 §6.2 has a
+    // client read and discard them. Returning the 100 as though it were the
+    // answer left the actual response unread on the socket, so a server that
+    // sends `100 Continue` — which any server may — looked like a success
+    // with no body. Bounded, so a peer cannot hold a connection open by
+    // sending them forever.
+    //
+    // Written as a loop over separately-declared vars because a multi-value
+    // binding is `let`, and these have to survive an iteration.
+    var proto = ""
+    var status = 0
+    var reason = ""
+    var hs = headers()
+    var cur = line
+    var interim = 0
+    while true {
+        let p, s, r = try parse_status_line(cur)
+        proto = p
+        status = s
+        reason = r
+        hs = try read_headers(st)
+        if status < 100 or status >= 200 { break }
+        interim += 1
+        if interim > 8 {
+            return errf("http: the server sent only interim (1xx) responses")
+        }
+        let next, more = try st.line()
+        if not more {
+            return errf("http: the server closed the connection after a " ||
+                        "{status}")
+        }
+        cur = next
+    }
+    var body = ""
+    // 1xx, 204 and 304 are defined to carry no body whatever their headers
+    // say, and waiting for one would wait for the timeout.
+    if want_body and status >= 200 and status != 204 and status != 304 {
+        body = try read_body(st, hs, max, true)
+    }
+    return Response{status: status, reason: reason, proto: proto,
+                    headers: hs, body: body}
+}
+
+// recv_request reads a whole request.
+func recv_request(st Stream, max int) Request throws IOError {
+    let line, ok = try st.line()
+    if not ok {
+        return errf("http: the client closed the connection without a request")
+    }
+    let method, target, proto = try parse_request_line(line)
+    let hs = try read_headers(st)
+    // Host is not optional in HTTP/1.1: it is how one address serves many
+    // names, and a request without it cannot be routed.
+    if str.equal_fold(proto, "HTTP/1.1") and not hs.has("host") {
+        return errf("http: HTTP/1.1 request with no Host header")
+    }
+    // A request has a body only when it says so. Reading to end-of-stream on
+    // one that says nothing would block until the client closed.
+    var body = ""
+    if hs.has("transfer-encoding") or hs.has("content-length") {
+        body = try read_body(st, hs, max, false)
+    }
+    var path = target
+    var query = ""
+    let q = str.index(target, "?")
+    if q >= 0 {
+        path = target[0..q]
+        query = target[q + 1..len(target)]
+    }
+    return Request{method: method, target: target, path: path, query: query,
+                   proto: proto, headers: hs, body: body}
+}
+
+// parse_status_line splits "HTTP/1.1 200 OK" into its three parts. The reason
+// phrase may be empty; the other two may not.
+func parse_status_line(line str) (str, int, str) throws IOError {
+    let sp = str.index(line, " ")
+    if sp <= 0 {
+        return errf("http: not a status line: {brief(line)}")
+    }
+    let proto = line[0..sp]
+    if not str.starts_with(proto, "HTTP/") {
+        return errf("http: not a status line: {brief(line)}")
+    }
+    let rest = line[sp + 1..len(line)]
+    var code = rest
+    var reason = ""
+    let sp2 = str.index(rest, " ")
+    if sp2 >= 0 {
+        code = rest[0..sp2]
+        reason = rest[sp2 + 1..len(rest)]
+    }
+    if len(code) != 3 {
+        return errf("http: status code {brief(code)} is not three digits")
+    }
+    let status = try parse_dec(code, 999, "status code")
+    if status < 100 {
+        return errf("http: status code {brief(code)} is not three digits")
+    }
+    return (proto, status, reason)
+}
+
+// parse_request_line splits "GET /path HTTP/1.1" into its three parts. All
+// three are required: a request line with no version is HTTP/0.9, which this
+// package does not speak.
+func parse_request_line(line str) (str, str, str) throws IOError {
+    let sp = str.index(line, " ")
+    if sp <= 0 {
+        return errf("http: not a request line: {brief(line)}")
+    }
+    let method = line[0..sp]
+    let rest = line[sp + 1..len(line)]
+    let sp2 = str.index(rest, " ")
+    if sp2 <= 0 {
+        return errf("http: request line has no HTTP version: {brief(line)}")
+    }
+    let target = rest[0..sp2]
+    let proto = rest[sp2 + 1..len(rest)]
+    if not str.starts_with(proto, "HTTP/") {
+        return errf("http: not an HTTP version: {brief(proto)}")
+    }
+    try check_token(method, "method")
+    if len(target) == 0 {
+        return errf("http: request line has an empty target")
+    }
+    // The method and every header go through a validator; the target did not,
+    // so a NUL or a bare CR travelled all the way into req.path for the
+    // handler to deal with. A request target is printable ASCII with no
+    // spaces — anything else is either an attack or a broken client.
+    each ch in target {
+        if ch <= ' ' or ch == '\u{7f}' {
+            return errf("http: request target contains a control character: " ||
+                        "{brief(target)}")
+        }
+    }
+    return (method, target, proto)
+}
+
+// read_headers reads a header block, up to and including the blank line that
+// ends it. Both the count and each line's length are bounded, so a peer that
+// sends headers forever is an error rather than a growing process.
+func read_headers(st Stream) Headers throws IOError {
+    var hs = headers()
+    var n = 0
+    while true {
+        let line, ok = try st.line()
+        if not ok {
+            return errf("http: the stream ended inside the header block")
+        }
+        if line == "" { return hs }
+        n += 1
+        if n > MAX_HEADERS {
+            return errf("http: more than {MAX_HEADERS} header lines")
+        }
+        // An indented line continues the one before it — "obs-fold", removed
+        // from the protocol precisely because two parsers disagreeing about
+        // where a header ends is how requests get smuggled past a proxy.
+        if line[0] == ' ' or line[0] == '\t' {
+            return errf("http: obsolete line folding is not accepted: " ||
+                        "{brief(line)}")
+        }
+        let colon = str.index(line, ":")
+        if colon < 0 {
+            return errf("http: header line with no colon: {brief(line)}")
+        }
+        if colon == 0 {
+            return errf("http: header line with an empty name: {brief(line)}")
+        }
+        let name = line[0..colon]
+        try check_token(name, "header name")
+        let value = str.trim(line[colon + 1..len(line)])
+        try check_value(value, "header value")
+        hs.add(name, value)
+    }
+    return hs
+}
+
+// read_body reads whatever body the headers describe: chunked, or a declared
+// Content-Length, or — for a response only — everything up to the close.
+func read_body(st Stream, hs Headers, max int,
+               to_eof bool) str throws IOError {
+    let te = hs.get("transfer-encoding")
+    let has_len = hs.has("content-length")
+    // PRESENT, not non-empty. `Transfer-Encoding:` with an empty value is a
+    // Transfer-Encoding header; branching on the VALUE let it slip through
+    // and the message got framed by Content-Length instead — which is the
+    // disagreement between two framings that the check below exists to
+    // refuse, arrived at by a different road.
+    if hs.has("transfer-encoding") {
+        if not str.equal_fold(str.trim(te), "chunked") {
+            return errf("http: Transfer-Encoding {brief(te)} is not supported " ||
+                        "(this release decodes `chunked` only)")
+        }
+        // Two ways to say how long the body is, and a proxy that believes one
+        // while the origin believes the other is the whole of request
+        // smuggling. Refuse rather than pick.
+        if has_len {
+            return errf("http: both Content-Length and " ||
+                        "Transfer-Encoding: chunked — refusing an ambiguous " ||
+                        "message length")
+        }
+        return try read_chunked(st, max)
+    }
+    if has_len {
+        // A repeated Content-Length is legal only if every copy agrees.
+        let vals = hs.all("content-length")
+        each v in vals {
+            if v != vals[0] {
+                return errf("http: Content-Length given twice with different " ||
+                            "values ({vals[0]} and {v})")
+            }
+        }
+        // Parsed AGAINST THE LIMIT, digit by digit, so an absurd length is a
+        // diagnostic and never an allocation. This is the one that matters.
+        let n = try parse_dec(str.trim(vals[0]), max, "Content-Length")
+        return try st.exact(n)
+    }
+    if to_eof { return try st.to_eof(max) }
+    return ""
+}
+
+// read_chunked decodes Transfer-Encoding: chunked.
+//
+// Each chunk is a hex size on its own line (with optional `;extensions` that
+// are parsed off and ignored), then that many bytes, then a CRLF. A zero size
+// ends the body and any trailer headers follow it. Every size is parsed
+// against the REMAINING budget, so the total cannot exceed `max` however many
+// chunks arrive.
+func read_chunked(st Stream, max int) str throws IOError {
+    var b = str.Builder{}
+    var total = 0
+    while true {
+        let line, ok = try st.line()
+        if not ok {
+            return errf("http: the stream ended before the final chunk")
+        }
+        var size_txt = line
+        let semi = str.index(size_txt, ";")
+        if semi >= 0 { size_txt = size_txt[0..semi] }
+        let size = try parse_hex(str.trim(size_txt), max - total,
+                                 "chunk size")
+        if size == 0 { break }
+        b.write(try st.exact(size))
+        total += size
+        // Exactly two bytes, and they must be CRLF. Reading a LINE here
+        // instead would let a chunk size one too large swallow the CR and
+        // pass — a size and a body that disagree is precisely what a chunked
+        // parser must not shrug at.
+        let sep = try st.exact(2)
+        if sep != "\r\n" {
+            return errf("http: chunk of {size} bytes is not followed by CRLF")
+        }
+    }
+    // Trailers, up to the blank line. A stream that ends without one is
+    // tolerated: the body is complete, and the final chunk said so.
+    var t = 0
+    while true {
+        let line, ok = try st.line()
+        if not ok { break }
+        if line == "" { break }
+        t += 1
+        if t > MAX_HEADERS {
+            return errf("http: more than {MAX_HEADERS} trailer lines")
+        }
+    }
+    return b.done()
+}
+
+// ------------------------------------------------------------------ scanning
+
+// parse_dec reads a decimal number, refusing anything that is not digits and
+// stopping the moment the value passes `limit`. The check is INSIDE the loop
+// on purpose: `Content-Length: 99999999999999999999` must be refused without
+// the intermediate ever overflowing, and refused before a caller sizes a
+// buffer from it.
+func parse_dec(s str, limit int, what str) int throws IOError {
+    if len(s) == 0 {
+        return errf("http: empty {what}")
+    }
+    var v = 0
+    each c in s {
+        if c < '0' or c > '9' {
+            return errf("http: {what} {brief(s)} is not a decimal number")
+        }
+        v = v * 10 + (int(c) - 48)
+        if v > limit {
+            return errf("http: {what} {brief(s)} exceeds the limit of {limit}")
+        }
+    }
+    return v
+}
+
+// parse_hex is parse_dec for a chunk size, with the same running limit.
+func parse_hex(s str, limit int, what str) int throws IOError {
+    if len(s) == 0 {
+        return errf("http: empty {what}")
+    }
+    var v = 0
+    each c in s {
+        var d = 0 - 1
+        if c >= '0' and c <= '9' { d = int(c) - 48 }
+        if c >= 'a' and c <= 'f' { d = int(c) - 87 }
+        if c >= 'A' and c <= 'F' { d = int(c) - 55 }
+        if d < 0 {
+            return errf("http: {what} {brief(s)} is not a hex number")
+        }
+        v = v * 16 + d
+        if v > limit {
+            return errf("http: {what} {brief(s)} exceeds the limit of {limit}")
+        }
+    }
+    return v
+}
+
+// port_of parses a URL's port. std/net already knows what a port is, so this
+// only re-dresses the diagnostic: net's message says nothing about which URL
+// it came from, and a program that fetched twenty of them would be told
+// "port 99999 out of range" with no way to tell which.
+func port_of(txt str, raw str) int throws IOError {
+    match net.parse_port(txt) {
+        Ok(p)  => return p
+        Err(e) => return errf("http: URL {brief(raw)}: {e.message()}")
+    }
+    return DEFAULT_PORT
+}
+
+// check_token accepts an RFC 7230 token — a method or a header name. The
+// point is not pedantry: a space in a header name is whitespace before the
+// colon, which two parsers read two ways, and a control character in a method
+// is a request line the next hop will split differently.
+func check_token(s str, what str) unit! {
+    if len(s) == 0 {
+        return errf("http: empty {what}")
+    }
+    each c in s {
+        if c <= ' ' or c > '~' {
+            return errf("http: {what} {brief(s)} contains an illegal character")
+        }
+        if c == ':' or c == '/' or c == '(' or c == ')' or c == ',' or
+           c == ';' or c == '<' or c == '>' or c == '=' or c == '?' or
+           c == '@' or c == '[' or c == ']' or c == '\\' or c == '{' or
+           c == '}' or c == '"' {
+            return errf("http: {what} {brief(s)} contains an illegal character")
+        }
+    }
+    return ()
+}
+
+// check_value accepts a header value: printable text and tabs, and above all
+// no CR and no LF. A value carrying either would end the header block early
+// and let whatever followed be read as headers — or as a second response —
+// which is response splitting.
+func check_value(s str, what str) unit! {
+    each c in s {
+        if c == '\r' or c == '\n' {
+            return errf("http: {what} contains a newline " ||
+                        "(response splitting is refused)")
+        }
+        if c < ' ' and c != '\t' {
+            return errf("http: {what} contains a control character")
+        }
+    }
+    return ()
+}
+
+// check_header validates both halves of one header line.
+func check_header(name str, value str) unit! {
+    try check_token(name, "header name")
+    try check_value(value, "header value")
+    return ()
+}
+
+// sends_body reports whether a method carries a body even when it is empty,
+// and so wants a `Content-Length: 0` rather than no length at all. Servers
+// that see a POST with neither are entitled to wait for one.
+func sends_body(method str) bool {
+    return method == "POST" or method == "PUT" or method == "PATCH"
+}
+
+// brief renders untrusted text for a diagnostic: at most 40 bytes, with
+// anything unprintable shown as `.`. Every message above that quotes what
+// came off the wire goes through it — an error message is written to a
+// terminal or a log, and a peer that could put an escape sequence in one
+// would be writing to that terminal itself.
+func brief(s str) str {
+    var out = []
+    var n = 0
+    var cut = false
+    each c in s {
+        if n >= 40 {
+            cut = true
+            break
+        }
+        if c < ' ' or c > '~' { out.append('.') } else { out.append(c) }
+        n += 1
+    }
+    var shown = str.from_runes(out)
+    if cut { shown = shown || "..." }
+    return "`" || shown || "`"
+}

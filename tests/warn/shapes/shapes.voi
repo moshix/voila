@@ -1,0 +1,9 @@
+// Exports a TRAIT and nothing else. A trait name is one of the two kinds an
+// importer may spell WITHOUT a qualifier (§11.2.1), so a file can reach this
+// package without ever writing `shapes` — which is the case unused-import has
+// to get right.
+package shapes
+
+trait Describe {
+    func describe(self) str
+}

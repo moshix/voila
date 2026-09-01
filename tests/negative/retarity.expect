@@ -1,0 +1,2 @@
+`divmod` declares 2 results, but returns 3 values
+`nothing` declares no results, but returns 1 value

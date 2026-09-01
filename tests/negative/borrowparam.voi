@@ -1,0 +1,34 @@
+// §6.1's two read-only positions. A borrowed parameter is lent for the length
+// of the call, so writing through it — to a field, no less — is the one thing
+// the mode does not permit; and a method that asked for `self` rather than
+// `mut self` asked for exactly the same thing.
+struct Buf { n int }
+
+func grow(b Buf, by int) {
+    b.n += by
+}
+
+// Legal, and must stay legal: rebinding the bare NAME of a borrowed
+// parameter points a local name elsewhere and the caller cannot tell. §6.1
+// forbids writing through a borrow, not naming one again.
+func norm(n int, xs []int) int {
+    if n < 0 { n = 0 - n }
+    xs = []
+    return n + len(xs)
+}
+
+struct Counter { n int }
+
+impl Counter {
+    func show(self) str {
+        self.n += 1
+        return "{self.n}"
+    }
+}
+
+func main() {
+    var c = Counter{n: 0}
+    var b = Buf{n: 1}
+    grow(b, 2)
+    say c.show(), b.n, norm(0 - 4, [1])
+}

@@ -21,6 +21,7 @@
 #include <poll.h>         /* poll() to bound accept() on every platform */
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
+#include <crt_externs.h> /* _NSGetEnviron: the environment block on macOS */
 #endif
 
 static bool eq(const char *a, const char *b) { return strcmp(a, b) == 0; }
@@ -54,6 +55,37 @@ static Value read_all_file(FILE *f) {
   return out;
 }
 
+/* vl_records_of splits `text` into fixed-width records. It is the shared body
+ * of File.records and Reader.records: one copy, so a dataset read through
+ * std/io cannot come out differently from the same dataset read through a
+ * file. Line-oriented input (any "\n" present) is padded or truncated per
+ * line; otherwise the text is one long fixed-width block. */
+Value vl_records_of(Value text, int64_t width) {
+  const char *s = vl_cstr(text);
+  int64_t n = vl_strlen(text);
+  Value out = vl_slice_new(0);
+  if (memchr(s, '\n', (size_t)n)) {
+    /* line-oriented dataset: each line padded or truncated to width */
+    int64_t start = 0;
+    for (int64_t i = 0; i <= n; i++) {
+      if (i == n && i == start) break;
+      if (i < n && s[i] != '\n') continue;
+      int64_t len = i - start;
+      if (len && s[start + len - 1] == '\r') len--;
+      char *rec = (char *)vl_alloc((size_t)width + 1);
+      memset(rec, ' ', (size_t)width);
+      memcpy(rec, s + start, (size_t)(len < width ? len : width));
+      vl_slice_append(out, vl_str_n(rec, width));
+      free(rec);
+      start = i + 1;
+    }
+  } else {
+    for (int64_t i = 0; i + width <= n; i += width)
+      vl_slice_append(out, vl_str_n(s + i, width));
+  }
+  return out;
+}
+
 Value vl_file_method(Value self, const char *name, Value *argv, int argc,
                      bool *ok) {
   VlFile *f = (VlFile *)self.u.o;
@@ -82,28 +114,7 @@ Value vl_file_method(Value self, const char *name, Value *argv, int argc,
     int64_t width = argv[0].u.i;
     if (width <= 0) vl_abort("record width must be positive");
     Value text = read_all_file(f->f);
-    const char *s = vl_cstr(text);
-    int64_t n = vl_strlen(text);
-    Value out = vl_slice_new(0);
-    if (memchr(s, '\n', (size_t)n)) {
-      /* line-oriented dataset: each line padded or truncated to width */
-      int64_t start = 0;
-      for (int64_t i = 0; i <= n; i++) {
-        if (i == n && i == start) break;
-        if (i < n && s[i] != '\n') continue;
-        int64_t len = i - start;
-        if (len && s[start + len - 1] == '\r') len--;
-        char *rec = (char *)vl_alloc((size_t)width + 1);
-        memset(rec, ' ', (size_t)width);
-        memcpy(rec, s + start, (size_t)(len < width ? len : width));
-        vl_slice_append(out, vl_str_n(rec, width));
-        free(rec);
-        start = i + 1;
-      }
-    } else {
-      for (int64_t i = 0; i + width <= n; i += width)
-        vl_slice_append(out, vl_str_n(s + i, width));
-    }
+    Value out = vl_records_of(text, width);
     vl_release(text);
     return out;
   }
@@ -112,6 +123,12 @@ Value vl_file_method(Value self, const char *name, Value *argv, int argc,
     vl_fprint(f->f, argv, argc, eq(name, "writeln"));
     return vl_unit();
   }
+  /* The bridge into std/io. `must os.open(p).reader()` is the shortest way to
+   * a buffered stream, and it is safe precisely because the reader RETAINS
+   * this file: the O_FILE the expression drops on the floor stays alive until
+   * the reader is done with it (see VlReader in voila_int.h). */
+  if (eq(name, "reader")) return vl_reader_of(self);
+  if (eq(name, "writer")) return vl_writer_of(self);
   *ok = false;
   return vl_nil();
 }
@@ -392,11 +409,25 @@ BI(bi_eprintf) {
   return vl_unit();
 }
 
+/* fmt.fprintf(dst, fmt, ...) — dst is an O_WRITER since os.stdout and
+ * os.stderr became writers (std/io), and still an O_FILE for a handle from
+ * os.open/os.create. A write failure is swallowed here exactly as the bare
+ * fwrite always swallowed it: fprintf's result stays unit, and a program that
+ * needs to SEE the failure writes through the writer's own write_all, which
+ * returns the IOError. */
 BI(bi_fprintf) {
   UNUSED;
-  VlFile *f = (VlFile *)argv[0].u.o;
   Value s = vl_sprintf_v(argv[1], argv + 2, argc - 2);
-  fwrite(vl_cstr(s), 1, (size_t)vl_strlen(s), f->f ? f->f : stderr);
+  if (argv[0].t == VL_OBJ && argv[0].u.o->kind == O_WRITER) {
+    bool ok = false;
+    Value r = vl_writer_method(argv[0], "write_all", &s, 1, &ok);
+    vl_release(r);
+  } else {
+    VlFile *f = (argv[0].t == VL_OBJ && argv[0].u.o->kind == O_FILE)
+                    ? (VlFile *)argv[0].u.o
+                    : NULL;
+    fwrite(vl_cstr(s), 1, (size_t)vl_strlen(s), (f && f->f) ? f->f : stderr);
+  }
   vl_release(s);
   return vl_unit();
 }
@@ -454,7 +485,200 @@ BI(bi_bytes_human) {
   return vl_str(buf);
 }
 
+/* ------------------------------------------------------------ fmt.table */
+
+/* table_cells points `*out` at a row's cells and returns how many there are.
+ * A row is normally a slice ([][]str is the everyday shape) and a tuple is
+ * accepted too, because `[(1, "a"), (2, "b")]` is the natural way to write a
+ * table of mixed types. Anything else — a bare string, a number — is ONE
+ * cell, so `fmt.table(names)` prints the list rather than aborting. */
+static int64_t table_cells(Value row, Value **out) {
+  if (row.t == VL_OBJ && row.u.o->kind == O_SLICE) {
+    VlSlice *s = (VlSlice *)row.u.o;
+    *out = s->e;
+    return s->len;
+  }
+  if (row.t == VL_OBJ && row.u.o->kind == O_TUPLE) {
+    VlTuple *t = (VlTuple *)row.u.o;
+    *out = t->e;
+    return (int64_t)t->n;
+  }
+  *out = NULL;
+  return 1; /* the row itself is the single cell */
+}
+
+/* table_width is the cell's width in RUNES, not bytes. A table exists to line
+ * up on screen, so "café" occupies four columns and not five — which is where
+ * this parts company with fmt.pad, whose width is a byte count (D.2). */
+static int64_t table_width(Value s) {
+  const unsigned char *p = (const unsigned char *)vl_cstr(s);
+  int64_t n = vl_strlen(s), w = 0;
+  for (int64_t i = 0; i < n; w++) {
+    int len = 1;
+    if (p[i] >= 0xF0) len = 4;
+    else if (p[i] >= 0xE0) len = 3;
+    else if (p[i] >= 0xC0) len = 2;
+    if (i + len > n) len = 1;
+    i += len;
+  }
+  return w;
+}
+
+/* table_numeric decides ONE cell's alignment, and it reads the cell's TYPE,
+ * never the look of its text: int, float and dec sit at the right of their
+ * column so the digits line up, and everything else — a numeral passed as a
+ * string included — sits at the left. Per cell rather than per column is what
+ * makes the ordinary report come out right: in `[["name","qty"],["apple",3]]`
+ * the label is text and lines up left while the count is a number and lines
+ * up right, which a column-wide vote could never do (the header would drag
+ * the whole column back to the left). A caller who wants the other alignment
+ * passes the other type. */
+static bool table_numeric(Value v) {
+  return v.t == VL_INT || v.t == VL_FLOAT ||
+         (v.t == VL_OBJ && v.u.o->kind == O_DEC);
+}
+
+static void table_spaces(Value b, int64_t n) {
+  while (n > 0) {
+    static const char blanks[16] = "                ";
+    int64_t k = n < 16 ? n : 16;
+    Value s = vl_str_n(blanks, k);
+    vl_builder_write(b, s);
+    vl_release(s);
+    n -= k;
+  }
+}
+
+/* fmt.table(rows) -> str.  Every column is padded to its widest cell and
+ * separated from the next by two spaces. Rows may be ragged: a short row
+ * leaves the remaining columns empty and a long one widens the table.
+ *
+ * The rows are joined by "\n" with NO trailing newline, so `say
+ * fmt.table(rows)` prints exactly the table and nothing more. Trailing
+ * padding is never emitted either — no line ends in blanks, which keeps the
+ * result diffable and safe to paste. */
+BI(bi_table) {
+  UNUSED;
+  /* A package native carries no static signature, so the argument arrives
+   * unchecked and vl_len happily measures a str, a map or a chan — after
+   * which vl_slice_data would cast it to Value* and read wild memory.
+   * fmt.table("hello") segfaulted. Refuse anything that is not a slice, in
+   * the house shape (cf. the guards beside the other collection natives). */
+  if (argc == 0) return vl_str("");
+  if (argv[0].t != VL_OBJ || argv[0].u.o->kind != O_SLICE)
+    vl_abort("fmt.table() of %s", vl_kind_name(argv[0]));
+  int64_t nrows = vl_len(argv[0]);
+  if (nrows == 0) return vl_str("");
+  int64_t ncols = 0;
+  {
+    /* Widths only: table_cells inspects the value and runs no user code, so
+     * one derivation is safe for the whole sweep. */
+    Value *rows = vl_slice_data(argv[0]);
+    for (int64_t r = 0; r < nrows; r++) {
+      Value *cells;
+      int64_t n = table_cells(rows[r], &cells);
+      if (n > ncols) ncols = n;
+    }
+  }
+
+  /* Pass 1: render every cell ONCE — rendering twice would run a user Show
+   * method twice, which is observable — and learn each column's width and
+   * each cell's alignment along the way. */
+  Value *text = (Value *)vl_alloc(sizeof(Value) * (size_t)(nrows * ncols));
+  bool *right = (bool *)vl_alloc(sizeof(bool) * (size_t)(nrows * ncols));
+  int64_t *width = (int64_t *)vl_alloc(sizeof(int64_t) * (size_t)ncols);
+  for (int64_t c = 0; c < ncols; c++) width[c] = 0;
+  for (int64_t r = 0; r < nrows; r++) {
+    for (int64_t c = 0; c < ncols; c++) {
+      int64_t i = r * ncols + c;
+      /* Re-derive through the OBJECT on every cell, and own the cell across
+       * the render. vl_tostr below can run a user `show`, and that is
+       * ordinary user code: it may append to — or pop from — the very slice
+       * being tabled, which reallocates the backing store and invalidates
+       * any Value* cached before the call. Caching one across it read freed
+       * memory. Every other callback loop in this runtime (call.c's map,
+       * coll.c's iterator) already re-reads through the object; this one
+       * did not. */
+      Value *rows_now = vl_slice_data(argv[0]);
+      int64_t nrows_now = vl_len(argv[0]);
+      Value *cells = NULL;
+      int64_t n = 0;
+      if (r < nrows_now) n = table_cells(rows_now[r], &cells);
+      if (r >= nrows_now || c >= n) { /* ragged, or the row went away */
+        text[i] = vl_str("");
+        right[i] = false;
+        continue;
+      }
+      Value cell = vl_retain(cells ? cells[c] : rows_now[r]);
+      right[i] = table_numeric(cell);
+      text[i] = vl_tostr(cell);
+      vl_release(cell);
+      int64_t w = table_width(text[i]);
+      if (w > width[c]) width[c] = w;
+    }
+  }
+
+  /* Pass 2: emit. `last` is the rightmost column this row actually fills, so
+   * the padding that would follow it is never written. */
+  Value b = vl_builder_new();
+  for (int64_t r = 0; r < nrows; r++) {
+    if (r > 0) {
+      Value nl = vl_str("\n");
+      vl_builder_write(b, nl);
+      vl_release(nl);
+    }
+    int64_t last = -1;
+    for (int64_t c = 0; c < ncols; c++)
+      if (vl_strlen(text[r * ncols + c]) > 0) last = c;
+    for (int64_t c = 0; c <= last; c++) {
+      int64_t i = r * ncols + c;
+      int64_t pad = width[c] - table_width(text[i]);
+      if (right[i]) table_spaces(b, pad);
+      vl_builder_write(b, text[i]);
+      if (c < last) {
+        if (!right[i]) table_spaces(b, pad);
+        table_spaces(b, 2);
+      }
+    }
+  }
+  Value out = vl_builder_done(b);
+  vl_release(b);
+  for (int64_t i = 0; i < nrows * ncols; i++) vl_release(text[i]);
+  free(text);
+  free(right);
+  free(width);
+  return out;
+}
+
 /* ---------------------------------------------------------------- os */
+
+/* The environment BLOCK. On macOS a program reaches it through _NSGetEnviron
+ * rather than the `environ` symbol, which is only guaranteed to the main
+ * executable — libvoila is a static archive today but need not stay one. */
+#if defined(__APPLE__)
+#define OS_ENVIRON (*_NSGetEnviron())
+#else
+extern char **environ;
+#define OS_ENVIRON environ
+#endif
+
+/* Every std/os call that can fail reports it the way os.read does: an IOError
+ * VALUE, never a throw, so `match`, `try`, `else` and `must` all compose over
+ * it. os_errno carries the operation AND the platform's reason, because
+ * "cannot create directory" alone cannot tell "it is already there" from "you
+ * may not" — the two calls for which the answer differs. */
+static Value os_err(const char *msg) {
+  Value m = vl_str(msg);
+  Value e = vl_exc_new("IOError", &m, 1, NULL, NULL, 0);
+  vl_release(m);
+  return e;
+}
+
+static Value os_errno(const char *op) {
+  char buf[256];
+  snprintf(buf, sizeof buf, "%s: %s", op, strerror(errno));
+  return os_err(buf);
+}
 
 BI(os_read) {
   UNUSED;
@@ -510,6 +734,52 @@ BI(os_create) {
   return vl_file_new(f, vl_cstr(argv[0]), false);
 }
 
+/* os.input(prompt) is the one call an interactive program needs: it writes the
+ * prompt, FLUSHES it (a prompt still sitting in stdout's buffer is not a
+ * prompt), reads one line from the os.stdin singleton, and hands it back
+ * without its line terminator — "\r\n" as well as "\n", so a file typed on
+ * one platform and read on another behaves.
+ *
+ * At end of input it returns an IOError VALUE rather than "", because "" is a
+ * legitimate answer to a prompt. That is what lets the loop read
+ *     while true { let line = os.input("> ") else break ; … }
+ * and terminate on ^D rather than spinning on empty lines. */
+BI(os_input) {
+  UNUSED;
+  if (argc > 0) {
+    Value p = vl_tostr(argv[0]);
+    fwrite(vl_cstr(p), 1, (size_t)vl_strlen(p), stdout);
+    vl_release(p);
+  }
+  fflush(stdout);
+  bool ok = false;
+  Value line = vl_reader_method(vl_stdin(), "read_line", NULL, 0, &ok);
+  /* a read failure, as distinct from end of input: hand it straight back */
+  if (line.t == VL_OBJ && line.u.o->kind == O_ERR) return line;
+  int64_t n = vl_strlen(line);
+  if (n == 0) {
+    vl_release(line);
+    Value m = vl_str("end of input");
+    Value e = vl_exc_new("IOError", &m, 1, NULL, NULL, 0);
+    vl_release(m);
+    return e;
+  }
+  const char *s = vl_cstr(line);
+  if (n > 0 && s[n - 1] == '\n') n--;
+  if (n > 0 && s[n - 1] == '\r') n--;
+  Value out = vl_str_n(s, n);
+  vl_release(line);
+  return out;
+}
+
+/* os.isatty(h) reports whether a handle is a terminal — the test a program
+ * makes before deciding to prompt, colourize, or draw a progress bar. With no
+ * argument it asks about os.stdin, which is the usual question. */
+BI(os_isatty) {
+  UNUSED;
+  return vl_bool(vl_io_isatty(argc ? argv[0] : vl_stdin()));
+}
+
 BI(os_exists) { UNUSED; return vl_bool(access(vl_cstr(argv[0]), F_OK) == 0); }
 BI(os_remove) { UNUSED; remove(vl_cstr(argv[0])); return vl_unit(); }
 BI(os_args) { UNUSED; return vl_retain(g_args); }
@@ -563,22 +833,212 @@ BI(os_listdir) {
   return out;
 }
 
-/* os.run(prog, args) -> int.  Runs a program with stdio inherited and returns
- * its exit status (128+signal when it was killed). */
-BI(os_run) {
+/* os.mkdir(path) -> unit!  ONE directory, and it must not already exist —
+ * EEXIST is a failure here exactly as mkdir(2) reports it, which is what makes
+ * mkdir usable as a lock. os.mkdir_all is the "just make sure it is there"
+ * variant. The mode is 0777 masked by the process umask, the same rule the
+ * shell's mkdir follows, so a directory made here is indistinguishable from
+ * one made by the shell-out it replaces. */
+BI(os_mkdir) {
   UNUSED;
-  Value av = argv[1];
-  int n = (int)vl_len(av);
+  if (mkdir(vl_cstr(argv[0]), 0777) != 0) return os_errno("mkdir");
+  return vl_unit();
+}
+
+/* mkdir_p creates `path` and every missing parent, editing the buffer in
+ * place to name each ancestor in turn and putting the separator back
+ * afterwards. An existing DIRECTORY is success (that is what `mkdir -p`
+ * means, and it is also how the race with a concurrent maker resolves); an
+ * existing non-directory is not, or the caller would carry on believing it
+ * had a directory it does not have. */
+static bool mkdir_one(char *path) {
+  struct stat st;
+  if (stat(path, &st) == 0) {
+    if (S_ISDIR(st.st_mode)) return true;
+    errno = ENOTDIR;
+    return false;
+  }
+  if (mkdir(path, 0777) == 0) return true;
+  return errno == EEXIST && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+/* FORWARD over the separators rather than recursing down them: the path is
+ * user data, and one C frame per component turned a long path into a stack
+ * overflow — a SIGSEGV the program cannot catch, where the whole point of
+ * this call is to hand back a catchable IOError. */
+static bool mkdir_p(char *path) {
+  for (char *p = path; *p; p++) {
+    if (*p != '/' || p == path) continue;
+    *p = 0;
+    bool ok = mkdir_one(path);
+    *p = '/';
+    if (!ok) return false;
+  }
+  return mkdir_one(path);
+}
+
+/* os.mkdir_all(path) -> unit!  `mkdir -p`: the whole chain, and an existing
+ * directory is not an error. */
+BI(os_mkdir_all) {
+  UNUSED;
+  char *p = vl_strdup_n(vl_cstr(argv[0]), vl_strlen(argv[0]));
+  bool ok = mkdir_p(p);
+  int e = errno; /* free() is allowed to clobber errno; the reason must live */
+  free(p);
+  if (!ok) {
+    errno = e;
+    return os_errno("mkdir_all");
+  }
+  return vl_unit();
+}
+
+/* os.rmdir(path) -> unit!  Removes an EMPTY directory. Deleting a tree is not
+ * offered: a recursive delete driven by a computed path is the single most
+ * destructive thing a std library can hand out, and os.listdir plus os.remove
+ * spell it in the caller's own code, where it can be read. */
+BI(os_rmdir) {
+  UNUSED;
+  if (rmdir(vl_cstr(argv[0])) != 0) return os_errno("rmdir");
+  return vl_unit();
+}
+
+/* os.rename(from, to) -> unit!  rename(2): atomic, and confined to ONE file
+ * system — a move across devices fails with EXDEV, and the caller answers
+ * that with os.copy plus os.remove. An existing `to` is replaced. */
+BI(os_rename) {
+  UNUSED;
+  if (rename(vl_cstr(argv[0]), vl_cstr(argv[1])) != 0)
+    return os_errno("rename");
+  return vl_unit();
+}
+
+/* os.copy(from, to) -> int!  Copies the contents AND the permission bits, and
+ * returns the number of bytes written. The mode is not a nicety: a build that
+ * copies a compiled binary and loses the execute bit produces a file the
+ * kernel refuses to run. Set-user-ID and friends are deliberately not carried
+ * over — `cp` does not either, and a copy that did would be a way to
+ * manufacture a privileged binary out of an unprivileged one. */
+BI(os_copy) {
+  UNUSED;
+  FILE *in = fopen(vl_cstr(argv[0]), "rb");
+  if (!in) return os_errno("copy");
+  struct stat st;
+  bool have_mode = fstat(fileno(in), &st) == 0;
+  /* Refuse a copy onto the SOURCE before opening the destination "wb",
+   * because that open truncates: os.copy(p, p) reported success and left a
+   * zero-byte file where the data had been. Compared by (dev, ino) rather
+   * than by path text, so a second name for the same file — a hard link, a
+   * symlink, `./a` against `a` — is caught too. cp(1) refuses this for the
+   * same reason. */
+  struct stat dst;
+  if (have_mode && stat(vl_cstr(argv[1]), &dst) == 0 &&
+      dst.st_dev == st.st_dev && dst.st_ino == st.st_ino) {
+    fclose(in);
+    Value m = vl_str("copy: source and destination are the same file");
+    Value e = vl_exc_new("IOError", &m, 1, NULL, NULL, 0);
+    vl_release(m);
+    return e;
+  }
+  FILE *out = fopen(vl_cstr(argv[1]), "wb");
+  if (!out) {
+    int e = errno;
+    fclose(in);
+    errno = e;
+    return os_errno("copy");
+  }
+  char buf[65536];
+  int64_t total = 0;
+  int err = 0;
+  size_t n;
+  while ((n = fread(buf, 1, sizeof buf, in)) > 0) {
+    if (fwrite(buf, 1, n, out) != n) {
+      err = errno ? errno : EIO;
+      break;
+    }
+    total += (int64_t)n;
+  }
+  if (!err && ferror(in)) err = errno ? errno : EIO;
+  if (!err && have_mode) fchmod(fileno(out), st.st_mode & 0777);
+  fclose(in);
+  /* fclose is where a buffered write finally reaches the disk, so its failure
+   * is the copy's failure and must not be dropped. */
+  if (fclose(out) != 0 && !err) err = errno ? errno : EIO;
+  if (err) {
+    errno = err;
+    return os_errno("copy");
+  }
+  return vl_int(total);
+}
+
+/* os.tempdir() -> str.  NAMES the directory for scratch files — $TMPDIR when
+ * the environment gives one (macOS hands every process a private one), else
+ * "/tmp". Any trailing "/" is dropped so `os.tempdir() || "/x"` is a path and
+ * not "//x". Making a scratch directory inside it is os.mkdir's job: this
+ * call creates nothing, so it cannot leave anything behind. */
+BI(os_tempdir) {
+  UNUSED;
+  const char *d = getenv("TMPDIR");
+  if (!d || !*d) d = getenv("TMP");
+  if (!d || !*d) d = "/tmp";
+  int64_t n = (int64_t)strlen(d);
+  while (n > 1 && d[n - 1] == '/') n--;
+  return vl_str_n(d, n);
+}
+
+/* os.realpath(path) -> str!  The canonical absolute path: every symlink
+ * resolved, every "." and ".." removed. The path must EXIST — that is
+ * realpath(3)'s contract, and the IOError says which part did not. */
+BI(os_realpath) {
+  UNUSED;
+  char *p = realpath(vl_cstr(argv[0]), NULL);
+  if (!p) return os_errno("realpath");
+  Value s = vl_str(p);
+  free(p);
+  return s;
+}
+
+/* build_argv turns (prog, []args) into a NUL-terminated C argv; free_argv
+ * undoes it. Shared by os.run and os.run_capture so the two can never come to
+ * disagree about how a command line is assembled. */
+static char **build_argv(Value prog, Value args, int *nout) {
+  int n = (int)vl_len(args);
   char **cargv = (char **)calloc((size_t)n + 2, sizeof(char *));
   if (!cargv) vl_abort("out of memory");
-  cargv[0] = vl_strdup_n(vl_cstr(argv[0]), vl_strlen(argv[0]));
-  Value *data = vl_slice_data(av);
+  cargv[0] = vl_strdup_n(vl_cstr(prog), vl_strlen(prog));
+  Value *data = vl_slice_data(args);
   for (int i = 0; i < n; i++) {
     Value s = vl_tostr(data[i]);
     cargv[i + 1] = vl_strdup_n(vl_cstr(s), vl_strlen(s));
     vl_release(s);
   }
   cargv[n + 1] = NULL;
+  *nout = n;
+  return cargv;
+}
+
+static void free_argv(char **cargv, int n) {
+  for (int i = 0; i <= n; i++) free(cargv[i]);
+  free(cargv);
+}
+
+/* wait_status turns waitpid's status into the exit code Voila reports:
+ * 128+signal when the child was killed, -1 when we could not tell. */
+static int64_t wait_status(pid_t pid) {
+  int status = 0;
+  while (waitpid(pid, &status, 0) < 0) {
+    if (errno != EINTR) return -1;
+  }
+  if (WIFEXITED(status)) return WEXITSTATUS(status);
+  if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+  return -1;
+}
+
+/* os.run(prog, args) -> int.  Runs a program with stdio inherited and returns
+ * its exit status (128+signal when it was killed). */
+BI(os_run) {
+  UNUSED;
+  int n = 0;
+  char **cargv = build_argv(argv[0], argv[1], &n);
 
   /* The child inherits our stdout. Flush first, or our buffered `say` output
    * would appear AFTER the child's — the interpreter, whose stdout is
@@ -586,23 +1046,122 @@ BI(os_run) {
   fflush(NULL);
   pid_t pid = fork();
   if (pid < 0) {
-    for (int i = 0; i <= n; i++) free(cargv[i]);
-    free(cargv);
+    free_argv(cargv, n);
     return vl_int(-1);
   }
   if (pid == 0) {
     execvp(cargv[0], cargv);
     _exit(127); /* exec failed: the shell's convention */
   }
-  int status = 0;
-  while (waitpid(pid, &status, 0) < 0) {
-    if (errno != EINTR) break;
+  int64_t code = wait_status(pid);
+  free_argv(cargv, n);
+  return vl_int(code);
+}
+
+/* os.run_capture(prog, args) -> (int, str, str)!
+ *
+ * os.run lets the child inherit our stdout, which is right for a build driver
+ * and useless for a program that wants the ANSWER. This runs the child with
+ * both output streams on pipes and hands back (status, stdout, stderr) — the
+ * same status convention as os.run, so the two differ only in the capture.
+ * The child's stdin is still ours: a filter reads what we would have read.
+ *
+ * The two pipes are drained TOGETHER, through poll(). A pipe buffer is finite
+ * and a child that fills one blocks until somebody reads it, so draining
+ * stdout to the end BEFORE looking at stderr would deadlock against any child
+ * that writes a large diagnostic — precisely the case this call exists for.
+ *
+ * Only a failure to START the child is an IOError; a child that ran and
+ * failed is a status, which is the caller's to judge. */
+BI(os_run_capture) {
+  UNUSED;
+  int n = 0;
+  char **cargv = build_argv(argv[0], argv[1], &n);
+  int outp[2], errp[2];
+  if (pipe(outp) != 0) {
+    int e = errno;
+    free_argv(cargv, n);
+    errno = e;
+    return os_errno("run_capture");
   }
-  for (int i = 0; i <= n; i++) free(cargv[i]);
-  free(cargv);
-  if (WIFEXITED(status)) return vl_int(WEXITSTATUS(status));
-  if (WIFSIGNALED(status)) return vl_int(128 + WTERMSIG(status));
-  return vl_int(-1);
+  if (pipe(errp) != 0) {
+    int e = errno;
+    close(outp[0]);
+    close(outp[1]);
+    free_argv(cargv, n);
+    errno = e;
+    return os_errno("run_capture");
+  }
+  fflush(NULL); /* our own buffered output goes first — as in os.run */
+  pid_t pid = fork();
+  if (pid < 0) {
+    int e = errno;
+    close(outp[0]);
+    close(outp[1]);
+    close(errp[0]);
+    close(errp[1]);
+    free_argv(cargv, n);
+    errno = e;
+    return os_errno("run_capture");
+  }
+  if (pid == 0) {
+    dup2(outp[1], 1);
+    dup2(errp[1], 2);
+    close(outp[0]);
+    close(outp[1]);
+    close(errp[0]);
+    close(errp[1]);
+    execvp(cargv[0], cargv);
+    _exit(127);
+  }
+  close(outp[1]);
+  close(errp[1]);
+  Value acc[2];
+  acc[0] = vl_builder_new();
+  acc[1] = vl_builder_new();
+  struct pollfd fds[2];
+  fds[0].fd = outp[0];
+  fds[1].fd = errp[0];
+  fds[0].events = fds[1].events = POLLIN;
+  fds[0].revents = fds[1].revents = 0;
+  int live = 2;
+  while (live > 0) {
+    /* poll ignores a negative fd (revents 0), so a stream already at end of
+     * file simply stops being asked about. */
+    if (poll(fds, 2, -1) < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    for (int i = 0; i < 2; i++) {
+      if (fds[i].fd < 0 || fds[i].revents == 0) continue;
+      char buf[8192];
+      ssize_t got = read(fds[i].fd, buf, sizeof buf);
+      if (got > 0) {
+        Value s = vl_str_n(buf, (int64_t)got);
+        vl_builder_write(acc[i], s);
+        vl_release(s);
+        continue;
+      }
+      if (got < 0 && errno == EINTR) continue;
+      close(fds[i].fd);
+      fds[i].fd = -1;
+      live--;
+    }
+  }
+  for (int i = 0; i < 2; i++)
+    if (fds[i].fd >= 0) close(fds[i].fd); /* poll() itself failed */
+  int64_t code = wait_status(pid);
+  free_argv(cargv, n);
+  Value trio[3];
+  trio[0] = vl_int(code);
+  trio[1] = vl_builder_done(acc[0]);
+  trio[2] = vl_builder_done(acc[1]);
+  vl_release(acc[0]);
+  vl_release(acc[1]);
+  Value t = vl_tuple_new(trio, 3); /* retains all three */
+  vl_release(trio[1]);
+  vl_release(trio[2]);
+  return t;
 }
 
 /* os.exe returns the path of the RUNNING executable. The compiler needs it to
@@ -672,6 +1231,57 @@ BI(os_env) {
   UNUSED;
   const char *v = getenv(vl_cstr(argv[0]));
   return v ? vl_str(v) : vl_nil();
+}
+
+/* os.setenv / os.unsetenv change THIS process's environment: what os.env
+ * reads back, and what every child started afterwards inherits (os.run and
+ * os.run_capture fork, so they carry it). They do not reach a process that is
+ * already running, ours or anyone else's.
+ *
+ * Neither is safe to call while other tasks run: setenv may reallocate the
+ * environment block that a concurrent getenv is reading. Set what you need
+ * before you spawn. */
+BI(os_setenv) {
+  UNUSED;
+  Value v = vl_tostr(argv[1]);
+  int rc = setenv(vl_cstr(argv[0]), vl_cstr(v), 1);
+  int e = errno;
+  vl_release(v);
+  if (rc != 0) {
+    errno = e;
+    return os_errno("setenv");
+  }
+  return vl_unit();
+}
+
+BI(os_unsetenv) {
+  UNUSED;
+  if (unsetenv(vl_cstr(argv[0])) != 0) return os_errno("unsetenv");
+  return vl_unit();
+}
+
+/* os.environ() -> map[str]str.  A SNAPSHOT of the whole environment, in the
+ * order the environment block holds it (maps here are insertion-ordered, so
+ * that order is what the caller sees). A duplicated name keeps its FIRST
+ * binding, because that is the one getenv answers with — the map must not
+ * disagree with os.env about what the environment says. */
+BI(os_environ) {
+  UNUSED;
+  Value m = vl_map_new();
+  char **env = OS_ENVIRON;
+  for (int i = 0; env && env[i]; i++) {
+    const char *eq = strchr(env[i], '=');
+    if (!eq) continue; /* not a binding; the kernel does not make these */
+    Value k = vl_str_n(env[i], (int64_t)(eq - env[i]));
+    Value seen;
+    if (vl_map_get(m, k, &seen)) {
+      vl_release(seen);
+    } else {
+      vl_map_set(m, k, vl_str(eq + 1));
+    }
+    vl_release(k);
+  }
+  return m;
 }
 
 BI(os_exit) {
@@ -1182,6 +1792,37 @@ BI(time_after) {
 BI(time_millis) { UNUSED; return vl_dur(raw_int(argv[0]) * 1000000LL); }
 BI(time_seconds) { UNUSED; return vl_dur(raw_int(argv[0]) * 1000000000LL); }
 
+/* The two shims std/time's calendar half is written on. Everything else about
+ * dates — the civil/day-number conversions, RFC 3339 formatting and parsing —
+ * is arithmetic and lives in std/time/time.voi, in Voila. In particular there
+ * is deliberately NO strftime here: it is locale-dependent, and this project
+ * compares program output byte for byte. */
+
+/* time._instant(nanos) — an instant from nanoseconds since the epoch. The
+ * inverse, instant -> nanoseconds, is the `unix_nanos` method in call.c. */
+BI(time_instant) { UNUSED; return vl_instant(raw_int(argv[0])); }
+
+/* time._local_offset(unix_seconds) — the process's local UTC offset in
+ * seconds east of Greenwich AT THAT INSTANT, which is the only way to get
+ * summer time right for a timestamp that is not now.
+ *
+ * This is the whole of std/time's timezone support and it is on purpose: the
+ * package knows UTC, a fixed offset, and whatever offset the C library says
+ * the process is at. There is no tzdata reader, no named zone, and no way to
+ * ask what the offset WILL be after a rule change (§13.4). */
+BI(time_local_offset) {
+  UNUSED;
+  time_t t = (time_t)raw_int(argv[0]);
+  struct tm lt;
+  /* A refusal reads as UTC. localtime_r returns NULL once the year would
+   * overflow `struct tm`'s int field — glibc does, macOS does not — and the
+   * only alternative would be to throw out of what every caller treats as a
+   * plain question. The seconds are ten-thousand-year-scale by then; the
+   * limit is documented in std/time/time.voi's timezone note. */
+  if (localtime_r(&t, &lt) == NULL) return vl_int(0);
+  return vl_int((int64_t)lt.tm_gmtoff);
+}
+
 /* ---------------------------------------------------------------- log */
 
 static Value log_at(const char *tag, Value *argv, int argc) {
@@ -1500,21 +2141,33 @@ BI(json_decode) {
 
 /* ---------------------------------------------------------------- rand */
 
+/* std/rand is the FAST, REPRODUCIBLE sequence and is not fit for security.
+ * random(3) is a trinomial-feedback generator: a few hundred outputs pin its
+ * whole state, so an attacker who sees any of the stream can predict the
+ * rest. Nothing here may choose a key, a token, a nonce, a password reset
+ * link or a session id — std/crypto's crypto.random is the source for all of
+ * those, and this comment is the whole reason both exist.
+ *
+ * rand.seed keeps meaning exactly what it says: seeding produces the same
+ * sequence again, which is what makes a test with random input reproducible.
+ * What changed is the DEFAULT seed. vl_init used to call
+ * srandom((unsigned)time(NULL)), which has one-second granularity, so two
+ * processes started in the same second dealt the same "random" cards — and a
+ * program that never calls rand.seed is guessable from nothing but its start
+ * time. The default seed now comes from the CSPRNG (vl_init, below).
+ *
+ * rand.float divides by 2^31-1 rather than RAND_MAX: RAND_MAX bounds rand(3),
+ * not random(3), and the two are only equal by coincidence on the platforms
+ * this runs on today. */
 BI(rand_int) { UNUSED; return vl_int(random() % (raw_int(argv[0]) ? raw_int(argv[0]) : 1)); }
-BI(rand_float) { UNUSED; return vl_float((double)random() / (double)RAND_MAX); }
+BI(rand_float) { UNUSED; return vl_float((double)random() / 2147483647.0); }
 BI(rand_seed) { UNUSED; srandom((unsigned)raw_int(argv[0])); return vl_unit(); }
 
-BI(uuid_new) {
-  UNUSED;
-  char buf[40];
-  snprintf(buf, sizeof buf, "%08lx-%04lx-4%03lx-%04lx-%012lx",
-           (unsigned long)random() & 0xffffffffUL,
-           (unsigned long)random() & 0xffffUL,
-           (unsigned long)random() & 0xfffUL,
-           ((unsigned long)random() & 0x3fffUL) | 0x8000UL,
-           (unsigned long)random() & 0xffffffffffffUL);
-  return vl_str(buf);
-}
+/* uuid.new is version 4 over the CSPRNG (crypto.c). It used to be five draws
+ * from random(3), which made two UUIDs minted by two processes started in the
+ * same second IDENTICAL — the seed was the clock in seconds and the sequence
+ * is deterministic from it. Uniqueness is the only property a UUID has. */
+BI(uuid_new) { UNUSED; return vl_uuid_v4(); }
 
 /* ---------------------------------------------------------------- strings */
 
@@ -1545,6 +2198,21 @@ typedef struct {
   const char *name;
   VlFn fn;
 } Entry;
+
+/* ---------------------------------------------------------------- regex */
+
+/* regex.c exposes typed helpers; these are the VlFn shims the natives table
+ * holds. A bad pattern comes back as an error VALUE from vl_regex_compile,
+ * so every one of these composes with match/try/else/must. */
+BI(regex_compile) { UNUSED; return vl_regex_compile(argv[0]); }
+BI(regex_matches) { UNUSED; return vl_regex_matches(argv[0], argv[1]); }
+BI(regex_find) { UNUSED; return vl_regex_find(argv[0], argv[1]); }
+BI(regex_find_all) { UNUSED; return vl_regex_find_all(argv[0], argv[1]); }
+BI(regex_replace) {
+  UNUSED;
+  return vl_regex_replace(argv[0], argv[1], argv[2]);
+}
+BI(regex_split) { UNUSED; return vl_regex_split(argv[0], argv[1]); }
 
 static const Entry table[] = {
     /* prelude */
@@ -1577,7 +2245,7 @@ static const Entry table[] = {
     {"fmt.print", bi_print}, {"fmt.println", bi_println},
     {"fmt.comma", bi_comma}, {"fmt.bytes", bi_bytes_human},
     {"fmt.pad", sf_pad}, {"fmt.pad_left", sf_pad_left},
-    {"fmt.center", sf_center},
+    {"fmt.center", sf_center}, {"fmt.table", bi_table},
 
     /* os */
     {"os.read", os_read}, {"os.write", os_write}, {"os.open", os_open},
@@ -1585,9 +2253,23 @@ static const Entry table[] = {
     {"os.remove", os_remove}, {"os.args", os_args}, {"os.env", os_env},
     {"os.exit", os_exit}, {"os.on_abort", os_on_abort},
     {"os.isdir", os_isdir}, {"os.listdir", os_listdir},
-    {"os.run", os_run}, {"os.cwd", os_cwd}, {"os.pid", os_pid},
+    {"os.run", os_run}, {"os.run_capture", os_run_capture},
+    {"os.cwd", os_cwd}, {"os.pid", os_pid},
     {"os.exe", os_exe}, {"os.mtime", os_mtime}, {"os.size", os_size},
     {"os.hostname", os_hostname},
+    {"os.input", os_input}, {"os.isatty", os_isatty},
+    {"os.mkdir", os_mkdir}, {"os.mkdir_all", os_mkdir_all},
+    {"os.rmdir", os_rmdir}, {"os.rename", os_rename},
+    {"os.copy", os_copy}, {"os.tempdir", os_tempdir},
+    {"os.realpath", os_realpath},
+    {"os.setenv", os_setenv}, {"os.unsetenv", os_unsetenv},
+    {"os.environ", os_environ},
+
+    /* io (the reader/writer kinds live in io.c) */
+    {"io.reader", vl_io_reader}, {"io.writer", vl_io_writer},
+    {"io.buffered", vl_io_buffered}, {"io.copy", vl_io_copy},
+    {"io.pipe", vl_io_pipe}, {"io.read_all", vl_io_read_all},
+    {"io.discard", vl_io_discard},
 
     /* net (the C syscall shim; the API is Voilà, in std/net) */
     {"net._listen_tcp", net_listen_tcp}, {"net._connect_tcp", net_connect_tcp},
@@ -1600,6 +2282,18 @@ static const Entry table[] = {
     {"net._connect_unix", net_connect_unix}, {"net._close", net_close},
     {"net._set_timeout", net_set_timeout}, {"net.resolve", net_resolve},
 
+    /* std/sync (sync.c). Internal shims only: Mutex/RWLock/Atomic/Once/
+       WaitGroup and every closure-shaped call are Voilà source. */
+    {"sync._mutex", vl_sync_mutex}, {"sync._lock", vl_sync_lock},
+    {"sync._unlock", vl_sync_unlock}, {"sync._try_lock", vl_sync_try_lock},
+    {"sync._rwlock", vl_sync_rwlock}, {"sync._rlock", vl_sync_rlock},
+    {"sync._wlock", vl_sync_wlock}, {"sync._rwunlock", vl_sync_rwunlock},
+    {"sync._try_rlock", vl_sync_try_rlock},
+    {"sync._try_wlock", vl_sync_try_wlock},
+    {"sync._atomic", vl_sync_atomic}, {"sync._load", vl_sync_load},
+    {"sync._store", vl_sync_store}, {"sync._add", vl_sync_add},
+    {"sync._swap", vl_sync_swap}, {"sync._cas", vl_sync_cas},
+
     /* math */
     {"math.sqrt", math_sqrt}, {"math.sin", math_sin}, {"math.cos", math_cos},
     {"math.tan", math_tan}, {"math.asin", math_asin}, {"math.acos", math_acos},
@@ -1611,6 +2305,8 @@ static const Entry table[] = {
     {"time.now", time_now}, {"time.since", time_since},
     {"time.sleep", time_sleep}, {"time.after", time_after},
     {"time.millis", time_millis}, {"time.seconds", time_seconds},
+    {"time._instant", time_instant},
+    {"time._local_offset", time_local_offset},
 
     /* log */
     {"log.info", log_info}, {"log.warn", log_warn}, {"log.error", log_error},
@@ -1627,6 +2323,30 @@ static const Entry table[] = {
     /* rand / uuid */
     {"rand.int", rand_int}, {"rand.float", rand_float},
     {"rand.seed", rand_seed}, {"uuid.new", uuid_new},
+
+    /* crypto (the digests and the entropy source live in crypto.c) */
+    {"crypto.md5", vl_crypto_md5},
+    {"crypto.md5_raw", vl_crypto_md5_raw},
+    {"crypto.sha1", vl_crypto_sha1},
+    {"crypto.sha1_raw", vl_crypto_sha1_raw},
+    {"regex.compile", regex_compile}, {"regex.matches", regex_matches},
+    {"regex.find", regex_find}, {"regex.find_all", regex_find_all},
+    {"regex.replace", regex_replace}, {"regex.split", regex_split},
+    {"crypto.sha256", vl_crypto_sha256},
+    {"crypto.sha256_raw", vl_crypto_sha256_raw},
+    {"crypto.sha512", vl_crypto_sha512},
+    {"crypto.sha512_raw", vl_crypto_sha512_raw},
+    {"crypto.hmac_md5", vl_crypto_hmac_md5},
+    {"crypto.hmac_md5_raw", vl_crypto_hmac_md5_raw},
+    {"crypto.hmac_sha1", vl_crypto_hmac_sha1},
+    {"crypto.hmac_sha1_raw", vl_crypto_hmac_sha1_raw},
+    {"crypto.hmac_sha256", vl_crypto_hmac_sha256},
+    {"crypto.hmac_sha256_raw", vl_crypto_hmac_sha256_raw},
+    {"crypto.hmac_sha512", vl_crypto_hmac_sha512},
+    {"crypto.hmac_sha512_raw", vl_crypto_hmac_sha512_raw},
+    {"crypto.random", vl_crypto_random},
+    {"crypto.random_int", vl_crypto_random_int},
+    {"crypto.equal", vl_crypto_equal},
 
     /* conv (package-qualified safe conversions) */
     {"conv.to_int", bi_to_int}, {"conv.to_float", bi_to_float},
@@ -1664,7 +2384,8 @@ bool vl_has_name(const char *name) {
          eq(name, "time.Nanosecond") || eq(name, "time.Microsecond") ||
          eq(name, "time.Minute") || eq(name, "time.Hour") ||
          eq(name, "math.pi") || eq(name, "math.e") ||
-         eq(name, "os.stderr") || eq(name, "os.stdout");
+         eq(name, "os.stderr") || eq(name, "os.stdout") ||
+         eq(name, "os.stdin");
 }
 
 Value vl_lookup_value(const char *name) {
@@ -1676,8 +2397,14 @@ Value vl_lookup_value(const char *name) {
   if (eq(name, "time.Hour")) return vl_dur(3600000000000LL);
   if (eq(name, "math.pi")) return vl_float(3.14159265358979323846);
   if (eq(name, "math.e")) return vl_float(2.71828182845904523536);
-  if (eq(name, "os.stderr")) return vl_file_new(stderr, "<stderr>", true);
-  if (eq(name, "os.stdout")) return vl_file_new(stdout, "<stdout>", true);
+  /* The three standard handles are process-wide SINGLETONS, not fresh objects
+   * per lookup: the backend emits vl_lookup_value inline at every use site, so
+   * a new buffered reader for each `os.stdin` would silently discard whatever
+   * the previous one had read ahead. (Fresh writers were harmless, and fresh
+   * readers would not be — hence all three are made once, in vl_io_init.) */
+  if (eq(name, "os.stderr")) return vl_retain(vl_stderr());
+  if (eq(name, "os.stdout")) return vl_retain(vl_stdout());
+  if (eq(name, "os.stdin")) return vl_retain(vl_stdin());
   VlFn fn = vl_lookup_fn(name);
   if (fn) return vl_native(name, fn);
   vl_abort("unknown name `%s`", name);
@@ -1722,7 +2449,20 @@ bool vl_match(VlFrame *f, Value subject, const VlPat *p, const Value *consts) {
   }
   if (!(subject.t == VL_OBJ && subject.u.o->kind == O_ENUM)) return false;
   VlEnum *e = (VlEnum *)subject.u.o;
-  if (!eq(e->var->variant, p->name)) return false;
+  /* A pattern name may be package-qualified (`geom.Circle`) while the variant
+   * the runtime records is the short one (`Circle`) paired with the enum's own
+   * qualified type name (`geom.Shape`). Two packages may now each declare an
+   * `Empty`, so the qualifier is CHECKED and not merely stripped: matching on
+   * the wrong package's variant must fail rather than silently succeed. */
+  const char *pname = p->name;
+  const char *dot = strrchr(pname, '.');
+  if (dot) {
+    size_t qlen = (size_t)(dot - pname);
+    if (strncmp(e->var->type, pname, qlen) != 0 || e->var->type[qlen] != '.')
+      return false;
+    pname = dot + 1;
+  }
+  if (!eq(e->var->variant, pname)) return false;
   if (p->nelems == 0) return true;
   if (p->nelems != e->n) return false;
   for (int i = 0; i < p->nelems; i++)
@@ -1836,7 +2576,24 @@ void vl_parse(VlFrame *f, Value srcv, const char *fold, const VlTerm *terms,
 void vl_init(int argc, char **argv) {
   g_args = vl_slice_new(0);
   for (int i = 1; i < argc; i++) vl_slice_append(g_args, vl_str(argv[i]));
-  srandom((unsigned)time(NULL));
+  /* Seed std/rand's default sequence from the CSPRNG, not the clock. A
+   * time(NULL) seed has one-second granularity, so every process started in
+   * the same second shared a sequence and any of them could be replayed by
+   * anyone who knew roughly when it ran. rand.seed still overrides this, and
+   * still gives back the same sequence every time — that is the point of it.
+   *
+   * This is the ONE place that uses the non-aborting draw. Every program runs
+   * this line, including the overwhelming majority that never ask for a
+   * random number, so a machine with no reachable entropy source must not be
+   * a machine where no Voilà program starts. Falling back to the old clock
+   * seed here loses nothing that was ever claimed: std/rand is unfit for
+   * security whatever seeds it (see the rand section above), and uuid.new
+   * and crypto.random do NOT come through here — they abort instead. */
+  unsigned seed;
+  if (!vl_try_random_bytes(&seed, sizeof seed))
+    seed = (unsigned)time(NULL) ^ ((unsigned)getpid() << 8);
+  srandom(seed);
+  vl_io_init(); /* os.stdin/os.stdout/os.stderr, made once (std/io) */
   vl_group_begin(vl_nil()); /* the implicit root group (§9.1) */
 }
 

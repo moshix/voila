@@ -3,6 +3,7 @@ package main
 use "app/geom"
 use "app/report"
 use "app/geom" as g
+use "app/Box"
 
 func main() {
     let shapes = [Circle(2.0), Rect(3.0, 4.0)]
@@ -33,7 +34,21 @@ func main() {
     geom.Set("hello")
     say geom.Get(), geom.Defaulted()
 
+    // A trait DEFAULT inherited by a type whose name matches a PACKAGE must
+    // not steal that package's function slot. `Box.Area` is minted twice —
+    // once by Box/area.voi, once as the inherited default below — and the
+    // package function must keep it. (It briefly did not: the inherited-
+    // default alias overwrote fnIdx unguarded, so this printed 7.)
+    say Box.Area()
+    let boxed = Box{}
+    say boxed.Area()
+
     // A local may shadow a package name; the loader must respect that.
     let geom = 42
     say geom
 }
+
+// Named to collide with the `Box` package on purpose; see above.
+trait Measured { func Area() int = 7 }
+struct Box { }
+impl Measured for Box { }

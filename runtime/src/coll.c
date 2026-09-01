@@ -383,8 +383,62 @@ bool vl_iter_next(Value itv, Value *key, Value *val) {
     *val = v;
     return true;
   }
-  default:
-    vl_abort("cannot iterate over %s", vl_kind_name(src));
+  case O_READER: {
+    /* `each line in os.stdin` streams: ONE read_line per step, so a program
+     * can consume input larger than memory. The terminator is stripped, as
+     * str.lines() strips it, and read_line's "" end marker is unambiguous
+     * because a blank line reads as "\n" (std/io). */
+    bool ok = false;
+    Value line = vl_reader_method(src, "read_line", NULL, 0, &ok);
+    if (line.t == VL_OBJ && line.u.o->kind == O_ERR)
+      vl_throw(line); /* `each` has no failure channel; does not return */
+    int64_t n = vl_strlen(line);
+    if (n == 0) {
+      vl_release(line);
+      return false;
+    }
+    const char *s = vl_cstr(line);
+    if (n > 0 && s[n - 1] == '\n') n--;
+    if (n > 0 && s[n - 1] == '\r') n--;
+    *key = vl_int(it->i);
+    *val = vl_str_n(s, n);
+    vl_release(line);
+    it->i++;
+    return true;
   }
+  case O_STRUCT:
+  case O_ENUM: {
+    /* A user type iterates by defining `next(mut self) ?T`: each step calls
+     * it, and nil ends the loop. Duck-typed through the method table, exactly
+     * as the Show trait is (vl_user_show, types.c) — a trait declaration is
+     * decorative in this release, so the METHOD is the protocol. */
+    const char *tn = src.u.o->kind == O_STRUCT
+                         ? ((VlStruct *)src.u.o)->type->name
+                         : ((VlEnum *)src.u.o)->var->type;
+    const VlMethod *m = (tn && tn[0]) ? vl_find_method(tn, "next") : NULL;
+    if (!m || !m->has_self) break; /* no protocol: the abort below explains */
+    Value self = src;
+    Value v = m->fn(&self, 1, NULL);
+    if (v.t == VL_NIL) {
+      vl_release(v);
+      return false;
+    }
+    *key = vl_int(it->i);
+    *val = v;
+    it->i++;
+    return true;
+  }
+  default:
+    break;
+  }
+  /* The `next` advice is only actionable for a nominal type the program can
+   * add a method to; suggesting it for a file or a channel would send the
+   * reader off to write a method the runtime would never consult. */
+  if (src.t == VL_OBJ &&
+      (src.u.o->kind == O_STRUCT || src.u.o->kind == O_ENUM)) {
+    vl_abort("cannot iterate over %s: define `next(mut self) ?T` on it",
+             vl_kind_name(src));
+  }
+  vl_abort("cannot iterate over %s", vl_kind_name(src));
   return false;
 }

@@ -1,0 +1,5 @@
+package main
+
+use "example.com/lib/greet"
+
+func main() { say greet.Hello() }

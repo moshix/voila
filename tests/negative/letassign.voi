@@ -1,0 +1,26 @@
+// §4: a `let` binding cannot be reassigned. Mutating THROUGH one is a wholly
+// different thing and stays legal — both are here side by side so the rule
+// can never be widened into deep immutability by accident.
+struct Point { x int, y int }
+
+func main() {
+    let n = 1
+    n = 2
+    n += 3
+
+    var m = 10
+    m = 11                      // legal: `var`
+
+    let p = Point{x: 1, y: 2}
+    p.x = 5                     // legal: a field, not a rebinding
+
+    var counts = make(map[str]int)
+    counts["a"] = 1             // legal: an index, not a rebinding
+
+    {
+        var n = 0               // shadows the outer `let`: assignable
+        n = 1
+        say n
+    }
+    say n, m, p.x, counts["a"]
+}

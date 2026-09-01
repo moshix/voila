@@ -1,0 +1,460 @@
+// 29_http.voi — std/http: client, server, URL parsing and the refusals
+// (§13.3, §13.4).
+//
+// Every exchange here runs between a server task and a client task in THIS
+// process, over the loopback interface on an OS-chosen port. So the test needs
+// no network, no fixed port and no listening service — and nothing it prints
+// depends on either: the port is never printed, the tasks never print (only
+// the client's findings travel out, on a channel, and are printed after the
+// group has joined), and no timing is reported. The golden is therefore
+// byte-identical at every -O level.
+//
+// The malformed-response cases are the point of half of this file. Each one is
+// served by a RAW socket that writes bytes std/http must refuse, and each must
+// produce an ERROR VALUE — promptly. A parser that hung on any of them would
+// hang this test rather than fail it, which is the failure mode worth having.
+package main
+
+use "std/http"
+use "std/net"
+use "std/str"
+
+// ---------------------------------------------------------------- the server
+//
+// handle answers three paths and 404s everything else. What it says about the
+// request is what proves the SERVER's parsing: the method, the path and query
+// split off the target, the body length, that a Host header arrived, and a
+// custom header read back in the wrong case.
+func handle(req http.Request) http.Response {
+    if req.path == "/hello" {
+        var r = http.text(200, "hello " || req.query || "\n")
+        r.headers.set("X-Method", req.method)
+        r.headers.set("X-Has-Host", str(req.header("HOST") != ""))
+        r.headers.add("X-Note", "first")
+        r.headers.add("X-Note", "second")
+        return r
+    }
+    if req.path == "/echo" {
+        return http.text(200, "body=" || req.body || " len=" ||
+                              str(len(req.body)) ||
+                              " ct=" || req.header("content-TYPE") || "\n")
+    }
+    if req.path == "/created" {
+        return http.response(201, "application/json", "[1,2,3]")
+    }
+    return http.not_found()
+}
+
+// serve binds an ephemeral loopback port, publishes its address, and serves
+// `n` requests. It prints NOTHING: everything it might want to say goes out on
+// `done`, which main prints after the group.
+func serve(n int, addr chan[str], done chan[str]) {
+    match http.listen("127.0.0.1:0") {
+        Err(e)  => { addr <- "" ; done <- ("listen failed: " || e.message()) }
+        Ok(srv) => {
+            addr <- srv.addr()
+            var i = 0
+            var trouble = ""
+            while i < n {
+                match srv.serve_one(handle) {
+                    Ok(u)  => u
+                    Err(e) => trouble = e.message()
+                }
+                i += 1
+            }
+            srv.close()
+            if trouble != "" { done <- ("server: " || trouble) }
+            else { done <- "server: every request served" }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- the client
+
+func exchange(addr chan[str], out chan[str]) {
+    let where = <-addr
+    if where == "" { close(out) ; return }
+    let base = "http://" || where
+
+    // A GET with a query string.
+    match http.get(base || "/hello?who=world") {
+        Err(e) => out <- ("get: ERR " || e.message())
+        Ok(r)  => {
+            out <- ("get status: " || str(r.status) || " " || r.reason ||
+                    " ok=" || str(r.ok()))
+            // The same header, asked for in three different cases.
+            out <- ("get content-type: " || r.header("Content-Type"))
+            out <- ("get CONTENT-TYPE: " || r.header("CONTENT-TYPE"))
+            out <- ("get content-length: " || r.header("content-length"))
+            out <- ("get method seen by the server: " || r.header("x-method"))
+            out <- ("get Host reached the server: " || r.header("X-HAS-HOST"))
+            out <- ("get repeated header: " || str(r.headers.all("x-note")))
+            out <- ("get body: " || str.trim(r.body))
+        }
+    }
+
+    // A POST with a body.
+    match http.post(base || "/echo", "sixteen chars!!!") {
+        Err(e) => out <- ("post: ERR " || e.message())
+        Ok(r)  => out <- ("post: " || str(r.status) || " " || str.trim(r.body))
+    }
+
+    // The general form: any method, any headers, any body.
+    var hs = http.headers()
+    hs.set("Content-Type", "text/x-voila")
+    hs.set("X-Trace", "abc")
+    match http.request("PUT", base || "/echo", hs, "put body") {
+        Err(e) => out <- ("put: ERR " || e.message())
+        Ok(r)  => out <- ("put: " || str(r.status) || " " || str.trim(r.body))
+    }
+
+    // A response the handler builds by hand, with its own media type.
+    match http.get(base || "/created") {
+        Err(e) => out <- ("created: ERR " || e.message())
+        Ok(r)  => out <- ("created: " || str(r.status) || " " || r.reason ||
+                          " " || r.header("content-type") || " " || r.body)
+    }
+
+    // And a 404.
+    match http.get(base || "/nowhere") {
+        Err(e) => out <- ("404: ERR " || e.message())
+        Ok(r)  => out <- ("404: " || str(r.status) || " " || r.reason ||
+                          " ok=" || str(r.ok()) || " " || str.trim(r.body))
+    }
+    close(out)
+}
+
+// round_trip runs the five exchanges above against one server.
+func round_trip() {
+    let addr = chan[str](1)
+    let done = chan[str](1)
+    let out  = chan[str](32)
+    group {
+        spawn serve(5, addr, done)
+        spawn exchange(addr, out)
+    }
+    each line in out { say line }
+    say <-done
+}
+
+// ------------------------------------------------ the server API by hand
+//
+// serve_one is the convenience; this is the half underneath it — accept a
+// connection, read the request, write the response — and it is also where
+// Server.set_timeout is exercised, since a long-lived server that never sets
+// one is a connection away from a task that never returns.
+func by_hand(addr chan[str], done chan[str]) {
+    match http.listen("127.0.0.1:0") {
+        Err(e)  => { addr <- "" ; done <- ("listen failed: " || e.message()) }
+        Ok(srv) => {
+            match srv.set_timeout(30000) {
+                Ok(u)  => u
+                Err(e) => done <- ("set_timeout failed: " || e.message())
+            }
+            addr <- srv.addr()
+            match srv.accept() {
+                Err(e)   => done <- ("accept failed: " || e.message())
+                Ok(sess) => {
+                    match sess.read_request() {
+                        Err(e)  => done <- ("read failed: " || e.message())
+                        Ok(req) => {
+                            let r = http.text(200, "by hand: " || req.method ||
+                                                   " " || req.path || "\n")
+                            match sess.respond(r) {
+                                Ok(u)  => done <- "server: answered by hand"
+                                Err(e) => done <- ("respond: " || e.message())
+                            }
+                        }
+                    }
+                    sess.close()
+                }
+            }
+            srv.close()
+        }
+    }
+}
+
+func by_hand_client(addr chan[str], out chan[str]) {
+    let where = <-addr
+    if where == "" { close(out) ; return }
+    match http.get("http://" || where || "/by-hand") {
+        Err(e) => out <- ("by hand: ERR " || e.message())
+        Ok(r)  => out <- ("by hand: " || str(r.status) || " " ||
+                          str.trim(r.body))
+    }
+    close(out)
+}
+
+func session_by_hand() {
+    let addr = chan[str](1)
+    let done = chan[str](1)
+    let out  = chan[str](8)
+    group {
+        spawn by_hand(addr, done)
+        spawn by_hand_client(addr, out)
+    }
+    each line in out { say line }
+    say <-done
+}
+
+// ------------------------------------------------- a chunked REQUEST body
+//
+// The server side of chunked decoding: a raw client writes a chunked POST by
+// hand — two chunks and a trailer — and the handler must see the reassembled
+// body.
+func chunked_client(addr chan[str], out chan[str]) {
+    let where = <-addr
+    if where == "" { close(out) ; return }
+    match net.connect(where) {
+        Err(e) => out <- ("chunked request: connect " || e.message())
+        Ok(conn) => {
+            let req = "POST /echo HTTP/1.1\r\nHost: h\r\n" ||
+                      "Content-Type: text/plain\r\n" ||
+                      "Transfer-Encoding: chunked\r\n\r\n" ||
+                      "4\r\nwiki\r\n5;ext=1\r\npedia\r\n0\r\nX-T: 1\r\n\r\n"
+            match conn.write_all(req) {
+                Ok(u)  => u
+                Err(e) => out <- ("chunked request: write " || e.message())
+            }
+            match conn.read_all() {
+                Err(e)   => out <- ("chunked request: read " || e.message())
+                Ok(resp) => out <- ("chunked request: " || last_line(resp))
+            }
+            conn.close()
+        }
+    }
+    close(out)
+}
+
+func chunked_request() {
+    let addr = chan[str](1)
+    let done = chan[str](1)
+    let out  = chan[str](8)
+    group {
+        spawn serve(1, addr, done)
+        spawn chunked_client(addr, out)
+    }
+    each line in out { say line }
+    say <-done
+}
+
+// last_line is the final non-empty line of a raw response — the body, for the
+// one-line bodies this test's handler writes. The status line and the headers
+// are dropped: the round-trip above already pins them, and this case is only
+// about what the SERVER made of a chunked request body.
+func last_line(resp str) str {
+    var last = ""
+    each l in str.lines(resp) {
+        let t = str.trim(l)
+        if t != "" { last = t }
+    }
+    return last
+}
+
+// ------------------------------------------------------ raw, hostile servers
+//
+// raw_serve accepts ONE connection, reads the request head (up to the blank
+// line), then writes `reply` verbatim and closes. `reply` is whatever bytes
+// the case under test wants std/http to face.
+func raw_serve(reply str, addr chan[str], done chan[str]) {
+    match net.listen("127.0.0.1:0") {
+        Err(e)  => { addr <- "" ; done <- ("listen failed: " || e.message()) }
+        Ok(lis) => {
+            addr <- lis.addr()
+            match lis.accept() {
+                Err(e)   => done <- ("accept failed: " || e.message())
+                Ok(conn) => {
+                    while true {
+                        match conn.read_line() {
+                            Err(e)   => break
+                            Ok(line) => {
+                                if len(line) == 0 { break }
+                                if line == "\r\n" or line == "\n" { break }
+                            }
+                        }
+                    }
+                    match conn.write_all(reply) {
+                        Ok(u)  => u
+                        Err(e) => e
+                    }
+                    conn.close()
+                    lis.close()
+                    done <- ""
+                }
+            }
+        }
+    }
+}
+
+func raw_probe(label str, addr chan[str], out chan[str]) {
+    let where = <-addr
+    if where == "" { close(out) ; return }
+    match http.get("http://" || where || "/x") {
+        Err(e) => out <- (label || ": ERR " || e.message())
+        Ok(r)  => out <- (label || ": " || str(r.status) ||
+                          " body=" || str.trim(r.body))
+    }
+    close(out)
+}
+
+// raw_case is one hostile-server exchange, start to finish.
+func raw_case(label str, reply str) {
+    let addr = chan[str](1)
+    let done = chan[str](1)
+    let out  = chan[str](8)
+    group {
+        spawn raw_serve(reply, addr, done)
+        spawn raw_probe(label, addr, out)
+    }
+    each line in out { say line }
+    let trouble = <-done
+    if trouble != "" { say "  (raw server: " || trouble || ")" }
+}
+
+// ------------------------------------------------------------------- urls
+
+func show_url(raw str) {
+    match http.parse_url(raw) {
+        Err(e) => say "  ERR", e.message()
+        Ok(u)  => say "  scheme=" || u.scheme || " host=" || u.host ||
+                      " port=" || str(u.port) || " path=" || u.path ||
+                      " query=" || u.query || " target=" || u.target() ||
+                      " text=" || u.text()
+    }
+}
+
+// shadowed proves that `http` is an ordinary name before it is a package
+// qualifier: a local binding of it shadows the package for its scope, so the
+// two lines below are a method call on a str and a `len` of a list. Adding a
+// name to low.PackageNames() has broken working programs exactly here before.
+func shadowed() {
+    let http = "hyper text"
+    say "shadowed:", http.upper()
+    let net = ["a", "b", "c"]
+    say "shadowed:", len(net)
+}
+
+
+func main() {
+    say "-- urls --"
+    show_url("http://example.com/index.html")
+    show_url("http://example.com")
+    show_url("http://example.com:8080/a/b?x=1&y=2")
+    show_url("http://example.com/search?q=voila")
+    show_url("http://[::1]:9000/v6")
+    show_url("http://example.com/page#anchor")
+    say "-- urls this package refuses --"
+    show_url("https://example.com/secret")
+    show_url("ftp://example.com/f")
+    show_url("example.com/no-scheme")
+    show_url("http:///no-host")
+    show_url("http://user:pw@example.com/")
+    show_url("http://example.com:99999/")
+
+    say "-- headers are case-insensitive --"
+    var h = http.headers()
+    h.add("Content-Type", "text/plain")
+    h.add("Set-Cookie", "a=1")
+    h.add("set-cookie", "b=2")
+    say "  get:", h.get("CONTENT-TYPE"), "|", h.get("content-type")
+    say "  has:", h.has("SET-COOKIE"), h.has("X-Absent")
+    say "  all:", h.all("Set-Cookie")
+    say "  names:", h.names()
+    h.set("SET-COOKIE", "only=1")
+    say "  after set:", h.count(), h.names(), h.all("set-cookie")
+    h.remove("content-TYPE")
+    say "  after remove:", h.count(), h.names()
+
+    say "-- a header value may not carry a newline --"
+    var bad = http.headers()
+    bad.add("X-Evil", "ok\r\nInjected: yes")
+    match bad.render() {
+        Ok(t)  => say "  UNEXPECTED", t
+        Err(e) => say "  ERR", e.message()
+    }
+
+    say "-- status codes --"
+    say " ", http.reason_phrase(200), "|", http.reason_phrase(404), "|",
+        http.reason_phrase(503), "|", http.reason_phrase(599)
+
+    say "-- client and server, over loopback --"
+    round_trip()
+
+    say "-- the server API by hand --"
+    session_by_hand()
+
+    say "-- a chunked request body --"
+    chunked_request()
+
+    say "-- the package writes the message length, not the caller --"
+    var te = http.headers()
+    te.set("Transfer-Encoding", "chunked")
+    match http.request("POST", "http://127.0.0.1:1/x", te, "body") {
+        Ok(r)  => say "  UNEXPECTED", r.status
+        Err(e) => say "  ERR", e.message()
+    }
+
+    say "-- a chunked response body --"
+    raw_case("chunked",
+             "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ||
+             "5\r\nhello\r\n7;ext=1\r\n, world\r\n0\r\nX-Trailer: 1\r\n\r\n")
+
+    say "-- responses that must be refused, not guessed at --"
+    raw_case("no status line", "nothing like a response\r\n\r\n")
+    raw_case("no colon in a header",
+             "HTTP/1.1 200 OK\r\nBadHeader\r\n\r\n")
+    raw_case("space before the colon",
+             "HTTP/1.1 200 OK\r\nX-Bad : 1\r\n\r\n")
+    // Three regressions found by review, each pinned by the wire bytes that
+    // broke it. `Transfer-Encoding:` with an EMPTY value is still a
+    // Transfer-Encoding header: branching on the value let it through and the
+    // message got framed by Content-Length instead, leaving the rest of the
+    // bytes on the socket for whatever read next.
+    raw_case("empty TE", "HTTP/1.1 200 OK\r\nTransfer-Encoding:\r\n" ||
+                         "Content-Length: 5\r\n\r\nHELLOX")
+    // A 1xx is INTERIM — the real response follows it. Returning the 100 as
+    // the answer left the actual response unread.
+    raw_case("1xx then real", "HTTP/1.1 100 Continue\r\n\r\n" ||
+                              "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+    // ...but a peer must not hold the connection open by sending only those.
+    raw_case("only 1xx", str.repeat("HTTP/1.1 100 Continue\r\n\r\n", 12))
+    raw_case("folded header",
+             "HTTP/1.1 200 OK\r\nX-A: 1\r\n more\r\n\r\n")
+    raw_case("absurd Content-Length",
+             "HTTP/1.1 200 OK\r\nContent-Length: 99999999999999\r\n\r\nxx")
+    raw_case("Content-Length that is not a number",
+             "HTTP/1.1 200 OK\r\nContent-Length: twelve\r\n\r\nxx")
+    raw_case("body shorter than Content-Length",
+             "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort")
+    raw_case("Content-Length twice, disagreeing",
+             "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\nabc")
+    raw_case("Content-Length and chunked together",
+             "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n" ||
+             "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+    raw_case("a Transfer-Encoding this release cannot decode",
+             "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nzz")
+    raw_case("a chunk not followed by CRLF",
+             "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ||
+             "5\r\nhelloXX0\r\n\r\n")
+    raw_case("a chunk size that is not hex",
+             "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n")
+    raw_case("a stream that ends mid-chunk",
+             "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel")
+    // A line has to be BOUNDED, not merely terminated eventually: this peer
+    // sends a header that never ends, and the refusal must arrive while the
+    // buffer is still one line long rather than after it has grown to fit.
+    raw_case("a header line with no end",
+             "HTTP/1.1 200 OK\r\nX-Long: " || str.repeat("a", 70000))
+    raw_case("nothing at all", "")
+
+    say "-- responses that are fine --"
+    raw_case("204 carries no body",
+             "HTTP/1.1 204 No Content\r\n\r\n")
+    raw_case("no length: the body ends at the close",
+             "HTTP/1.1 200 OK\r\n\r\nfree bytes")
+    raw_case("an empty reason phrase",
+             "HTTP/1.1 200 \r\nContent-Length: 2\r\n\r\nhi")
+
+    say "-- `http` is a name before it is a package --"
+    shadowed()
+}

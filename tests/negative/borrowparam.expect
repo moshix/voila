@@ -1,0 +1,2 @@
+cannot assign to `b.n`: `b` is borrowed; declare the parameter `mut` to write through it (§6.1)
+cannot assign to `self.n`: `show` does not take `mut self` (§6.1)

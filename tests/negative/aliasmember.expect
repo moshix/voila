@@ -1,0 +1,5 @@
+package `str` has no member `nonexistent`
+`time.millis` takes 1 argument, but 0 are given
+!unknown identifier `s`
+!unknown identifier `t`
+!package `s`

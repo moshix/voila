@@ -1,0 +1,21 @@
+// The CONTROL for the two exemptions beside it. Everything here is reachable
+// only through the qualifier, so this package must still be reported when it
+// is imported and unused:
+//
+//   * `make` and `set` are CALLs, but of nobody's declaration, so they are
+//     not an initializer effect — a rule that counted every call would have
+//     exempted most packages ever written;
+//   * an INHERENT impl on the package's OWN type is not a foreign impl: the
+//     only way to get a `Thing` is to spell `plain.Thing`.
+package plain
+
+var Table = make(map[str]int)
+var Seen = set([])
+
+struct Thing {
+    n int
+}
+
+impl Thing {
+    func get(self) int { return self.n }
+}

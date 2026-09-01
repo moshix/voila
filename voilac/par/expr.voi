@@ -175,9 +175,27 @@ impl Parser {
     }
 
     // expr_to_named turns an already-parsed expression back into the type of a
-    // composite literal: `Point{…}`, `pkg.Point{…}`, `Stack[int]{…}`. It
-    // returns a TNAMED node, or 0 when the expression is not a type name.
-    func expr_to_named(mut self, x int) int {
+    // composite literal: `Point{…}`, `pkg.Point{…}`, `Stack[int]{…}`,
+    // `Stack[Box[int]]{…}`. It returns a TNAMED node, or 0 when the expression
+    // is not a type name.
+    //
+    // The type of a composite and a generic ARGUMENT are the same grammar once
+    // the argument may itself be an instantiation, so this is one function
+    // under two names — the second is what the recursion below calls itself.
+    func expr_to_named(mut self, x int) int { return self.expr_to_type(x) }
+
+    // expr_to_type converts a generic ARGUMENT: a name, a qualified name, or
+    // another instantiation.
+    //
+    // The nested arm is why `Stack[Box[int]]{}` parses at all. It used to be
+    // refused — the Go parser's exprToType accepted a name and nothing else —
+    // and the refusal was not a decision about the language: the ANNOTATION
+    // form `var s Stack[Box[int]]` has always parsed (type_expr recurses), and
+    // low.short_type already renders a nested TNAMED, so the composite spelling
+    // was the one place the nesting stopped. Recursing here only ever turns a
+    // parse error into a type, so no program that used to compile can mean
+    // something else now.
+    func expr_to_type(mut self, x int) int {
         let n = self.T.Get(x)
         if n.Kind == ast.IDENT {
             return self.T.Add(ast.TNAMED, n.Line, n.Col, 0, 0, n.Sval, [])
@@ -191,31 +209,13 @@ impl Parser {
             return 0
         }
         if n.Kind == ast.INDEX {
+            // The BASE is checked before the argument is converted, so a
+            // failure here leaves no orphan TNAMED behind in the arena.
             let b = self.T.Get(n.Kids[0])
             if b.Kind != ast.IDENT { return 0 }
-            // The ARGUMENT may only be a plain or qualified name: `Stack[int]{}`
-            // and `Stack[pkg.T]{}` are composite literals, `Stack[Box[int]]{}`
-            // is not (the Go parser's exprToType accepts neither an index nor
-            // anything else nested).
             let arg = self.expr_to_type(n.Kids[1])
             if arg == 0 { return 0 }
             return self.T.Add(ast.TNAMED, n.Line, n.Col, 0, 0, b.Sval, [arg])
-        }
-        return 0
-    }
-
-    // expr_to_type converts a generic ARGUMENT: a name, or a qualified name.
-    func expr_to_type(mut self, x int) int {
-        let n = self.T.Get(x)
-        if n.Kind == ast.IDENT {
-            return self.T.Add(ast.TNAMED, n.Line, n.Col, 0, 0, n.Sval, [])
-        }
-        if n.Kind == ast.FIELD {
-            let b = self.T.Get(n.Kids[0])
-            if b.Kind == ast.IDENT {
-                return self.T.Add(ast.TNAMED, n.Line, n.Col, 0, 0,
-                                  b.Sval || "." || n.Sval, [])
-            }
         }
         return 0
     }

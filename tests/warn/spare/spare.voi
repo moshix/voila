@@ -1,0 +1,4 @@
+// Imported by unusedimport.voi and never used. That is the whole point of it.
+package spare
+
+func Unused() int { return 0 }

@@ -1,0 +1,39 @@
+package three
+
+// A package that declares names the LANGUAGE predeclares. Short-name
+// resolution must NOT hand these to an importer: a bare `Some` in another
+// package is the option variant, and a bare `Show` is the builtin trait.
+// Before that guard, an import of this package silently rebound every
+// `Some(x)` pattern in the importing file — one candidate, so not even an
+// ambiguity error — and the match then never fired, because vl_match tests
+// the builtin arms by BARE name before it looks at any enum.
+enum Reply { Some(v int), None }
+
+trait Show { func Render(self) str }
+
+struct Card { }
+
+impl Show for Card {
+    func Render(self) str { return "card" }
+}
+
+func Wrapped() Reply { return Some(9) }
+
+// `secret` is package-private, so no importer may reach it — not as
+// `three.secret`, and not bare either (see tests/multipkg-bad/privatebare).
+// Inside the package it is an ordinary name.
+enum Vis { Public, secret }
+
+func Hidden() str {
+    match secret {
+        secret  => return "three:secret"
+        Public  => return "three:public"
+    }
+}
+
+func Name(r Reply) str {
+    match r {
+        Some(v) => return "three:some {v}"
+        None    => return "three:none"
+    }
+}

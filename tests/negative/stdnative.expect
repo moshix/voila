@@ -1,0 +1,21 @@
+package `str` has no member `len` (§13.4)
+package `fmt` has no member `printff`; did you mean `fmt.printf`? (§13.4)
+package `str` has no member `uper`; did you mean `str.upper`? (§13.4)
+package `os` has no member `reed`; did you mean `os.read`? (§13.4)
+!has no member `upper`
+!has no member `index`
+!has no member `printf`
+!has no member `exists`
+!has no member `fprintf`
+!has no member `pi`
+!has no member `e`
+!has no member `stdout`
+!has no member `Second`
+!has no member `Millisecond`
+!has no member `now`
+!has no member `now_utc`
+!has no member `Builder`
+!has no member `blank`
+!has no member `shout`
+!has no member `unix`
+!is not imported

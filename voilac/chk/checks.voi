@@ -38,9 +38,19 @@ func int_hi(t str) int {
     return 0
 }
 
-// is_numeric reports whether a type participates in the widening lattice.
+// is_numeric reports whether a type participates in the widening lattice
+// (§3.2). `rune` is in the list although is_int_type leaves it out: it IS an
+// integer to the runtime — `vl_int` carries int, byte and rune alike — and
+// arithmetic on one is ordinary.
+//
+// There were TWO of these, one here and one at the foot of chk/expr.voi
+// differing only in `rune`, and a package is one flat namespace: the second
+// silently replaced the first for BOTH callers. The loader's
+// check_package_names now refuses that, and this is the surviving definition
+// — the one that was in fact running.
 func is_numeric(t str) bool {
-    return is_int_type(t) or t == "float" or t == "dec" or t == "f32"
+    return is_int_type(t) or t == "rune" or t == "float" or t == "dec" or
+           t == "f32"
 }
 
 // The signed and unsigned rungs of the lattice; 0 means "not on this ladder".

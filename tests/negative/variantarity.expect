@@ -1,0 +1,4 @@
+variant `Circle` takes 1 value, but 2 are matched
+variant `Rect` takes 2 values, but 1 is matched
+variant `Circle` takes 1 value, but 0 are given
+variant `Rect` takes 2 values, but 3 are given

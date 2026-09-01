@@ -1,33 +1,31 @@
 // Package chk implements Voilà's static checks — the self-hosted port of
 // internal/check.
 //
-// It is the pragmatic stage-0 subset: borrow-escape in struct fields (§6.2),
-// the Acyclicity Rule (§6.3), the widening-lattice literal checks (§3.2),
-// match exhaustiveness (§3.5), straight-line use-after-move (§6.1) and the
-// literal format-string checks (§13.1).
+// It began as the pragmatic stage-0 subset — borrow-escape in struct fields
+// (§6.2), the Acyclicity Rule (§6.3), the widening-lattice literal checks
+// (§3.2), match exhaustiveness (§3.5), straight-line use-after-move (§6.1)
+// and the literal format-string checks (§13.1) — and has since grown trait
+// conformance and generic bounds (traits.voi), binding discipline (bind.voi),
+// declaration well-formedness (sig.voi), call sites (callsite.voi), std
+// package members (stdpkg.voi), native arities (native.voi), and finally
+// EXPRESSION TYPES (expr.voi), which is the one that asks whether a value
+// fits the hole it is put in.
 //
 // The Go checker fills a diag.Bag with a message, a span, a label, notes and
-// help; here a diagnostic is only its position and its message text, which
-// must match Go's byte for byte — Check returns them rendered as
-// "<src>:<line>:<col>: <message>", sorted by position exactly as diag.Bag's
-// Render sorts them.
+// help; here a diagnostic is its position, its severity and its message text,
+// which must match Go's byte for byte. Check hands back the BAG rather than
+// rendered lines: only main.voi knows the -W policy that decides whether a
+// warning is printed at all, and a checker that had already flattened its
+// diagnostics to strings could not be told.
 //
 // The AST is an arena (package ast), so every "node pointer" is an int index
 // and 0 means absent.
 package chk
 
 use "voilac/ast"
+use "voilac/diag"
+use "voilac/typ"
 use "std/str"
-
-// Diag is one diagnostic: where, and what. File matters — a program is many
-// packages flattened into one arena, and a diagnostic in an imported package
-// reported against the entry file points at a line that may not exist there.
-struct Diag {
-    File str
-    Line int
-    Col  int
-    Msg  str
-}
 
 struct Checker {
     T    ast.Tree
@@ -41,8 +39,54 @@ struct Checker {
     enums   map[str]int   // name → ENUMDEC node
     funcs   map[str]int   // name → FUNC node
     excs    map[str]int   // name → EXCDEC node
+    traits  map[str]int   // flat name → TRAITDEC node
     sNames  []str
     eNames  []str
+    tNames  []str
+
+    // The type universe (package typ): every nominal name an annotation may
+    // legally spell, plus the arena the type-shaped checks intern into. It is
+    // filled by collect_types below, from the same declaration list.
+    Ty typ.Table
+
+    // The METHOD UNION, keyed "Type|method" — every impl block on a type
+    // plus an exception's own methods, which is what the flat dispatch table
+    // will hold. Built once by chk/traits.voi's check_traits and read again
+    // when a generic bound has to be judged at an instantiation site, which
+    // happens later (check_sigs) and elsewhere. One table, one rule.
+    mset map[str]int
+
+    // The struct FIELD table (expr.voi), keyed "Type|field" → FIELDDECL
+    // node, and the impl block each method came from, keyed "Type|method" →
+    // IMPLDEC. The second is what lets a method's `T` be replaced by the
+    // receiver's written type argument: the method table alone remembers the
+    // body but not which generic list it was written under.
+    flds   map[str]int
+    implOf map[str]int
+
+    // Every method NAME declared anywhere in the program, in any impl block,
+    // exception or trait. LOOKUP ONLY, never iterated. It exists because a
+    // trait-typed receiver dispatches on the value's DYNAMIC type (call.c's
+    // vl_callm resolves by name against the flat table and the annotation
+    // plays no part), so the only honest thing a checker can say about
+    // `d.m()` on a `d Describe` is that NOTHING in this program declares an
+    // `m` at all.
+    mnames set[str]
+
+    // Expression-typing context (expr.voi): the type of `self` in the
+    // enclosing method, the enclosing function's single declared result (0
+    // when it declares none, several, or is a closure), and its name for the
+    // diagnostic. Recorded on the checker rather than threaded through every
+    // recursion, exactly as the binding state below is.
+    eSelf int
+    eRes  int
+    eFn   str
+
+    // Binding-discipline state (bind.voi). The enclosing method's self-mode
+    // is recorded rather than threaded through the recursion, so a closure
+    // written inside a method still knows whose `self` it captured.
+    bFn      str
+    bSelfMut bool
 
     // Acyclicity state (acyclic.voi). A slice cannot be grown through a
     // parameter, so the owning-edge table and the reported-cycle set live on
@@ -52,21 +96,66 @@ struct Checker {
     path     set[str]        // the types on the acyclicity DFS stack
     reported set[str]
 
-    Diags []Diag
+    // The std packages, as they appear after grafting (stdpkg.voi). sdSrc is
+    // every VOILÀ-SOURCE package the release has and sdC every C-native one,
+    // sdUser the ones a USER package has taken the qualifier of, sdPkgs the
+    // Voilà-source ones this program actually grafted, sdHave every dotted
+    // name a reference may legally resolve to (grafted declarations, C
+    // natives and package constants), sdNames the PUBLIC subset a near miss
+    // may be drawn from, and sdGlobals the global-scope names that stop a
+    // qualifier from being read as one (a top-level `var path`).
+    sdSrc     set[str]
+    sdC       set[str]
+    sdUser    set[str]
+    sdPkgs    set[str]
+    sdHave    set[str]
+    sdNames   []str
+    sdGlobals set[str]
+
+    // The NATIVE argument counts (native.voi), read from low.NativeArities:
+    // every native's minimum and maximum, keyed by the name the runtime
+    // resolves — a std/str function under its bare spelling and its `str.`
+    // one. natBare is the subset a BARE call may name at all (the lowerer's
+    // prelude list, which is narrower than the natives), and natShadow the
+    // declared names that resolve ahead of it and are in no other table here
+    // — enum VARIANTS, and TYPE declarations (`type index = int` makes
+    // `index(5)` a conversion, and collect() files only the struct-carrying
+    // kind under structs).
+    natMin     map[str]int
+    natMax     map[str]int
+    natBare    set[str]
+    natShadow  set[str]
+
+    // Every diagnostic this pass produces, in the order the checks ran.
+    // Sorting and rendering belong to diag.Bag, which is also what gives a
+    // check the choice of severity.
+    D diag.Bag
 }
 
 // Check runs every static check over a loaded, flattened program and returns
 // the diagnostics — empty when the program is clean.
-func Check(t ast.Tree, file int, srcName str) []str {
+func Check(t ast.Tree, file int) diag.Bag {
     var c = Checker{
         T: t, file: file,
         structs: make(map[str]int), enums: make(map[str]int),
         funcs: make(map[str]int), excs: make(map[str]int),
-        sNames: [], eNames: [],
+        traits: make(map[str]int),
+        sNames: [], eNames: [], tNames: [],
         edges: [], adj: make(map[str][]int), path: set([]),
-        reported: set([]), Diags: [],
+        reported: set([]), D: diag.New(), Ty: typ.New(),
+        mset: make(map[str]int),
+        flds: make(map[str]int), implOf: make(map[str]int),
+        mnames: set([]),
+        eSelf: 0, eRes: 0, eFn: "",
+        bFn: "", bSelfMut: false,
+        sdSrc: set([]), sdC: set([]), sdUser: set([]), sdPkgs: set([]),
+        sdHave: set([]), sdNames: [],
+        sdGlobals: set([]),
+        natMin: make(map[str]int), natMax: make(map[str]int),
+        natBare: set([]), natShadow: set([]),
     }
     c.collect()
+    c.collect_types()
     c.check_borrow_fields()
     c.check_acyclicity()
     c.check_lattice()
@@ -75,7 +164,21 @@ func Check(t ast.Tree, file int, srcName str) []str {
     c.check_format_strings()
     c.check_call_sites()
     c.check_composites()
-    return c.render(srcName)
+    c.check_traits()
+    c.check_bindings()
+    c.check_sigs()
+    c.check_unreachable()
+    c.check_std_members()
+    // LAST: it reads check_std_members' package tables and check_traits'
+    // method union, both of which decide whether a `pkg.member` callee really
+    // is a native.
+    c.check_native_calls()
+    // LAST OF ALL: expression typing reads every table above — the method
+    // union, the field table, the declaration tables and check_native_calls'
+    // natShadow, which is what stops `int(x)` being read as a conversion when
+    // the program declares something else of that name.
+    c.check_expr_types()
+    return c.D
 }
 
 impl Checker {
@@ -94,6 +197,13 @@ impl Checker {
                 self.funcs[n.Sval] = d
             } else if n.Kind == ast.EXCDEC {
                 self.excs[n.Sval] = d
+            } else if n.Kind == ast.TRAITDEC {
+                // The name is the FLAT one: a package's trait is
+                // `pkg.Name` here, a builtin's is bare, and every reference
+                // to either — an impl header, a bound, an annotation — was
+                // rewritten to the same string by the loader (§11.2.1).
+                if not (n.Sval in self.traits) { self.tNames.append(n.Sval) }
+                self.traits[n.Sval] = d
             } else if n.Kind == ast.TYPEDEC {
                 let sd = self.T.Kid(d, 0)
                 if sd != 0 { self.add_struct(n.Sval, sd) }
@@ -106,17 +216,41 @@ impl Checker {
         self.structs[name] = node
     }
 
+    // collect_types fills the nominal universe the type table resolves names
+    // against: every struct, enum, exception, type declaration and TRAIT the
+    // program declares, under the flat name the loader produced.
+    //
+    // Traits are in the list because a trait IS a type in annotation position
+    // — samples/08_shapes.voi declares `func report(items []Describe)`. Like
+    // everything else here they arrive under their FLAT name: a package's
+    // trait is `geom.Named`, a builtin's is bare, and the loader rewrote
+    // every reference — annotation, `impl` header, generic bound — to the
+    // same string, so nothing in this file has to know about packages.
+    func collect_types(mut self) {
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            let n = self.T.Get(d)
+            if n.Kind == ast.STRUCTDEC or n.Kind == ast.ENUMDEC or
+               n.Kind == ast.EXCDEC or n.Kind == ast.TYPEDEC or
+               n.Kind == ast.TRAITDEC {
+                self.Ty.Declare(n.Sval)
+            }
+        }
+    }
+
     // report_at is the normal entry: it takes the file from the NODE, which is
     // the only thing that knows which package it came from.
     func report_at(mut self, node int, msg str) {
         let n = self.T.Get(node)
-        self.Diags.append(Diag{File: self.T.FileOf(node), Line: n.Line,
-                               Col: n.Col, Msg: msg})
+        self.D.error(self.T.FileOf(node), n.Line, n.Col, "", msg)
     }
 
-    // report is for the few checks that carry a position without a node.
-    func report(mut self, line int, col int, msg str) {
-        self.Diags.append(Diag{File: "", Line: line, Col: col, Msg: msg})
+    // warn_at is report_at at the other severity. `code` is the stable name
+    // -Wno-<code> and -Werror=<code> address the warning by, so every caller
+    // must pass one diag.Codes() lists — a warning nobody can switch off has
+    // no business being on by default.
+    func warn_at(mut self, node int, code str, msg str) {
+        let n = self.T.Get(node)
+        self.D.warn(self.T.FileOf(node), n.Line, n.Col, code, msg)
     }
 
     // ------------------------------------------------------------ borrows
@@ -137,35 +271,6 @@ impl Checker {
         }
     }
 
-    // ------------------------------------------------------------ output
-
-    // render sorts the diagnostics by position and formats them. The sort is
-    // an INSERTION sort because it must be STABLE: diag.Bag uses
-    // sort.SliceStable, so two diagnostics at one position keep the order the
-    // checks produced them in.
-    func render(self, srcName str) []str {
-        var ds = []
-        each d in self.Diags { ds.append(d) }
-        var i = 1
-        while i < len(ds) {
-            let cur = ds[i]
-            var j = i - 1
-            while j >= 0 and after(ds[j], cur) {
-                ds[j + 1] = ds[j]
-                j -= 1
-            }
-            ds[j + 1] = cur
-            i += 1
-        }
-        var out = []
-        each d in ds {
-            var f = d.File
-            if f == "" { f = srcName }
-            out.append("{f}:{d.Line}:{d.Col}: {d.Msg}")
-        }
-        return out
-    }
-
     // ------------------------------------------------------------ walkers
 
     // all_stmts lists every statement the Go checker's walkStmts visits, in
@@ -180,6 +285,19 @@ impl Checker {
             if n.Kind == ast.FUNC {
                 each s in self.walk_block(self.T.Kid(d, 0)) { out.append(s) }
             } else if n.Kind == ast.IMPLDEC {
+                each m in self.T.Get(self.T.Kid(d, 0)).Kids {
+                    each s in self.walk_block(self.T.Kid(m, 0)) {
+                        out.append(s)
+                    }
+                }
+            } else if n.Kind == ast.TRAITDEC {
+                // A trait DEFAULT body is live code: low.lower_trait_default
+                // compiles it and cg registers it for every implementor, so
+                // it runs. These walkers were written when it was dead
+                // syntax, and without this arm a bad format string, a
+                // non-exhaustive match or a use-after-move inside a default
+                // passed `check` and failed at run time — the one
+                // inconsistency the verb exists to prevent.
                 each m in self.T.Get(self.T.Kid(d, 0)).Kids {
                     each s in self.walk_block(self.T.Kid(m, 0)) {
                         out.append(s)
@@ -306,16 +424,6 @@ impl Checker {
         }
         return out
     }
-}
-
-// after reports whether a sorts after b by (line, col).
-// after orders diagnostics by (file, line, col) — the same key diag.Bag sorts
-// on, so a multi-package program's diagnostics are grouped by file rather than
-// interleaved by line number across files.
-func after(a Diag, b Diag) bool {
-    if a.File != b.File { return a.File > b.File }
-    if a.Line != b.Line { return a.Line > b.Line }
-    return a.Col > b.Col
 }
 
 // chr renders one byte value as a string.

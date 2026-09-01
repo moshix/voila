@@ -7,7 +7,6 @@
 package main
 
 use "std/net"
-use "std/fmt"
 
 // respond binds a UDP socket, echoes each datagram back to its sender with a
 // prefix, and stops when it receives "DONE".

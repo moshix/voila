@@ -1,0 +1,157 @@
+// 16_traits.voi — trait DEFAULT method bodies, which now RUN.
+//
+// A trait method may carry an implementation the implementor inherits, in
+// two spellings: a full `{ … }` block, and the short form `= expr` which
+// means `{ return expr }`. Both parsed from the beginning and neither was
+// ever lowered, so `p.subtitle()` type-checked, compiled, and then died at
+// the call with "has no method" — precisely the "check said ok, build
+// refused" split the `check` verb exists to prevent.
+//
+// What is pinned here:
+//
+//   * a default used AS IS, in both spellings;
+//   * a default OVERRIDDEN by the implementor — the override must win, and
+//     the default's body must not run at all (Post.subtitle proves it by
+//     answering something the default could never produce);
+//   * two different types inheriting one default — Page and Photo both
+//     answer `(none)`. Program output cannot prove they share ONE compiled
+//     body rather than a copy each (that is `grep vf_` on the emitted C),
+//     but it does prove both inherit, which is what a reader needs;
+//   * a default that calls ANOTHER trait method on `self` — `banner` reaches
+//     `title`, which every implementor writes differently, so the call must
+//     dispatch on the RUNTIME type rather than on the trait;
+//   * a default reaching a plain top-level function, to show its body is
+//     lowered in the ordinary way and not in some trait-only sub-language;
+//   * the union rule from 07_funcs, the other way round: `Ledger` writes
+//     `stamp` in an INHERENT impl block, so the trait's default must not
+//     shadow the method the program actually wrote;
+//   * a SELF-LESS default, reached as `Type.method()`. That spelling is a
+//     static CALL resolved through cg's fnIdx, not a CALLM resolved through
+//     the method table, so registering only the table row left `check` happy
+//     and the backend refusing;
+//   * a trait declared AFTER the impl block that names it;
+//   * the synthetic-name collision. A default is compiled under
+//     `{Trait}$${method}` and a closure under `{enclosing}$fn{N}`, in ONE
+//     namespace that cg keys by name with the last writer winning. With a
+//     single `$` separator, trait `Sink`'s default `fn1` and the first
+//     closure inside `func Sink` are both `Sink$fn1` — and one silently
+//     replaced the other, in whichever direction declaration order decided.
+//     `Sink` below is that program, and it miscompiled non-trait code.
+
+use "std/str"
+
+func bracket(s str) str { return "[" || s || "]" }
+
+trait Titled {
+    // No body: every implementor owes this one.
+    func title(self) str
+
+    // The short form. `= expr` is `{ return expr }`, nothing more.
+    func subtitle(self) str = "(none)"
+
+    // A full block, calling back into the trait — `title` is dispatched on
+    // whatever type `self` turns out to be at run time.
+    func banner(self) str {
+        return bracket(self.title() || " / " || self.subtitle())
+    }
+
+    // Defaults take parameters like any other method.
+    func shout(self, times int) str {
+        return self.title() || str.repeat("!", times)
+    }
+}
+
+struct Page  { name str }
+struct Photo { alt str }
+struct Post  { name str, sub str }
+
+impl Titled for Page {
+    func title(self) str { return self.name }
+}
+
+impl Titled for Photo {
+    func title(self) str { return self.alt }
+}
+
+// Post overrides the default. The default body still exists — Page and Photo
+// use it — but Post must never reach it.
+impl Titled for Post {
+    func title(self) str { return self.name }
+    func subtitle(self) str { return "by " || self.sub }
+}
+
+// The union rule: a trait method may live in an INHERENT impl block, and a
+// method the program writes always beats a default it could have inherited.
+trait Stamped {
+    func stamp(self) str = "unstamped"
+}
+struct Ledger { n int }
+impl Ledger { func stamp(self) str { return "ledger#{self.n}" } }
+impl Stamped for Ledger { }
+
+// A self-less default: no `self`, so the only way to call it is
+// `Type.method()` — a static call, which travels a different road to the
+// same body than `value.method()` does.
+trait Kinded {
+    func kind() str = "generic"
+    func name(self) str
+}
+struct Widget { s str }
+impl Kinded for Widget { func name(self) str { return self.s } }
+
+// The trait is declared BELOW the impl that names it; cg indexes traits in a
+// pass of its own so that forward reference resolves.
+impl Sink for Drain { }
+struct Drain { }
+trait Sink { func fn1(self) str = "sink-default" }
+
+// …and `Sink` is also a top-level function containing a closure. The closure
+// is named `Sink$fn1`; the trait default must NOT be.
+func Sink() str {
+    let c = fn() str { return "sink-closure" }
+    return c()
+}
+
+// A trait whose DEFAULT collides with a C native's name, implemented for a
+// PRIMITIVE by an empty block. The inherited-default alias is registered in
+// fnIdx so `T.m()` reaches the shared body — but fnIdx and the natives table
+// are two namespaces and emit_call reads fnIdx first, so an unguarded alias
+// silently rerouted every `str.upper` in the whole program while `"x".upper()`
+// still reached the native. The two roads disagreeing is the tell.
+trait Shouty { func upper(self) str = "HIJACKED" }
+impl Shouty for str { }
+
+func main() {
+    let pg = Page{name: "Home"}
+    let ph = Photo{alt: "Sunset"}
+    let po = Post{name: "Release", sub: "moshix"}
+
+    // The default, as is — and the same compiled body for both types.
+    say pg.title(), pg.subtitle()
+    say ph.title(), ph.subtitle()
+
+    // The override wins.
+    say po.title(), po.subtitle()
+
+    // A default calling another trait method on self: one body, three
+    // answers, because `title` dispatches on the runtime type.
+    say pg.banner()
+    say ph.banner()
+    say po.banner()
+
+    // A default with parameters.
+    say pg.shout(3), po.shout(1)
+
+    // The inherent method beats the default it could have inherited.
+    say Ledger{n: 7}.stamp()
+
+    // A self-less default, reached the only way it can be.
+    say Widget.kind(), Widget{s: "w"}.name()
+
+    // The collision: the closure and the trait default must be two bodies.
+    say Sink(), Drain{}.fn1()
+
+    // Both roads must still answer the native (see the note above main).
+    say str.upper("abc")
+    say "abc".upper()
+}

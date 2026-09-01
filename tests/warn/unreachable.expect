@@ -1,0 +1,4 @@
+unreachable.voi:12:5: warning[unreachable]: unreachable: the `return`
+warning[unreachable]: unreachable: the `throw` above it always leaves this block
+warning[unreachable]: unreachable: the `break` above it always leaves this block
+warning[unreachable]: unreachable: the `continue` above it always leaves this block

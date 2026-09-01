@@ -110,12 +110,14 @@ impl Tree {
     // merges a program's packages into a single tree, and how the parser folds
     // an interpolated string's sub-expressions in.
     //
-    // Grafting CONSUMES the source: the kid ids are relocated in place and the
-    // node is appended with its Kids slice SHARED, not copied. The old
-    // copy-per-node form allocated a fresh slice for every node of every
-    // package and was the single largest cost in `load` (profiled: the bulk
-    // of 2.26 s on the compiler's own build). The caller must not use the
-    // source tree afterwards — the loader and the parser both discard it.
+    // Grafting CONSUMES the source — hence `src mut Tree`, which is what the
+    // body has always done and what chk/bind.voi now insists is DECLARED: the
+    // kid ids are relocated in place and the node is appended with its Kids
+    // slice SHARED, not copied. The old copy-per-node form allocated a fresh
+    // slice for every node of every package and was the single largest cost
+    // in `load` (profiled: the bulk of 2.26 s on the compiler's own build).
+    // The caller must not use the source tree afterwards — the loader and the
+    // parser both discard it.
     //
     // ARENA INVARIANT: every node OWNS its Kids slice — two nodes must never
     // share one. In-place relocation walks each node's slice exactly once; a
@@ -123,7 +125,7 @@ impl Tree {
     // past the arena. (The parser once aliased a match arm's body to its
     // block's kids; that latent sharing surfaced the moment this function
     // stopped copying.)
-    func Graft(mut self, src Tree, root int) int {
+    func Graft(mut self, src mut Tree, root int) int {
         let base = len(self.Nodes)
         let n = len(src.Nodes)
         var j = 1

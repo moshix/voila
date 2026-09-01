@@ -1,0 +1,39 @@
+// A package is not reached only through its QUALIFIER, and getting that wrong
+// is how this warning breaks a build. Trait names and enum variants may be
+// spelled BARE (§11.2.1), so an import can be load-bearing while the
+// qualifier appears nowhere at all — take the advice to delete it and the
+// program stops compiling with `no trait ...`. globalqual.voi is the same
+// four channels written with the qualifier.
+//
+//   shapes — reached only as the bare trait `Describe`: in an impl, in a
+//            generic bound, and in annotation position
+//   tags   — reached only as the bare variants `Red` and `Blue`, built and
+//            matched
+//   spare  — genuinely unused, and reported, so this fixture cannot pass by
+//            the warning having been switched off altogether
+use "shapes"
+use "tags"
+use "spare"
+use "std/fmt"
+
+struct Box {
+    w int
+}
+
+impl Describe for Box {
+    func describe(self) str { return "box {self.w}" }
+}
+
+func show[T: Describe](x T) str { return x.describe() }
+
+func count(items []Describe) int { return len(items) }
+
+func main() {
+    var t = Red
+    var s = "?"
+    match t {
+        Red  => s = "red"
+        Blue => s = "blue"
+    }
+    fmt.printf("%s %s %d\n", show(Box{w: 2}), s, count([]))
+}

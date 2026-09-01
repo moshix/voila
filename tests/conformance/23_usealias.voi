@@ -1,0 +1,48 @@
+// 23_usealias.voi — `use "std/…" as q` binds the alias, for every shape a
+// std package reaches a program through.
+//
+// The parser has always accepted the `as` clause (par/par.voi's use_decl) and
+// the loader then dropped it for a std import: imports_of returns early for
+// KIND_STD and KIND_STDSRC, so nothing recorded the alias and `s.upper("x")`
+// was `unknown identifier `s``. It worked for user packages the whole time
+// (tests/multipkg uses `use "app/geom" as g`), which made the gap look like a
+// rule rather than the omission it was.
+//
+// Three shapes, because a std package is reached through three kinds of node
+// and the alias has to survive all of them: a CALL through a FIELD, a TYPE
+// annotation, and a COMPOSITE literal. The optional-argument forms are here
+// too — chk/native.voi now counts every native's arguments, and `substr(s, 2)`
+// and `substr(s, 2, 3)` are both correct.
+package main
+
+use "std/str" as s
+use "std/fmt" as f
+use "std/path" as p
+use "std/time" as t
+
+// A TYPE annotation under the alias. std/str's Builder is the only std type a
+// program routinely spells (§13.2).
+func greet(b mut s.Builder, who str) {
+    b.write("hello, ")
+    b.write(s.upper(who))
+}
+
+func main() {
+    // A CALL through the alias, and the original spelling still works beside
+    // it: a qualifier is program-wide, so the alias ADDS a spelling.
+    say s.upper("x")
+    say str.upper("y")
+    f.printf("%s|%s\n", s.trim("  z  "), p.base("/a/b/c.txt"))
+
+    // A COMPOSITE under the alias.
+    var sb = s.Builder{}
+    greet(sb, "world")
+    say sb.done()
+
+    // Optional arguments, both ways round.
+    say s.substr("hello", 2)
+    say s.substr("hello", 2, 3)
+
+    // A Voilà-SOURCE std package (grafted, not C) under an alias.
+    say t.millis(5)
+}

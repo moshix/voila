@@ -1,0 +1,18 @@
+// An `as` alias for a std package is REWRITTEN to the package's own name
+// (load/rewrite.voi), so every later stage judges the canonical spelling and
+// none of them has to know about aliases. This fixture is the proof: a member
+// that does not exist must be reported against `str`, and a wrong argument
+// count against `time.millis` — not against `s` and `t`, which no table
+// anywhere holds.
+package main
+
+use "std/str" as s
+use "std/time" as t
+
+func main() {
+    say s.nonexistent("x")
+    say t.millis()
+    // ...and the alias itself is not an unknown identifier any more, which is
+    // what the `!` line of the .expect asserts.
+    say s.upper("ok")
+}

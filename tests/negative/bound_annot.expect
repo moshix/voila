@@ -1,0 +1,1 @@
+`Point` does not implement `Describe`, required by the bound `T: Describe` on `Stack`: method `describe` is missing (§3.7)

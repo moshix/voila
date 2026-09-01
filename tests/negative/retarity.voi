@@ -1,0 +1,21 @@
+// The number of values returned must match the number declared — with the
+// one exception that makes the compiler's own source legal: exactly ONE
+// expression may satisfy N results, because it forwards a whole tuple.
+func divmod(a int, b int) (int, int) {
+    return a ~/ b, a % b, 0
+}
+
+func nothing() {
+    return 1
+}
+
+// Legal, and must stay legal: one expression, two results.
+func again(a int, b int) (int, int) {
+    return divmod(a, b)
+}
+
+func main() {
+    let q, r = again(7, 2)
+    say q, r
+    nothing()
+}

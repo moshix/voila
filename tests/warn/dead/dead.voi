@@ -1,0 +1,8 @@
+// Nothing anywhere in this package mentions `time`. This is the case that
+// IS reported — and the message must name the package it searched, not the
+// file, because the package is what it searched.
+package dead
+
+use "std/time"
+
+func Nothing() int { return 0 }

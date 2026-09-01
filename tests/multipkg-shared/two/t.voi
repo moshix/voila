@@ -1,0 +1,25 @@
+package two
+
+// The same three names as package `one`, and a `Node` of a different ARITY —
+// so a program that confused the two would not merely mislabel a value, it
+// would build one with the wrong number of fields.
+enum L { Empty, Node(a int, b int) }
+
+trait Named { func Name(self) str }
+
+struct Tag { }
+
+impl Named for Tag {
+    func Name(self) str { return "two" }
+}
+
+func Mk() L { return Node(3, 4) }
+
+func Zero() L { return Empty }
+
+func Show(l L) str {
+    match l {
+        Empty      => return "two:empty"
+        Node(a, b) => return "two:node {a},{b}"
+    }
+}

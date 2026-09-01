@@ -1,0 +1,360 @@
+// std/test — assertions, table tests and a pass/fail tally (§13.4).
+//
+// Until this package the project had exactly two levels of testing: a bare
+// `assert(cond, msg)`, which ABORTS the process on the first disagreement and
+// tells you nothing but the message you wrote yourself, and selftest.bash,
+// which compares a whole program's stdout against a golden file. Nothing sat
+// between them — no way to run twenty checks and be told which three failed,
+// and no way to be told what a check expected and what it actually got. That
+// is the gap this fills.
+//
+// A Suite is a VALUE you thread through your checks. Nothing here aborts and
+// nothing here throws: an assertion records its verdict, prints the failure
+// if there is one, and hands back a bool so the caller may branch on it. The
+// process exit code is decided in exactly one place, `done`, at the end.
+//
+// ---------------------------------------------------------- how to use it
+//
+//     use "std/test"
+//
+//     func main() {
+//         var t = test.suite("str")
+//         t.eq("upper", str.upper("ab"), "AB")
+//         t.table("len", [test.row("empty", len(""), 0),
+//                         test.row("abc",   len("abc"), 3)])
+//         t.raises("bad index", fn() { let x = [1, 2][9] })
+//         t.done()               // summary, then exit 1 if anything failed
+//     }
+//
+// `done` is the only thing here that ends the process. A caller that wants
+// the tally without the exit — a conformance golden, say, or a suite folded
+// into a larger one — calls `report` instead, which prints the same summary
+// and returns whether everything passed.
+//
+// ------------------------------------------------- there is no test RUNNER
+//
+// This release has no `voila test` verb, and this package deliberately does
+// not pretend otherwise: a suite is an ORDINARY PROGRAM with a `main`, built
+// and run like any other. That is the whole reason `done` exists — the exit
+// status is the only thing a shell-driven harness can read.
+//
+// When a runner does arrive it needs nothing new from here. The loader
+// already skips `*_test.voi` when it reads a user package
+// (voilac/load/load.voi), so those files are invisible to `voila build` today
+// and are free for a runner to claim. Its job would then be: compile the
+// package together with its `_test.voi` files, synthesise a `main` that makes
+// one Suite, call every `func test_*(mut t test.Suite)` it discovered, and
+// finish with `t.done()`. `merge` is here for exactly that shape — one Suite
+// per file, folded into one tally — and `failures` hands a runner the lines
+// so it can print them its own way instead of ours.
+//
+// ------------------------------------------------------------ conventions
+//
+// Failures go to STDOUT, not stderr, and are printed the moment they happen.
+// One stream keeps a failure next to the output that led to it, which is what
+// you want when reading a log; a runner that wants them separated has
+// `failures` and can print them wherever it likes.
+//
+// Every assertion takes a `what` label first. It is not decoration: the
+// failure line is `FAIL {suite}/{what}`, and a suite whose labels are all
+// "check" is a suite whose failures you have to count lines to locate.
+//
+// `raises` is not spelled `throws` because `throws` is a KEYWORD (§2.5) and
+// cannot be an identifier. The same rule renamed `Case`'s constructor: `case`
+// is a keyword too, so a Case is built with the composite literal
+// `test.Case{name: …, input: …, want: …}` and only `row` gets a function.
+//
+// Every value a failure prints goes through `repr`, so a str comes out
+// QUOTED. That is not decoration either: `expected ab, got ab ` is a failure
+// line that looks like a compiler bug, and `expected "ab", got "ab "` is one
+// that names the trailing space it is actually about.
+package test
+
+use "std/str"
+use "std/os"
+
+// Suite is one test run: a name, a tally, and the failures collected so far.
+//
+// It is threaded by REFERENCE — every assertion is `mut self` and writes the
+// tally back — so `var t = test.suite("x")` followed by `check(t)` for a
+// helper `func check(t mut test.Suite)` records into the same Suite the
+// caller will later report on.
+struct Suite {
+    name    str
+    passed  int
+    failed  int
+    fails   []str
+    verbose bool
+}
+
+// Row is one row of a table test: a label and the two values to compare. Both
+// values are ALREADY COMPUTED when the row is built, which is what lets a
+// table read as data:
+//
+//     t.table("base", [test.row("file", path.base("a/b.c"), "b.c"),
+//                      test.row("root", path.base("/"),     "")])
+//
+// When the subject is a function of an input rather than a finished value,
+// that is `Case` and `run` below.
+struct Row[T] {
+    name str
+    got  T
+    want T
+}
+
+// Case is one row of a table test whose subject is a FUNCTION: the input to
+// feed it and the result expected back. `run` applies the function.
+//
+// Build one with the composite literal — `test.Case{name: "up", input: "ab",
+// want: "AB"}` — because `case` is a keyword and cannot name a constructor.
+struct Case[I, W] {
+    name  str
+    input I
+    want  W
+}
+
+// ------------------------------------------------------------- constructors
+
+// suite makes an empty Suite. The name prefixes every failure line and the
+// summary, so give it the name of the thing under test.
+func suite(name str) Suite {
+    return Suite{name: name, passed: 0, failed: 0, fails: [], verbose: false}
+}
+
+// row builds one Row. It exists only for brevity at the call site — a table
+// of ten rows written out as composite literals is a table nobody reads.
+func row[T](name str, got T, want T) Row[T] {
+    return Row[T]{name: name, got: got, want: want}
+}
+
+// ------------------------------------------------------------------- Suite
+
+impl Suite {
+    // eq asserts that `got` equals `want`. Equality is the language's own
+    // `==`, which is DEEP for lists and structs (§5), so a whole record or a
+    // whole parsed row compares in one call and the failure prints both sides
+    // whole rather than field by field.
+    func eq[T](mut self, what str, got T, want T) bool {
+        if got == want { return self.pass(what) }
+        return self.flunk(what, "expected {repr(want)}, got {repr(got)}")
+    }
+
+    // ne asserts that `got` differs from `want`. The failure prints the value
+    // once: both sides are equal, so printing both would print it twice.
+    func ne[T](mut self, what str, got T, want T) bool {
+        if got != want { return self.pass(what) }
+        return self.flunk(what, "expected anything but {repr(want)}")
+    }
+
+    // near asserts that `got` is within `tol` of `want`. It is the assertion
+    // for float and for dec — the two types where `eq` is a trap, because
+    // 0.1 + 0.2 is not 0.3 in binary floating point and because a dec
+    // computed under one `numeric digits` setting need not equal the same
+    // value computed under another.
+    //
+    // All three arguments must be the SAME numeric type: the subtraction and
+    // the comparison are the language's, and mixing a dec with a float is a
+    // conversion this function does not make on your behalf.
+    func near[T](mut self, what str, got T, want T, tol T) bool {
+        let off = abs(got - want)
+        if off <= tol { return self.pass(what) }
+        return self.flunk(what,
+                          "expected {repr(want)} within {repr(tol)}, got " ||
+                          "{repr(got)} (off by {repr(off)})")
+    }
+
+    // ok asserts a condition that has already been reduced to a bool. Prefer
+    // `eq` where you can: `ok("len", len(v) == 3)` can only report "expected
+    // true", while `eq("len", len(v), 3)` reports the length it found.
+    func ok(mut self, what str, cond bool) bool {
+        if cond { return self.pass(what) }
+        return self.flunk(what, "expected true, got false")
+    }
+
+    // not_ok is `ok` inverted, for a condition that must be false.
+    func not_ok(mut self, what str, cond bool) bool {
+        if not cond { return self.pass(what) }
+        return self.flunk(what, "expected false, got true")
+    }
+
+    // raises asserts that calling `f` THROWS, and hands back the exception's
+    // message so the caller can go on and assert something about it:
+    //
+    //     let m = t.raises("bad port", fn() { must net.parse_port("x") })
+    //     t.ok("says why", str.contains(m, "not a number"))
+    //
+    // An empty result means nothing was thrown — which is itself the failure,
+    // and has already been recorded by the time you see it.
+    //
+    // Only an EXCEPTION is caught. A function that returns an error value
+    // (`T!`) has not thrown, and is asserted with `eq` on the `Err` arm or by
+    // wrapping the call in `must`.
+    func raises(mut self, what str, f) str {
+        match attempt f() {
+            Ok(v)  => {
+                self.flunk(what, "expected a throw, none happened " ||
+                                 "(the call returned {repr(v)})")
+                return ""
+            }
+            Err(e) => {
+                self.pass(what)
+                return e.message()
+            }
+        }
+    }
+
+    // raises_msg asserts that `f` throws AND that the message contains
+    // `want`. A substring rather than the whole message on purpose: an
+    // exception's derived message carries its fields, and a test that pinned
+    // the whole of it would break every time a field was added.
+    func raises_msg(mut self, what str, want str, f) bool {
+        match attempt f() {
+            Ok(v)  => {
+                return self.flunk(what,
+                                  "expected a throw whose message contains " ||
+                                  "{repr(want)}, none happened")
+            }
+            Err(e) => {
+                let msg = e.message()
+                if str.contains(msg, want) { return self.pass(what) }
+                return self.flunk(what,
+                                  "expected a throw whose message contains " ||
+                                  "{repr(want)}, got {repr(msg)}")
+            }
+        }
+    }
+
+    // fail records a failure outright, for the case no assertion fits — an
+    // arm of a `match` that should have been unreachable, say.
+    func fail(mut self, what str, why str) bool {
+        return self.flunk(what, why)
+    }
+
+    // ------------------------------------------------------- table tests
+
+    // table runs `eq` over a list of finished Rows. Each row's label is
+    // appended to `what`, so a failure names the row and not just the table.
+    // It returns whether EVERY row passed, and it runs all of them either
+    // way: stopping at the first failure would hide the other nineteen.
+    func table[T](mut self, what str, rows []Row[T]) bool {
+        var all = true
+        each r in rows {
+            if not self.eq(what || "/" || r.name, r.got, r.want) {
+                all = false
+            }
+        }
+        return all
+    }
+
+    // run applies `f` to each Case's input and compares the result with its
+    // want. It is `table` for the common shape where the table is really a
+    // list of arguments to one function:
+    //
+    //     t.run("upper", [test.Case{name: "ascii", input: "ab", want: "AB"},
+    //                     test.Case{name: "empty", input: "",   want: ""}],
+    //           fn(s) { return str.upper(s) })
+    //
+    // `f` runs OUTSIDE any exception handling. A case that throws unwinds the
+    // whole suite — which is the honest answer, because a table test cannot
+    // say whether the throw was the point of the case; use `raises` when it
+    // was.
+    func run[I, W](mut self, what str, cases []Case[I, W], f) bool {
+        var all = true
+        each c in cases {
+            if not self.eq(what || "/" || c.name, f(c.input), c.want) {
+                all = false
+            }
+        }
+        return all
+    }
+
+    // ----------------------------------------------------------- reporting
+
+    // merge folds another Suite's tally and failures into this one. The
+    // failure lines already carry the other suite's name, so they stay
+    // attributable after the fold — which is the whole point of prefixing
+    // them at the time they are recorded rather than at the time they are
+    // printed.
+    func merge(mut self, other Suite) {
+        self.passed += other.passed
+        self.failed += other.failed
+        each line in other.fails {
+            self.fails.append(line)
+        }
+    }
+
+    // failures is every failure line recorded so far, in the order they
+    // happened. A runner that wants to print them its own way reads this
+    // instead of relying on the printing `flunk` already did.
+    func failures(self) []str {
+        return self.fails
+    }
+
+    // summary is the one-line tally. Both numbers are always printed, even
+    // when one is zero, so a log can be grepped for "0 failed" with no
+    // special case for the happy path.
+    func summary(self) str {
+        return "{self.name}: {self.passed} passed, {self.failed} failed"
+    }
+
+    // report prints the summary and returns whether everything passed. It
+    // does NOT exit — this is the entry point for a suite that is part of a
+    // larger program, and for a golden-output test that must finish with a
+    // zero status while still showing a failure.
+    func report(self) bool {
+        say self.summary()
+        return self.failed == 0
+    }
+
+    // done is `report` plus the process exit status: 1 when anything failed,
+    // and a plain return when nothing did. It is the last line of a suite's
+    // `main`, and the only thing in this package that ends the process.
+    func done(self) {
+        if not self.report() {
+            os.exit(1)
+        }
+    }
+
+    // ------------------------------------------------------------ recording
+
+    // pass and flunk are the two places a verdict is recorded, so the tally
+    // and the printing cannot drift apart. Both return the verdict as a bool
+    // so every assertion above can `return self.pass(…)` and be a one-liner.
+    func pass(mut self, what str) bool {
+        self.passed += 1
+        if self.verbose {
+            say "ok   {self.name}/{what}"
+        }
+        return true
+    }
+
+    func flunk(mut self, what str, why str) bool {
+        self.failed += 1
+        let line = "FAIL {self.name}/{what}: {why}"
+        self.fails.append(line)
+        say line
+        return false
+    }
+}
+
+// ------------------------------------------------------------------ helpers
+
+// repr renders any value the way it would appear INSIDE a collection, which
+// is the rendering that quotes a str and a rune and leaves everything else
+// bare: `repr("ab ")` is `"ab "`, `repr(3)` is `3`.
+//
+// That distinction is the whole point. Plain interpolation of a str yields
+// its bytes, so `expected ab, got ab ` is a failure line that hides the very
+// difference it was printed to show — and the same goes for `""` against
+// `" "`, and for a str `"3"` against an int `3`.
+//
+// The one-element list is how the quoting is reached: the language renders a
+// value inside a collection with `show` and a bare value with `str`, and only
+// the collection form is reachable from Voilà. Wrapping and then dropping the
+// brackets is exact — the outer list contributes exactly one leading `[` and
+// one trailing `]`, whatever is inside it — and it costs one allocation on a
+// path that only runs when a test has already failed.
+func repr[T](v T) str {
+    let boxed = "{[v]}"
+    return boxed[1..len(boxed) - 1]
+}

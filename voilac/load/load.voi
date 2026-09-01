@@ -11,9 +11,18 @@
 // containing a dot, so these names cannot collide with anything the user wrote,
 // and the checker, the lowerer and the C backend need no knowledge of packages
 // at all.
+//
+// EVERY declaration is flattened, including enum VARIANT names and TRAIT names
+// (§11.2.1). Those two used to be left global across the whole program, which
+// meant two packages could not both declare an `Empty` or a `Named` — a
+// restriction no ecosystem can live with. What keeps the qualified form from
+// making programs uglier is the short-name rule in rewrite.voi: an unqualified
+// variant or trait resolves in the current package, then in exactly one
+// import, and two candidates is an error naming both.
 package load
 
 use "voilac/ast"
+use "voilac/diag"
 use "voilac/par"
 use "std/os"
 use "std/str"
@@ -25,6 +34,7 @@ const KIND_USER   = 1   // a directory under the module root
 const KIND_BAD    = 2   // neither — a typo, or an escape attempt
 const KIND_STDSRC = 3   // a std package written in Voilà: grafted from the
                         // embedded source (voilac/std), like a user package
+const KIND_NOSTD  = 4   // named as std, but this release does not provide it
 
 struct Pkg {
     name    str          // the qualifier: the directory's base name
@@ -35,6 +45,29 @@ struct Pkg {
     paths   []str        // each file's openable path
     imports map[str]int  // qualifier (honouring `as`) → index into Loader.pkgs
     decls   set[str]
+
+    // What this package contributes WITHOUT a qualifier, which is what
+    // unused.voi has to know before it may call an import unused:
+    //   globals     — trait names and enum VARIANT names: the names an
+    //                 importer may spell WITHOUT a qualifier, resolved by
+    //                 the rewriter's short-name rule (import_global). A
+    //                 slice, not a set: it is walked, and order must be
+    //                 stable.
+    //   foreignImpl — the package adds methods to a type it did not declare.
+    //                 They arrive by DISPATCH, so the importing code can
+    //                 depend on them while naming nothing at all.
+    //   hasInit     — a package-level binding whose initializer RUNS
+    //                 something. Dropping the import drops the effect, and
+    //                 nothing anywhere complains.
+    // The last two are filled by a SECOND pass, once `decls` is complete —
+    // see the note in load_pkg.
+    globals     []str
+    // The same names as `globals`, as a set: import_global asks "does this
+    // package export the bare name `Circle`?" once per unresolved identifier,
+    // and a linear scan of every import's slice is the wrong shape for that.
+    globalSet   set[str]
+    foreignImpl bool
+    hasInit     bool
     // A Voilà-source std package (std/net): its files come from the embedded
     // blob, not the filesystem, so they must NOT enter the run-cache key
     // (which re-opens every path). See the graft loop and source_key.
@@ -49,18 +82,26 @@ struct Program {
     Src     str        // the entry file's text, for the listing's source echo
     Sources []str      // every file that took part, as displayed
     Paths   []str      // the same files, as they can actually be RE-OPENED
-    Errs    []str
+
+    // Errors AND warnings. The loader is where `unused-import` lives (see
+    // unused.voi), so this stage no longer produces only refusals; main.voi
+    // renders the bag under the -W policy and exits only on the errors.
+    Diags   diag.Bag
 }
 
 struct Loader {
     root      str
     mod       str            // the module name from voila.mod, read once
+    // The resolved dependency graph: the main module's voila.mod, one
+    // selected version per required module path, and the directory serving
+    // each. Built once in Load and read-only afterwards. See mod.voi.
+    mi        ModInfo
     pkgs      []Pkg
     byDir     map[str]int
     qualifier map[str]str    // base name → the directory that claimed it
     order     []int          // dependency-first
     stack     []str          // directories, for cycle detection
-    Errs      []str
+    D         diag.Bag
     Sources   []str
     Paths     []str
 
@@ -71,12 +112,26 @@ struct Loader {
     rwSelf      int
     rwFile      str
     mainImports map[str]int
+    // Every top-level name the ENTRY file declares. The entry file's names
+    // stay bare, so it has no Pkg and qualify() cannot answer for it — this
+    // is what lets step 1 of the short-name rule (the current package) apply
+    // to it anyway. See global_name in rewrite.voi.
+    mainDecls   set[str]
     rwScopes    []set[str]
+    // This FILE's `use "std/…" as q` aliases: the alias, to the package's
+    // real name. Unlike a user package's, a std alias cannot live in
+    // Pkg.imports — there is no Pkg to point at for a C package, and the
+    // qualifier must survive as a qualifier rather than flatten — so it is
+    // rebuilt per file by rw_file. See std_alias in rewrite.voi.
+    rwStdAlias  map[str]str
 }
 
 // Load parses the entry file, pulls in every user package it reaches and
 // returns one flattened AST.
-func Load(entry str) Program {
+// The compiler's own version is passed in rather than reached for: `load`
+// must not import `main`, and the `voila <ver>` line in voila.mod has to be
+// compared against something.
+func Load(entry str, compilerVer str) Program {
     var abs = entry
     try {
         abs = path.Abs(entry)
@@ -84,19 +139,23 @@ func Load(entry str) Program {
         abs = entry
     }
     let root = module_root(path.Dir(abs))
+    let mi = Modules(root)
     var l = Loader{
-        root: root, mod: module_name(root), pkgs: [], byDir: make(map[str]int),
-        qualifier: make(map[str]str), order: [], stack: [], Errs: [],
+        root: root, mod: mi.Mod.Module, mi: mi, pkgs: [],
+        byDir: make(map[str]int),
+        qualifier: make(map[str]str), order: [], stack: [], D: diag.New(),
         Sources: [], Paths: [], at: entry, rwSelf: 0 - 1, rwFile: "",
-        mainImports: make(map[str]int), rwScopes: [],
+        mainImports: make(map[str]int), mainDecls: set([]), rwScopes: [],
+        rwStdAlias: make(map[str]str),
     }
 
     var prog = Program{T: ast.NewTree(), File: 0, Entry: entry, Src: "",
-                       Sources: [], Paths: [], Errs: []}
+                       Sources: [], Paths: [], Diags: diag.New()}
     match os.read(entry) {
         Ok(t)  => prog.Src = t
         Err(e) => {
-            prog.Errs.append("cannot read {entry}: {e.message()}")
+            // No file, so no position: raw() carries the line as written.
+            prog.Diags.raw("", "cannot read {entry}: {e.message()}")
             return prog
         }
     }
@@ -105,10 +164,29 @@ func Load(entry str) Program {
     let mainRoot = p.File()
     l.Sources.append(entry)
     l.Paths.append(entry)
-    each e in p.Errs { l.Errs.append(e) }
-    if len(l.Errs) > 0 {
-        prog.Errs = l.Errs
+    each e in p.Errs { l.D.raw(entry, e) }
+    if l.D.NErrors() > 0 {
+        prog.Diags = l.D
         return prog
+    }
+
+    // The module file, and the dependency graph it describes. A malformed
+    // voila.mod is reported BEFORE any import is resolved: every resolution
+    // below reads the graph, and answering out of a graph the compiler has
+    // already found wrong would only produce a second, more confusing error.
+    l.report_module_errors(compilerVer)
+    if l.D.NErrors() > 0 {
+        prog.Diags = l.D
+        return prog
+    }
+
+    // The entry file's own top-level names, gathered BEFORE any rewriting:
+    // they stay bare, and the short-name rule must not let an import claim
+    // one of them out from under the file that declared it.
+    each d in p.T.Get(p.T.Kid(mainRoot, 1)).Kids {
+        each nm in decl_names(p.T, d) {
+            if nm != "" { l.mainDecls.add(nm) }
+        }
     }
 
     // Pull in every user package the entry file reaches, and build main's
@@ -117,20 +195,40 @@ func Load(entry str) Program {
     each q in keys(mainImports) {
         l.mainImports[q] = mainImports[q]
     }
-    if len(l.Errs) > 0 {
-        prog.Errs = l.Errs
+    if l.D.NErrors() > 0 {
+        prog.Diags = l.D
         return prog
     }
-    l.check_global_names()
+    l.check_package_names()
 
     var mt = ast.NewTree()
     var decls = []
     each pi in l.order {
+        // Which qualifiers this package MENTIONS, gathered from every one of
+        // its files before any of them is rewritten — the rewrite is what
+        // destroys the alias, and Graft below consumes the tree outright.
+        // See unused.voi for why the scan spans the package and not the file.
+        // An embedded std package is skipped: its source lives inside the
+        // compiler, so advice about it is advice nobody can act on.
+        var mentioned = set([])
+        if not l.pkgs[pi].embedded {
+            var si = 0
+            while si < len(l.pkgs[pi].trees) {
+                add_qualifiers(l.pkgs[pi].trees[si], mentioned)
+                si += 1
+            }
+        }
         var fi = 0
         while fi < len(l.pkgs[pi].trees) {
             l.rwSelf = pi
             l.rwFile = l.pkgs[pi].sources[fi]
             l.rwScopes = []
+            if not l.pkgs[pi].embedded {
+                l.at = l.pkgs[pi].sources[fi]
+                l.warn_unused_imports(l.pkgs[pi].trees[fi],
+                                      l.pkgs[pi].roots[fi], mentioned,
+                                      "package `" || l.pkgs[pi].name || "`")
+            }
             l.rw_file(l.pkgs[pi].trees[fi], l.pkgs[pi].roots[fi])
 
             mt.BeginFile(l.pkgs[pi].sources[fi])
@@ -142,9 +240,9 @@ func Load(entry str) Program {
             let scriptList = mt.Kid(grafted, 2)
             if mt.NKids(scriptList) > 0 {
                 let s0 = mt.Get(mt.Kid(scriptList, 0))
-                l.Errs.append("{l.pkgs[pi].sources[fi]}:{s0.Line}:{s0.Col}: " ||
-                              "a package file may not contain loose " ||
-                              "statements; put them in a function")
+                l.D.error(l.pkgs[pi].sources[fi], s0.Line, s0.Col, "",
+                          "a package file may not contain loose " ||
+                          "statements; put them in a function")
             }
             fi += 1
         }
@@ -162,6 +260,12 @@ func Load(entry str) Program {
     l.rwSelf = 0 - 1
     l.rwFile = entry
     l.rwScopes = []
+    l.at = entry
+    // The entry file is a package of one, so its own mentions are the whole
+    // scan.
+    var mainMentions = set([])
+    add_qualifiers(p.T, mainMentions)
+    l.warn_unused_imports(p.T, mainRoot, mainMentions, "this file")
     l.rw_file(p.T, mainRoot)
 
     mt.BeginFile(entry)
@@ -195,7 +299,7 @@ func Load(entry str) Program {
     prog.T = mt
     prog.Sources = l.Sources
     prog.Paths = l.Paths
-    prog.Errs = l.Errs
+    prog.Diags = l.D
     return prog
 }
 
@@ -224,11 +328,16 @@ impl Loader {
                 self.at = saved
                 continue
             }
+            if k == KIND_NOSTD {
+                // The `use` site is the right place for this: the package is
+                // named here, and reporting it here is what keeps `check` and
+                // `build` in agreement — otherwise the program passes `check`
+                // and dies in the backend, which has no `use` to point at.
+                self.err(un.Line, un.Col, std_diagnostic(ipath))
+                continue
+            }
             if k == KIND_BAD {
-                self.err(un.Line, un.Col,
-                         "no package `{ipath}`: it is not a std package and no " ||
-                         "such directory exists under the module root " ||
-                         "({self.root})")
+                self.err(un.Line, un.Col, self.missing_pkg(ipath))
                 continue
             }
             if un.Ival2 != 0 {
@@ -253,61 +362,149 @@ impl Loader {
     func err(mut self, line int, col int, msg str) {
         var at = self.at
         if at == "" { at = self.root }
-        self.Errs.append("{at}:{line}:{col}: {msg}")
+        self.D.error(at, line, col, "", msg)
     }
 
-    // check_global_names rejects the collisions flattening cannot express: enum
-    // VARIANT names and TRAIT names stay global (patterns and trait bounds have
-    // no qualified form), so two packages may not both define one.
-    func check_global_names(mut self) {
-        var seenPkg = make(map[str]str)
-        var seenWhat = make(map[str]str)
+    // warn is err at the other severity. `code` is the stable name -Wno- and
+    // -Werror= address it by; diag.Codes() is the list of legal ones.
+    func warn(mut self, line int, col int, code str, msg str) {
+        var at = self.at
+        if at == "" { at = self.root }
+        self.D.warn(at, line, col, code, msg)
+    }
+
+    // check_package_names rejects a clash WITHIN one package. Enum variant
+    // names and trait names are qualified like every other declaration now,
+    // so two packages may each declare `Empty` — but the two `Empty`s of one
+    // package would flatten to the same name, and `decls` is a set, so
+    // nothing else would ever say so.
+    //
+    // The scan covers EVERY package-level declaration, not just the two
+    // kinds that used to be global, because they are all in one flat
+    // namespace now: `enum Shape { Circle }` beside `func Circle()` mints
+    // `geom.Circle` twice, and last writer wins in fnIdx with nothing said.
+    // Checking only variants and traits would have left that silent while
+    // the message claimed a package's names are unique.
+    //
+    // The scope is deliberately one package and not the program: that is the
+    // whole point of qualifying these names, and a program-wide check would
+    // put the old restriction back under a new name.
+    func check_package_names(mut self) {
         each pi in self.order {
+            var seen = make(map[str]str)
             let pk = self.pkgs[pi]
             each fi, t in pk.trees {
                 self.at = pk.sources[fi]
                 each d in t.Get(t.Kid(pk.roots[fi], 1)).Kids {
                     let dn = t.Get(d)
                     if dn.Kind == ast.ENUMDEC {
+                        self.claim(seen, dn.Sval, "enum", pk.name,
+                                   dn.Line, dn.Col)
                         each v in t.Get(t.Kid(d, 0)).Kids {
                             let vn = t.Get(v)
-                            self.claim(seenPkg, seenWhat, vn.Sval, "variant",
-                                       pk.name, vn.Line, vn.Col)
+                            self.claim(seen, vn.Sval, "variant", pk.name,
+                                       vn.Line, vn.Col)
                         }
-                    } else if dn.Kind == ast.TRAITDEC {
-                        self.claim(seenPkg, seenWhat, dn.Sval, "trait",
-                                   pk.name, dn.Line, dn.Col)
+                    } else if dn.Kind == ast.GLOBAL {
+                        // A `let a, b = …` introduces several; the position
+                        // is the statement's.
+                        let sd = t.Kid(d, 0)
+                        var ln = dn.Line
+                        var cl = dn.Col
+                        if sd != 0 {
+                            ln = t.Get(sd).Line
+                            cl = t.Get(sd).Col
+                        }
+                        each nm in decl_names(t, d) {
+                            self.claim(seen, nm, "binding", pk.name, ln, cl)
+                        }
+                    } else {
+                        let what = decl_kind_word(dn.Kind)
+                        if what == "" { continue }
+                        self.claim(seen, dn.Sval, what, pk.name,
+                                   dn.Line, dn.Col)
                     }
                 }
             }
         }
     }
 
-    func claim(mut self, seenPkg mut map[str]str, seenWhat mut map[str]str,
-               name str, what str, pkg str, line int, col int) {
-        if name in seenPkg and seenPkg[name] != pkg {
+    func claim(mut self, seen mut map[str]str, name str, what str, pkg str,
+               line int, col int) {
+        if name == "" { return }
+        if name in seen {
             self.err(line, col,
-                     "{what} `{name}` is declared in both `{seenPkg[name]}` " ||
-                     "and `{pkg}`; {what}s are global across a program because " ||
-                     "patterns and trait bounds have no qualified form")
+                     "{what} `{name}` is already declared in package " ||
+                     "`{pkg}` (as a {seen[name]}); a package's names must be " ||
+                     "unique within it")
             return
         }
-        seenPkg[name] = pkg
-        seenWhat[name] = what
+        seen[name] = what
     }
 
-    // resolve classifies an import path. An unresolvable path is an ERROR: it
-    // must never be waved through as "probably std", which would let a broken
-    // program pass `check` and fail at run time.
-    func resolve(self, p str) (str, int) {
-        // A Voilà-source std package (std/net, or the bare form `net`) is
-        // classified BEFORE the generic std/ check, so the C std packages
-        // (std/os, std/str, …) keep their exact KIND_STD path unchanged.
-        if std_src_base(p) != "" { return "", KIND_STDSRC }
-        if str.starts_with(p, "std/") { return "", KIND_STD }
-        if not str.contains(p, "/") and is_std(p) { return "", KIND_STD }
-        if path.IsAbs(p) or str.contains(p, "\\") { return "", KIND_BAD }
+    // report_module_errors renders everything the module graph found: the
+    // main voila.mod's own syntax errors, the language-version check, a
+    // dependency's malformed voila.mod, and voila.sum drift.
+    func report_module_errors(mut self, compilerVer str) {
+        let mfile = self.mi.Mod.File
+        each e in self.mi.Mod.Errs {
+            self.D.error(mfile, e.Line, 1, "", e.Msg)
+        }
+        // The language version. A module may ask for a compiler no older than
+        // itself; a NEWER requirement is a refusal, and both versions are
+        // named because "unsupported version" without them is unactionable.
+        let lang = self.mi.Mod.Lang
+        if lang != "" and VerCmp(lang, compilerVer) > 0 {
+            self.D.error(mfile, 1, 1, "",
+                         "voila.mod requires language version {lang}, but " ||
+                         "this compiler is {compilerVer}")
+        }
+        each d in self.mi.Deep {
+            self.D.raw("", d)
+        }
+        self.verify_sums()
+    }
 
+    // verify_sums compares each CACHED dependency against voila.sum.
+    //
+    // A module with no voila.sum at all is not checked: it has never fetched
+    // anything through `voila get`, and inventing a failure for a file the
+    // user has never seen would only teach them to delete it. Once the file
+    // exists it is authoritative — a missing entry is as much a refusal as a
+    // wrong one, because both mean the tree on disk is not the tree that was
+    // recorded.
+    //
+    // A `replace` to a local directory is NOT hashed. It is source the user
+    // is editing, by definition not pinned, and hashing it would make every
+    // keystroke a checksum failure.
+    func verify_sums(mut self) {
+        let sums, present = ReadSum(self.root)
+        if not present { return }
+        let sfile = SumPath(self.root)
+        each p in self.mi.Paths {
+            if IsLocal(self.mi, p) { continue }
+            var dir = ""
+            if p in self.mi.Dir { dir = self.mi.Dir[p] }
+            if dir == "" or not os.isdir(dir) { continue }
+            let ver = self.mi.Ver[p]
+            let want = FindSum(sums, p, ver)
+            let got = ModHash(dir)
+            if want == "" {
+                self.D.error(sfile, 1, 1, "",
+                             "no voila.sum entry for `{p}` {ver}; run: " ||
+                             "voila get {p}@{ver}")
+            } else if want != got {
+                self.D.error(sfile, 1, 1, "",
+                             "checksum mismatch for `{p}` {ver}: voila.sum " ||
+                             "records {want}, but {dir} hashes to {got}")
+            }
+        }
+    }
+
+    // root_candidate is the directory an import path would name UNDER the
+    // module root, or "" when the path escapes it. Both resolve() and the
+    // failure message need it, and they must agree on the answer.
+    func root_candidate(self, p str) str {
         var clean = p
         if str.starts_with(clean, "./") { clean = clean[2..len(clean)] }
         if self.mod != "" {
@@ -318,11 +515,103 @@ impl Loader {
             }
         }
         let dir = path.Clean(path.Join(self.root, clean))
+        // The package must live UNDER the module root: `use "../../etc"` is
+        // not a package reference, it is an escape.
+        if not path.HasPrefixDir(self.root, dir) { return "" }
+        return dir
+    }
 
-        // The package must live UNDER the module root: `use "../../etc"` is not
-        // a package reference, it is an escape.
-        if not path.HasPrefixDir(self.root, dir) { return "", KIND_BAD }
-        if not os.isdir(dir) { return "", KIND_BAD }
+    // missing_pkg names EVERY place the import was looked for. The old message
+    // named only the module root, which was actively misleading the moment
+    // there was anywhere else to look: a user whose dependency was simply not
+    // fetched was told their directory was missing.
+    func missing_pkg(self, p str) str {
+        var places = []
+        let mp = ModMatch(self.mi, p)
+        if mp != "" {
+            var ver = ""
+            if mp in self.mi.Ver { ver = self.mi.Ver[mp] }
+            let dir = ModDirFor(self.mi, p)
+            places.append("`{mp}` {ver} would serve it from {dir}")
+            if IsLocal(self.mi, mp) {
+                places.append("that `replace` target does not exist")
+            } else if not os.isdir(ModCacheDir(mp, ver)) {
+                places.append("the module cache has no copy — run: " ||
+                              "voila get {mp}@{ver}")
+            }
+        } else {
+            places.append("no `require` in {self.mi.Mod.File} covers it")
+            places.append("the module cache is " || ModCacheRoot())
+            let cand = self.root_candidate(p)
+            if cand == "" {
+                places.append("and it escapes the module root ({self.root})")
+            } else {
+                places.append("and no directory {cand} exists")
+            }
+        }
+        return "no package `{p}`: it is not a std package; " ||
+               str.join(places, "; ")
+    }
+
+    // resolve classifies an import path. An unresolvable path is an ERROR: it
+    // must never be waved through as "probably std", which would let a broken
+    // program pass `check` and fail at run time.
+    //
+    // The order is fixed and total (§11.1): a Voilà-source std package, a C
+    // std package, a `replace` target, the module cache, a directory under
+    // the module root, and then KIND_BAD — whose message names all of them.
+    func resolve(self, p str) (str, int) {
+        // A Voilà-source std package (std/net, or the bare form `net`) is
+        // classified BEFORE the generic std/ check, so the C std packages
+        // (std/os, std/str, …) keep their exact KIND_STD path unchanged.
+        if std_src_base(p) != "" { return "", KIND_STDSRC }
+        // An explicit `std/…` is a std reference and nothing else, so it is
+        // settled here and never falls through to the directory search: the
+        // only remaining question is whether this release provides it. The
+        // first segment decides, so `std/math/dec` rides on `math`.
+        if str.starts_with(p, "std/") {
+            let b = std_base(p)
+            if b == "" { return "", KIND_BAD }
+            // A SUBPATH names something no release provides: no std package
+            // has subpackages. Accepting `std/os/nonesuch` — which the first
+            // cut did, because only the first segment was consulted — binds
+            // the qualifier `os` to a path the program never asked for, and
+            // let one spelling of the mistake pass while `std/net/tcp` was
+            // rejected. Both are KIND_NOSTD now, and std_diagnostic names the
+            // subpackage as the missing part.
+            if str.contains(p[4..len(p)], "/") { return "", KIND_NOSTD }
+            if is_std_c(b) { return "", KIND_STD }
+            return "", KIND_NOSTD
+        }
+        if not str.contains(p, "/") and is_std_c(p) { return "", KIND_STD }
+        if path.IsAbs(p) or str.contains(p, "\\") { return "", KIND_BAD }
+
+        // A DEPENDENCY: the longest required module path that prefixes this
+        // import. It is answered before the module root so that `require`
+        // means what it says even when a same-named directory happens to sit
+        // beside the program. ModDirFor has already applied the `replace`
+        // rule and the cache layout, so there is one branch here and not two.
+        let dep = ModDirFor(self.mi, p)
+        if dep != "" {
+            if os.isdir(dep) { return dep, KIND_USER }
+            return "", KIND_BAD
+        }
+
+        let dir = self.root_candidate(p)
+        if dir == "" { return "", KIND_BAD }
+        if not os.isdir(dir) {
+            // Last: a bare name that is no directory may still be shorthand
+            // for a std package this release does not implement, and that is
+            // the more useful thing to say than "no such directory". Only the
+            // PLANNED names reach here — an implemented one (bare `os`, bare
+            // `net`) was classified above, before the directory search, and so
+            // shadows a same-named local directory. That precedence predates
+            // this function's split and is left as it was.
+            if not str.contains(p, "/") and std_planned(p) {
+                return "", KIND_NOSTD
+            }
+            return "", KIND_BAD
+        }
         return dir, KIND_USER
     }
 
@@ -387,7 +676,8 @@ impl Loader {
 
         var pk = Pkg{name: name, dir: dir, trees: [], roots: [], sources: [],
                      paths: [], imports: make(map[str]int), decls: set([]),
-                     embedded: false}
+                     globals: [], globalSet: set([]),
+                     foreignImpl: false, hasInit: false, embedded: false}
         // Register BEFORE recursing, so a cycle is caught by the stack check.
         self.pkgs.append(pk)
         let pi = len(self.pkgs) - 1
@@ -409,7 +699,7 @@ impl Loader {
             self.at = disp
             var p = par.New(disp, text)
             let root = p.File()
-            each e in p.Errs { self.Errs.append(e) }
+            each e in p.Errs { self.D.raw(disp, e) }
             self.pkgs[pi].trees.append(p.T)
             self.pkgs[pi].roots.append(root)
             self.pkgs[pi].sources.append(disp)
@@ -418,8 +708,20 @@ impl Loader {
                 each dn in decl_names(p.T, d) {
                     self.pkgs[pi].decls.add(dn)
                 }
+                each gn in global_names(p.T, d) {
+                    self.pkgs[pi].globals.append(gn)
+                    self.pkgs[pi].globalSet.add(gn)
+                }
             }
         }
+
+        // A SECOND pass, because both answers need `decls` COMPLETE. An impl
+        // written above its own type — or in an earlier file of the package —
+        // would read as foreign in the first pass, and a global calling a
+        // function declared further down would read as calling a stranger.
+        // Both mistakes err towards EXEMPTION, which is the safe direction,
+        // so this is not a bug fix; it is refusing to be right by accident.
+        self.scan_bare_surface(pi)
 
         // Then its imports, honouring `as` aliases exactly as main's are.
         var k = 0
@@ -476,7 +778,8 @@ impl Loader {
         self.stack.append(ident)
         var pk = Pkg{name: name, dir: ident, trees: [], roots: [], sources: [],
                      paths: [], imports: make(map[str]int), decls: set([]),
-                     embedded: true}
+                     globals: [], globalSet: set([]),
+                     foreignImpl: false, hasInit: false, embedded: true}
         self.pkgs.append(pk)
         let pi = len(self.pkgs) - 1
         self.byDir[ident] = pi
@@ -487,7 +790,7 @@ impl Loader {
             self.at = disp
             var p = par.New(disp, text)
             let root = p.File()
-            each e in p.Errs { self.Errs.append(e) }
+            each e in p.Errs { self.D.raw(disp, e) }
             self.pkgs[pi].trees.append(p.T)
             self.pkgs[pi].roots.append(root)
             self.pkgs[pi].sources.append(disp)
@@ -498,8 +801,20 @@ impl Loader {
                 each dn in decl_names(p.T, d) {
                     self.pkgs[pi].decls.add(dn)
                 }
+                each gn in global_names(p.T, d) {
+                    self.pkgs[pi].globals.append(gn)
+                    self.pkgs[pi].globalSet.add(gn)
+                }
             }
         }
+
+        // A SECOND pass, because both answers need `decls` COMPLETE. An impl
+        // written above its own type — or in an earlier file of the package —
+        // would read as foreign in the first pass, and a global calling a
+        // function declared further down would read as calling a stranger.
+        // Both mistakes err towards EXEMPTION, which is the safe direction,
+        // so this is not a bug fix; it is refusing to be right by accident.
+        self.scan_bare_surface(pi)
 
         // Transitive imports: a std/net that `use`s std/str (C, skipped) or
         // another Voilà-source std package (grafted) is resolved here.
@@ -516,15 +831,48 @@ impl Loader {
         self.stack = self.stack[0..len(self.stack) - 1]
         return pi
     }
+
+    // scan_bare_surface fills the two flags unused.voi consults for the
+    // channels no scan of the IMPORTING file could ever find — see the note
+    // at the top of unused.voi. It runs once per package, after every file of
+    // it has been parsed, so `decls` is the package's complete set of names.
+    func scan_bare_surface(mut self, pi int) {
+        var fi = 0
+        while fi < len(self.pkgs[pi].trees) {
+            let t = self.pkgs[pi].trees[fi]
+            let r = self.pkgs[pi].roots[fi]
+            each d in t.Get(t.Kid(r, 1)).Kids {
+                if is_foreign_impl(t, d, self.pkgs[pi].decls) {
+                    self.pkgs[pi].foreignImpl = true
+                }
+                if has_init_effect(t, d, self.pkgs[pi].decls) {
+                    self.pkgs[pi].hasInit = true
+                }
+            }
+            fi += 1
+        }
+    }
 }
 
-// decl_names lists the package-level names a declaration introduces. Enum
-// VARIANTS and TRAIT names stay global (patterns and trait bounds have no
-// qualified syntax), so they are excluded here and checked for uniqueness
-// across the program instead.
+// decl_names lists the package-level names a declaration introduces —
+// INCLUDING enum VARIANT names and TRAIT names, which used to be excluded and
+// kept in one namespace spanning the whole program. They are ordinary
+// declarations now: `Circle` in package `geom` is `geom.Circle`, `Named` is
+// `geom.Named`, and two independent packages may each declare an `Empty`
+// without colliding. What keeps that from making programs uglier is
+// SHORT-NAME resolution in the rewriter (import_global): an unqualified
+// `Circle` resolves in the current package, then in exactly one import.
 func decl_names(t ast.Tree, d int) []str {
     let n = t.Get(d)
-    if n.Kind == ast.FUNC or n.Kind == ast.STRUCTDEC or n.Kind == ast.ENUMDEC or
+    if n.Kind == ast.ENUMDEC {
+        var out = [n.Sval]
+        each v in t.Get(t.Kid(d, 0)).Kids {
+            out.append(t.Get(v).Sval)
+        }
+        return out
+    }
+    if n.Kind == ast.TRAITDEC { return [n.Sval] }
+    if n.Kind == ast.FUNC or n.Kind == ast.STRUCTDEC or
        n.Kind == ast.EXCDEC or n.Kind == ast.TYPEDEC {
         return [n.Sval]
     }
@@ -535,6 +883,117 @@ func decl_names(t ast.Tree, d int) []str {
         if sn.Kind == ast.VAR { return [sn.Sval] }
     }
     return []
+}
+
+// decl_kind_word names a declaration kind for a diagnostic, or "" for a node
+// that introduces no package-level name of its own (an impl block's methods
+// belong to their type, not to the package).
+func decl_kind_word(k int) str {
+    if k == ast.FUNC      { return "function" }
+    if k == ast.STRUCTDEC { return "struct" }
+    if k == ast.EXCDEC    { return "exception" }
+    if k == ast.TYPEDEC   { return "type" }
+    if k == ast.TRAITDEC  { return "trait" }
+    return ""
+}
+
+// global_names lists the names a package offers WITHOUT a qualifier: trait
+// names and enum VARIANT names. They are a subset of decl_names now rather
+// than its complement — they are flattened like everything else — but they
+// remain the only names an importer may spell bare, so they still need a list
+// of their own.
+//
+// Two callers need it. The rewriter's import_global resolves an unqualified
+// `Circle` through it; and unused.voi, because a `use` may exist for no other
+// purpose than to bring one of these into scope, with its qualifier then
+// appearing nowhere at all.
+func global_names(t ast.Tree, d int) []str {
+    let n = t.Get(d)
+    if n.Kind == ast.TRAITDEC { return [n.Sval] }
+    if n.Kind == ast.ENUMDEC {
+        var out = []
+        each v in t.Get(t.Kid(d, 0)).Kids {
+            out.append(t.Get(v).Sval)
+        }
+        return out
+    }
+    return []
+}
+
+// is_foreign_impl reports whether a declaration adds methods to a type this
+// package did NOT declare — `impl geom.Point { … }`, `impl Show for str`.
+// The judgement is on the TARGET and nothing else: an impl on the package's
+// own type is reachable only through that type, which can only be spelled
+// `pkg.Name`, so it is not a bare channel at all.
+//
+// This matters to unused.voi and nowhere else. A method that arrives through
+// an impl is reached by DISPATCH, so a file can depend on the package that
+// wrote it while naming nothing of it — not the qualifier, not the trait.
+// `decls` must be the package's COMPLETE declaration set, which is why
+// this runs in a second pass.
+//
+// An impl whose target resolves to nothing (a typo, or a type from an import
+// that failed) reads as foreign. That errs towards exemption, the only
+// direction this may err in.
+func is_foreign_impl(t ast.Tree, d int, decls set[str]) bool {
+    let n = t.Get(d)
+    if n.Kind != ast.IMPLDEC { return false }
+    let ty = n.Ival
+    if ty == 0 { return true }
+    let name = t.Get(ty).Sval
+    if index_of(name, '.') >= 0 { return true }   // impl other.T { … }
+    return not (name in decls)
+}
+
+// has_init_effect reports whether a declaration is a package-level binding
+// whose initializer RUNS something of this package's. That is the fourth
+// channel: `var Ready = announce()` makes `use "p"` load-bearing for its
+// EFFECT, and dropping the import drops the effect with nothing said anywhere
+// — no diagnostic, no abort, just a program that quietly does less.
+//
+// Voilà has no blank import (`use _ "p"`), so a plain `use` is the only way
+// to spell "imported for effect" and this is the only way to recognise it.
+func has_init_effect(t ast.Tree, d int, decls set[str]) bool {
+    if t.Kind(d) != ast.GLOBAL { return false }
+    let s = t.Kid(d, 0)
+    if s == 0 { return false }
+    let k = t.Kind(s)
+    if k != ast.LET and k != ast.VAR { return false }
+    return init_calls(t, t.Kid(s, 0), decls)
+}
+
+// init_calls reports whether an initializer contains a call that could RUN
+// user code: a bare call to one of this package's own declarations, or any
+// `q.f(...)` into another package.
+//
+// Consulting `decls` is what keeps this NARROW, and narrow is the point.
+// `make(map[str]int)`, `set([])`, `chan[int](4)`, `str(x)` and `len(xs)` are
+// all CALL nodes with a bare IDENT callee — and none of those callees is
+// anybody's declaration, so none of them exempts a package. Treating every
+// CALL as an effect would have exempted most packages ever written and left
+// the warning worth nothing.
+func init_calls(t ast.Tree, e int, decls set[str]) bool {
+    if e == 0 { return false }
+    let n = t.Get(e)
+    if n.Kind == ast.CALL {
+        let callee = t.Kid(e, 0)
+        if callee != 0 {
+            let cn = t.Get(callee)
+            if cn.Kind == ast.FIELD { return true }
+            if cn.Kind == ast.IDENT and (cn.Sval in decls) { return true }
+            // An immediately-invoked closure — `var Ready = fn() int { … }()`
+            // — is user code by construction, so calling it is an effect even
+            // when its body mentions nothing this package declares. Without
+            // this arm the package looked import-free, the warning told the
+            // reader to delete the `use`, and the initializer's output
+            // silently vanished.
+            if cn.Kind == ast.CLOSURE { return true }
+        }
+    }
+    each k in n.Kids {
+        if init_calls(t, k, decls) { return true }
+    }
+    return false
 }
 
 // module_root walks up to the nearest directory holding voila.mod; failing
@@ -550,35 +1009,100 @@ func module_root(dir str) str {
     return dir
 }
 
-// module_name reads voila.mod once; resolve() consults the cached value.
-func module_name(root str) str {
-    var data = ""
-    match os.read(path.Join(root, "voila.mod")) {
-        Ok(d)  => data = d
-        Err(e) => return ""
-    }
-    each line in str.lines(data) {
-        let f = fields(line)
-        if len(f) >= 2 and f[0] == "module" { return f[1] }
-    }
-    return ""
+// ModuleRoot is module_root for callers outside this package — `voila get`
+// and `voila mod` both need the module the user is standing in.
+func ModuleRoot(dir str) str { return module_root(dir) }
+
+// The std packages come in three flavours, and a `use` must be told apart into
+// exactly one of them: implemented in C (below), implemented in Voilà source
+// (is_std_src), or documented but absent (std_planned). Anything else is a
+// typo. One list per flavour, so nothing can be waved through by default.
+
+// std_c_packages are the std packages the C runtime implements as natives —
+// the qualifiers in runtime/src/std.c's table[] and voilac/cg/instr.voi's
+// pkg_natives(). selftest.bash holds this list plus std.Packages() equal to
+// low.PackageNames(), so a package cannot be admitted here and then be
+// unqualifiable in the lowerer.
+//
+// The test is "has Voilà source to graft", not "is entirely Voilà": `net` is
+// deliberately absent because only its syscall shim is C, and `time` because
+// its calendar half is Voilà even though its stopwatch half (now, since,
+// sleep, after and the duration constants) is pure C. A package must appear
+// in exactly one of the two lists, or std_diagnostic would name it twice.
+func std_c_packages() []str {
+    return ["conv", "crypto", "fmt", "io", "json", "log", "math", "os",
+            "rand", "regex", "sort", "str", "uuid"]
 }
 
-func is_std(name str) bool {
-    let stds = ["fmt", "str", "os", "math", "time", "json", "log", "regex",
-                "http", "conv", "sort", "rand", "uuid", "io", "sync", "chan",
-                "test", "vm", "ffi", "net"]
-    each s in stds {
+func is_std_c(name str) bool {
+    each s in std_c_packages() {
         if s == name { return true }
     }
     return false
 }
 
 // is_std_src reports whether a std package is written in Voilà source (and so
-// is grafted from the embedded blob), rather than provided as C natives. This
-// is the single registry the loader, and future packages, extend.
+// is grafted from the embedded blob), rather than provided as C natives. The
+// registry IS the blob, so this can never drift from what is embedded.
 func is_std_src(name str) bool {
-    return name == "net"
+    each p in std.Packages() {
+        if p == name { return true }
+    }
+    return false
+}
+
+// std_planned are the packages voila_specification.md §13.4 documents and this
+// release does not implement. Naming them apart from the unknown-name case is
+// the whole value of the list: `use "std/xml"` is a promise not yet kept,
+// `use "std/stf"` is a misspelling, and the two want different advice.
+func std_planned(name str) bool {
+    let planned = ["chan", "ffi", "maps",
+                   "slices", "vm", "xml", "yaml"]
+    each s in planned {
+        if s == name { return true }
+    }
+    return false
+}
+
+// std_base is the package an import path names, spelled the way §13.4 spells
+// it: the `std/` prefix dropped, and only the FIRST segment kept, because a
+// sub-package belongs to its parent — `std/math/dec` names `math`, and a
+// diagnostic about `math/dec` would name a package that has never existed.
+func std_base(p str) str {
+    var b = p
+    if str.starts_with(b, "std/") { b = b[4..len(b)] }
+    let slash = str.index(b, "/")
+    if slash >= 0 { b = b[0..slash] }
+    return b
+}
+
+// std_diagnostic explains a KIND_NOSTD import. It takes the WHOLE import path,
+// not just the base: `std/net/tcp` names a package that does exist with a
+// subpackage that does not, and reporting "no std package `net`" and then
+// listing `net` among the ones that exist would contradict itself.
+//
+// The list of what DOES exist is generated from the two registries, so it
+// cannot go stale as they grow.
+func std_diagnostic(p str) str {
+    let name = std_base(p)
+    if is_std_c(name) or is_std_src(name) {
+        var sub = p
+        if str.starts_with(sub, "std/") { sub = sub[4..len(sub)] }
+        let slash = str.index(sub, "/")
+        if slash >= 0 {
+            let tail = sub[slash + 1..len(sub)]
+            return "std package `{name}` has no subpackage `{tail}`"
+        }
+    }
+    if std_planned(name) {
+        return "std package `{name}` is documented in the specification " ||
+               "(§13.4) but not implemented in this release"
+    }
+    var have = std_c_packages()
+    each sp in std.Packages() { have.append(sp) }
+    have.sort()
+    return "no std package `{name}`: the std packages are " ||
+           str.join(have, ", ")
 }
 
 // std_src_base returns the package base name if `p` names a Voilà-source std

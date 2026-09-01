@@ -1,0 +1,72 @@
+// A native carries no static signature, so nothing anywhere counted its
+// arguments: `time.millis()` reached a body that reads argv[0] the caller
+// never provided and the program died of SIGSEGV — after `check` said ok.
+// low.NativeArities gives every native a bound and chk/native.voi enforces it.
+//
+// The `!` lines of the .expect are the other half of the check and matter as
+// much as the refusals: an optional argument is real, and rejecting a working
+// call would be a worse bug than the crash being fixed.
+package main
+
+use "std/str"
+use "std/time"
+use "std/fmt"
+use "std/os"
+
+enum Shape { Round, Square }
+
+// A bare type ALIAS makes a call of that name a CONVERSION (§3.2), which the
+// lowerer resolves before the prelude. `index` is also a std/str native, so a
+// check that did not know about aliases reported `index(5)` as a one-argument
+// call to a two-argument native — an accusation about a call that is not a
+// native call at all.
+//
+// An alias conversion does not RUN yet (the backend emits `CONV index` and
+// the runtime knows no such conversion, since aliases are erased) — a
+// separate gap, and not this check's to report. This is a `check`-only
+// fixture, so the call below is never executed; what it pins is the silence.
+type index = int
+
+func main() {
+    // Too FEW: each of these reads an argument that was never passed.
+    say time.millis()
+    say str.replace("a", "b")
+    say fmt.fprintf(os.stdout)
+
+    // Too MANY: an argument no path can read, silently dropped.
+    say str.trim_left("..x", ".")
+    say os.cwd(1)
+
+    // Correct, and it must stay correct: the optional-argument forms, the
+    // variadic families, and the bare prelude spelling.
+    say str.substr("hello", 2)
+    say str.substr("hello", 2, 3)
+    say str.find_any("a,b", ",")
+    say str.find_any("a,b", ",", 1)
+    fmt.printf("%s\n", "ok")
+    say substr("hello", 2)
+    say to_int("12")
+    say to_int("ff", 16)
+
+    // A module function of the same name is resolved BEFORE the prelude, so
+    // its own arity is what counts — two arguments, which the native `upper`
+    // would refuse.
+    say upper("a", "b")
+    // An enum VARIANT is resolved before the prelude too.
+    say Shape.Round
+    // ...and so is a type alias, whose call is a conversion, not a native.
+    say index(5)
+    shadowed()
+}
+
+func upper(a str, b str) str { return a || b }
+
+// A local binding shadows a package qualifier, so this is a method call on a
+// str and not a package call at all. It lives in its own function because the
+// bind collection is per DECLARATION and deliberately position-blind: a `let`
+// anywhere in a body suppresses the check for that name throughout it, which
+// can only lose a diagnostic and never invent one.
+func shadowed() {
+    let time = "not the package"
+    say time.upper()
+}

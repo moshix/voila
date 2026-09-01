@@ -1,0 +1,10 @@
+// unused-import is answered per PACKAGE, not per file. Both directions:
+//
+//   sib   — a.voi writes the `use`, b.voi mentions it. Used, and silent.
+//   dead  — no file of the package mentions it. Reported, naming the package.
+use "sib"
+use "dead"
+
+func main() {
+    say sib.Area() + dead.Nothing()
+}

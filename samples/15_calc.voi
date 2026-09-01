@@ -1,0 +1,276 @@
+// 15_calc.voi — an INTERACTIVE calculator: a recursive-descent expression
+// evaluator wrapped in a read-eval-print loop over standard input (§13,
+// std/io).
+//
+// 04_calculator.voi is this program's ancestor and evaluates eleven hardcoded
+// strings, because when it was written Voilà could not read standard input at
+// all. Everything that changed is at the bottom of this file: `os.input`
+// replaces the array of canned expressions, and `each line in os.stdin`
+// streams the rest of the input for `:sum`. The evaluator itself is ordinary
+// Voilà and could have been written in any release.
+//
+// Three std/io features carry the session:
+//   os.input(prompt)  writes the prompt, FLUSHES it, and returns one line —
+//                     or an IOError at end of input, which is how ^D ends the
+//                     loop without a sentinel word.
+//   os.isatty(h)      tells a terminal from a pipe, so a script run through
+//                     the program is announced rather than silently prompted
+//                     at.
+//   each line in ...  streams: `:sum` adds up an input larger than memory.
+package main
+
+use "std/fmt"
+use "std/str"
+
+// Calc is one session: the line being evaluated, how far into it the parser
+// has got, and the variables the session has accumulated. It lives for the
+// whole run, which is what makes this a session and not a series of
+// unrelated sums.
+struct Calc {
+    src  str
+    pos  int
+    vars map[str]float
+}
+
+impl Calc {
+    // ------------------------------------------------------ the scanner
+    //
+    // One character of lookahead is all this grammar needs, so there is no
+    // token type: peek() skips blanks and reports the next byte (-1 at the
+    // end of the line), and take() consumes it.
+
+    func peek(mut self) int {
+        while self.pos < len(self.src) and self.src[self.pos] == 32 {
+            self.pos += 1
+        }
+        if self.pos >= len(self.src) { return -1 }
+        return self.src[self.pos]
+    }
+
+    func take(mut self) {
+        self.pos += 1
+    }
+
+    func is_digit(self, c int) bool {
+        return c >= 48 and c <= 57
+    }
+
+    func is_name(self, c int) bool {
+        if c >= 97 and c <= 122 { return true }   // a-z
+        if c >= 65 and c <= 90  { return true }   // A-Z
+        return c == 95                             // _
+    }
+
+    // ------------------------------------------------------ the grammar
+    //
+    // expr := term (('+' | '-') term)*
+
+    func expr(mut self) float! {
+        var left = try self.term()
+        for {
+            let c = self.peek()
+            if c == 43 {                           // '+'
+                self.take()
+                left = left + try self.term()
+            } else if c == 45 {                    // '-'
+                self.take()
+                left = left - try self.term()
+            } else {
+                return left
+            }
+        }
+    }
+
+    // term := power (('*' | '/' | '%') power)*
+    func term(mut self) float! {
+        var left = try self.power()
+        for {
+            let c = self.peek()
+            if c == 42 {                           // '*'
+                self.take()
+                left = left * try self.power()
+            } else if c == 47 {                    // '/'
+                self.take()
+                let r = try self.power()
+                if r == 0.0 { return err("division by zero") }
+                left = left / r
+            } else if c == 37 {                    // '%'
+                self.take()
+                let r = try self.power()
+                if r == 0.0 { return err("division by zero") }
+                left = left % r
+            } else {
+                return left
+            }
+        }
+    }
+
+    // power := unary ('^' power)?   — right-associative
+    func power(mut self) float! {
+        let base = try self.unary()
+        if self.peek() == 94 {                     // '^'
+            self.take()
+            let e = try self.power()
+            return base ** e
+        }
+        return base
+    }
+
+    // unary := '-' unary | primary
+    func unary(mut self) float! {
+        if self.peek() == 45 {                     // '-'
+            self.take()
+            return -(try self.unary())
+        }
+        return try self.primary()
+    }
+
+    // primary := number | name | '(' expr ')'
+    func primary(mut self) float! {
+        let c = self.peek()
+        if c == -1 { return err("unexpected end of expression") }
+        if c == 40 {                               // '('
+            self.take()
+            let v = try self.expr()
+            if self.peek() != 41 { return err("missing closing parenthesis") }
+            self.take()
+            return v
+        }
+        if self.is_digit(c) {
+            let start = self.pos
+            while self.pos < len(self.src) and
+                  (self.is_digit(self.src[self.pos]) or
+                   self.src[self.pos] == 46) {
+                self.pos += 1
+            }
+            let text = self.src[start..self.pos]
+            let v = try to_float(text) else return err("bad number {text}")
+            return v
+        }
+        if self.is_name(c) {
+            let name = self.word()
+            if name in self.vars { return self.vars[name] }
+            return err("unknown variable {name}")
+        }
+        let bad = str.from_runes([rune(c)])
+        return err("unexpected character {bad} at column {self.pos + 1}")
+    }
+
+    // word scans an identifier at the current position.
+    func word(mut self) str {
+        let start = self.pos
+        while self.pos < len(self.src) and self.is_name(self.src[self.pos]) {
+            self.pos += 1
+        }
+        return self.src[start..self.pos]
+    }
+
+    // ------------------------------------------------------ one input line
+    //
+    // A line is either `name = expr`, which stores, or a bare expression,
+    // which evaluates. The assignment form is recognised by scanning a name
+    // and then looking for '=' — and unscanned (pos rewound) when what
+    // follows is not one, so `x` alone is still an expression.
+
+    func eval(mut self, line str) float! {
+        self.src = line
+        self.pos = 0
+        let c = self.peek()
+        if self.is_name(c) {
+            let mark = self.pos
+            let name = self.word()
+            if self.peek() == 61 {                 // '='
+                self.take()
+                let v = try self.expr()
+                try self.done()
+                self.vars[name] = v
+                return v
+            }
+            self.pos = mark                        // not an assignment
+        }
+        let v = try self.expr()
+        try self.done()
+        return v
+    }
+
+    // done insists the whole line was consumed, so "1 2" and "4 $ 2" are
+    // errors rather than a silent 1 and a silent 4.
+    func done(mut self) unit! {
+        let c = self.peek()
+        if c != -1 {
+            let bad = str.from_runes([rune(c)])
+            return err("unexpected {bad} at column {self.pos + 1}")
+        }
+        return ()
+    }
+}
+
+// sum_rest adds up every remaining line of standard input. `each` over a
+// reader pulls ONE line per step, so this works on an input far larger than
+// memory — it never builds a slice of the whole stream.
+func sum_rest() {
+    var total = 0.0
+    var n = 0
+    each line in os.stdin {
+        let text = str.trim(line)
+        if text == "" { continue }
+        // to_float yields nil, not an error value, for text that is not a
+        // number — so the test is against nil, and `Ok(v)` would happily
+        // bind that nil.
+        let v = to_float(text)
+        if v == nil {
+            say "  skipped:", text
+            continue
+        }
+        total = total + v
+        n += 1
+    }
+    fmt.printf("  %d values, total %v\n", n, total)
+}
+
+func main() {
+    // os.isatty separates a human at a terminal from a script on a pipe.
+    // The suite runs this program on a pipe, so the golden takes the second
+    // branch; typed at a terminal it takes the first.
+    if os.isatty(os.stdin) {
+        say "calc — expressions, `name = value`, :vars, :sum, :q to quit"
+    } else {
+        say "calc — reading a script from standard input"
+    }
+
+    var c = Calc{src: "", pos: 0, vars: make(map[str]float)}
+    while true {
+        // An IOError from os.input is END OF INPUT — ^D at a terminal, or
+        // the pipe running dry — which is how the loop ends without needing
+        // a sentinel word. "" is a legitimate answer to a prompt and means
+        // nothing of the kind, which is why os.input distinguishes them.
+        var line = ""
+        match os.input("calc> ") {
+            Ok(s)  => line = s
+            Err(e) => { say "" ; break }   // finish the unanswered prompt
+        }
+        let cmd = str.trim(line)
+
+        if cmd == "" { continue }
+        if cmd == ":q" { say "bye" ; break }
+        if cmd == ":vars" {
+            if len(c.vars) == 0 {
+                say "  (no variables yet)"
+            } else {
+                each name, v in c.vars {
+                    fmt.printf("  %-8s = %v\n", name, v)
+                }
+            }
+            continue
+        }
+        if cmd == ":sum" {
+            sum_rest()
+            continue
+        }
+
+        match c.eval(cmd) {
+            Ok(v)  => fmt.printf("  = %v\n", v)
+            Err(e) => fmt.printf("  ! %s\n", e.message())
+        }
+    }
+}

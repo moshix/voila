@@ -299,6 +299,34 @@ static void obj_free(VlObj *o) {
     if (!s->closed && s->fd >= 0) close(s->fd);
     break;
   }
+  case O_READER:
+  case O_WRITER:
+    /* Same mandate as O_SOCKET above, and one more besides: a reader RETAINS
+     * the file or socket it reads from, so without this arm the owner is
+     * never released and the file it kept alive is never closed. The body
+     * lives in io.c so the POSIX close(2) stays in one file. */
+    if (o->kind == O_READER) vl_reader_free(o);
+    else vl_writer_free(o);
+    break;
+  case O_MUTEX:
+  case O_RWLOCK:
+    /* Mandatory, like O_SOCKET above: a pthread lock owns kernel or libc
+     * state that pthread_*_destroy is what releases. The bodies live in
+     * sync.c so the pthread calls stay in the one file that owns them. */
+    if (o->kind == O_MUTEX) vl_sync_mutex_free(o);
+    else vl_sync_rwlock_free(o);
+    break;
+  case O_REGEX:
+    /* Mandatory, like the arms above: a compiled pattern owns its program,
+     * its class bitmaps and the pattern text. This switch has no `default:`
+     * precisely so a new kind cannot leak by being forgotten here. */
+    vl_regex_free(o);
+    break;
+  case O_ATOMIC:
+    /* One int64 inline in the object; nothing to release. The arm is here
+     * anyway — an omitted case is exactly the silent hole this switch has no
+     * `default:` in order to expose. */
+    break;
   case O_BUILDER:
     free(((VlBuilder *)o)->b);
     break;
@@ -506,6 +534,12 @@ const char *vl_kind_name(Value v) {
   case O_RANGE: return "range";
   case O_FILE: return "file";
   case O_SOCKET: return "socket";
+  case O_READER: return "reader";
+  case O_WRITER: return "writer";
+  case O_MUTEX: return "mutex";
+  case O_RWLOCK: return "rwlock";
+  case O_ATOMIC: return "atomic";
+  case O_REGEX: return "regex";
   case O_BUILDER: return "builder";
   case O_TYPE: return "type";
   case O_FRAME: return "frame";
@@ -963,6 +997,40 @@ static void str_into(Value b, Value v) {
     VlSocket *s = (VlSocket *)v.u.o;
     snprintf(tmp, sizeof tmp, "<socket fd=%d%s>", s->fd,
              s->closed ? " closed" : "");
+    bputs(b, tmp);
+    return;
+  }
+  case O_READER: {
+    bputs(b, "<reader ");
+    Value n = ((VlReader *)v.u.o)->name;
+    bwrite(b, vl_cstr(n), vl_strlen(n));
+    bputs(b, ((VlReader *)v.u.o)->closed ? " closed>" : ">");
+    return;
+  }
+  case O_WRITER: {
+    bputs(b, "<writer ");
+    Value n = ((VlWriter *)v.u.o)->name;
+    bwrite(b, vl_cstr(n), vl_strlen(n));
+    bputs(b, ((VlWriter *)v.u.o)->closed ? " closed>" : ">");
+    return;
+  }
+  /* A lock has no state that can be read without taking it, and taking one
+   * to print it would be a lock held across `say`. So they print as their
+   * kind. The atomic is different twice over: it HAS a readable state and a
+   * seq-cst load is exactly what str_into may do, and it is a box around a
+   * value rather than an opaque handle — so it prints like its two nearest
+   * relatives, O_SHARED and O_CELL just above, which print what is inside
+   * them rather than <shared>/<cell>. */
+  case O_REGEX: {
+    bputs(b, "/");
+    bputs(b, vl_regex_src(v));
+    bputs(b, "/");
+    return;
+  }
+  case O_MUTEX: bputs(b, "<mutex>"); return;
+  case O_RWLOCK: bputs(b, "<rwlock>"); return;
+  case O_ATOMIC: {
+    snprintf(tmp, sizeof tmp, "%lld", (long long)vl_sync_atomic_peek(v.u.o));
     bputs(b, tmp);
     return;
   }

@@ -1,0 +1,10 @@
+one:node 7 one:empty
+two:node 3,4 two:empty
+one two
+pair 0
+local empty
+builtin Some 3
+plain
+three:some 9 three:secret
+one node 7
+right

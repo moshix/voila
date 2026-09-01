@@ -1,0 +1,77 @@
+2:1 KW struct
+2:8 IDENT P
+2:10 OP {
+2:12 IDENT v
+2:14 IDENT int
+2:18 OP }
+2:19 SEMI
+3:1 KW trait
+3:7 IDENT Show
+3:12 OP {
+3:14 KW func
+3:19 IDENT show
+3:23 OP (
+3:24 KW self
+3:28 OP )
+3:30 IDENT str
+3:34 OP }
+3:35 SEMI
+4:1 KW impl
+4:6 IDENT Show
+4:11 KW for
+4:15 IDENT P
+4:17 OP {
+4:19 KW func
+4:24 IDENT show
+4:28 OP (
+4:29 KW self
+4:33 OP )
+4:35 IDENT str
+4:39 OP {
+4:41 KW return
+4:48 STR P
+4:52 OP }
+4:54 OP }
+4:55 SEMI
+5:1 KW func
+5:6 IDENT apply
+5:11 OP (
+5:12 IDENT cb
+5:15 KW func
+5:19 OP (
+5:20 IDENT int
+5:23 OP )
+5:25 IDENT int
+5:28 OP ,
+5:30 IDENT n
+5:32 IDENT int
+5:35 OP )
+5:37 IDENT int
+5:41 OP {
+5:43 KW return
+5:50 IDENT cb
+5:52 OP (
+5:53 IDENT n
+5:54 OP )
+5:56 OP }
+5:57 SEMI
+6:1 KW say
+6:5 IDENT apply
+6:10 OP (
+6:11 IDENT fn
+6:13 OP (
+6:14 IDENT x
+6:16 IDENT int
+6:19 OP )
+6:21 IDENT int
+6:25 OP {
+6:27 KW return
+6:34 IDENT x
+6:36 OP +
+6:38 INT 1
+6:40 OP }
+6:41 OP ,
+6:43 INT 41
+6:45 OP )
+6:46 SEMI
+7:1 EOF

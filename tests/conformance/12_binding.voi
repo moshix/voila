@@ -7,6 +7,16 @@
 // The interpreter always copied, so the two engines disagreed. Both now MOVE
 // into a fresh register.
 
+// A top-level name that happens to be a std PACKAGE name shadows the package.
+// `path` and `sync` are qualifiers a dotted name may carry (low/names.voi),
+// but a GLOBAL of that name is a value, and `path.upper()` is a method call on
+// a str. Globals are not in the lowerer's scope chain, so the qualifier test
+// has to ask about them by name — and until it did, adding std/path and
+// std/sync to the package table turned this working program into a package
+// call that died in the backend.
+var path = "/etc/hosts"
+var sync = "in step"
+
 func main() {
     // The simple case.
     let end = "END"
@@ -51,4 +61,10 @@ func main() {
     say "6:", int("0o755", 0), int("0x1f", 0), int("0b1011", 0), int("0755", 0)
     say "7:", int("1_000_000", 0), int("-0x10", 0), int("42", 0)
     say "8:", int("ff", 16), int("777", 8), to_int("zz")
+
+    // The globals declared above, reached as values and not as packages.
+    say "9:", path.upper(), sync.upper(), len(path)
+    // A LOCAL of a package name shadows it too, which always worked.
+    let str = "shadowed"
+    say "10:", str.upper()
 }

@@ -1,0 +1,170 @@
+// The OTHER half of chk/expr.voi's fixture pair, and by far the more
+// important one: every shape a plausible over-tightening would wrongly
+// reject. The whole file is correct code and the .expect below is nothing
+// but absence lines.
+//
+// A check that rejects a working program is the worst outcome there is, so
+// each construct here is one the header of chk/expr.voi names as a refusal.
+package main
+
+use "std/str"
+
+// ---- generics at the DEFINITION site: `T` stands for nothing written down.
+struct Box[T] { v T }
+
+impl[T] Box[T] {
+    func get(self) T { return self.v }
+    func put(mut self, x T) { self.v = x }
+}
+
+// … and at a USE site, where the argument really is the receiver's own.
+func roundtrip() int {
+    var b = Box[int]{v: 1}
+    b.put(7)
+    return b.get()
+}
+
+// ---- traits: a default body, a type that inherits it, and a trait-typed
+// value that dispatches dynamically.
+trait Greeter {
+    func name(self) str
+    func greet(self) str { return "hello, " || self.name() }
+}
+
+struct En { who str }
+struct Fr { who str }
+
+impl Greeter for En { func name(self) str { return self.who } }
+
+impl Greeter for Fr {
+    func name(self) str { return self.who }
+    func greet(self) str { return "bonjour, " || self.who }
+}
+
+// `greet` is INHERITED by En — no `impl` block writes it — and calling it on
+// a concrete En must not be reported as a missing method.
+func inherited() str {
+    let e = En{who: "world"}
+    return e.greet()
+}
+
+// A trait-typed hole takes any implementor, and a trait-typed receiver
+// answers the trait's own methods including the defaulted one.
+func dynamic() str {
+    let gs []Greeter = [En{who: "a"}, Fr{who: "b"}]
+    var out = ""
+    each g in gs {
+        out = out || g.greet() || g.name()
+    }
+    let one Greeter = En{who: "c"}
+    return out || one.greet()
+}
+
+// A trait-typed receiver dispatches on the value's RUNTIME type, so a
+// method the trait never declared is reachable through it. `vl_callm`
+// resolves by the dynamic type name and the annotation plays no part; a
+// checker that answered "only the trait's own methods" rejected this exact
+// program.
+impl En { func shout(self) str { return self.who || "!" } }
+
+func dynamic_inherent() str {
+    let g Greeter = En{who: "d"}
+    return g.shout()
+}
+
+// A module-level name may be RE-DECLARED, and a function written between the
+// two bindings still sees the later one at run time — the module scope is
+// whole before any body runs. A walker that re-bound each global as it passed
+// judged `later.n` against the earlier declaration's type.
+struct Early { e str }
+struct Late { n int }
+
+var reused Early = Early{e: "first"}
+
+func reads_reused() int { return reused.n }
+
+let reused = Late{n: 11}
+
+// ---- `str` is a primitive AND a package, and its functions are reachable
+// bare, as `str.f(s)` and as `s.f()`.
+func duality(s str) str {
+    let a = upper(s)
+    let b = str.upper(s)
+    let c = s.upper()
+    return a || b || c || str(len(s))
+}
+
+// ---- `?T` and `T!`: `Some`/`Ok`/`Err` are patterns, never constructors, so
+// a `?int` hole takes an `int` and takes nil.
+func maybe(x ?int) ?int {
+    if x == nil { return nil }
+    return 5
+}
+
+exception Bad { why str }
+
+func risky(n int) int! {
+    if n < 0 { throw Bad{why: "negative"} }
+    return n
+}
+
+func unwrapping() int {
+    let a = must risky(3)
+    let b = risky(4) else 0
+    return a + b + must maybe(1)
+}
+
+// ---- the numeric lattice (§3.2): the families widen into each other and
+// the literals are untyped.
+func numbers() float {
+    var f float = 1
+    let i int = 2
+    let by byte = 'a'
+    let r rune = 'b'
+    f = float(i) + f
+    return f + float(int(by) + int(r))
+}
+
+// ---- a variadic parameter binds a SLICE of its element type.
+func variadic(parts ...str) str {
+    var out = ""
+    each p in parts { out = out || p }
+    return out
+}
+
+// ---- a struct FIELD holding a callable is dispatched like a method, and a
+// method NAME with no call is a method value.
+struct Ops { apply fn(int) int }
+
+func callable() int {
+    let o = Ops{apply: fn(x int) int { return x + 1 }}
+    return o.apply(1)
+}
+
+// ---- `unit` is the empty type; a boxed value is a handle, not the value.
+func nothing() unit { return }
+
+func boxed() int {
+    let sh = shared(Box[int]{v: 3})
+    return sh.get().v
+}
+
+// ---- the collection shapes `each` really has (checked against the runtime,
+// not assumed): a slice yields elements, a map yields VALUES.
+func collections() int {
+    var m map[str]int = make(map[str]int)
+    m["a"] = 1
+    var total = 0
+    each v in m { total += v }
+    each k, v in m { total += len(k) + v }
+    let names []str = ["x", "y"]
+    each i, s in names { total += i + len(s) }
+    let uniq set[str] = set(["p"])
+    each u in uniq { total += len(u) }
+    return total
+}
+
+nothing()
+say roundtrip(), inherited(), dynamic(), dynamic_inherent()
+say reads_reused(), duality("s"), unwrapping()
+say numbers(), variadic("a", "b"), callable(), boxed(), collections()

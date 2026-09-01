@@ -224,7 +224,14 @@ impl Parser {
             let n = self.expect(tok.IDENT)
             var bound = ""
             if self.accept(tok.COLON) {
+                // A bound names a TRAIT, and trait names are package-
+                // qualified (§11.2.1), so `[T: geom.Named]` must parse. The
+                // loader resolves either spelling to the same flat name.
                 bound = self.expect(tok.IDENT).Lit
+                while self.at(tok.DOT) {
+                    self.next()
+                    bound = bound || "." || self.expect(tok.IDENT).Lit
+                }
             }
             gs.append(self.add(ast.GENERIC, n, 0, 0, n.Lit || "|" || bound, []))
             if not self.accept(tok.COMMA) { break }
@@ -451,9 +458,12 @@ impl Parser {
             if fn2.Kind != ast.TNAMED {
                 self.error("trait name expected before `for`")
             }
-            // A trait name has no qualified form (§11.5): `impl pkg.Show for T`
-            // names the trait `Show`, exactly as the Go parser records it.
-            trait_name = bare_name(fn2.Sval)
+            // The trait name is recorded EXACTLY as written, qualifier and
+            // all: trait names are package-qualified like every other
+            // declaration (§11.2.1), so `impl pkg.Show for T` names a
+            // different trait than a local `Show`, and the loader is the
+            // stage that resolves either one to its flat name.
+            trait_name = fn2.Sval
             ty = self.type_expr()
         }
         self.expect(tok.LBRACE)
@@ -644,16 +654,6 @@ impl Parser {
         }
         return self.add(ast.TFN, t, res, 0, "", [self.T.List(ps)])
     }
-}
-
-// bare_name drops a package qualifier: "fmt.Show" → "Show".
-func bare_name(s str) str {
-    var i = len(s) - 1
-    while i >= 0 {
-        if s[i] == '.' { return s[i + 1..len(s)] }
-        i -= 1
-    }
-    return s
 }
 
 func type_start(k int) bool {

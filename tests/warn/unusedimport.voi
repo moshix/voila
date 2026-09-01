@@ -1,0 +1,24 @@
+// unused-import — the warning fires on the imports nothing reaches, and stays
+// silent on the ones that are used, however indirectly.
+//
+// FIRES:   std/time — imported, never mentioned
+//          spare    — a user package nothing reaches
+//
+// SILENT:  std/fmt  — used plainly
+//          geom     — used through its ALIAS, which is what the loader must
+//                     look for and what the rewriter would have thrown away
+//          std/str  — used ONLY through the bare method-call duality
+//                     (`s.upper()` IS `str.upper(s)`), so the word `str`
+//                     never appears. This line is the regression guard on the
+//                     exemption in voilac/load/unused.voi.
+use "std/fmt"
+use "std/str"
+use "std/time"
+use "geom" as g
+use "spare"
+
+func main() {
+    let p = g.Point{X: 3, Y: 4}
+    var s = "ok"
+    fmt.printf("%d %s\n", g.Sum(p), s.upper())
+}

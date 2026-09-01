@@ -1,0 +1,23 @@
+// `test`, `csv` and `http` are ordinary words before they are package names,
+// and a program that binds one at the TOP LEVEL was legal before those
+// packages existed. It must stay legal: a global binding shadows the
+// qualifier, so `test.upper()` below is a method call on a str and not a
+// package member at all. Adding a name to low.PackageNames() has broken
+// working programs this way before, which is why the three `!` lines are the
+// point of this fixture.
+//
+// The diagnostic it does expect is on `path`, which nothing here shadows —
+// proof that the check is still awake and the silence above is shadowing
+// rather than a check that gave up.
+use "std/path"
+
+var test = "shout"
+var csv = "a,b"
+var http = "hyper text"
+
+func main() {
+    say test.upper()
+    say len(csv.split(","))
+    say http.upper()
+    say path.bse("a/b.voi")
+}

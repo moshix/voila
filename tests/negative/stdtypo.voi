@@ -1,0 +1,7 @@
+// A misspelled std package is a typo, not an unkept promise, so it is told
+// what does exist rather than what is coming.
+use "std/stf"
+
+func main() {
+    say stf.upper("shout")
+}

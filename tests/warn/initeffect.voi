@@ -1,0 +1,17 @@
+// The fourth channel a package can be reached through: the EFFECT of a
+// package-level initializer. Nothing in this file mentions `boot`, and
+// nothing ever could — so the question is put to the imported package
+// instead, and a package with an initializer that runs its own code is never
+// reported.
+//
+// `plain` is the control, and it is the important half: its globals are built
+// with `make` and `set`, and it has an inherent impl on its own type. Neither
+// is a channel, so it must still be REPORTED — otherwise the two exemptions
+// beside it would have quietly swallowed the whole warning.
+use "boot"
+use "plain"
+use "std/fmt"
+
+func main() {
+    fmt.printf("initeffect\n")
+}

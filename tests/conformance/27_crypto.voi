@@ -1,0 +1,235 @@
+// 27_crypto.voi — std/crypto: digests, HMAC and the entropy source (§13.4).
+//
+// ALMOST EVERY DIGEST BELOW IS A PUBLISHED VECTOR, and the few that are not
+// say so in their own label. The golden is not a snapshot of what this
+// runtime happens to produce — it is the table printed in FIPS 180-4 (SHA-1,
+// SHA-256, SHA-512), RFC 1321 appendix A.5 (MD5), RFC 4231 (HMAC-SHA-256 and
+// HMAC-SHA-512) and RFC 2202 (HMAC-MD5, HMAC-SHA-1), so a reader can check
+// the .out against those documents by eye. Re-recording the golden from a
+// broken implementation would therefore be visible, which is the whole point
+// of using someone else's numbers — and it is why the handful of rows that
+// are only cross-checks against an independent implementation are gathered
+// under their own heading instead of sitting unmarked among the vectors.
+//
+// The EMPTY message is present for all four algorithms, and it is not
+// ceremony: with no message at all the padding IS the entire input, so a
+// wrong length encoding or a wrong reserved field shows up there and is
+// hidden by every non-empty input.
+//
+// The random source cannot be checked by value — that is what makes it a
+// random source. Its PROPERTIES are checked instead: the right number of
+// bytes, and two draws that differ.
+package main
+
+use "std/crypto"
+use "std/fmt"
+use "std/str"
+use "std/uuid"
+use "std/rand"
+
+// row prints one labelled digest, aligned, so the golden reads as a table.
+func row(label str, digest str) {
+    fmt.printf("%-32s %s\n", label, digest)
+}
+
+func main() {
+    // ---------------------------------------------------------- SHA-256
+    // FIPS 180-4 §D.1/D.2 and the NIST example set.
+    say "-- sha256 (FIPS 180-4) --"
+    row("\"\"", crypto.sha256(""))
+    row("\"abc\"", crypto.sha256("abc"))
+    row("448-bit message", crypto.sha256(
+        "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"))
+
+    // ---------------------------------------------------------- SHA-512
+    say "-- sha512 (FIPS 180-4) --"
+    row("\"\"", crypto.sha512(""))
+    row("\"abc\"", crypto.sha512("abc"))
+    row("896-bit message", crypto.sha512(
+        "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmn" ||
+        "hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"))
+
+    // ------------------------------------------------------------ SHA-1
+    // LEGACY. Present for checksums and interop only — SHAttered (2017)
+    // produced a real collision, so nothing here may carry a signature.
+    say "-- sha1 (FIPS 180-4) — LEGACY, broken for security --"
+    row("\"\"", crypto.sha1(""))
+    row("\"abc\"", crypto.sha1("abc"))
+    row("448-bit message", crypto.sha1(
+        "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"))
+
+    // -------------------------------------------------------------- MD5
+    // LEGACY. The whole of RFC 1321's appendix A.5 suite, in its order.
+    say "-- md5 (RFC 1321 A.5) — LEGACY, broken for security --"
+    row("\"\"", crypto.md5(""))
+    row("\"a\"", crypto.md5("a"))
+    row("\"abc\"", crypto.md5("abc"))
+    row("\"message digest\"", crypto.md5("message digest"))
+    row("a..z", crypto.md5("abcdefghijklmnopqrstuvwxyz"))
+    row("A..Za..z0..9", crypto.md5(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"))
+    row("eighty digits", crypto.md5(
+        "1234567890123456789012345678901234567890" ||
+        "1234567890123456789012345678901234567890"))
+
+    // --------------------------------------------- the long-message vector
+    // FIPS 180-4 and RFC 1321 both publish the digest of one million `a`s,
+    // and it is the only vector here that is many thousands of blocks long:
+    // it is what catches a length counter that is too narrow or that stops
+    // being carried across the block loop.
+    say "-- one million a's (FIPS 180-4, RFC 1321) --"
+    let million = repeat("a", 1000000)
+    row("sha256", crypto.sha256(million))
+    row("sha512", crypto.sha512(million))
+    row("sha1", crypto.sha1(million))
+    row("md5", crypto.md5(million))
+
+    // ------------------------------------------ padding boundary probes
+    // These four are NOT published vectors — they are cross-checks against
+    // an independent implementation — and they are labelled so, because the
+    // value of the table above is that a reader can hold it against the
+    // documents. 112 is the length at which SHA-512's 128-bit length field
+    // no longer fits in the final block and the padding spills into a second
+    // one; 55/56 are the same boundary for the 64-byte block.
+    say "-- padding boundaries (cross-checks, not published vectors) --"
+    row("sha256 of 55 a's", crypto.sha256(repeat("a", 55)))
+    row("sha256 of 56 a's", crypto.sha256(repeat("a", 56)))
+    row("sha512 of 111 a's", crypto.sha512(repeat("a", 111)))
+    row("sha512 of 112 a's", crypto.sha512(repeat("a", 112)))
+
+    // ------------------------------------------- the two input spellings
+    // A message may be a str or a []byte, and the two must never disagree:
+    // a digest that depended on how the caller happened to be holding the
+    // bytes would be useless for interoperating with anything.
+    say "-- a str and a []byte are the same message --"
+    say "str == []byte:",
+        crypto.sha256("abc") == crypto.sha256(bytes("abc"))
+    say "raw digest of a raw digest:",
+        crypto.sha256(crypto.sha256_raw("abc"))
+
+    // ---------------------------------------------- the two output forms
+    // The plain name gives hex; `_raw` gives the digest bytes, over which
+    // the encoders that already exist (str.hex, str.b64) are the whole
+    // encoding layer. Their agreement is what makes that claim true.
+    say "-- hex and raw are the same digest --"
+    say "raw length (sha256/sha512/sha1/md5):",
+        [len(crypto.sha256_raw("")), len(crypto.sha512_raw("")),
+         len(crypto.sha1_raw("")), len(crypto.md5_raw(""))]
+    say "raw.hex() == hex:",
+        crypto.sha256_raw("abc").hex() == crypto.sha256("abc")
+    say "sha256(\"abc\").b64():", crypto.sha256_raw("abc").b64()
+
+    // --------------------------------------------- HMAC-SHA-256 / -SHA-512
+    // RFC 4231's test cases, by their numbers there. Case 6 and case 7 use
+    // a 131-byte key — longer than SHA-256's 64-byte block, so the key is
+    // hashed first (RFC 2104's K' rule), and longer than SHA-512's 128-byte
+    // block too. That branch has no other coverage.
+    let k20 = unhex(repeat("0b", 20))
+    let kaa = unhex(repeat("aa", 20))
+    let mdd = unhex(repeat("dd", 50))
+    let k25 = unhex("0102030405060708090a0b0c0d0e0f101112131415" || "16171819")
+    let mcd = unhex(repeat("cd", 50))
+    let big = unhex(repeat("aa", 131))
+    let long_msg = "This is a test using a larger than block-size key " ||
+                   "and a larger than block-size data. The key needs to " ||
+                   "be hashed before being used by the HMAC algorithm."
+
+    say "-- hmac-sha256 (RFC 4231) --"
+    row("case 1", crypto.hmac_sha256(k20, "Hi There"))
+    row("case 2", crypto.hmac_sha256("Jefe", "what do ya want for nothing?"))
+    row("case 3", crypto.hmac_sha256(kaa, mdd))
+    row("case 4", crypto.hmac_sha256(k25, mcd))
+    row("case 6 (long key)", crypto.hmac_sha256(big,
+        "Test Using Larger Than Block-Size Key - Hash Key First"))
+    row("case 7 (long key, long msg)", crypto.hmac_sha256(big, long_msg))
+
+    say "-- hmac-sha512 (RFC 4231) --"
+    row("case 1", crypto.hmac_sha512(k20, "Hi There"))
+    row("case 2", crypto.hmac_sha512("Jefe", "what do ya want for nothing?"))
+    row("case 3", crypto.hmac_sha512(kaa, mdd))
+    row("case 4", crypto.hmac_sha512(k25, mcd))
+    row("case 6 (long key)", crypto.hmac_sha512(big,
+        "Test Using Larger Than Block-Size Key - Hash Key First"))
+    row("case 7 (long key, long msg)", crypto.hmac_sha512(big, long_msg))
+
+    // ------------------------------------------- HMAC-MD5 and HMAC-SHA-1
+    // RFC 2202 cases 1 and 2. Both are legacy hashes; HMAC over them has no
+    // practical forgery, but a new protocol still wants HMAC-SHA-256.
+    say "-- hmac-md5 and hmac-sha1 (RFC 2202) --"
+    row("md5 case 1", crypto.hmac_md5(unhex(repeat("0b", 16)), "Hi There"))
+    row("md5 case 2",
+        crypto.hmac_md5("Jefe", "what do ya want for nothing?"))
+    row("sha1 case 1", crypto.hmac_sha1(k20, "Hi There"))
+    row("sha1 case 2",
+        crypto.hmac_sha1("Jefe", "what do ya want for nothing?"))
+
+    // The empty key with the empty message: the ipad/opad blocks are then
+    // the only input the inner hash ever sees.
+    say "-- hmac of nothing, keyed with nothing --"
+    row("md5", crypto.hmac_md5("", ""))
+    row("sha1", crypto.hmac_sha1("", ""))
+    row("sha256", crypto.hmac_sha256("", ""))
+    row("sha512", crypto.hmac_sha512("", ""))
+    say "hmac raw == hmac hex:",
+        crypto.hmac_sha256_raw("k", "m").hex() == crypto.hmac_sha256("k", "m")
+
+    // ------------------------------------------------------ crypto.equal
+    say "-- constant-time comparison --"
+    say "same:", crypto.equal(crypto.sha256_raw("abc"),
+                              crypto.sha256_raw("abc"))
+    say "one bit apart:", crypto.equal(crypto.sha256_raw("abc"),
+                                       crypto.sha256_raw("abd"))
+    say "different lengths:", crypto.equal("abc", "abcd")
+    say "a str equals the same []byte:", crypto.equal("abc", bytes("abc"))
+
+    // ---------------------------------------------------- the CSPRNG
+    // No value here can be pinned, so the properties are. Two draws that
+    // collide would be a 1-in-2^256 accident or a broken source, and the
+    // second is the only one that has ever happened.
+    say "-- crypto.random: properties, not values --"
+    say "asked for 32, got:", len(crypto.random(32))
+    say "zero bytes is empty:", len(crypto.random(0))
+    say "two draws differ:", crypto.random(32) != crypto.random(32)
+    say "hex is twice as long:", len(crypto.random(16).hex())
+    var in_range = true
+    for i in 0..200 {
+        let r = crypto.random_int(10)
+        if r < 0 or r >= 10 { in_range = false }
+    }
+    say "200 draws of random_int(10) all in [0,10):", in_range
+    say "random_int(1) is always 0:", crypto.random_int(1)
+    // A bound that came out wrong is an ordinary program error — most likely
+    // `crypto.random_int(len(xs))` over an empty collection — so it must be
+    // something a program can handle rather than an uncatchable abort. Every
+    // other range error in the runtime is catchable; this one is too.
+    match attempt crypto.random_int(0) {
+        Ok(v)  => say "a zero bound was accepted:", v
+        Err(e) => say "a zero bound is catchable:", e.message()
+    }
+
+    // uuid.new draws from the same source. Its shape is fixed by RFC 4122
+    // §4.4 even though its content is not: five hex fields of 8-4-4-4-12,
+    // the version nibble 4, and the variant bits 10x (so the first character
+    // of the fourth field is one of 8, 9, a, b).
+    say "-- uuid.new is version 4 over the CSPRNG --"
+    let u = uuid.new()
+    let parts = str.split(u, "-")
+    say "field widths:", [len(parts[0]), len(parts[1]), len(parts[2]),
+                          len(parts[3]), len(parts[4])]
+    say "version nibble:", str.left(parts[2], 1)
+    say "variant nibble is one of 89ab:",
+        str.contains("89ab", str.left(parts[3], 1))
+    say "two uuids differ:", uuid.new() != uuid.new()
+
+    // std/rand is the OTHER generator, and the contract that makes it worth
+    // keeping is reproducibility: the same seed deals the same sequence.
+    // (Its DEFAULT seed now comes from the CSPRNG rather than the clock,
+    // which cannot be observed from inside one process — two processes
+    // started in the same second used to agree, and no longer do.)
+    say "-- std/rand: seeded, reproducible, and not for secrets --"
+    rand.seed(42)
+    let first = [rand.int(1000), rand.int(1000), rand.int(1000)]
+    rand.seed(42)
+    let again = [rand.int(1000), rand.int(1000), rand.int(1000)]
+    say "the same seed deals the same hand:", first == again
+}

@@ -1,0 +1,36 @@
+// The same four channels as globalname.voi, spelled with the QUALIFIER that
+// variant and trait names now admit (§11.2.1). The qualifier appears in a
+// PVARIANT, an IMPLDEC and a GENERIC bound — three node kinds whose Sval used
+// to be a bare name and can now be dotted — and unused-import has to read the
+// qualifier out of each of them. It did not at first: the whole dotted string
+// was matched against the package's names, nothing matched, and the warning
+// told the reader to delete an import the program cannot compile without.
+//
+//   spare — genuinely unused, and still reported, so this fixture cannot pass
+//           by the warning having been switched off altogether
+use "shapes"
+use "tags"
+use "spare"
+use "std/fmt"
+
+struct Box {
+    w int
+}
+
+impl shapes.Describe for Box {
+    func describe(self) str { return "box {self.w}" }
+}
+
+func show[T: shapes.Describe](x T) str { return x.describe() }
+
+func count(items []shapes.Describe) int { return len(items) }
+
+func main() {
+    var t = tags.Red
+    var s = "?"
+    match t {
+        tags.Red  => s = "red"
+        tags.Blue => s = "blue"
+    }
+    fmt.printf("%s %s %d\n", show(Box{w: 2}), s, count([]))
+}

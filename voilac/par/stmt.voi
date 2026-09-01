@@ -347,8 +347,18 @@ impl Parser {
             return self.add(ast.PLIT, t, 0, 0, "", [self.unary()])
         }
         if k == tok.IDENT {
-            let name = self.next().Lit
+            var name = self.next().Lit
             if name == "_" { return self.add(ast.PWILD, t, 0, 0, "", []) }
+            // A DOTTED name is a package-qualified variant — `geom.Circle`.
+            // Variant names are qualified like every other declaration, so a
+            // pattern must be able to spell the qualifier; a name that got
+            // here with a dot in it can only be a variant, never a binding.
+            var dotted = false
+            while self.at(tok.DOT) {
+                self.next()
+                name = name || "." || self.expect(tok.IDENT).Lit
+                dotted = true
+            }
             if self.at(tok.LPAREN) {
                 self.next()
                 var subs = []
@@ -359,8 +369,10 @@ impl Parser {
                 self.expect(tok.RPAREN)
                 return self.add(ast.PVARIANT, t, 0, 0, name, subs)
             }
-            // A capitalised bare name is a payload-less variant; lowercase binds.
-            if is_upper_first(name) {
+            // A capitalised bare name is a payload-less variant; lowercase
+            // binds. A dotted name is a variant whatever its case: a binding
+            // has no qualifier to spell.
+            if dotted or is_upper_first(name) {
                 return self.add(ast.PVARIANT, t, 0, 0, name, [])
             }
             return self.add(ast.PBIND, t, 0, 0, name, [])
