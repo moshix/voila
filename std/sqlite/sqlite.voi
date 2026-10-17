@@ -1,0 +1,475 @@
+// std/sqlite — an embedded SQL database (§13.4), on the vendored SQLite
+// amalgamation (runtime/src/vendor/sqlite), compiled into the program only
+// when it uses this package. The binary still links libc alone.
+//
+//     use "std/sqlite"
+//
+//     let db = try sqlite.open("app.db")          // or ":memory:"
+//     defer db.close()
+//     try db.exec("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY " ||
+//                 "KEY, name TEXT NOT NULL, age INTEGER)")
+//     try db.run("INSERT INTO users (name, age) VALUES (?, ?)", "ada", 36)
+//     each row in try db.query("SELECT id, name FROM users WHERE age > ?", 30) {
+//         say row.int("id"), row.str("name")
+//     }
+//
+// ---------------------------------------------------------------- values
+//
+// A parameter (`?`, `?NNN`, `:name` — bound by position) is an int, a
+// float, a bool (1 or 0), a str (TEXT), a []byte (BLOB), a dec (its exact
+// TEXT) or nil (NULL): anything that implements `sqlite.Arg`. The count
+// must match the statement's, or the call is an error before it runs.
+//
+// A column comes back as a `Value` — Null, Int, Float, Text or Blob — and a
+// Row offers both that and SQLite's own lenient accessors: row.int(col),
+// row.float(col), row.str(col), row.bytes(col) convert as SQLite does (NULL
+// is 0, 0.0, "" or []), and an unknown column name throws KeyError.
+//
+//     match row.get("age") {
+//         Value.Null    => say "no age"
+//         Value.Int(n)  => say n
+//         _             => say "something else"
+//     }
+//
+// TYPED ROWS. sqlite.decode[T](row) builds a T from a row, column names as
+// field names, by json.decode's rules (a field with a default may be
+// missing; an unknown column, or a value of the wrong kind, is an error):
+//
+//     struct User { id int, name str, age int = 0 }
+//     each row in try db.query("SELECT id, name, age FROM users") {
+//         let u = try sqlite.decode[User](row)
+//     }
+//
+// ---------------------------------------------------------------- errors
+//
+// Every failure — a syntax error, a constraint violated, a locked file —
+// is an IOError value whose message is SQLite's own, prefixed `sqlite:`:
+// it composes with match, try, else and must like every other I/O here.
+//
+// ----------------------------------------------------------- transactions
+//
+//     try db.transaction(fn() unit! {
+//         try db.run("UPDATE acct SET bal = bal - ? WHERE id = ?", 10, 1)
+//         try db.run("UPDATE acct SET bal = bal + ? WHERE id = ?", 10, 2)
+//         return ()
+//     })
+//
+// commits when the function returns Ok and rolls back when it returns an
+// error OR throws (the exception then continues on its way). begin, commit
+// and rollback are there for the hand-written form.
+//
+// ---------------------------------------------------------------- tasks
+//
+// Tasks are OS threads, and SQLite is built SERIALIZED: every call on a
+// connection holds that connection's lock, so a DB and its statements may
+// be used from any task without corrupting anything.
+//
+// A TRANSACTION takes the connection: from begin (or the start of
+// transaction()) until commit or rollback, every other task's call on that
+// connection WAITS. SQLite has one transaction per connection, so without
+// this another task's statement would run inside it — and be rolled back
+// with it. The waiting is real: a task holding a transaction must not wait
+// on a task that is waiting for the connection (a channel between them,
+// say), or neither moves. And the gate isolates CALLS, not iterations: an
+// open Stmt that one task is stepping through with next() is not isolated
+// from another task's transaction on the same connection — its later steps
+// can see that task's writes, uncommitted ones included. For isolation,
+// use a separate connection.
+// That includes the tasks it SPAWNS: a
+// transaction is one task's, so a task started inside one cannot use the
+// connection until it ends — spawned in a `group` the transaction waits
+// for, it fails at once with a "deadlock" error rather than hang (and,
+// spawned outside one, it runs after the commit, outside the transaction).
+// Pass the work back to the transaction's task, or give the other task a
+// connection of its own. A task that ends holding a transaction it began
+// by hand (returned, threw or faulted before commit) has it rolled back,
+// and the connection given back, when its thread exits. What stays the
+// program's to avoid is a conversation: two tasks stepping one Stmt
+// interleave its rows.
+//
+// For concurrent writers, give each task its own `sqlite.open` of the
+// file — connections wait up to 5 s (set_busy_timeout) for each other's
+// locks, and SQLite's file locking keeps them consistent.
+package sqlite
+
+use "std/json"
+use "std/str"
+
+// The handle types: opaque, as net.Sock is. The C side owns what is behind
+// them and releases it when the last reference goes.
+struct DbH {}
+struct StH {}
+
+// Arg is what a parameter may be: the marker the bound values implement.
+trait Arg {}
+impl Arg for int {}
+impl Arg for float {}
+impl Arg for bool {}
+impl Arg for str {}
+impl Arg for dec {}
+impl Arg for []byte {}
+
+// Value is one column of one row, in SQLite's five storage classes.
+enum Value {
+    Null
+    Int(int)
+    Float(float)
+    Text(str)
+    Blob([]byte)
+}
+
+// SQLite's column type codes (sqlite3_column_type).
+const T_INT   = 1
+const T_FLOAT = 2
+const T_TEXT  = 3
+const T_BLOB  = 4
+const T_NULL  = 5
+
+// Open flags, as the C side reads them.
+const OPEN_READONLY = 1
+const OPEN_CREATE   = 2
+
+// DB is an open connection.
+struct DB {
+    h DbH
+}
+
+// open opens (creating it if missing) the database file at `path`;
+// ":memory:" is a private in-memory database.
+func open(path str) DB throws IOError {
+    return DB{h: try sqlite._open(path, OPEN_CREATE)}
+}
+
+// open_readonly opens an existing database for reading only.
+func open_readonly(path str) DB throws IOError {
+    return DB{h: try sqlite._open(path, OPEN_READONLY)}
+}
+
+// version is the vendored SQLite's version, "3.54.0".
+func version() str {
+    return sqlite._version()
+}
+
+impl DB {
+    // close closes the connection. Idempotent; a statement still open on
+    // it fails from then on.
+    func close(self) {
+        sqlite._close(self.h)
+    }
+
+    // exec runs SQL that returns no rows and takes no parameters — one
+    // statement or a whole script of them, separated by `;`.
+    func exec(self, sql str) throws IOError {
+        try sqlite._exec(self.h, sql)
+    }
+
+    // run runs ONE statement with parameters and returns the number of rows
+    // it changed (INSERT, UPDATE, DELETE; 0 for the rest).
+    func run(self, sql str, args ...?Arg) int throws IOError {
+        let st = try self.prepare(sql)
+        defer st.close()
+        return try st.run(args...)
+    }
+
+    // query runs ONE statement and returns every row it produces.
+    func query(self, sql str, args ...?Arg) []Row throws IOError {
+        let st = try self.prepare(sql)
+        defer st.close()
+        return try st.query(args...)
+    }
+
+    // query_one is the first row of a query, or nil when there is none.
+    func query_one(self, sql str, args ...?Arg) ?Row throws IOError {
+        let st = try self.prepare(sql)
+        defer st.close()
+        try st.bind(args...)
+        return try st.next()
+    }
+
+    // prepare compiles ONE statement for repeated use: bind, step, reset,
+    // and close when done. More than one statement is an error.
+    func prepare(self, sql str) Stmt throws IOError {
+        let h = try sqlite._prepare(self.h, sql)
+        return Stmt{h: h, cols: sqlite._columns(h), db: self.h}
+    }
+
+    // begin, commit and rollback are the transaction verbs. `begin` is
+    // BEGIN IMMEDIATE: it takes the write lock at once, so a transaction
+    // that will write fails (or waits) at its start, not halfway through.
+    // It also takes the CONNECTION for this task until commit or rollback:
+    // every other task's call on it waits (see "tasks" above). Always end
+    // what you begin — transaction() does it for you.
+    func begin(self) throws IOError {
+        try sqlite._begin(self.h)
+    }
+
+    func commit(self) throws IOError {
+        try sqlite._exec(self.h, "COMMIT")
+    }
+
+    func rollback(self) throws IOError {
+        try sqlite._exec(self.h, "ROLLBACK")
+    }
+
+    // transaction runs `body` inside BEGIN … COMMIT, rolling back when it
+    // returns an error — which transaction then returns — or throws, when
+    // the exception is rethrown after the rollback. Transactions do not
+    // nest: a transaction inside another fails at its BEGIN.
+    func transaction(self, body fn() unit!) unit! {
+        try self.begin()
+        // However this function is left — an error, a throw, or a FAULT
+        // that a recovery point contains (http._contain, around an http
+        // handler), which no `catch` ever sees — a transaction still open is
+        // rolled back, and with it the connection is given back to the
+        // other tasks. A defer is the one construct every way out runs.
+        defer self.settle()
+        match body() {
+            Ok(u) => u
+            Err(e) => return e
+        }
+        // A COMMIT can fail too (another connection holds a lock past the
+        // busy timeout), and it leaves the transaction OPEN: the deferred
+        // settle rolls it back, or the next statement would run inside it.
+        try self.commit()
+        return ()
+    }
+
+    // settle rolls back a transaction that is still open, ignoring a
+    // failure of the rollback itself (there is nothing left to do with
+    // one). transaction() defers it.
+    func settle(self) {
+        if self.in_transaction() {
+            match self.rollback() {
+                Ok(u) => u
+                Err(e) => e
+            }
+        }
+    }
+
+    // in_transaction reports whether THIS task holds the connection's
+    // transaction. It never waits for another task's to end.
+    func in_transaction(self) bool {
+        return sqlite._in_tx(self.h)
+    }
+
+    // changes is the number of rows the last statement changed.
+    func changes(self) int {
+        return sqlite._changes(self.h)
+    }
+
+    // last_insert_id is the rowid of the last row inserted on this
+    // connection.
+    func last_insert_id(self) int {
+        return sqlite._last_id(self.h)
+    }
+
+    // set_busy_timeout is how long, in milliseconds, a call waits for
+    // another connection's lock before failing with "database is locked"
+    // (5000 from open; 0 fails at once).
+    func set_busy_timeout(self, ms int) {
+        sqlite._busy_timeout(self.h, ms)
+    }
+}
+
+// Stmt is a prepared statement. `cols` are its result columns' names; `db`
+// is its connection's handle (the C statement keeps that alive too).
+struct Stmt {
+    h    StH
+    cols []str
+    db   DbH
+}
+
+impl Stmt {
+    // bind rewinds the statement and binds its parameters, as many as it
+    // has.
+    func bind(self, args ...?Arg) throws IOError {
+        try sqlite._bind(self.h, args)
+    }
+
+    // next steps to the next row: the row, or nil when there are no more.
+    func next(self) ?Row throws IOError {
+        if not (try sqlite._step(self.h)) { return nil }
+        return self.row()
+    }
+
+    // run binds, runs the statement to its end, and returns the number of
+    // rows it changed.
+    func run(self, args ...?Arg) int throws IOError {
+        try sqlite._bind(self.h, args)
+        while try sqlite._step(self.h) {}
+        return sqlite._changes(self.db)
+    }
+
+    // query binds and collects every row.
+    func query(self, args ...?Arg) []Row throws IOError {
+        try sqlite._bind(self.h, args)
+        var out = []
+        while try sqlite._step(self.h) {
+            out.append(self.row())
+        }
+        return out
+    }
+
+    // reset rewinds the statement, keeping its bindings.
+    func reset(self) {
+        sqlite._reset(self.h)
+    }
+
+    // close releases the statement. Idempotent.
+    func close(self) {
+        sqlite._finalize(self.h)
+    }
+
+    // row reads the current row's columns.
+    func row(self) Row {
+        var vals = []
+        each i, c in self.cols {
+            vals.append(column(self.h, i))
+        }
+        return Row{cols: self.cols, vals: vals}
+    }
+}
+
+// column converts column i of the current row to a Value.
+func column(h StH, i int) Value {
+    let t = sqlite._col_type(h, i)
+    if t == T_INT { return Value.Int(sqlite._col_int(h, i)) }
+    if t == T_FLOAT { return Value.Float(sqlite._col_float(h, i)) }
+    if t == T_TEXT { return Value.Text(sqlite._col_text(h, i)) }
+    if t == T_BLOB { return Value.Blob(sqlite._col_blob(h, i)) }
+    return Value.Null
+}
+
+// Row is one result row: the column names and their values, in order.
+struct Row {
+    cols []str
+    vals []Value
+}
+
+impl Row {
+    // len is the number of columns.
+    func len(self) int {
+        return len(self.vals)
+    }
+
+    // at is the value of column i.
+    func at(self, i int) Value {
+        return self.vals[i]
+    }
+
+    // index is the position of the column called `col`, or -1. The first
+    // one wins when a join repeats a name.
+    func index(self, col str) int {
+        each i, c in self.cols {
+            if c == col { return i }
+        }
+        return 0 - 1
+    }
+
+    // get is the value of the column called `col`; an unknown name throws
+    // KeyError.
+    func get(self, col str) Value {
+        let i = self.index(col)
+        if i < 0 { throw KeyError{key: col} }
+        return self.vals[i]
+    }
+
+    // is_null reports whether the column is NULL.
+    func is_null(self, col str) bool {
+        match self.get(col) {
+            Value.Null => return true
+            _ => return false
+        }
+        return false
+    }
+
+    // int, float, str and bytes read a column the way SQLite converts one:
+    // NULL is the zero value, a number of the other kind converts, and text
+    // that is a number reads as it.
+    func int(self, col str) int {
+        match self.get(col) {
+            Value.Int(n) => return n
+            Value.Float(f) => return int(f)
+            Value.Text(s) => {
+                match to_int(str.trim(s)) {
+                    Ok(n) => return n
+                    Err(e) => return 0
+                }
+            }
+            _ => return 0
+        }
+        return 0
+    }
+
+    func float(self, col str) float {
+        match self.get(col) {
+            Value.Int(n) => return float(n)
+            Value.Float(f) => return f
+            Value.Text(s) => {
+                match to_float(str.trim(s)) {
+                    Ok(f) => return f
+                    Err(e) => return 0.0
+                }
+            }
+            _ => return 0.0
+        }
+        return 0.0
+    }
+
+    func str(self, col str) str {
+        match self.get(col) {
+            Value.Int(n) => return str(n)
+            Value.Float(f) => return str(f)
+            Value.Text(s) => return s
+            Value.Blob(b) => {
+                match from_bytes(b) {
+                    Ok(s) => return s
+                    Err(e) => return ""
+                }
+            }
+            _ => return ""
+        }
+        return ""
+    }
+
+    func bytes(self, col str) []byte {
+        match self.get(col) {
+            Value.Blob(b) => return b
+            Value.Text(s) => return bytes(s)
+            Value.Null => return []
+            _ => return bytes(self.str(col))
+        }
+        return []
+    }
+
+    // map is the row as column name → Value.
+    func map(self) map[str]Value {
+        var m = make(map[str]Value)
+        each i, c in self.cols {
+            if not (c in m) { m[c] = self.vals[i] }
+        }
+        return m
+    }
+
+    // json renders the row as a JSON object, column names as keys: NULL is
+    // null, a number a number, TEXT a string and a BLOB an array of its
+    // bytes. sqlite.decode[T] decodes this text into T.
+    func json(self) str {
+        var b = str.Builder{}
+        b.write("\{")
+        each i, c in self.cols {
+            if i > 0 { b.write(",") }
+            b.write(json.encode(c))
+            b.write(":")
+            match self.vals[i] {
+                Value.Null => b.write("null")
+                Value.Int(n) => b.write(str(n))
+                Value.Float(f) => b.write(json.encode(f))
+                Value.Text(s) => b.write(json.encode(s))
+                Value.Blob(x) => b.write(json.encode(x))
+            }
+        }
+        b.write("\}")
+        return b.done()
+    }
+}

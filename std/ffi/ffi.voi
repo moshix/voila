@@ -1,0 +1,245 @@
+// std/ffi — calling C, and raw C memory (§12).
+//
+// EVERYTHING THIS PACKAGE TOUCHES IS OUTSIDE THE SAFETY GUARANTEES. A wrong
+// prototype, a pointer used after its block was freed, a C function writing
+// past a buffer: none of these is caught, and any of them can corrupt the
+// program. That is why it is marked — every `use "std/ffi"` draws the
+// `ffi` warning, which `-Wall` prints and `voila check --strict` turns into
+// an error — and why it is the only package that can.
+//
+// ------------------------------------------------------------ calling C
+//
+//     use "std/ffi"
+//
+//     ffi "C" {
+//         link "z"                                     // cc ... -lz
+//         func strlen(s *char) usize
+//         func getpid() int
+//         func zlibVersion() *char
+//         func compress(dst *u8, dstlen *u64, src *char, n u64) int
+//         func snprintf(buf *char, n usize, fmt *char, args ...) int
+//     }
+//
+// Each `func` is a C prototype, and calling it calls C. The C types map to
+// the Voilà types a caller passes:
+//
+//     int long usize i32 u8 …      an integer (a narrow one is range-checked)
+//     float double                 float          bool        bool
+//     *char                        a str in; a ?str out (NULL is nil)
+//     *void, *u8, *T, **T …        ffi.Ptr        (no result) void
+//     `...`                        C varargs, at most six, by run-time kind
+//
+// A `*char` argument lends the str's bytes, read-only, for the duration of
+// the call; C must neither keep the pointer nor write through it. A `*char` result is COPIED into a str at once,
+// so C keeps ownership of what it returned. To hand C a buffer it may write,
+// allocate one here.
+//
+// ------------------------------------------------------------ raw memory
+//
+//     let buf = ffi.alloc(64)              // 64 zeroed bytes
+//     defer ffi.free(buf)
+//     buf.write_u32(0, 0xCAFE)
+//     say buf.read_u32(0), buf.read_str(4, 3)
+//
+// A Ptr is an address and, when this package allocated it, the size of the
+// block behind it: reads and writes are checked against that size, so an
+// offset past the end throws RangeError before C memory is touched. A Ptr
+// that came from C has no known size (-1) and is not checked. ffi.free
+// accepts only a live block ffi.alloc returned — freeing twice, or freeing
+// memory C allocated, aborts rather than corrupting the allocator.
+//
+// C structs are memory at offsets: `sizeof` gives each C type's size, and
+// the reader/writer pair for each field's type does the rest. There is no
+// struct layout syntax in this release.
+package ffi
+
+// Ptr is a C address. `addr` 0 is NULL; `size` is the number of bytes known
+// to be valid from addr on, or -1 when nobody said (a pointer C returned).
+struct Ptr {
+    addr int
+    size int
+}
+
+// null is the NULL pointer.
+func null() Ptr { return Ptr{addr: 0, size: 0 - 1} }
+
+// at is a Ptr to an address C reported some other way (an integer field of
+// a struct, say), with no known size.
+func at(addr int) Ptr { return Ptr{addr: addr, size: 0 - 1} }
+
+// alloc is n bytes of zeroed C memory, which stays allocated until
+// ffi.free. n < 0 throws RangeError.
+func alloc(n int) Ptr {
+    return Ptr{addr: ffi._alloc(n), size: n}
+}
+
+// free releases a block alloc (or cstr, or from_bytes) returned. Freeing
+// null is a no-op.
+func free(p Ptr) {
+    ffi._free(p.addr)
+}
+
+// cstr is a NUL-terminated copy of s in C memory — for a C function that
+// keeps the pointer, which a `*char` argument does not allow. Free it.
+func cstr(s str) Ptr {
+    let p = alloc(len(s) + 1)
+    ffi._write_str(p.addr, s)
+    return p
+}
+
+// from_bytes is a copy of b in C memory, exactly len(b) bytes. Free it.
+func from_bytes(b []byte) Ptr {
+    let p = alloc(len(b))
+    if len(b) > 0 { ffi._write_str(p.addr, b) }
+    return p
+}
+
+// sizeof is the size in bytes of a C scalar type, by the names an ffi block
+// accepts: "int" is 4, "long" and every pointer 8, "char" 1, "double" 8.
+// An unknown name throws ValueError.
+func sizeof(ctype str) int {
+    if ctype == "char" or ctype == "i8" or ctype == "u8" or ctype == "uchar" or
+       ctype == "byte" or ctype == "bool" or ctype == "int8_t" or
+       ctype == "uint8_t" {
+        return 1
+    }
+    if ctype == "short" or ctype == "ushort" or ctype == "i16" or
+       ctype == "u16" or ctype == "int16_t" or ctype == "uint16_t" {
+        return 2
+    }
+    if ctype == "int" or ctype == "uint" or ctype == "i32" or ctype == "u32" or
+       ctype == "unsigned" or ctype == "float" or ctype == "f32" or
+       ctype == "int32_t" or ctype == "uint32_t" {
+        return 4
+    }
+    if ctype == "long" or ctype == "ulong" or ctype == "i64" or
+       ctype == "u64" or ctype == "usize" or ctype == "isize" or
+       ctype == "size_t" or ctype == "ssize_t" or ctype == "double" or
+       ctype == "f64" or ctype == "int64_t" or ctype == "uint64_t" or
+       ctype == "longlong" or ctype == "ulonglong" or ctype == "off_t" or
+       ctype == "intptr_t" or ctype == "uintptr_t" or ctype == "ptrdiff_t" or
+       ctype.starts_with("*") {
+        return 8
+    }
+    throw ValueError{msg: "ffi.sizeof: `{ctype}` is not a C type this " ||
+                          "package knows"}
+}
+
+// The element codes of runtime/src/ffi.c's _read and _write.
+const C_I8  = 1
+const C_U8  = 2
+const C_I16 = 3
+const C_U16 = 4
+const C_I32 = 5
+const C_U32 = 6
+const C_I64 = 7
+const C_U64 = 8
+const C_F32 = 9
+const C_F64 = 10
+const C_PTR = 11
+
+impl Ptr {
+    // is_null reports whether this is the NULL pointer.
+    func is_null(self) bool { return self.addr == 0 }
+
+    // offset is the pointer n bytes further on; a known size shrinks by n.
+    // Moving outside a block of known size throws RangeError.
+    func offset(self, n int) Ptr {
+        if self.size >= 0 {
+            if n < 0 or n > self.size {
+                throw RangeError{msg: "ffi: offset {n} is outside a block " ||
+                                      "of {self.size} bytes"}
+            }
+            return Ptr{addr: self.addr + n, size: self.size - n}
+        }
+        return Ptr{addr: self.addr + n, size: 0 - 1}
+    }
+
+    // check is the gate every reader and writer passes: a NULL pointer, a
+    // negative offset, and — when the size is known — an access that would
+    // run past the end are refused before C memory is touched.
+    func check(self, off int, width int) {
+        if self.addr == 0 {
+            throw RuntimeError{msg: "ffi: NULL pointer dereference"}
+        }
+        if off < 0 {
+            throw RangeError{msg: "ffi: negative offset {off}"}
+        }
+        if self.size >= 0 and off + width > self.size {
+            throw RangeError{msg: "ffi: {width} bytes at offset {off} run " ||
+                                  "past a block of {self.size} bytes"}
+        }
+    }
+
+    func read_i8(self, off int) int  { self.check(off, 1); return ffi._read(self.addr + off, C_I8) }
+    func read_u8(self, off int) int  { self.check(off, 1); return ffi._read(self.addr + off, C_U8) }
+    func read_i16(self, off int) int { self.check(off, 2); return ffi._read(self.addr + off, C_I16) }
+    func read_u16(self, off int) int { self.check(off, 2); return ffi._read(self.addr + off, C_U16) }
+    func read_i32(self, off int) int { self.check(off, 4); return ffi._read(self.addr + off, C_I32) }
+    func read_u32(self, off int) int { self.check(off, 4); return ffi._read(self.addr + off, C_U32) }
+    func read_i64(self, off int) int { self.check(off, 8); return ffi._read(self.addr + off, C_I64) }
+    // read_u64 throws RangeError for a value above the largest int.
+    func read_u64(self, off int) int { self.check(off, 8); return ffi._read(self.addr + off, C_U64) }
+    func read_f32(self, off int) float { self.check(off, 4); return ffi._read(self.addr + off, C_F32) }
+    func read_f64(self, off int) float { self.check(off, 8); return ffi._read(self.addr + off, C_F64) }
+
+    // read_ptr reads a pointer stored at off (a `char **` element, a struct
+    // field); the Ptr it returns has no known size.
+    func read_ptr(self, off int) Ptr {
+        self.check(off, 8)
+        return Ptr{addr: ffi._read(self.addr + off, C_PTR), size: 0 - 1}
+    }
+
+    func write_i8(self, off int, v i8)   { self.check(off, 1); ffi._write(self.addr + off, C_I8, v) }
+    func write_u8(self, off int, v u8)   { self.check(off, 1); ffi._write(self.addr + off, C_U8, v) }
+    func write_i16(self, off int, v i16) { self.check(off, 2); ffi._write(self.addr + off, C_I16, v) }
+    func write_u16(self, off int, v u16) { self.check(off, 2); ffi._write(self.addr + off, C_U16, v) }
+    func write_i32(self, off int, v i32) { self.check(off, 4); ffi._write(self.addr + off, C_I32, v) }
+    func write_u32(self, off int, v u32) { self.check(off, 4); ffi._write(self.addr + off, C_U32, v) }
+    func write_i64(self, off int, v int) { self.check(off, 8); ffi._write(self.addr + off, C_I64, v) }
+    func write_u64(self, off int, v u64) { self.check(off, 8); ffi._write(self.addr + off, C_U64, v) }
+    func write_f32(self, off int, v float) { self.check(off, 4); ffi._write(self.addr + off, C_F32, v) }
+    func write_f64(self, off int, v float) { self.check(off, 8); ffi._write(self.addr + off, C_F64, v) }
+
+    // write_ptr stores p's address at off.
+    func write_ptr(self, off int, p Ptr) {
+        self.check(off, 8)
+        ffi._write(self.addr + off, C_PTR, p.addr)
+    }
+
+    // read_cstr reads a NUL-terminated string starting at off. In a block of
+    // known size the search stops at its end, so a missing NUL cannot run
+    // into whatever follows.
+    func read_cstr(self, off int) str {
+        self.check(off, 0)
+        if self.size >= 0 {
+            return ffi._read_str(self.addr + off, 0 - 1, self.size - off)
+        }
+        return ffi._read_str(self.addr + off, 0 - 1, 0 - 1)
+    }
+
+    // read_str is the n bytes at off, as a str (NULs and all).
+    func read_str(self, off int, n int) str {
+        if n < 0 { throw RangeError{msg: "ffi: read_str of {n} bytes"} }
+        self.check(off, n)
+        return ffi._read_str(self.addr + off, n)
+    }
+
+    // read_bytes is the n bytes at off, as a []byte.
+    func read_bytes(self, off int, n int) []byte {
+        return bytes(self.read_str(off, n))
+    }
+
+    // write_str copies s's bytes to off — no NUL is added; write_u8 one
+    // after it if C wants a terminated string.
+    func write_str(self, off int, s str) {
+        self.check(off, len(s))
+        ffi._write_str(self.addr + off, s)
+    }
+
+    // write_bytes copies b to off.
+    func write_bytes(self, off int, b []byte) {
+        self.check(off, len(b))
+        if len(b) > 0 { ffi._write_str(self.addr + off, b) }
+    }
+}

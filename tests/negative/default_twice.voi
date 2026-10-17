@@ -1,0 +1,20 @@
+// Two traits that both DEFAULT a method of one name, both implemented by a
+// type that writes the method itself in neither: the method table holds one
+// row per (type, method), so one default would silently answer for both —
+// a bound on the second trait reaching the first trait's body. Refused,
+// like a method written twice (§3.6). A type that writes the method, and
+// one trait implemented at two arguments, stay legal.
+trait A { func f(self) str = "A-default" }
+trait B { func f(self) str = "B-default" }
+trait M[T] { func tag(self) str = "m" }
+struct X {}
+struct Y {}
+struct Z {}
+impl A for X {}
+impl B for X {}
+impl A for Y {}
+impl B for Y { func f(self) str { return "Y" } }
+impl M[int] for Z {}
+impl M[str] for Z {}
+func gb[T: B](x T) str { return x.f() }
+func main() { say gb(X{}), gb(Y{}), Z{}.tag() }

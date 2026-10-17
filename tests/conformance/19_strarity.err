@@ -1,1 +1,2 @@
 abort: str.trim_left takes at most 1 argument, but 2 are given
+  at main (tests/conformance/19_strarity.voi:31)

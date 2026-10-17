@@ -1,0 +1,8 @@
+// The number of explicit type arguments must match the declaration.
+struct Lru[K, V] { cap int }
+func mk[K, V](k K, v V) int { return 1 }
+func main() {
+    say mk[str, int, bool]("a", 1)
+    let l = Lru[str]{cap: 1}
+    say l.cap
+}

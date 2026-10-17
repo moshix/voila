@@ -1,0 +1,10 @@
+exhaustive_expr.voi:8:12: match on `Shape` is not exhaustive; missing cases: Rect
+exhaustive_expr.voi:12:12: match is not exhaustive
+exhaustive_expr.voi:16:12: match is not exhaustive
+exhaustive_expr.voi:20:13: match is not exhaustive
+exhaustive_expr.voi:25:12: match is not exhaustive
+!exhaustive_expr.voi:30:
+!exhaustive_expr.voi:31:
+!exhaustive_expr.voi:32:
+!exhaustive_expr.voi:37:
+!exhaustive_expr.voi:38:

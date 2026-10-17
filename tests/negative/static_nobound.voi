@@ -1,0 +1,5 @@
+// `T.m()` names a static method through a type parameter, and some bound of
+// T must declare it — a builtin bound declares nothing.
+trait Default { func default() Self }
+func make_it[T: Show]() T { return T.default() }
+func main() { }

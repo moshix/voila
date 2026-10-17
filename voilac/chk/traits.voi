@@ -103,6 +103,13 @@ impl Checker {
         // is the precedence the backend applies (its `written` set bars an
         // inherited row for a pair the type declared), and the two must not
         // disagree about which body answers a call.
+        //
+        // TWO traits that both DEFAULT one name, both implemented by a type
+        // that writes the method in neither, are refused: the table holds
+        // one row per (type, method), so one default would silently answer
+        // for both traits — a bound on the second dispatching to the first
+        // trait's body. `inherited` remembers which trait gave each row.
+        var inherited = make(map[str]str)
         each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
             let n = self.T.Get(d)
             if n.Kind != ast.IMPLDEC or n.Sval == "" { continue }
@@ -113,8 +120,19 @@ impl Checker {
                 if self.T.Kind(m) != ast.FUNC { continue }
                 // Abstract: nothing to inherit.
                 if self.T.Kid(m, 0) == 0 and self.T.Kid(m, 5) == 0 { continue }
-                let k = tn || "|" || self.T.Get(m).Sval
-                if not (k in mset) { mset[k] = m }
+                let mn = self.T.Get(m).Sval
+                let k = tn || "|" || mn
+                if not (k in mset) {
+                    mset[k] = m
+                    inherited[k] = n.Sval
+                } else if k in inherited and inherited[k] != n.Sval {
+                    let first = inherited[k]
+                    self.report_at(d, "`{tn}` inherits a default `{mn}` " ||
+                        "from both `{first}` and `{n.Sval}`; the method " ||
+                        "table holds one entry per (type, method), so one " ||
+                        "default would silently answer for both traits — " ||
+                        "write `{mn}` for `{tn}` itself (§3.6)")
+                }
             }
         }
 
@@ -126,7 +144,7 @@ impl Checker {
         // ---- every impl block, in declaration order.
         each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
             if self.T.Kind(d) != ast.IMPLDEC { continue }
-            self.check_impl(d, mset)
+            self.check_impl(d, self.mset)
         }
 
         // ---- every generic bound, wherever one can be written.
@@ -152,7 +170,25 @@ impl Checker {
             if self.T.Kind(m) != ast.FUNC { continue }
             let mn = self.T.Get(m)
             let k = tn || "|" || mn.Sval
-            if k in mset {
+            if k in mset and owner != 0 and k in self.implOf and
+               self.T.Get(owner).Sval != "" and
+               self.T.Get(self.implOf[k]).Sval == self.T.Get(owner).Sval and
+               self.T.Get(owner).Sval in self.traits and
+               self.T.NKids(self.T.Kid(self.traits[self.T.Get(owner).Sval],
+                                       1)) > 0 {
+                // Two impls of ONE generic trait at different arguments —
+                // `impl Into[str] for Cel` and `impl Into[int] for Cel` —
+                // that both write the same method. Dispatch is by name, so
+                // the second could never be reached: say that, not merely
+                // "declared twice".
+                let tr = self.T.Get(owner).Sval
+                self.report_at(m, "`{tn}` implements `{tr}` twice and both " ||
+                                  "write `{mn.Sval}`; methods dispatch by " ||
+                                  "(type, name), not by trait argument, so " ||
+                                  "a type may implement a generic trait at " ||
+                                  "several arguments only if they write " ||
+                                  "different methods (§3.6)")
+            } else if k in mset {
                 self.report_at(m, "`{tn}.{mn.Sval}` is declared twice; the " ||
                                   "method table holds one entry per (type, " ||
                                   "method) and silently keeps the first " ||
@@ -198,8 +234,19 @@ impl Checker {
         }
         if tn == "" { return }
 
-        // Conformance, against the union.
+        // A GENERIC trait is implemented at named arguments, as many as it
+        // declares: `impl Into[str] for Cel`, never a bare `impl Into`.
         let tr = self.traits[n.Sval]
+        let want = self.T.NKids(self.T.Kid(tr, 1))
+        var given = 0
+        if self.T.Kid(d, 2) != 0 { given = self.T.NKids(self.T.Kid(d, 2)) }
+        if want != given {
+            self.report_at(d, "`" || n.Sval || "` takes " || str(want) ||
+                plural(want, " type argument", " type arguments") ||
+                ", but this impl gives " || str(given) || " (§3.6)")
+        }
+
+        // Conformance, against the union.
         each m in self.T.Get(self.T.Kid(tr, 0)).Kids {
             if self.T.Kind(m) != ast.FUNC { continue }
             let mn = self.T.Get(m)
@@ -313,6 +360,7 @@ impl Checker {
             } else if n.Kind == ast.EXCDEC {
                 self.check_method_bounds(self.T.Kid(d, 1))
             } else if n.Kind == ast.TRAITDEC {
+                self.check_bounds(self.T.Kid(d, 1))
                 self.check_method_bounds(self.T.Kid(d, 0))
             } else if n.Kind == ast.TYPEDEC {
                 let sd = self.T.Kid(d, 0)
@@ -328,21 +376,38 @@ impl Checker {
         }
     }
 
-    // check_bounds judges one generic list. GENERIC.Sval is "name|bound" —
-    // load/rewrite.voi's bind_generics binds parts[0] and throws the bound
-    // away, which is why nothing has ever looked at it.
+    // check_bounds judges one generic list. GENERIC.Sval is "name|bound",
+    // several bounds joined by `+`, and each bound is also a TNAMED kid that
+    // carries a generic trait's arguments. Every bound must name a trait,
+    // and one that names a GENERIC trait must give it as many arguments as
+    // it declares — `[T: Into]` is as incomplete as `impl Into for T`.
     func check_bounds(mut self, list int) {
         if list == 0 { return }
         each g in self.T.Get(list).Kids {
             if self.T.Kind(g) != ast.GENERIC { continue }
             let parts = str.split(self.T.Get(g).Sval, "|")
             if len(parts) < 2 { continue }
-            let b = parts[1]
-            if b == "" { continue }
-            if b in self.traits or is_builtin_trait(b) { continue }
-            self.report_at(g, "unknown trait `{b}` bounding `{parts[0]}`: " ||
-                              "the traits in scope are " ||
-                              self.trait_list() || " (§3.7)")
+            if parts[1] == "" { continue }
+            let bs = self.T.Get(g).Kids
+            each i, b in str.split(parts[1], "+") {
+                if not (b in self.traits) {
+                    if is_builtin_trait(b) { continue }
+                    self.report_at(g, "unknown trait `{b}` bounding " ||
+                                      "`{parts[0]}`: the traits in scope " ||
+                                      "are " || self.trait_list() ||
+                                      " (§3.7)")
+                    continue
+                }
+                let want = self.T.NKids(self.T.Kid(self.traits[b], 1))
+                var given = 0
+                if i < len(bs) { given = self.T.NKids(bs[i]) }
+                if want != given {
+                    self.report_at(g, "`" || b || "` takes " || str(want) ||
+                        plural(want, " type argument", " type arguments") ||
+                        ", but the bound on `" || parts[0] || "` gives " ||
+                        str(given) || " (§3.7)")
+                }
+            }
         }
     }
 
@@ -357,20 +422,64 @@ impl Checker {
     // the structural one, which the two CALLERS enforce by only ever handing
     // over a named type. None of them is a guess: each is a case where the
     // checker has no basis for an answer, so it gives none.
-    func check_one_bound(mut self, site int, arg str, spec str, owner str) {
-        let parts = str.split(spec, "|")
+    func check_one_bound(mut self, site int, arg str, gen int, owner str) {
+        let parts = str.split(self.T.Get(gen).Sval, "|")
         if len(parts) < 2 { return }
-        let b = parts[1]
-        if b == "" { return }
-        if not (b in self.traits) { return }   // builtin, or already reported
+        if parts[1] == "" { return }
         if self.Ty.IsParam(arg) { return }     // the definition site
         if not self.judgeable(arg) { return }  // nothing to judge it against
-        let miss = self.missing_for(arg, b)
-        if miss == "" { return }
         let p = parts[0]
-        self.report_at(site, "`{arg}` does not implement `{b}`, required " ||
-                             "by the bound `{p}: {b}` on `{owner}`: method " ||
-                             "`{miss}` is missing (§3.7)")
+        let bnodes = self.T.Get(gen).Kids
+        // Several bounds (`T: Show + Into[str]`): each is judged on its own,
+        // and the first unmet one is the one reported.
+        each i, b in str.split(parts[1], "+") {
+            if not (b in self.traits) { continue }  // builtin, or reported
+            let miss = self.missing_for(arg, b)
+            if miss != "" {
+                self.report_at(site, "`{arg}` does not implement `{b}`, " ||
+                                     "required by the bound `{p}: {b}` on " ||
+                                     "`{owner}`: method `{miss}` is " ||
+                                     "missing (§3.7)")
+                return
+            }
+            if i < len(bnodes) {
+                let have = self.wrong_trait_args(arg, b, bnodes[i])
+                if have != "" {
+                    let want = self.Ty.Text(self.Ty.FromAST(self.T, bnodes[i]))
+                    self.report_at(site, "`{arg}` implements {have}, not " ||
+                                         "`{want}`, required by the bound " ||
+                                         "`{p}: {want}` on `{owner}` (§3.7)")
+                    return
+                }
+            }
+        }
+    }
+
+    // wrong_trait_args answers, for a bound naming a GENERIC trait at
+    // arguments (`Into[str]`), whether `arg` explicitly implements that
+    // trait only at OTHER arguments — and then spells the ones it does
+    // (`Into[int]`), else "". Only explicit `impl Trait[…] for arg` blocks
+    // count, and only arguments both sides spell without a type parameter or
+    // an unknown name: a type satisfying the trait structurally, through the
+    // union rule, has no arguments written down to be wrong.
+    func wrong_trait_args(mut self, arg str, b str, bnode int) str {
+        if self.T.NKids(bnode) == 0 { return "" }
+        let want = self.Ty.FromAST(self.T, bnode)
+        if self.Ty.HasError(want) or self.Ty.HasParam(want) { return "" }
+        var seen = []
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            if self.T.Kind(d) != ast.IMPLDEC { continue }
+            if self.T.Get(d).Sval != b or self.impl_target(d) != arg {
+                continue
+            }
+            let tw = self.T.Kid(d, 2)
+            if tw == 0 or self.T.NKids(tw) == 0 { return "" }
+            let got = self.Ty.FromAST(self.T, tw)
+            if self.Ty.HasError(got) or self.Ty.HasParam(got) { return "" }
+            if got == want { return "" }
+            seen.append("`" || self.Ty.Text(got) || "`")
+        }
+        return str.join(seen, " and ")
     }
 
     // judgeable reports whether this program can see the WHOLE method set of
@@ -480,7 +589,7 @@ impl Checker {
             if self.T.Kind(gs[i]) == ast.GENERIC and
                self.T.Kind(args[i]) == ast.TNAMED {
                 self.check_one_bound(args[i], self.T.Get(args[i]).Sval,
-                                     self.T.Get(gs[i]).Sval, name)
+                                     gs[i], name)
             }
             i += 1
         }
@@ -522,9 +631,11 @@ impl Checker {
                     self.insts_in(m)
                 }
             } else if n.Kind == ast.TRAITDEC {
+                self.Ty.PushParams(self.trait_params(d))
                 each m in self.T.Get(self.T.Kid(d, 0)).Kids {
                     self.insts_in(m)
                 }
+                self.Ty.PopParams()
             } else if n.Kind == ast.GLOBAL {
                 self.walk_insts(self.T.Kid(d, 0), set([]))
             }
@@ -571,18 +682,44 @@ impl Checker {
         if not (bn in self.funcs) { return }
         let gl = self.T.Kid(self.funcs[bn], 3)
         if self.T.NKids(gl) == 0 { return }
-        let idx = self.T.Kid(ix, 1)
-        if self.T.Kind(idx) != ast.IDENT { return }
-        let arg = self.T.Get(idx).Sval
-        // The index must NAME A TYPE, or this is a subscript and not an
-        // instantiation at all.
-        if not self.Ty.Resolves(arg) and not self.Ty.IsParam(arg) { return }
-        // `f[int]` writes exactly ONE type argument — index_tail parses a
-        // single expression — so only the first parameter is ever bound.
-        let g = self.T.Kid(gl, 0)
-        if self.T.Kind(g) != ast.GENERIC { return }
-        self.check_one_bound(idx, arg, self.T.Get(g).Sval,
-                             self.T.Get(self.funcs[bn]).Sval)
+        // The COUNT, when this is certainly an instantiation: several
+        // arguments, arguments read as types, or one that names a type.
+        // Generics are erased, so a wrong count would otherwise compile and
+        // simply be ignored.
+        let given = self.T.NKids(ix) - 1
+        var inst = self.T.Get(ix).Ival2 == 2 or given > 1
+        let a1 = self.T.Kid(ix, 1)
+        if not inst and self.T.Kind(a1) == ast.IDENT {
+            let an = self.T.Get(a1).Sval
+            inst = self.Ty.Resolves(an) or self.Ty.IsParam(an)
+        }
+        if inst and given != self.T.NKids(gl) {
+            let want = self.T.NKids(gl)
+            self.report_at(ix, "`" || bn || "` takes " || str(want) ||
+                plural(want, " type argument", " type arguments") ||
+                ", but " || str(given) || plural(given, " is", " are") ||
+                " given")
+            return
+        }
+        // `f[int]` writes one type argument and `mk[str, int]` several:
+        // index_tail gives each its own kid after the base, and the i-th
+        // argument stands for the i-th generic parameter.
+        var i = 1
+        while i < self.T.NKids(ix) and i - 1 < self.T.NKids(gl) {
+            let idx = self.T.Kid(ix, i)
+            i += 1
+            if self.T.Kind(idx) != ast.IDENT { continue }
+            let arg = self.T.Get(idx).Sval
+            // The index must NAME A TYPE, or this is a subscript and not an
+            // instantiation at all.
+            if not self.Ty.Resolves(arg) and not self.Ty.IsParam(arg) {
+                continue
+            }
+            let g = self.T.Kid(gl, i - 2)
+            if self.T.Kind(g) != ast.GENERIC { continue }
+            self.check_one_bound(idx, arg, g,
+                                 self.T.Get(self.funcs[bn]).Sval)
+        }
     }
 
     // trait_list spells the traits a bound may name, built rather than

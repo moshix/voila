@@ -20,8 +20,8 @@ func hold_and_sleep(mu sync.Mutex) {
 }
 
 // count is spawned as a call rather than written as a closure inside the
-// loop, because a closure that captured the loop variable is a documented
-// backend refusal (tests/negative-native/loopcapture.voi).
+// loop. (A closure capturing the loop variable was a backend refusal when
+// this was written; it is legal now — tests/conformance/39_loopclosure.voi.)
 func count(a sync.Atomic, n int) {
     for i in 0..n {
         a.inc()

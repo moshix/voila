@@ -1,0 +1,40 @@
+// A spawned task shares its group's variables (§10): it may store into a
+// slice element or a field of one, but nothing that could race another
+// task's write — assigning the variable itself (a lost update), storing
+// into a map in it (a store may add a key), growing, shrinking or
+// reordering a collection in it, calling a `mut self` method on it, or
+// handing it to a `mut` parameter. Each refusal names `cell`/`shared` or a
+// channel instead.
+struct Counter { n int }
+impl Counter { func bump(mut self) { self.n += 1 } }
+struct Box2 { tags map[str]int, xs []int }
+func fill(xs mut []int) { xs[0] = 1 }
+func main() {
+    var n = 0
+    var out = make([]int, 4)
+    var m = map[str]int{"a": 1}
+    var c = Counter{n: 0}
+    var b = Box2{tags: map[str]int{}, xs: [1]}
+    var s = set([1])
+    group {
+        spawn { n += 1 }
+        spawn { n = 5 }
+        spawn { out = [] }
+        spawn { m["b"] = 2 }
+        spawn { b.tags["x"] = 1 }
+        spawn { out.append(1) }
+        spawn { out.insert(0, 1) }
+        spawn { out.sort() }
+        spawn { m.delete("a") }
+        spawn { s.add(2) }
+        spawn { c.bump() }
+        spawn { fill(out) }
+        spawn { b.xs.pop() }
+        spawn fill(out)
+        spawn { out[0] = 7 }
+        spawn { b.xs[0] = 2 }
+        spawn { var mine = []int{}; mine.append(1); var k = 0; k += 1 }
+        spawn { let snap = out[0]; say snap, m["a"] }
+    }
+    say n, out, m, c.n, b.xs, len(s)
+}

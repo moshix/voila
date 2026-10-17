@@ -1,0 +1,28 @@
+bad JSON at line 1, column 1: number out of range (the exponent is beyond 999999999)
+bad JSON at line 1, column 1: number out of range (the exponent is beyond 999999999)
+number out of range for float
+1e+300 1E+400
+dec: refused
+float: refused
+float of dec: refused
+0 2.5
+{"Red":1,"Green":2} {Red: 1, Green: 2}
+{"true":"yes","false":"no"} {true: "yes", false: "no"}
+{80: "http"}
+{'a': 1}
+Blue: `Blue` is not a variant of Color
+maybe: expected bool, got string
+caught: json.encode: the value nests deeper than 512 levels
+true true
+3
+caught: ffi strlen: argument 1 contains a NUL byte, which a C string cannot hold
+[1, 2, 3]
+[1, 2, 3]
+after stop 0
+os.signal_stop: not a channel os.signals returned
+os.kill: a pid must be positive (a process group is os.kill_group) os.kill: a pid must be positive (a process group is os.kill_group)
+os.kill_group: a process group id must be positive
+true
+true
+walk as expected: true
+ok 1.5

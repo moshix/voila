@@ -20,6 +20,9 @@ exception LowerError {
     Msg  str
     Line int
     Col  int
+    // The file the node came from (ast.Tree.FileOf), "" when unknown: a
+    // refusal inside an imported package must name that package's file.
+    File str
 }
 
 // Scope is one lexical scope. Boundary marks a function frame edge: a lookup
@@ -27,6 +30,9 @@ exception LowerError {
 // by-reference closure capture.
 struct Scope {
     vars     map[str]str   // name → register
+    // name → the binding's static type text, when one is known: an
+    // annotation, or a certain inference (sized.voi). Lookup only.
+    types    map[str]str
     boundary bool
 }
 
@@ -36,6 +42,7 @@ struct LoopCtx {
     contL      str
     finDepth   int   // the fins-stack depth when the loop began
     scopeDepth int
+    body       int   // the loop's body block (for the capture check)
 }
 
 // FinRegion tracks one try statement for exit-edge duplication: a
@@ -94,6 +101,12 @@ struct FnState {
     curFn      str
     inGlobal   bool
     scopeLen   int
+    canFail    bool
+    curResult  str
+    finLoops   []int
+    capNames   set[str]
+    fnBody     int
+    wNames     set[str]
 }
 
 struct Lowerer {
@@ -109,7 +122,22 @@ struct Lowerer {
     structs    set[str]
     enums      set[str]
     exceptions set[str]
-    aliases    set[str]
+    aliases    set[str]          // every `type X …` without a struct
+    // `type X = T` (an ALIAS, §3.8) → T rendered as short_type text, and the
+    // names declared `type X T` — a NEWTYPE, a distinct type whose values
+    // the runtime wraps (VlType.newtype). Both are subsets of `aliases`.
+    aliasTo    map[str]str
+    newtypes   set[str]
+
+    // The declaration tables of the sized-integer inference (sized.voi):
+    // a function's or method's single result type, a struct field's type
+    // ("S|f") and order, and an annotated global's type.
+    funcResult map[str]str
+    fieldTy    map[str]str
+    fieldOrder map[str][]str
+    globalTy   map[str]str
+    // The enclosing function's single declared result type, for `return`.
+    curResult  str
     prelude    set[str]
     packages   set[str]
 
@@ -120,6 +148,39 @@ struct Lowerer {
     pendLabels []str
     scopes     []Scope
     loops      []LoopCtx
+    // One entry per `finally` block being lowered in this function, holding
+    // len(loops) where it began: control may not leave a finally (stmt.voi,
+    // lower_try_catch), so a return, or a break/continue whose loop is
+    // outside it, is refused.
+    finLoops   []int
+    // The names some closure, spawn or defer body inside the function
+    // being lowered refers to (captured_in): its variables shared by
+    // reference, which a write through never copies (boxcow.voi,
+    // byref_root).
+    capNames   set[str]
+    // While an index is lowered: captured variables it reads from the
+    // subscript's own snapshot (expr.voi, lower_index); the latest
+    // snapshot (VARREAD) of each captured name; the indices a locked
+    // write computed before taking the lock (stmt.voi, assign_to).
+    snapOver   map[str]str
+    lastSnap   map[str]str
+    preIdx     map[int]str
+    // `mut` arguments copied in from captured variables, to be copied out
+    // after the call (boxcow.voi, flush_mut_args): the argument nodes and
+    // the registers holding the copies.
+    pendWB     []int
+    pendWBR    []str
+    pendPre    []int    // indices pre_mut_indices computed for the call
+    // The escape analysis of closure literals (expr.voi, closure_escapes):
+    // the body of the function being lowered, and the literals proven to
+    // run only in place — called at once, handed straight to a builtin
+    // collection method, or bound by a `let` used only so.
+    fnBody     int
+    inPlace    set[int]
+    // The names written after they are bound anywhere in the outermost
+    // function being lowered, nested closures included (written_in): a
+    // captured variable NOT among them is read without the frame's lock.
+    wNames     set[str]
     fins       []FinRegion
     switches   []SwitchCtx
     catchRegs  []str
@@ -127,6 +188,56 @@ struct Lowerer {
     curFn      str
     closureSeq map[str]int
     inGlobal   bool
+    // Whether `try e` / `e?` may RETURN the failure from the function being
+    // lowered: it returns `T!` or `?T`, or nothing, or declares `throws`
+    // (whose callers the goldens show receiving the failure), or it is a
+    // closure with no written result or a $INIT/$SCRIPT/spawn/defer body.
+    // In a function that promised a plain `T` and no `throws`, returning
+    // the error would hand the caller an error disguised as a `T`, so there
+    // the failure is RAISED, as `must` would (§8.1).
+    canFail    bool
+    // >0 while the second or later alternative of an or-pattern is built:
+    // its binds reuse the registers the first alternative declared.
+    patReuse   int
+    // The per-iteration environment of the closure lower_closure just
+    // lowered: its operand for MKCLOS (`env(r3,r5)`), or "" when it
+    // captures no loop variable. Read by mkclos_args right after the call.
+    lastEnv    str
+
+    // Static trait methods through a type parameter (traitdesc.voi): every
+    // trait and top-level function by flat name, the type parameters of each
+    // function that receive a hidden type descriptor, and — for the body
+    // being lowered — its type parameters (name → bounds), whether those
+    // carry descriptors, and whether it is a trait default with `self` (1),
+    // one without (2), or neither (0).
+    traitDecl   map[str]int
+    funcDecl    map[str]int
+    descOf      map[str][]str
+    curGens     map[str]str
+    curGensDesc bool
+    traitSelf   int
+    // The `mut` parameters of the function being lowered: a Box reached
+    // through one is written in place (boxcow.voi).
+    mutParams   set[str]
+    // The written result type of the closure literal lower_closure is about
+    // to lower (expr.voi sets it, lower_closure consumes it), or "".
+    pendResult  str
+    // The copy-on-write threshold lower_assign counted for a `mut`
+    // parameter's write before evaluating the value (boxcow.voi), or "".
+    pendThr     str
+    // The same threshold handed on to the ROOT of a deeper write path
+    // (uniq_path), or "".
+    rootThr     str
+    // The temporaries uniq_path read the levels of a write path into, in
+    // order: dead once the write is done, and KILLed then (kill_path), so
+    // that none counts as a second owner at the next write.
+    pathTemps   []str
+    // Every method NAME some impl, trait or exception declares with a `mut
+    // self` receiver. A call `L.m(…)` whose name is in it makes the lvalue L
+    // unique first (boxcow.voi): dispatch is by run-time type, so the name
+    // is all a call site knows, and copying a receiver the method turns out
+    // not to write costs a copy, never correctness.
+    mutMethods  set[str]
 }
 
 func New(t ast.Tree, file int, source str) Lowerer {
@@ -135,10 +246,23 @@ func New(t ast.Tree, file int, source str) Lowerer {
         globals: set([]), funcs: set([]), funcParams: make(map[str][]str),
         variants: make(map[str]VariantInfo),
         structs: set([]), enums: set([]), exceptions: set([]),
-        aliases: set([]), prelude: set([]), packages: set([]),
+        aliases: set([]), aliasTo: make(map[str]str), newtypes: set([]),
+        funcResult: make(map[str]str), fieldTy: make(map[str]str),
+        fieldOrder: make(map[str][]str), globalTy: make(map[str]str),
+        curResult: "",
+        prelude: set([]), packages: set([]),
         fi: 0, nextReg: 0, nextLabel: 0, pendLabels: [], scopes: [],
         loops: [], fins: [], switches: [], catchRegs: [], curLine: 0,
+        finLoops: [],
         curFn: "", closureSeq: make(map[str]int), inGlobal: false,
+        patReuse: 0, canFail: true, lastEnv: "",
+        traitDecl: make(map[str]int), funcDecl: make(map[str]int),
+        descOf: make(map[str][]str), curGens: make(map[str]str),
+        curGensDesc: false, traitSelf: 0, mutParams: set([]),
+        pendResult: "", pendThr: "", rootThr: "", pathTemps: [], mutMethods: set([]),
+        snapOver: make(map[str]str), lastSnap: make(map[str]str),
+        preIdx: make(map[int]str), pendWB: [], pendWBR: [], pendPre: [],
+        fnBody: 0, inPlace: set([]), wNames: set([]),
     }
     return lo
 }
@@ -146,12 +270,20 @@ func New(t ast.Tree, file int, source str) Lowerer {
 impl Lowerer {
     func fail(self, node int, msg str) throws LowerError {
         let n = self.T.Get(node)
-        throw LowerError{Msg: msg, Line: n.Line, Col: n.Col}
+        throw LowerError{Msg: msg, Line: n.Line, Col: n.Col,
+                         File: self.T.FileOf(node)}
     }
 
     // ------------------------------------------------------------ collect
 
     func collect(mut self) {
+        // The builtin methods that write a slice, a map or a set in place
+        // (runtime/src/call.c) make their receiver unique like a `mut self`
+        // method: containers have value semantics too (§6.4).
+        each mn in ["append", "pop", "insert", "sort", "sort_by", "reverse", "set",
+                    "delete", "remove", "add"] {
+            self.mutMethods.add(mn)
+        }
         each n in PreludeNames() { self.prelude.add(n) }
         each n in PackageNames() { self.packages.add(n) }
         // The predeclared exception types are constructible and catchable just
@@ -180,11 +312,17 @@ impl Lowerer {
                 }
             } else if n.Kind == ast.EXCDEC {
                 self.exceptions.add(n.Sval)
+                self.collect_mut_methods(self.T.Kid(d, 1))
             } else if n.Kind == ast.TYPEDEC {
                 if self.T.Kid(d, 0) != 0 {
                     self.structs.add(n.Sval)
                 } else {
                     self.aliases.add(n.Sval)
+                    if n.Ival2 == 1 {
+                        self.aliasTo[n.Sval] = self.short_type(n.Ival)
+                    } else {
+                        self.newtypes.add(n.Sval)
+                    }
                 }
             } else if n.Kind == ast.IMPLDEC {
                 let tn = self.named_type_name(n.Ival)
@@ -193,17 +331,33 @@ impl Lowerer {
                     let mn = self.T.Get(m)
                     self.funcParams[tn || "." || mn.Sval] = self.param_names(m)
                 }
+                self.collect_mut_methods(ms)
+            } else if n.Kind == ast.TRAITDEC {
+                self.collect_mut_methods(self.T.Kid(d, 0))
             } else if n.Kind == ast.GLOBAL {
                 each nm in self.binding_names(self.T.Kid(d, 0)) {
                     self.globals.add(nm)
                 }
             }
         }
+        self.collect_descs()
         // Script-form top-level bindings live in the global scope.
         let script = self.T.Kid(self.file, 2)
         each s in self.T.Get(script).Kids {
             each nm in self.binding_names(s) {
                 self.globals.add(nm)
+            }
+        }
+    }
+
+    // collect_mut_methods adds the `mut self` methods of one method list to
+    // mutMethods. A FUNC's flags are 1 self, 2 mut (ast.FUNC).
+    func collect_mut_methods(mut self, list int) {
+        if list == 0 { return }
+        each m in self.T.Get(list).Kids {
+            if self.T.Kind(m) != ast.FUNC { continue }
+            if (self.T.Get(m).Ival2 & 3) == 3 {
+                self.mutMethods.add(self.T.Get(m).Sval)
             }
         }
     }
@@ -236,6 +390,7 @@ impl Lowerer {
 
     func LowerModule(mut self) throws LowerError {
         self.collect()
+        self.collect_sized()
         self.collect_type_decls()
 
         // $INIT: global initialisers, in declaration order.
@@ -259,22 +414,48 @@ impl Lowerer {
 
         each d in self.T.Get(decls).Kids {
             let n = self.T.Get(d)
-            if n.Kind == ast.FUNC {
+            if n.Kind == ast.FFIDEC {
+                // An ffi block's `link` libraries, deduplicated in order.
+                each l in self.T.Get(self.T.Kid(d, 0)).Kids {
+                    let lib = self.T.Get(l).Sval
+                    var seen = false
+                    each have in self.M.Links {
+                        if have == lib { seen = true }
+                    }
+                    if not seen { self.M.Links.append(lib) }
+                }
+            } else if n.Kind == ast.FUNC {
+                self.set_gens(self.T.Kid(d, 3), true)
                 self.lower_func_decl(n.Sval, d)
             } else if n.Kind == ast.IMPLDEC {
                 let tn = self.named_type_name(n.Ival)
                 each m in self.T.Get(self.T.Kid(d, 0)).Kids {
+                    self.set_gens(self.T.Kid(d, 1), false)
+                    self.add_gens(self.T.Kid(m, 3))
                     self.lower_func_decl(tn || "." || self.T.Get(m).Sval, m)
                 }
             } else if n.Kind == ast.EXCDEC {
                 each m in self.T.Get(self.T.Kid(d, 1)).Kids {
+                    self.set_gens(self.T.Kid(m, 3), false)
                     self.lower_func_decl(n.Sval || "." || self.T.Get(m).Sval, m)
                 }
             } else if n.Kind == ast.TRAITDEC {
                 each m in self.T.Get(self.T.Kid(d, 0)).Kids {
+                    self.set_gens(self.T.Kid(d, 1), false)
+                    self.add_gens(self.T.Kid(m, 3))
+                    self.traitSelf = 2
+                    if (self.T.Get(m).Ival2 & 1) != 0 { self.traitSelf = 1 }
                     self.lower_trait_default(n.Sval, m)
+                    self.traitSelf = 0
                 }
             }
+        }
+        self.set_gens(0, false)
+        // Drop each single-use temporary right after its one reader, so
+        // a stale temporary is not an owner when the value is next written
+        // (kill.voi).
+        each fi, f in self.M.Funcs {
+            insert_kills(self.M, fi)
         }
     }
 
@@ -350,7 +531,10 @@ impl Lowerer {
             pendLabels: self.pendLabels, loops: self.loops, fins: self.fins,
             switches: self.switches, catchRegs: self.catchRegs,
             curLine: self.curLine, curFn: self.curFn, inGlobal: self.inGlobal,
-            scopeLen: len(self.scopes),
+            scopeLen: len(self.scopes), canFail: self.canFail,
+            curResult: self.curResult, finLoops: self.finLoops,
+            capNames: self.capNames, fnBody: self.fnBody,
+            wNames: self.wNames,
         }
     }
 
@@ -366,6 +550,12 @@ impl Lowerer {
         self.curLine = s.curLine
         self.curFn = s.curFn
         self.inGlobal = s.inGlobal
+        self.canFail = s.canFail
+        self.curResult = s.curResult
+        self.finLoops = s.finLoops
+        self.capNames = s.capNames
+        self.fnBody = s.fnBody
+        self.wNames = s.wNames
         self.scopes = self.scopes[0..s.scopeLen]
     }
 
@@ -373,7 +563,8 @@ impl Lowerer {
     func begin_fn(mut self, name str, sig str, srcLine int) {
         self.M.Funcs.append(ir.Func{
             Name: name, Sig: sig, NRegs: 0, Instrs: [], SrcLine: srcLine,
-            Ups: [], LoopCapture: "", NParams: 0, Elide: false, RegT: [],
+            Ups: [], LoopCapture: "", File: "", NParams: 0, Elide: false,
+            RegT: [], Named: [], Plain: [],
         })
         self.fi = len(self.M.Funcs) - 1
         self.nextReg = 0
@@ -383,9 +574,12 @@ impl Lowerer {
         self.fins = []
         self.switches = []
         self.catchRegs = []
+        self.finLoops = []
+        self.capNames = set([])
         self.curLine = 0
         self.curFn = name
         self.inGlobal = false
+        self.canFail = true
     }
 
     func lower_func_decl(mut self, name str, d int) throws LowerError {
@@ -401,18 +595,79 @@ impl Lowerer {
         let saved = self.save_fn()
         let dn = self.T.Get(d)
         self.begin_fn(name, self.func_sig(d), dn.Line)
+        self.capNames = self.captured_in(body)
+        self.fnBody = body
+        self.wNames = set([])
+        self.written_in(body, self.wNames)
+        self.M.Funcs[self.fi].File = self.T.FileOf(d)
+        // A function that declares no result has no way to hand a failure
+        // to its caller either — the caller would discard a `unit` — so
+        // `try`/`?` RAISE there, exactly as under a plain `T` result. The one
+        // exception is `main`: a failure returned from it is the documented
+        // "error value escaping the main procedure" (App. C, code 1).
+        self.canFail = can_fail(self.T, self.T.Kid(d, 2)) or
+                       (self.T.NKids(self.T.Kid(d, 2)) == 0 and
+                        name == "main") or
+                       self.T.NKids(self.T.Kid(d, 4)) > 0
 
         self.push_scope(true)
         if (dn.Ival2 & 1) != 0 {
             self.declare("self")
+            // A method's `self` is its impl target: `Type.method`.
+            let dot = str.last_index(name, ".")
+            if dot > 0 { self.set_type("self", name[0..dot]) }
+        }
+        // A top-level generic function's hidden type descriptors come
+        // FIRST, one per parameter that needs one (traitdesc.voi), named
+        // `$T` — a spelling no identifier can collide with. A method's name
+        // here is `Type.method`, never its FUNC's own Sval, so only a
+        // top-level function can match.
+        if name == dn.Sval and name in self.descOf {
+            each g in self.descOf[name] {
+                self.declare("$" || g)
+            }
         }
         let ps = self.T.Get(self.T.Kid(d, 1)).Kids
+        let savedMut = self.mutParams
+        self.mutParams = set([])
+        // A `mut self` receiver is written in place like a `mut` parameter,
+        // and is counted like one before a write (boxcow.voi's pre_count).
+        if (dn.Ival2 & 3) == 3 { self.mutParams.add("self") }
         each p in ps {
-            self.declare(self.T.Get(p).Sval)
+            let rp = self.declare(self.T.Get(p).Sval)
+            self.set_param_type(p)
+            if (self.T.Get(p).Ival2 & 16) == 0 and self.T.Get(p).Ival != 0 {
+                self.note_plain(rp, self.decl_type(self.T.Get(p).Ival))
+            }
+            if (self.T.Get(p).Ival2 & 3) == ast.MODE_MUT {
+                self.mutParams.add(self.T.Get(p).Sval)
+            }
         }
         // Parameters occupy the lowest registers; nothing else has been
         // declared yet, so the counter IS the parameter count.
         self.M.Funcs[self.fi].NParams = self.nextReg
+        // A trait default WITH a receiver may write `Self.m()`: its Self is
+        // the type the call was dispatched as, which the dispatcher hands
+        // over and which must be read FIRST, before anything else can call
+        // through the method table (traitdesc.voi, vl_self_desc).
+        if self.traitSelf == 1 {
+            let rself = self.declare("$Self")
+            self.emit(dn.Line, "SELFTY", [rself, self.lookup("self")])
+        }
+        let rs = self.T.Get(self.T.Kid(d, 2)).Kids
+        self.curResult = ""
+        if len(rs) == 1 { self.curResult = self.decl_type(rs[0]) }
+        // A parameter of a sized type is range-checked ON ENTRY (sized.voi):
+        // one place covers every caller, direct or through a closure.
+        each p in ps {
+            let pn = self.T.Get(p)
+            if (pn.Ival2 & 16) == 0 {
+                let pt = sized_norm(self.decl_type(pn.Ival))
+                if pt != "" {
+                    self.emit(dn.Line, "CKSZ", [self.lookup_local(pn.Sval), pt])
+                }
+            }
+        }
         // Callee-side calling convention: defaults and variadic packing are
         // function prologue (this mirrors the interpreter's bindParams).
         each p in ps {
@@ -430,12 +685,31 @@ impl Lowerer {
                 self.mark(done)
             }
         }
+        if (dn.Ival2 & ast.FUNC_FFI) != 0 {
+            // A C function from an `ffi` block (§12): no body, one FFI
+            // instruction — the C signature, then every parameter's register
+            // (the variadic one, already packed into a slice by VARARG
+            // above, last) — whose result is returned. cg/instr.voi's
+            // emit_ffi turns it into the unboxing, the call and the boxing.
+            var fargs = [self.T.Get(self.T.Kid(d, 6)).Sval]
+            each p in ps {
+                fargs.append(self.lookup_local(self.T.Get(p).Sval))
+            }
+            let rd = self.new_reg()
+            var ins = [rd]
+            each a in fargs { ins.append(a) }
+            self.emit(dn.Line, "FFI", ins)
+            if self.T.NKids(self.T.Kid(d, 2)) > 0 {
+                self.emit(dn.Line, "RET", [rd])
+            }
+        }
         if body != 0 {
             self.lower_body(body, false)
         }
         self.emit(0, "RET", [])
         self.M.Funcs[self.fi].NRegs = self.nextReg
         self.pop_scope()
+        self.mutParams = savedMut
         self.restore_fn(saved)
     }
 
@@ -500,6 +774,13 @@ impl Lowerer {
         let saved = self.save_fn()
         self.begin_fn(name, sig, 0)
         self.inGlobal = global
+        each s in stmts {
+            each nm in self.captured_in(s) { self.capNames.add(nm) }
+        }
+        // No single body to judge closure literals against: each escapes.
+        self.fnBody = 0
+        self.wNames = set([])
+        each s in stmts { self.written_in(s, self.wNames) }
 
         self.push_scope(true)
         each s in stmts {
@@ -515,7 +796,7 @@ impl Lowerer {
     // and returns its name. Closures capture the enclosing frame by reference:
     // the new scope is pushed ON TOP of the current stack with a boundary, so
     // outer names render as ^upvalues.
-    func lower_closure(mut self, params []int, body int, note str,
+    func lower_closure(mut self, at int, params []int, body int, note str,
                        srcLine int) str throws LowerError {
         let outer = self.curFn
         var seq = 0
@@ -524,13 +805,106 @@ impl Lowerer {
         self.closureSeq[outer] = seq
         let name = outer || "$fn" || str(seq)
 
+        // PER-ITERATION BINDINGS (Go 1.22 semantics). A variable declared
+        // inside a loop is a fresh binding on every iteration, but a frame
+        // slot is per procedure, so a closure capturing the frame would see
+        // the slot's LATEST value. Instead, the loop variables this closure
+        // names are SNAPSHOT into a small environment frame at the moment the
+        // closure is created — one per closure, so each iteration's closure
+        // keeps that iteration's values — and the closure's frame chain runs
+        // closure → env → enclosing frame. In the scope stack the env is a
+        // boundary scope of its own, so the closure body resolves the loop
+        // variables at depth 1 and everything further out one level deeper.
+        //
+        // A snapshot is exactly a fresh binding as long as nobody ASSIGNS the
+        // variable after the closure is made; one that is reassigned (in the
+        // loop or in the closure) would silently stop being shared, so that
+        // one case is refused — with its position and its own name.
+        var envNames = []
+        var envRegs = []
+        if len(self.loops) > 0 {
+            let start = self.loops[0].scopeDepth
+            var cand = []
+            var seen = set([])
+            each p in params { self.free_names(p, cand, seen) }
+            self.free_names(body, cand, seen)
+            let atn = self.T.Get(at)
+            each nm in cand {
+                let idx = self.binding_scope(nm)
+                if idx < start { continue }
+                // A name the closure declares itself (a parameter, a `let`,
+                // a pattern bind, a loop variable) is the closure's own, not
+                // a capture — over-approximated: any declaration counts.
+                var mine = false
+                each p in params {
+                    if self.T.Get(p).Sval == nm { mine = true }
+                }
+                if mine or self.declares(body, nm) { continue }
+                // The loop whose body declares it: the innermost one that
+                // began at or before the binding's scope.
+                var lp = self.loops[0]
+                var lpi = 0
+                each li, l in self.loops {
+                    if l.scopeDepth <= idx {
+                        lp = l
+                        lpi = li
+                    }
+                }
+                // An assignment in the loop BEFORE the closure is made only
+                // changes the value the closure copies. One after it — or
+                // anywhere, when the closure sits in a loop nested inside
+                // the declaring one and so runs again after the assignment —
+                // would not be shared.
+                let nested = lpi < len(self.loops) - 1
+                if self.assigned_after(lp.body, nm, atn.Line, atn.Col,
+                                       nested) or
+                   self.assigned_in(body, nm) {
+                    self.fail(at, "this closure captures `" || nm || "`, " ||
+                        "which is declared inside a loop and assigned to " ||
+                        "there. Each iteration's closure receives its own " ||
+                        "copy of `" || nm || "`, taken when the closure is " ||
+                        "created, so the assignment would not be shared. " ||
+                        "Declare it before the loop to share one variable " ||
+                        "across iterations, or copy it into a `let` to " ||
+                        "capture its value")
+                }
+                envNames.append(nm)
+                envRegs.append(self.scopes[idx].vars[nm])
+            }
+        }
+
         let saved = self.save_fn()
+        if len(envNames) > 0 {
+            // The env scope: slot i holds envNames[i]. It is popped with
+            // everything else by restore_fn (save_fn recorded the depth).
+            self.push_scope(true)
+            each i, nm in envNames {
+                let top = len(self.scopes) - 1
+                self.scopes[top].vars[nm] = "r" || str(i)
+                self.mark_named("r" || str(i))
+                let nt = self.name_type_below(nm, top)
+                if nt != "" { self.put_type(top, nm, nt) }
+            }
+        }
         self.begin_fn(name, note, srcLine)
+        self.capNames = self.captured_in(body)
+        // A closure's own literals are judged against its own body; the
+        // names written are the enclosing function's (wNames, inherited).
+        self.fnBody = body
+        self.M.Funcs[self.fi].File = self.T.FileOf(at)
+        // The CALLER decided whether this body can carry a failure (a
+        // closure by its written result, spawn/defer bodies always).
+        self.canFail = saved.canFail
 
         self.push_scope(true)   // boundary: outer locals become ^upvalues
         each p in params {
             self.declare(self.T.Get(p).Sval)
+            self.set_param_type(p)
         }
+        // A closure answers to its own result — the one a closure literal
+        // wrote, handed over in pendResult; a spawn/defer body has none.
+        self.curResult = self.pendResult
+        self.pendResult = ""
         self.M.Funcs[self.fi].NParams = self.nextReg
         each p in params {
             let pn = self.T.Get(p)
@@ -555,22 +929,158 @@ impl Lowerer {
         }
         self.M.Funcs[self.fi].NRegs = self.nextReg
 
-        // Does this closure capture a variable declared inside an enclosing
-        // loop? Each iteration is a fresh binding to the interpreter, but one
-        // frame slot to a frame-capturing backend — so the fact must travel in
-        // the IR, and the C backend refuses rather than answering differently.
-        if len(saved.loops) > 0 {
-            let inner = saved.loops[len(saved.loops) - 1]
-            each up in self.M.Funcs[self.fi].Ups {
-                if up.Scope >= inner.scopeDepth {
-                    self.M.Funcs[self.fi].LoopCapture = up.Name
-                    break
+        self.pop_scope()
+        self.restore_fn(saved)
+        self.lastEnv = ""
+        if len(envRegs) > 0 {
+            self.lastEnv = "env(" || str.join(envRegs, ",") || ")"
+        }
+        return name
+    }
+
+    // mkclos_args is the operand list of the MKCLOS that creates the closure
+    // just lowered: its destination, its name, and its env snapshot if any.
+    func mkclos_args(mut self, rd str, name str) []str {
+        var out = [rd, name]
+        if self.lastEnv != "" { out.append(self.lastEnv) }
+        self.lastEnv = ""
+        return out
+    }
+
+    // binding_scope is the index of the innermost scope binding `name`, or
+    // -1 when no scope does.
+    func binding_scope(self, name str) int {
+        var i = len(self.scopes) - 1
+        while i >= 0 {
+            if name in self.scopes[i].vars { return i }
+            i -= 1
+        }
+        return 0 - 1
+    }
+
+    // name_type_below is name_type, searching only scopes below `top`.
+    func name_type_below(self, name str, top int) str {
+        var i = top - 1
+        while i >= 0 {
+            if name in self.scopes[i].vars { return self.scope_type(i, name) }
+            i -= 1
+        }
+        return ""
+    }
+
+    // free_names collects, in first-occurrence order, every identifier a
+    // subtree mentions — over-collecting is harmless (a name the closure
+    // rebinds itself is merely snapshot for nothing).
+    func free_names(self, node int, out mut []str, seen mut set[str]) {
+        if node == 0 { return }
+        let n = self.T.Get(node)
+        if n.Kind == ast.IDENT or n.Kind == ast.DROP or n.Kind == ast.PBIND {
+            if n.Sval != "" and not (n.Sval in seen) {
+                seen.add(n.Sval)
+                out.append(n.Sval)
+            }
+        }
+        if n.Kind == ast.PARSETERM and n.Ival == 0 and not (n.Sval in seen) {
+            seen.add(n.Sval)
+            out.append(n.Sval)
+        }
+        if (n.Kind == ast.ARM or n.Kind == ast.IF) and n.Ival != 0 {
+            self.free_names(n.Ival, out, seen)
+        }
+        each k in n.Kids { self.free_names(k, out, seen) }
+    }
+
+    // captured_in lists the names that a closure, spawn or defer body
+    // inside `node` refers to — by name, so over-approximated: a closure's
+    // own parameters and locals count too, which only makes more writes
+    // go in place.
+    func captured_in(self, node int) set[str] {
+        var out = set([])
+        self.collect_captured(node, out)
+        return out
+    }
+
+    func collect_captured(self, node int, out mut set[str]) {
+        if node == 0 { return }
+        let n = self.T.Get(node)
+        if n.Kind == ast.CLOSURE or n.Kind == ast.SPAWNEXPR or
+           n.Kind == ast.DEFERSTMT {
+            var names = []
+            var seen = set([])
+            self.free_names(node, names, seen)
+            each nm in names { out.add(nm) }
+            return
+        }
+        each k in n.Kids { self.collect_captured(k, out) }
+    }
+
+    // declares reports whether a subtree binds `name` anywhere: a `let`, a
+    // `var`, a pattern bind, a loop or `catch` variable, a closure param.
+    func declares(self, node int, name str) bool {
+        if node == 0 { return false }
+        let n = self.T.Get(node)
+        let k = n.Kind
+        if k == ast.LET or k == ast.FOR or k == ast.EACH {
+            var head = n.Sval
+            let bar = str.index(head, "|")
+            if bar >= 0 { head = head[0..bar] }
+            each nm in str.split(head, ",") {
+                if nm == name { return true }
+            }
+        }
+        if (k == ast.VAR or k == ast.PBIND or k == ast.CATCH or
+            k == ast.PARAM) and n.Sval == name {
+            return true
+        }
+        if (k == ast.ARM or k == ast.IF) and n.Ival != 0 {
+            if self.declares(n.Ival, name) { return true }
+        }
+        each c in n.Kids {
+            if self.declares(c, name) { return true }
+        }
+        return false
+    }
+
+    // assigned_after is assigned_in counting only assignments written after
+    // (line, col) — or every one, when `all`.
+    func assigned_after(self, node int, name str, line int, col int,
+                        all bool) bool {
+        if node == 0 { return false }
+        let n = self.T.Get(node)
+        if n.Kind == ast.ASSIGN or n.Kind == ast.PARSETERM {
+            let late = all or n.Line > line or (n.Line == line and n.Col > col)
+            if late and self.assigned_in(node, name) { return true }
+            if n.Kind == ast.PARSETERM { return false }
+        }
+        each c in n.Kids {
+            if self.assigned_after(c, name, line, col, all) { return true }
+        }
+        return false
+    }
+
+    // assigned_in reports whether a subtree assigns `name` — a plain or
+    // compound assignment, a member of a parallel one, or a `parse` target.
+    func assigned_in(self, node int, name str) bool {
+        if node == 0 { return false }
+        let n = self.T.Get(node)
+        if n.Kind == ast.ASSIGN {
+            let t = self.T.Kid(node, 0)
+            let tn = self.T.Get(t)
+            if tn.Kind == ast.IDENT and tn.Sval == name { return true }
+            if tn.Kind == ast.TUPLE {
+                each m in tn.Kids {
+                    let mn = self.T.Get(m)
+                    if mn.Kind == ast.IDENT and mn.Sval == name { return true }
                 }
             }
         }
-        self.pop_scope()
-        self.restore_fn(saved)
-        return name
+        if n.Kind == ast.PARSETERM and n.Ival == 0 and n.Sval == name {
+            return true
+        }
+        each k in n.Kids {
+            if self.assigned_in(k, name) { return true }
+        }
+        return false
     }
 
     // ------------------------------------------------------------ emit
@@ -624,7 +1134,8 @@ impl Lowerer {
     // ------------------------------------------------------------ scopes
 
     func push_scope(mut self, boundary bool) {
-        self.scopes.append(Scope{vars: make(map[str]str), boundary: boundary})
+        self.scopes.append(Scope{vars: make(map[str]str),
+                                 types: make(map[str]str), boundary: boundary})
     }
 
     func pop_scope(mut self) {
@@ -637,7 +1148,76 @@ impl Lowerer {
         if name != "_" {
             self.scopes[len(self.scopes) - 1].vars[name] = r
         }
+        self.mark_named(r)
         return r
+    }
+
+    // note_plain records a named register whose static type is plain
+    // (ir.Func.Plain, plain_type).
+    func note_plain(mut self, r str, ty str) {
+        if not self.plain_type(ty, 0) { return }
+        if len(r) < 2 or r[0] != 'r' { return }
+        let n = to_int(r[1..len(r)])
+        if n == nil { return }
+        self.M.Funcs[self.fi].Plain.append(n)
+    }
+
+    // plain_type reports whether a static type (short_type spelling) holds
+    // no shared handle anywhere inside: a primitive, a str, a slice, map,
+    // set, optional or Box of plain types, or a non-generic struct whose
+    // fields are all plain. Anything unknown is not plain.
+    func plain_type(self, t str, depth int) bool {
+        if t == "" or t == "?" or t == LIT or depth > 8 { return false }
+        if t == "int" or t == "float" or t == "bool" or t == "str" or
+           t == "dec" or t == "rune" or t == "f32" or t == "i64" or
+           sized_norm(t) != "" {
+            return true
+        }
+        if str.starts_with(t, "[]") { return self.plain_type(t[2..len(t)], depth + 1) }
+        if str.starts_with(t, "?") { return self.plain_type(t[1..len(t)], depth + 1) }
+        if str.starts_with(t, "set[") and str.ends_with(t, "]") {
+            return self.plain_type(t[4..len(t) - 1], depth + 1)
+        }
+        if str.starts_with(t, "Box[") and str.ends_with(t, "]") and
+           not ("Box" in self.structs) {
+            return self.plain_type(t[4..len(t) - 1], depth + 1)
+        }
+        if str.starts_with(t, "map[") {
+            // map[K]V: K is plain by construction (a key is hashed by
+            // value); V is the rest after the matching bracket.
+            var lvl = 0
+            var i = 3
+            while i < len(t) {
+                if t[i] == '[' { lvl += 1 }
+                if t[i] == ']' {
+                    lvl -= 1
+                    if lvl == 0 { return self.plain_type(t[i + 1..len(t)], depth + 1) }
+                }
+                i += 1
+            }
+            return false
+        }
+        if t in self.structs and t in self.fieldOrder {
+            each f in self.fieldOrder[t] {
+                let k = t || "|" || f
+                if not (k in self.fieldTy) { return false }
+                if not self.plain_type(self.fieldTy[k], depth + 1) {
+                    return false
+                }
+            }
+            return true
+        }
+        return false
+    }
+
+    // mark_named records that a register holds a NAMED value in the
+    // function being lowered (ir.Func.Named): it is no temporary, and a
+    // reference it holds is an owner.
+    func mark_named(mut self, r str) {
+        if len(r) < 2 or r[0] != 'r' { return }
+        let n = to_int(r[1..len(r)])
+        if n == nil { return }
+        self.M.Funcs[self.fi].Named.append(n)
     }
 
     // lookup resolves a name to a local register or to an ^upvalue (having
@@ -730,7 +1310,65 @@ impl Lowerer {
         if hasNumeric {
             self.emit(0, "NDREST", [])
         }
+        if not wantLast { self.kill_scope(self.T.Get(b).Line) }
         self.pop_scope()
         return last
+    }
+
+    // kill_scope drops, at the end of a statement block, the values of the
+    // names the block declared — their scope ends here, and so do they
+    // (§6). It matters inside a LOOP: a binding of one iteration would
+    // otherwise still hold its value into the next, and count as a second
+    // holder when the value's location is written again — `let l =
+    // grid[0]` copying `grid[0]` on every append after it — or, for a
+    // `shared` value, keep a `weak` to the last iteration's upgradable
+    // after the loop. Never a name a closure captured by reference (an
+    // upvalue). The names
+    // are taken in sorted order: a map's order would make the IR differ
+    // from one run to the next.
+    func kill_scope(mut self, line int) {
+        let sc = self.scopes[len(self.scopes) - 1]
+        var names = []
+        each k in keys(sc.vars) { names.append(k) }
+        sort_strs(names)
+        var ups = set([])
+        let prefix = self.M.Funcs[self.fi].Name || "$fn"
+        each g in self.M.Funcs {
+            if str.starts_with(g.Name, prefix) {
+                each u in g.Ups { ups.add(u.Slot) }
+            }
+        }
+        each nm in names {
+            let r = sc.vars[nm]
+            if len(r) < 2 or r[0] != 'r' { continue }
+            let slot = to_int(r[1..len(r)])
+            if slot == nil or slot in ups { continue }
+            if slot < self.M.Funcs[self.fi].NParams { continue }
+            self.emit(line, "KILL", [r, "v"])
+        }
+    }
+}
+
+// can_fail reports whether a declared result list can carry a failure: a
+// single `T!` or `?T`.
+func can_fail(t ast.Tree, list int) bool {
+    if t.NKids(list) != 1 { return false }
+    let k = t.Kind(t.Kid(list, 0))
+    return k == ast.TRESULT or k == ast.TOPTION
+}
+
+// sort_strs sorts a slice of names in place (insertion sort: a scope holds
+// a handful).
+func sort_strs(xs mut []str) {
+    var i = 1
+    while i < len(xs) {
+        let x = xs[i]
+        var j = i - 1
+        while j >= 0 and xs[j] > x {
+            xs[j + 1] = xs[j]
+            j -= 1
+        }
+        xs[j + 1] = x
+        i += 1
     }
 }

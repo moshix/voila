@@ -34,14 +34,27 @@
 // away. `accept` hands back a Session for a caller who wants the request and
 // the response in their own hands.
 //
-// ------------------------------------------------------------------- NO TLS
+// `serve` is that loop written once, with a GRACEFUL STOP: it answers every
+// connection on its own task until a value arrives on the channel it is
+// given, then stops accepting, waits for the requests already in flight, and
+// returns. The channel is typically std/os's signal channel:
 //
-// There is no TLS in this release, so there is no `https`. An https:// URL is
-// REFUSED, by name, at `parse_url`. It is not quietly fetched over port 443 in
-// the clear and it is not downgraded to http:// — either would hand a
-// program's credentials to anyone on the path while its source code says
-// `https`, which is the worst outcome available. Terminate TLS outside the
-// program (a local proxy, a sidecar) and point this at the plaintext side.
+//     try srv.serve(hello, must os.signals(os.SIGINT, os.SIGTERM))
+//
+// ------------------------------------------------------------------- HTTPS
+//
+// An https:// URL is fetched over TLS 1.2 (std/tls), port 443 unless the URL
+// says otherwise, and the server's certificate is VERIFIED — against the
+// system's CA bundle, for the URL's host — before a byte of the request is
+// sent. A certificate that fails is an error, never a downgrade: an https
+// URL is never fetched in the clear. `Client.tls` is the std/tls Config the
+// client uses, so a private CA is `c.tls.ca_file = "ca.pem"` (and a test
+// against a throwaway certificate `c.tls.insecure = true`).
+//
+// A server speaks HTTPS from `listen_tls(addr, cert_file, key_file)`; every
+// verb below works on it unchanged. Each connection's handshake runs on that
+// connection's own task under `serve`, so a slow or hostile client stalls
+// nobody else.
 //
 // -------------------------------------------------------- what it refuses
 //
@@ -91,16 +104,22 @@
 //
 // ------------------------------------------------------- deliberately absent
 //
-// No TLS (above), no keep-alive, no redirects, no cookies, no multipart, no
-// percent-encoding helpers, no proxy support, no HTTP/2. Each is a package's
+// No keep-alive, no redirects, no cookies, no multipart, no proxy support,
+// no HTTP/2, no client certificates. Percent-encoding is here (`url_decode`,
+// `url_encode`, `parse_query`, `Request.query_params`); a path is NOT
+// decoded for you, because `%2F` and `/` mean different things in one. Each is a package's
 // worth of decisions on its own; none is needed to speak the protocol.
 package http
 
 use "std/net"
+use "std/os"
 use "std/str"
+use "std/time"
+use "std/tls"
 
 // The knobs, and the reason each has a number rather than being unbounded.
 const DEFAULT_PORT       = 80
+const DEFAULT_TLS_PORT   = 443
 const DEFAULT_TIMEOUT_MS = 30000     // a silent peer must not wedge a task
 const DEFAULT_MAX_BODY   = 33554432  // 32 MiB: a body, not a memory exhaustion
 const MAX_LINE           = 65536     // one status/header/chunk-size line
@@ -261,7 +280,7 @@ impl URL {
     // when it is not the default, which is what every other client does and
     // what virtual-host routing on the far side expects.
     func authority(self) str {
-        if self.port == DEFAULT_PORT {
+        if self.port == default_port(self.scheme) {
             if str.contains(self.host, ":") { return "[" || self.host || "]" }
             return self.host
         }
@@ -289,8 +308,8 @@ impl URL {
 // is never sent to the server, and carrying it in a struct whose whole job is
 // to be turned back into a request would invite someone to send it.
 //
-// https is refused here, once, so that every entry point refuses it: see the
-// NO TLS note at the top of this file.
+// The scheme is http or https (see HTTPS at the top of this file); any other
+// is refused here, once, so that every entry point refuses it.
 func parse_url(raw str) URL throws IOError {
     if len(raw) == 0 {
         return errf("http: empty URL")
@@ -301,15 +320,9 @@ func parse_url(raw str) URL throws IOError {
                     "(want http://host/path)")
     }
     let scheme = str.lower(raw[0..sep])
-    if scheme == "https" {
-        return errf("http: {brief(raw)} is https, and this release has no TLS " ||
-                    "— std/http speaks plaintext HTTP only. It will not fetch " ||
-                    "an https URL in the clear. Terminate TLS outside the " ||
-                    "program and use its http:// address.")
-    }
-    if scheme != "http" {
-        return errf("http: unsupported URL scheme `{scheme}` " ||
-                    "(std/http speaks http only)")
+    if scheme != "http" and scheme != "https" {
+        return errf("http: unsupported URL scheme {brief(scheme)} " ||
+                    "(std/http speaks http and https)")
     }
 
     var rest = raw[sep + 3..len(raw)]
@@ -337,7 +350,7 @@ func parse_url(raw str) URL throws IOError {
     }
 
     var host = auth
-    var port = DEFAULT_PORT
+    var port = default_port(scheme)
     if auth[0] == '[' {
         // An IPv6 literal: the colons inside the brackets are the address's,
         // not a port separator.
@@ -380,6 +393,12 @@ func parse_url(raw str) URL throws IOError {
                query: query}
 }
 
+// default_port is the port a URL of the scheme means when it names none.
+func default_port(scheme str) int {
+    if scheme == "https" { return DEFAULT_TLS_PORT }
+    return DEFAULT_PORT
+}
+
 // ------------------------------------------------------- request & response
 
 // Request is one request, as a server read it. `target` is the raw request
@@ -400,6 +419,109 @@ impl Request {
     func header(self, name str) str {
         return self.headers.get(name)
     }
+
+    // query_params decodes the query string into a map from each name to
+    // its FIRST value — `?a=1&b=x+y&a=2` is {"a": "1", "b": "x y"}. A
+    // malformed escape is an IOError. query_values keeps every value.
+    func query_params(self) map[str]str throws IOError {
+        var out = make(map[str]str)
+        let all = try parse_query(self.query)
+        each k, vs in all {
+            out[k] = vs[0]
+        }
+        return out
+    }
+
+    // query_values decodes the query string into every value of every name,
+    // in the order they were written.
+    func query_values(self) map[str][]str throws IOError {
+        return try parse_query(self.query)
+    }
+}
+
+// ------------------------------------------------------------- percent-codes
+
+// url_decode undoes percent-encoding: `%XX` is the byte 0xXX, and `+` is a
+// space — the form a query string and an HTML form body use. A `%` that is
+// not followed by two hex digits is an IOError rather than passed through:
+// a decoder that guessed would let two components disagree about one input.
+func url_decode(s str) str throws IOError {
+    let bs = bytes(s)
+    var out = []
+    var i = 0
+    while i < len(bs) {
+        let b = bs[i]
+        if b == 43 {                       // `+`
+            out.append(32)
+            i += 1
+        } else if b == 37 {                // `%`
+            if i + 2 >= len(bs) {
+                return errf("http: truncated escape in {brief(s)}")
+            }
+            let hi = hex_digit(bs[i + 1])
+            let lo = hex_digit(bs[i + 2])
+            if hi < 0 or lo < 0 {
+                return errf("http: bad escape in {brief(s)}")
+            }
+            out.append(hi * 16 + lo)
+            i += 3
+        } else {
+            out.append(b)
+            i += 1
+        }
+    }
+    return try str.from_bytes(out)
+}
+
+// url_encode percent-encodes s for a query string or a form body: letters,
+// digits and `-_.~` stay as they are, a space becomes `+`, and every other
+// byte becomes `%XX` (upper-case hex). url_decode(url_encode(s)) == s.
+func url_encode(s str) str {
+    let hex = "0123456789ABCDEF"
+    var b = str.Builder{}
+    each c in bytes(s) {
+        if (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or
+           (c >= 48 and c <= 57) or c == 45 or c == 95 or c == 46 or
+           c == 126 {
+            b.write(str.from_runes([c]))
+        } else if c == 32 {
+            b.write("+")
+        } else {
+            b.write("%" || hex[c ~/ 16..c ~/ 16 + 1] || hex[c % 16..c % 16 + 1])
+        }
+    }
+    return b.done()
+}
+
+// parse_query decodes `a=1&b=2&a=3` into every value of every name, in the
+// order they were written: {"a": ["1", "3"], "b": ["2"]}. A pair with no `=`
+// has the empty value; empty pairs (`a=1&&b=2`) are skipped.
+func parse_query(q str) map[str][]str throws IOError {
+    var out = make(map[str][]str)
+    if q == "" { return out }
+    each part in str.split(q, "&") {
+        if part == "" { continue }
+        let (rawk, rawv, found) = part.cut("=")
+        let k = try url_decode(rawk)
+        var v = ""
+        if found { v = try url_decode(rawv) }
+        if k in out {
+            var vs = out[k]
+            vs.append(v)
+            out[k] = vs
+        } else {
+            out[k] = [v]
+        }
+    }
+    return out
+}
+
+// hex_digit is the value of one ASCII hex digit, or -1.
+func hex_digit(c int) int {
+    if c >= 48 and c <= 57 { return c - 48 }
+    if c >= 97 and c <= 102 { return c - 87 }
+    if c >= 65 and c <= 70 { return c - 55 }
+    return 0 - 1
 }
 
 // Response is one response, as a client read it — or as a handler wants one
@@ -492,16 +614,20 @@ func reason_phrase(status int) str {
 
 // Client is a set of limits, not a connection: every request opens its own.
 // `timeout_ms` bounds each read and write on the socket, and `max_body` the
-// response body it will hold. Both are ordinary fields, so
-// `var c = http.client() ; c.timeout_ms = 2000` is the way to change them.
+// response body it will hold. `tls` is how an https:// request verifies its
+// server (std/tls's Config; its server_name, when empty, is the URL's host).
+// All are ordinary fields, so `var c = http.client() ; c.timeout_ms = 2000`
+// is the way to change them.
 struct Client {
     timeout_ms int
     max_body   int
+    tls        tls.Config
 }
 
 // client makes one with the defaults.
 func client() Client {
-    return Client{timeout_ms: DEFAULT_TIMEOUT_MS, max_body: DEFAULT_MAX_BODY}
+    return Client{timeout_ms: DEFAULT_TIMEOUT_MS, max_body: DEFAULT_MAX_BODY,
+                  tls: tls.Config{}}
 }
 
 impl Client {
@@ -552,6 +678,20 @@ impl Client {
 
         var conn = try net.connect(u.addr())
         try conn.set_timeout(self.timeout_ms)
+        if u.scheme == "https" {
+            // The handshake verifies the server before the request — and
+            // its headers, which may carry credentials — is written.
+            var cfg = self.tls
+            if cfg.server_name == "" { cfg.server_name = u.host }
+            cfg.timeout_ms = self.timeout_ms
+            match tls.client(conn, cfg) {
+                Ok(tc) => conn = tc
+                Err(e) => {
+                    conn.close()
+                    return e
+                }
+            }
+        }
 
         var b = str.Builder{}
         b.write(method || " " || u.target() || " HTTP/1.1\r\n")
@@ -586,10 +726,13 @@ func request(method str, url str, hdrs Headers, body str) Response throws IOErro
 // --------------------------------------------------------------------- server
 
 // Server is a listening socket plus the limits it hands to each connection.
+// `secure` says it speaks HTTPS, presenting `tls`'s certificate and key.
 struct Server {
     lis        net.Listener
     timeout_ms int
     max_body   int
+    secure     bool
+    tls        tls.Config
 }
 
 // listen binds a TCP listener, exactly as net.listen does — ":8080" for every
@@ -597,7 +740,36 @@ struct Server {
 func listen(addr str) Server throws IOError {
     let lis = try net.listen(addr)
     return Server{lis: lis, timeout_ms: DEFAULT_TIMEOUT_MS,
-                  max_body: DEFAULT_MAX_BODY}
+                  max_body: DEFAULT_MAX_BODY, secure: false,
+                  tls: tls.Config{}}
+}
+
+// listen_tls is listen for HTTPS: every connection is a TLS handshake first,
+// presenting the PEM certificate chain in `cert_file` and the private key in
+// `key_file`. Both are loaded now, so a bad file is reported here.
+func listen_tls(addr str, cert_file str, key_file str) Server throws IOError {
+    let cfg = tls.Config{cert_file: cert_file, key_file: key_file}
+    try tls.check_server(cfg)
+    let lis = try net.listen(addr)
+    return Server{lis: lis, timeout_ms: DEFAULT_TIMEOUT_MS,
+                  max_body: DEFAULT_MAX_BODY, secure: true, tls: cfg}
+}
+
+// secure_conn handshakes an accepted connection when the server is HTTPS
+// (closing it if the handshake fails), and hands a plain one back as it is.
+func secure_conn(conn net.Conn, secure bool, cfg tls.Config,
+                 tmo int) net.Conn throws IOError {
+    if not secure { return conn }
+    var c = cfg
+    c.timeout_ms = tmo
+    match tls.server(conn, c) {
+        Ok(tc) => return tc
+        Err(e) => {
+            conn.close()
+            return e
+        }
+    }
+    return conn
 }
 
 impl Server {
@@ -617,9 +789,12 @@ impl Server {
 
     // accept blocks for one connection and returns the Session over it. Use
     // this when the request and the response want handling by hand; use
-    // serve_one when a `fn(Request) Response` will do.
+    // serve_one when a `fn(Request) Response` will do. On an HTTPS server
+    // the handshake runs here, before accept returns (bounded by the
+    // server's timeout): `serve` runs it on each connection's own task.
     func accept(self) Session throws IOError {
-        let conn = try self.lis.accept()
+        let conn = try secure_conn(try self.lis.accept(), self.secure,
+                                   self.tls, self.timeout_ms)
         try conn.set_timeout(self.timeout_ms)
         return Session{conn: conn, st: stream(conn), max_body: self.max_body}
     }
@@ -653,10 +828,197 @@ impl Server {
         return ()
     }
 
+    // serve answers requests, each connection on its own task, until a
+    // value arrives on `stop` or `stop` is closed. Then it SHUTS DOWN
+    // GRACEFULLY: the listener is closed at once, so no new connection is
+    // accepted, and serve returns only after every request already being
+    // handled has been answered. A connection that fails — a malformed
+    // request, a peer that hangs up — is answered or dropped on its own
+    // task and never stops the server.
+    //
+    // An accept blocks inside the kernel, where neither a channel nor a
+    // cancellation reaches it (§10, Appendix D), so while serving the
+    // listener's deadline is lowered to SERVE_POLL_MS and a `timed out`
+    // accept just means "look at `stop` again". That bounds how long a stop
+    // takes to be noticed.
+    func serve(self, handler fn(Request) Response, stop chan[int]) unit! {
+        return self.serve_for(handler, stop, time.Nanosecond * 0)
+    }
+
+    // serve_for is serve with a DEADLINE on the graceful stop: once `stop`
+    // fires, the requests in flight get `grace` to finish, and any
+    // connection still open after that is shut down (Conn.shutdown), which
+    // ends its task with an error instead of letting one slow client hold
+    // the server open. A grace of zero or less waits without limit, as serve
+    // does.
+    //
+    // The deadline needs to know which connections are open, so each
+    // connection's task reports its start and its end to a tracker task
+    // (track_conns) over a channel; the tracker alone holds the list.
+    func serve_for(self, handler fn(Request) Response, stop chan[int],
+                   grace dur) unit! {
+        try self.lis.set_timeout(SERVE_POLL_MS)
+        let tmo = self.timeout_ms
+        let maxb = self.max_body
+        let secure = self.secure
+        let tcfg = self.tls
+        var failure = ""
+        let events = chan[ConnEvent](64)
+        var nextid = 0
+        group {
+            spawn track_conns(events, grace)
+            var running = true
+            while running {
+                select {
+                case v, ok := <-stop:
+                    running = false
+                default:
+                }
+                if not running { break }
+                match self.lis.accept() {
+                    Ok(conn) => {
+                        nextid += 1
+                        spawn answer_tracked(conn, nextid, events, tmo, maxb,
+                                             handler, secure, tcfg)
+                    }
+                    Err(e) => {
+                        if e.message() != "timed out" {
+                            failure = e.message()
+                            running = false
+                        }
+                    }
+                }
+            }
+            // Stop accepting NOW; the group then waits for the requests
+            // already on their tasks — and the tracker starts the clock.
+            self.lis.close()
+            events <- ConnEvent{op: EV_STOP, id: 0, conn: nil}
+        }
+        if failure != "" { return err("http: serve: " || failure) }
+        return ()
+    }
+
     // close stops listening. Idempotent.
     func close(self) {
         self.lis.close()
     }
+}
+
+// SERVE_POLL_MS is how often serve looks at its stop channel between
+// accepts — the longest a graceful stop waits to begin.
+const SERVE_POLL_MS = 100
+
+// ConnEvent is one report to serve_for's tracker: a connection opened or
+// done, or the stop that starts the grace period.
+struct ConnEvent {
+    op   int
+    id   int
+    conn ?net.Conn
+}
+
+const EV_OPEN = 1
+const EV_DONE = 2
+const EV_STOP = 3
+
+// answer_tracked is answer, bracketed by the two reports to the tracker.
+func answer_tracked(conn net.Conn, id int, events chan[ConnEvent], tmo int,
+                    maxb int, handler fn(Request) Response, secure bool,
+                    tcfg tls.Config) {
+    events <- ConnEvent{op: EV_OPEN, id: id, conn: conn}
+    // The handshake is this task's, not the accept loop's: one client that
+    // stalls it must not stall the server.
+    match secure_conn(conn, secure, tcfg, tmo) {
+        Ok(c) => answer(c, tmo, maxb, handler)
+        Err(e) => e
+    }
+    events <- ConnEvent{op: EV_DONE, id: id, conn: conn}
+}
+
+// track_conns keeps the set of open connections. After EV_STOP it waits
+// until the set is empty — or, with a positive grace, until the grace has
+// run out, when it shuts every remaining connection down and goes on
+// draining reports until their tasks have ended. It must keep reading to
+// the end: a task blocked on a full `events` would never finish.
+func track_conns(events chan[ConnEvent], grace dur) {
+    var open = make(map[int]net.Conn)
+    var stopping = false
+    var deadline = 0
+    var forced = false
+    while true {
+        if stopping and len(open) == 0 { return }
+        if stopping and not forced and grace.millis() > 0 and
+           time.now().unix_millis() >= deadline {
+            each id, c in open { c.shutdown() }
+            forced = true
+        }
+        select {
+        case e := <-events:
+            if e.op == EV_OPEN {
+                match e.conn {
+                    nil => ()
+                    c   => open[e.id] = c
+                }
+            }
+            if e.op == EV_DONE { open.delete(e.id) }
+            if e.op == EV_STOP {
+                stopping = true
+                deadline = time.now().unix_millis() + grace.millis()
+            }
+        case <-time.after(time.Millisecond * 20):
+        }
+    }
+}
+
+// answer is serve's per-connection task: one request, one response, then the
+// connection is closed. Every failure is answered (a 400 for a request that
+// does not parse, a 500 for a handler that throws) or dropped, and none
+// escapes: one bad client must not cancel the server's other tasks.
+func answer(conn net.Conn, tmo int, maxb int, handler fn(Request) Response) {
+    match conn.set_timeout(tmo) {
+        Ok(u) => u
+        Err(e) => {
+            conn.close()
+            return
+        }
+    }
+    var s = Session{conn: conn, st: stream(conn), max_body: maxb}
+    match s.read_request() {
+        Err(e) => {
+            match s.respond(text(400, "400 " || e.message() || "\n")) {
+                Ok(u)   => u
+                Err(e2) => e2
+            }
+        }
+        Ok(req) => {
+            // The handler is the program's code and may throw; a throw
+            // escaping this task would fail serve's group and stop the whole
+            // server, so it is answered here as a 500 instead.
+            //
+            // An ABORT in the handler — an index out of bounds, a field of
+            // nil, a failed assert — is contained here too: http._contain
+            // calls it under a recovery point (runtime/src/err.c, faults),
+            // so the defect costs this one request a 500, is reported on
+            // standard error, and every other connection carries on.
+            var resp = text(500, "500 internal server error\n")
+            try {
+                match http._contain(handler, req) {
+                    Ok(r)  => resp = r
+                    Err(e) => {
+                        os.stderr.write("http: handler for {req.method} " ||
+                                        "{brief(req.path).replace("%%", "%")}: " ||
+                                        "{e.message()}\n")
+                    }
+                }
+            } catch e {
+                resp = text(500, "500 internal server error\n")
+            }
+            match s.respond(resp) {
+                Ok(u)   => u
+                Err(e3) => e3
+            }
+        }
+    }
+    s.close()
 }
 
 // Session is one accepted connection: read a Request from it, write a
@@ -671,7 +1033,7 @@ struct Session {
 impl Session {
     // read_request reads and parses the request. See the refusal list at the
     // top of this file for what it will not accept.
-    func read_request(self) Request throws IOError {
+    func read_request(mut self) Request throws IOError {
         return try recv_request(self.st, self.max_body)
     }
 
@@ -884,7 +1246,7 @@ func strip_cr(line str) str {
 
 // recv_response reads a whole response. `want_body` is false for a HEAD,
 // whose response describes a body it does not send.
-func recv_response(st Stream, max int, want_body bool) Response throws IOError {
+func recv_response(st mut Stream, max int, want_body bool) Response throws IOError {
     let line, ok = try st.line()
     if not ok {
         return errf("http: the server closed the connection without a response")
@@ -933,7 +1295,7 @@ func recv_response(st Stream, max int, want_body bool) Response throws IOError {
 }
 
 // recv_request reads a whole request.
-func recv_request(st Stream, max int) Request throws IOError {
+func recv_request(st mut Stream, max int) Request throws IOError {
     let line, ok = try st.line()
     if not ok {
         return errf("http: the client closed the connection without a request")
@@ -1030,7 +1392,7 @@ func parse_request_line(line str) (str, str, str) throws IOError {
 // read_headers reads a header block, up to and including the blank line that
 // ends it. Both the count and each line's length are bounded, so a peer that
 // sends headers forever is an error rather than a growing process.
-func read_headers(st Stream) Headers throws IOError {
+func read_headers(st mut Stream) Headers throws IOError {
     var hs = headers()
     var n = 0
     while true {
@@ -1068,7 +1430,7 @@ func read_headers(st Stream) Headers throws IOError {
 
 // read_body reads whatever body the headers describe: chunked, or a declared
 // Content-Length, or — for a response only — everything up to the close.
-func read_body(st Stream, hs Headers, max int,
+func read_body(st mut Stream, hs Headers, max int,
                to_eof bool) str throws IOError {
     let te = hs.get("transfer-encoding")
     let has_len = hs.has("content-length")
@@ -1117,7 +1479,7 @@ func read_body(st Stream, hs Headers, max int,
 // ends the body and any trailer headers follow it. Every size is parsed
 // against the REMAINING budget, so the total cannot exceed `max` however many
 // chunks arrive.
-func read_chunked(st Stream, max int) str throws IOError {
+func read_chunked(st mut Stream, max int) str throws IOError {
     var b = str.Builder{}
     var total = 0
     while true {
@@ -1273,6 +1635,11 @@ func sends_body(method str) bool {
 // came off the wire goes through it — an error message is written to a
 // terminal or a log, and a peer that could put an escape sequence in one
 // would be writing to that terminal itself.
+//
+// Its result is meant for errf, whose message is a printf FORMAT, so a `%`
+// is doubled: a header or a URL carrying `%d` must come out as text, not be
+// read as a verb (which threw a FormatError instead of returning the
+// error).
 func brief(s str) str {
     var out = []
     var n = 0
@@ -1282,7 +1649,14 @@ func brief(s str) str {
             cut = true
             break
         }
-        if c < ' ' or c > '~' { out.append('.') } else { out.append(c) }
+        if c < ' ' or c > '~' {
+            out.append('.')
+        } else if c == '%' {
+            out.append('%')
+            out.append('%')
+        } else {
+            out.append(c)
+        }
         n += 1
     }
     var shown = str.from_runes(out)

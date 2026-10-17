@@ -62,9 +62,8 @@ func client(addr chan[str]) {
     show("POST /shout", http.post(base || "/shout", "voila"))
     show("GET /missing", http.get(base || "/missing"))
 
-    // https has no TLS behind it in this release, so it is refused by name
-    // rather than fetched in the clear — see the note at the top of std/http.
-    match http.get("https://example.com/") {
+    // A scheme std/http does not speak is refused by name, never guessed at.
+    match http.get("ftp://example.com/") {
         Ok(r)  => say "unexpected success:", r.status
         Err(e) => say "refused:", e.message()
     }

@@ -1,0 +1,266 @@
+// Tasks writing DIFFERENT elements and fields of one captured variable
+// (§10: the VARIABLE is shared with the group's tasks, its VALUE keeps
+// copy-on-write). Every store must land in the variable — none lost to a
+// copy-on-write judged by a count another writer's temporaries inflate
+// (low/boxcow.voi, var_root) — and a snapshot taken of it, by a task or
+// after the join, must keep its value. A collection grown from a closure
+// that reaches a task where the static rules do not follow it is
+// serialised by the runtime, so no append is lost either. selftest runs this many times at once, at
+// every optimisation level, and compares the output.
+use "std/sort"
+
+struct Cell { n int }
+struct Inner { vals []int }
+struct Outer { name str, inner Inner, cells []Cell }
+
+func push(xs mut []int, v int) { xs.append(v) }
+
+func main() {
+    let k = 8
+
+    // A slice, by index.
+    var out = make([]int, k)
+    group { for j in 0..k { spawn { out[j] = j * 10 } } }
+    say out
+
+    // A map READ by the tasks while none writes it.
+    var m = map[str]int{}
+    for j in 0..k { m["k" || str(j)] = j + 100 }
+    var got = make([]int, k)
+    group { for j in 0..k { spawn { got[j] = m["k" || str(j)] } } }
+    say got
+
+    // Nested: a slice in a struct field in a struct, and struct elements.
+    var o = Outer{name: "o", inner: Inner{vals: make([]int, k)},
+                  cells: []Cell{}}
+    for j in 0..k { o.cells.append(Cell{n: 0}) }
+    group {
+        for j in 0..k {
+            spawn {
+                o.inner.vals[j] = j + 1
+                o.cells[j].n = j * j
+            }
+        }
+    }
+    say o.inner.vals
+    var ns = []int{}
+    each c in o.cells { ns.append(c.n) }
+    say ns
+
+    // A slice of slices: each task fills its own row.
+    var grid = [][]int{}
+    for j in 0..k { grid.append(make([]int, 3)) }
+    group {
+        for j in 0..k {
+            spawn {
+                grid[j][0] = j
+                grid[j][1] = j + 1
+                grid[j][2] = j + 2
+            }
+        }
+    }
+    var sums = []int{}
+    each row in grid { sums.append(row[0] + row[1] + row[2]) }
+    say sums
+
+    // Read-modify-writes of one element from every task: a compound store,
+    // and a store whose call-free value reads the variable, lose nothing.
+    var tot = [0]
+    var c2 = Inner{vals: [0, 0]}
+    group {
+        for j in 0..k {
+            spawn {
+                for i in 0..2000 {
+                    tot[0] += 1
+                    c2.vals[1] = c2.vals[1] + 1
+                }
+            }
+        }
+    }
+    say tot, c2.vals
+
+    say snapshots()
+    say serialised()
+    say escaped()
+    say mutators()
+    say replaced()
+    say sorted_live()
+}
+
+// Snapshots: a value taken from the variable — by a task, before the
+// tasks, or after the join — is a value of its own, exactly as without
+// tasks; the tasks' stores land in the variable only.
+func snapshots() str {
+    var rows = [Cell{n: 1}, Cell{n: 2}, Cell{n: 3}]
+    let before = rows[0]
+    var seen = make([]int, 3)
+    group {
+        for j in 0..3 {
+            spawn {
+                let mine = rows[j]
+                rows[j].n = mine.n * 10
+                seen[j] = mine.n
+            }
+        }
+    }
+    let after = rows[1]
+    rows[1].n = 99
+    return "{before.n} {seen} {after.n} {rows[0].n} {rows[1].n} {rows[2].n}"
+}
+
+// Growth the static rules cannot see — a closure that reaches the tasks
+// inside a struct — is serialised at run time: every append of a
+// collection's own method lands. Through a `mut` parameter the copy-on-
+// write is serialised but the callee runs unlocked (no Voilà code runs
+// under a variable's lock), so appends may be lost — never memory.
+struct Job { run fn(int) }
+
+func serialised() str {
+    var acc = []int{}
+    let job = Job{run: fn(v int) { acc.append(v) }}
+    group {
+        for j in 0..k_tasks() {
+            spawn { for i in 0..250 { job.run(i) } }
+        }
+    }
+    var acc2 = []int{}
+    let job2 = Job{run: fn(v int) { push(acc2, v) }}
+    group {
+        for j in 0..k_tasks() {
+            spawn { for i in 0..250 { job2.run(i) } }
+        }
+    }
+    return "{len(acc)} {len(acc2) > 0 and len(acc2) <= 2000}"
+}
+
+func k_tasks() int { return 8 }
+
+// A growing closure that reaches the tasks by routes the static rules do
+// not follow — a struct field, a slice, a map, a return value, a global —
+// racing readers that index, measure, iterate and call natives (with and
+// without callbacks) on the collection, and the OWNER appending inside the
+// group body: every read works on its own snapshot (vl_varread), which a
+// writer copies rather than reallocate, so nothing is torn or freed under
+// a reader. The sums start at zero explicitly (`make([]int, n)` fills nil).
+var G Job = Job{run: fn(v int) { }}
+
+func returned(f fn(int)) fn(int) { return f }
+
+func escaped() str {
+    var out = [0]
+    let h = Job{run: fn(v int) { out.append(v) }}
+    let fs = [fn(v int) { out.append(v) }]
+    let m = map[str]fn(int){"g": fn(v int) { out.append(v) }}
+    let r = returned(fn(v int) { out.append(v) })
+    G = Job{run: fn(v int) { out.append(v) }}
+    var seen = [0, 0, 0, 0, 0, 0]
+    group {
+        spawn { for i in 0..2000 { h.run(1) } }
+        spawn { for i in 0..2000 { fs[0](1) } }
+        spawn { for i in 0..2000 { m["g"](1) } }
+        spawn { for i in 0..2000 { r(1) } }
+        spawn { for i in 0..2000 { G.run(1) } }
+        spawn { for i in 0..4000 { seen[0] = seen[0] + out[len(out) - 1] } }
+        spawn {
+            for i in 0..100 {
+                var s = 0
+                each v in out { s += v }
+                seen[1] = s
+            }
+        }
+        spawn {
+            for i in 0..100 {
+                seen[2] = len(out.map(fn(v int) str { return str(v) }))
+            }
+        }
+        spawn { for i in 0..400 { if out.contains(1) { seen[3] = 1 } } }
+        spawn { for i in 0..100 { seen[4] = len(out.filter(fn(v int) bool { return v > 0 })) } }
+        // the owner writes inside the group body while the tasks read
+        for i in 0..2000 { out.append(1) }
+        seen[5] = 1
+    }
+    // every append lands — each holds the variable's lock — so the
+    // length is exact; what the readers saw depends on the schedule
+    return "{len(out)} {seen[5]}"
+}
+
+// A `mut` argument and a `mut self` receiver in a captured variable, from a
+// closure the tasks reach through a struct, while other tasks iterate and
+// index the same variables: the callee writes a private copy (copy-in,
+// copy-out), so the readers' snapshots are never written in place. Updates
+// may be lost; memory never is.
+struct Bag { xs []int }
+impl Bag { func add(mut self, v int) { self.xs.append(v) } }
+
+func mutators() str {
+    var acc = [0]
+    var bag = Bag{xs: [0]}
+    let j1 = Job{run: fn(v int) { push(acc, v) }}
+    let j2 = Job{run: fn(v int) { bag.add(v) }}
+    var seen = [0, 0]
+    group {
+        for t in 0..3 { spawn { for i in 0..1000 { j1.run(1) } } }
+        for t in 0..3 { spawn { for i in 0..1000 { j2.run(1) } } }
+        spawn {
+            for i in 0..1000 {
+                var s = 0
+                each v in acc { s += v }
+                seen[0] = s
+            }
+        }
+        spawn { for i in 0..1000 { seen[1] = bag.xs[len(bag.xs) - 1] } }
+    }
+    return "{len(acc) > 0} {len(bag.xs) > 0}"
+}
+
+// A closure that reaches the tasks through a struct ASSIGNS the whole
+// variable while other tasks read it: every read takes its reference under
+// the frame's lock (vl_varread), so the value it holds is never the one
+// the assignment releases.
+func replaced() str {
+    var cur = [0, 0, 0]
+    let setter = Job{run: fn(v int) { cur = [v, v, v] }}
+    var seen = [0, 0]
+    group {
+        for t in 0..3 { spawn { for i in 0..2000 { setter.run(i) } } }
+        spawn {
+            for i in 0..2000 {
+                let s = cur
+                seen[0] = s[0] + s[1] + s[2]
+            }
+        }
+        spawn {
+            for i in 0..500 {
+                var n = 0
+                each v in cur { n += 1 }
+                seen[1] = n
+            }
+        }
+    }
+    return "{len(cur)} {seen[1]}"
+}
+
+// `sort.sort` and the `sort` method on a captured slice, from a closure the
+// tasks reach through a struct, while other tasks iterate and index it:
+// the sort is a `mut` argument (copy-in, copy-out) and sorts out of place,
+// committing under the slice's lock (vl_sort_slice).
+func sorted_live() str {
+    var nums = [5, 3, 9, 1, 7, 2, 8, 6, 4, 0]
+    let job = Job{run: fn(v int) {
+        sort.sort(nums)
+        nums.sort()
+    }}
+    var seen = [0, 0]
+    group {
+        for t in 0..3 { spawn { for i in 0..300 { job.run(i) } } }
+        spawn {
+            for i in 0..2000 {
+                var s = 0
+                each v in nums { s += v }
+                seen[0] = s
+            }
+        }
+        spawn { for i in 0..2000 { seen[1] = nums[len(nums) - 1] } }
+    }
+    return "{nums} {seen[0]}"
+}

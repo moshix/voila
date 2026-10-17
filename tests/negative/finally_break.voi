@@ -1,0 +1,7 @@
+// A `break` (or `continue`) whose loop ENCLOSES the finally would leave it
+// too, and is refused the same way as a `return` (finally_return.voi).
+func main() {
+    each i in 0..3 {
+        try { say i } finally { if i == 1 { break } }
+    }
+}

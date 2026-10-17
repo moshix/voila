@@ -1,0 +1,16 @@
+// A program's own generic `Box` shadows the predeclared one (§6.3), and its
+// element type is judged like any generic's: `Box[int]{}` takes ints.
+struct Box[T] { items []T }
+impl[T] Box[T] {
+    func push(mut self, v T) { self.items.append(v) }
+    func size(self) int { return len(self.items) }
+}
+func main() {
+    Box[int]{items: []}.push("oops")
+    var b = Box[str]{items: []}
+    b.push(3)
+    b.items.append(4.5)
+    // Legal: the right element, and the method that takes none.
+    b.push("ok")
+    say b.size(), Box[int]{items: [1]}.size()
+}

@@ -1,0 +1,98 @@
+// std/maps — generic helpers over maps (§13.4).
+//
+// A Voilà map iterates in INSERTION order, so every function here is
+// deterministic: `keys` and `values` come back in the order the entries were
+// first set, and a map built by `merge` or `filter` keeps that order too.
+// `keys_sorted` is the one to use when the order must not depend on how the
+// map was built — a report, a golden file, a hash over the contents.
+//
+// None of these changes its argument; each returns a new map or slice.
+package maps
+
+// keys is every key, in insertion order.
+func keys[K, V](m map[K]V) []K {
+    var out = []
+    each k, v in m { out.append(k) }
+    return out
+}
+
+// keys_sorted is every key in ascending order (`<`, or a key type's `cmp`).
+func keys_sorted[K, V](m map[K]V) []K {
+    var out = []
+    each k, v in m { out.append(k) }
+    out.sort()
+    return out
+}
+
+// values is every value, in the insertion order of their keys.
+func values[K, V](m map[K]V) []V {
+    var out = []
+    each k, v in m { out.append(v) }
+    return out
+}
+
+// items is every entry as a (key, value) pair, in insertion order.
+func items[K, V](m map[K]V) [](K, V) {
+    var out = []
+    each k, v in m { out.append((k, v)) }
+    return out
+}
+
+// merge is a copy of a with every entry of b set on top of it: where both
+// hold a key, b's value wins. a's keys keep their order and b's new keys
+// follow in theirs.
+func merge[K, V](a map[K]V, b map[K]V) map[K]V {
+    var out = make(map[K]V)
+    each k, v in a { out[k] = v }
+    each k, v in b { out[k] = v }
+    return out
+}
+
+// filter is the entries `keep(k, v)` accepts.
+func filter[K, V](m map[K]V, keep fn(K, V) bool) map[K]V {
+    var out = make(map[K]V)
+    each k, v in m {
+        if keep(k, v) { out[k] = v }
+    }
+    return out
+}
+
+// map_values is m with `f` applied to every value.
+func map_values[K, V, W](m map[K]V, f fn(V) W) map[K]W {
+    var out = make(map[K]W)
+    each k, v in m { out[k] = f(v) }
+    return out
+}
+
+// invert swaps keys and values. Where two keys share a value, the LAST of
+// them in insertion order wins.
+func invert[K, V](m map[K]V) map[V]K {
+    var out = make(map[V]K)
+    each k, v in m { out[v] = k }
+    return out
+}
+
+// from_items builds a map from (key, value) pairs; a later pair for the same
+// key replaces an earlier one.
+func from_items[K, V](ps [](K, V)) map[K]V {
+    var out = make(map[K]V)
+    each p in ps { out[p.0] = p.1 }
+    return out
+}
+
+// get_or is m[k], or `dflt` when m has no such key.
+func get_or[K, V](m map[K]V, k K, dflt V) V {
+    if k in m { return m[k] }
+    return dflt
+}
+
+// equal reports whether two maps hold the same keys with equal values,
+// whatever order they were built in.
+func equal[K, V](a map[K]V, b map[K]V) bool {
+    if len(a) != len(b) { return false }
+    each k, v in a {
+        if not (k in b) { return false }
+        if b[k] != v { return false }
+    }
+    return true
+}

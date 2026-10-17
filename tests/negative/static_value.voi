@@ -1,0 +1,10 @@
+// A function that receives type descriptors cannot be used as a value: a
+// call through the value would arrive without them.
+trait Default { func default() Self }
+struct P { x int }
+impl Default for P { func default() Self { return Self{x: 0} } }
+func make_it[T: Default]() T { return T.default() }
+func main() {
+    let f = make_it
+    say f
+}

@@ -15,7 +15,7 @@ func prelude_natives() []str {
     return ["len", "append", "close", "err", "errf", "assert", "min", "max",
             "abs", "sum", "avg", "round", "floor", "ceil", "trunc",
             "round_to", "range", "zip", "enumerate", "keys", "values",
-            "shared", "cell", "weak", "set", "printf", "sprintf",
+            "shared", "cell", "weak", "Box", "set", "printf", "sprintf",
             "to_int", "to_i8", "to_i16", "to_i32", "to_i64", "to_u8",
             "to_u16", "to_u32", "to_u64", "to_byte", "to_float", "to_dec",
             "to_rune",
@@ -103,6 +103,29 @@ func un_op_fns() map[str]str {
     return m
 }
 
+// sz_code maps a sized integer type name to the runtime's VL_SZ_* code
+// (voila.h): i8 i16 i32 u8 u16 u32 u64 → 1…7.
+func sz_code(t str) int {
+    if t == "i8"  { return 1 }
+    if t == "i16" { return 2 }
+    if t == "i32" { return 3 }
+    if t == "u8"  { return 4 }
+    if t == "u16" { return 5 }
+    if t == "u32" { return 6 }
+    return 7
+}
+
+// sz_op_code maps a sized-capable IR op to vl_arith_sz's operator code, or
+// -1 for an op that has no sized form.
+func sz_op_code(op str) int {
+    if op == "ADD"  { return 0 }
+    if op == "SUB"  { return 1 }
+    if op == "MUL"  { return 2 }
+    if op == "POW"  { return 3 }
+    if op == "IDIV" { return 4 }
+    return 0 - 1
+}
+
 // split_variant divides `pkg.Enum.Variant` into its type and variant halves at
 // the LAST dot — the type name itself may be package-qualified.
 func split_variant(name str) (str, str) {
@@ -112,10 +135,24 @@ func split_variant(name str) (str, str) {
 }
 
 impl Gen {
-    // is_variant reports whether type.variant names an enum variant. The Go
-    // backend has no way to tell yet, and neither has this one.
+    // is_variant reports whether type.variant names an enum variant: `typ`
+    // must be an enum this module declares (the IR's type table says so).
     func is_variant(self, typ str, variant str) bool {
-        return false
+        return len(self.variant_call(typ || "." || variant)) > 0
+    }
+
+    // variant_ctor returns the C name of the constructor function for one
+    // payload variant used as a VALUE (`let mk = Shape.Circle`), minting it
+    // on first use. Each is a three-line function emitted after the
+    // prototypes (see emit_ctors), so the closure LOADFN builds is an
+    // ordinary closure over no frame.
+    func variant_ctor(mut self, typ str, variant str) str {
+        let key = typ || "." || variant
+        each i, c in self.ctors {
+            if c == key { return fmt.sprintf("vc_%d", i) }
+        }
+        self.ctors.append(key)
+        return fmt.sprintf("vc_%d", len(self.ctors) - 1)
     }
 
     // variant_call recognizes a CALL whose name is Enum.Variant; it returns
@@ -165,6 +202,21 @@ impl Gen {
             if self.emit_native(f, ins) { return }
         }
 
+        // A SIZED arithmetic op (a fourth operand naming the type, see
+        // low/sized.voi) goes through the range-checking form.
+        if len(a) > 3 and sz_op_code(ins.Op) >= 0 {
+            self.p(fmt.sprintf("  vl_set(&%s, vl_arith_sz(%d, %s, %s, %d));",
+                               self.dst(f, a[0]), sz_op_code(ins.Op),
+                               self.operand(f, a[1]), self.operand(f, a[2]),
+                               sz_code(a[3])))
+            return
+        }
+        if ins.Op == "NEG" and len(a) > 2 {
+            self.p(fmt.sprintf("  vl_set(&%s, vl_neg_sz(%s, %d));",
+                               self.dst(f, a[0]), self.operand(f, a[1]),
+                               sz_code(a[2])))
+            return
+        }
         if ins.Op in self.binOp {
             let fn = self.binOp[ins.Op]
             self.p(fmt.sprintf("  vl_set(&%s, %s(%s, %s));",
@@ -197,6 +249,18 @@ impl Gen {
             } else {
                 self.p(fmt.sprintf("  vl_set(&%s, vl_retain(%s));",
                                    self.dst(f, a[0]), self.operand(f, a[1])))
+            }
+
+        case "CKSZ":
+            // A store into a sized location (low/sized.voi): range-check the
+            // value in place. A typed register checks natively, with the
+            // same cold trap.
+            let r = reg_slot(a[0])
+            if r >= 0 and self.rt(f, r) == ir.RT_INT {
+                self.p(fmt.sprintf("  vl_cksz_i(r%d_i, %d);", r, sz_code(a[1])))
+            } else {
+                self.p(fmt.sprintf("  vl_cksz(%s, %d);", self.operand(f, a[0]),
+                                   sz_code(a[1])))
             }
 
         case "ZERO":
@@ -262,10 +326,197 @@ impl Gen {
 
         case "CALLM":
             let argv, n = self.emit_argv(f, seq, a[3])
-            self.p(fmt.sprintf("  vl_set(&%s, vl_callm(%s, %s, %s, %s));",
+            if len(a) > 4 {
+                // a[4]: the receiver's STATIC type when the run time
+                // cannot know it — a sized integer is an `int` at run time
+                // (low/expr.voi) — tried first in the method table.
+                self.p(fmt.sprintf("  vl_set(&%s, vl_callm_as(%s, %s, %s, " ||
+                                   "%s, %s));", self.dst(f, a[0]),
+                                   self.operand(f, a[1]), c_quote(a[4]),
+                                   c_quote(a[2]), argv, n))
+            } else {
+                self.p(fmt.sprintf("  vl_set(&%s, vl_callm(%s, %s, %s, %s));",
+                                   self.dst(f, a[0]), self.operand(f, a[1]),
+                                   c_quote(a[2]), argv, n))
+            }
+            self.release_argv(seq, a[3])
+
+        case "SELFTY":
+            // The type a trait default was DISPATCHED as (its `Self`), read
+            // once at entry (runtime/src/call.c, vl_self_desc).
+            self.p(fmt.sprintf("  vl_set(&%s, vl_self_desc(%s));",
+                               self.dst(f, a[0]), self.operand(f, a[1])))
+
+        case "CALLT":
+            // A static trait method through a type descriptor
+            // (low/traitdesc.voi): a[1] holds the type's flat name.
+            let argv, n = self.emit_argv(f, seq, a[3])
+            self.p(fmt.sprintf("  vl_set(&%s, vl_callt(%s, %s, %s, %s));",
                                self.dst(f, a[0]), self.operand(f, a[1]),
                                c_quote(a[2]), argv, n))
             self.release_argv(seq, a[3])
+
+        case "UNIQ":
+            // A Box's or a struct's copy-on-write (low/boxcow.voi). a[2] is
+            // the threshold: digits, or a register holding a count RCOUNT
+            // took. a[3…] say where to WRITE BACK a copy — `fld ro name`,
+            // `idx rc ri`, `glb name`, `up name` — and nothing is written
+            // unless the value was actually copied. The tag is tested
+            // inline, so anything else costs two comparisons and no
+            // reference-count traffic.
+            let ud = self.dst(f, a[0])
+            let us = self.operand(f, a[1])
+            var thr = a[2]
+            if str.starts_with(thr, "r") {
+                thr = "(" || self.operand(f, thr) || ").u.i"
+            }
+            var wb = ""
+            if len(a) > 3 and a[3] == "fld" {
+                wb = fmt.sprintf(" vl_setfld(%s, %s, vl_retain(nb%d));",
+                                 self.operand(f, a[4]), c_quote(a[5]), seq)
+            } else if len(a) > 3 and a[3] == "idx" {
+                wb = fmt.sprintf(" vl_setidx(%s, %s, vl_retain(nb%d));",
+                                 self.operand(f, a[4]), self.operand(f, a[5]),
+                                 seq)
+            } else if len(a) > 3 and a[3] == "glb" {
+                wb = fmt.sprintf(" vl_set(&G[%d], vl_retain(nb%d));",
+                                 self.globals[a[4]], seq)
+            } else if len(a) > 3 and a[3] == "up" {
+                if not f.HasUp(a[4]) {
+                    self.failf(fmt.sprintf("cgen: unresolved upvalue `%s` " ||
+                                           "in %s", a[4], f.Name))
+                    return
+                }
+                let up = f.Up(a[4])
+                wb = fmt.sprintf(" vl_upset(F->up, %d, %d, vl_retain(nb%d));",
+                                 up.Depth - 1, up.Slot, seq)
+            }
+            // A STRUCT is copied on write too (vl_cow_unique): structs
+            // have value semantics (§3.4, §6.4), and the two tag tests are
+            // still the whole cost for anything else.
+            // A STRUCT and a CONTAINER are copied on write too (§3.4,
+            // §6.4): the kind mask is one test, and the count another. A
+            // temporary still holding the value would count as an owner;
+            // low/kill.voi drops every dead one first.
+            self.p(fmt.sprintf("  if (%s.t == VL_OBJ && ((1u << %s.u.o->kind) " ||
+                               "& VL_COW_KINDS) && %s.u.o->rc > %s) \{ " ||
+                               "Value nb%d = vl_cow_unique(%s, %s);" ||
+                               "%s vl_set(&%s, nb%d); \}", us, us, us, thr,
+                               seq, us, thr, wb, ud, seq))
+            if ud != us {
+                self.p(fmt.sprintf("  else vl_set(&%s, vl_retain(%s));", ud,
+                                   us))
+            }
+
+        case "KILL":
+            // A temporary no instruction reads again (low/kill.voi): its
+            // reference is dropped now rather than when the register is next
+            // written, so it does not count as an owner of the value. A
+            // natively typed register (-O3) holds no reference at all.
+            let ks = reg_slot(a[0])
+            if ks >= 0 and self.rt(f, ks) == ir.RT_BOX {
+                // "v" (low.kill_scope) marks the end of a binding's scope:
+                // the value dies there whatever it is (§6) — a `shared` one
+                // included, so a `weak` to it stops upgrading.
+                self.p(fmt.sprintf("  if (F->r[%d].t == VL_OBJ) \{ " ||
+                                   "Value k_ = F->r[%d]; F->r[%d].t = " ||
+                                   "VL_NIL; vl_release(k_); \}", ks, ks, ks))
+            }
+
+        case "ESCAPE":
+            // The closure in a[0] may escape its task (low/expr.voi): mark
+            // its frame chain before the value goes anywhere.
+            self.p(fmt.sprintf("  vl_closure_escapes(%s);",
+                               self.operand(f, a[0])))
+
+        case "VARREAD":
+            // A captured variable read as an owned snapshot (low/expr.voi,
+            // vl_varread): a[1] is its register here or its `^name`; a
+            // "fixed" binding (never written after it is made) is read
+            // with a plain reference — no write can replace it.
+            let src = a[1]
+            let fixed = len(a) > 2 and a[2] == "fixed"
+            if str.starts_with(src, "^") {
+                let rn = src[1..len(src)]
+                if not f.HasUp(rn) {
+                    self.failf(fmt.sprintf("cgen: unresolved upvalue `%s` " ||
+                                           "in %s", rn, f.Name))
+                    return
+                }
+                let up = f.Up(rn)
+                if fixed {
+                    self.p(fmt.sprintf("  vl_set(&%s, vl_retain(vl_up(F->up, " ||
+                                       "%d, %d)));", self.dst(f, a[0]),
+                                       up.Depth - 1, up.Slot))
+                } else {
+                    self.p(fmt.sprintf("  vl_set(&%s, vl_varread(vl_frame_up(" ||
+                                       "F->up, %d), %d));", self.dst(f, a[0]),
+                                       up.Depth - 1, up.Slot))
+                }
+            } else if self.rt(f, reg_slot(src)) != ir.RT_BOX {
+                // Natively typed (-O3): a scalar no closure reads through
+                // the frame (a name-only capture) — nothing to share.
+                self.p(fmt.sprintf("  vl_set(&%s, vl_retain(%s));",
+                                   self.dst(f, a[0]), self.operand(f, src)))
+            } else if fixed {
+                self.p(fmt.sprintf("  vl_set(&%s, vl_retain(F->r[%d]));",
+                                   self.dst(f, a[0]), reg_slot(src)))
+            } else {
+                self.p(fmt.sprintf("  vl_set(&%s, vl_varread(F, %d));",
+                                   self.dst(f, a[0]), reg_slot(src)))
+            }
+
+        case "SHAREDTHR":
+            // The copy-in threshold of a `mut` argument in a captured
+            // variable (low/boxcow.voi, private_copy): 0 — copy whatever
+            // it is — once a closure over the variable's frame may escape
+            // its task (VlFrame.escapes), beyond any count otherwise.
+            let k = a[1]
+            var fr = "F"
+            if str.starts_with(k, "^") {
+                let rn = k[1..len(k)]
+                if not f.HasUp(rn) {
+                    self.failf(fmt.sprintf("cgen: unresolved upvalue `%s` " ||
+                                           "in %s", rn, f.Name))
+                    return
+                }
+                fr = fmt.sprintf("vl_frame_up(F->up, %d)", f.Up(rn).Depth - 1)
+            }
+            self.p(fmt.sprintf("  vl_set(&%s, vl_int((%s)->escapes ? 0 : " ||
+                               "INT64_MAX));", self.dst(f, a[0]), fr))
+
+        case "VARLOCK", "VARUNLOCK":
+            // A write through a variable closures capture, under its
+            // frame's lock (low/boxcow.voi, var_root): a[0] is the
+            // variable's register (this frame) or its `^name` upvalue.
+            let k = a[0]
+            var fr = "F"
+            if str.starts_with(k, "^") {
+                let rn = k[1..len(k)]
+                if not f.HasUp(rn) {
+                    self.failf(fmt.sprintf("cgen: unresolved upvalue `%s` " ||
+                                           "in %s", rn, f.Name))
+                    return
+                }
+                fr = fmt.sprintf("vl_frame_up(F->up, %d)", f.Up(rn).Depth - 1)
+            }
+            if ins.Op == "VARLOCK" {
+                self.p(fmt.sprintf("  vl_varlock(%s);", fr))
+            } else {
+                self.p(fmt.sprintf("  vl_varunlock(%s);", fr))
+            }
+
+        case "RCOUNT":
+            // The reference count of a value, for UNIQ's threshold (0 for
+            // anything that is not an object).
+            let rs = self.operand(f, a[1])
+            self.p(fmt.sprintf("  vl_set(&%s, vl_int(%s.t == VL_OBJ ? " ||
+                               "(int64_t)%s.u.o->rc : 0));",
+                               self.dst(f, a[0]), rs, rs))
+
+        case "TYPEOF":
+            self.p(fmt.sprintf("  vl_set(&%s, vl_typedesc(%s));",
+                               self.dst(f, a[0]), self.operand(f, a[1])))
 
         case "CONV":
             if len(a) > 3 {
@@ -421,6 +672,10 @@ impl Gen {
             self.p(fmt.sprintf("  if (VL_TRY(h%d)) goto %s;", seq, a[0]))
         case "EHPOP":
             self.p("  vl_eh_pop();")
+        case "CATCHF":
+            // The in-flight exception, a fault included (low: try/finally).
+            self.p(fmt.sprintf("  vl_set(&%s, vl_eh_pending());",
+                               self.dst(f, a[0])))
         case "CATCH":
             self.p(fmt.sprintf("  vl_set(&%s, vl_eh_current());",
                                self.dst(f, a[0])))
@@ -449,9 +704,33 @@ impl Gen {
                 self.failf(fmt.sprintf("cgen: unknown closure %s", a[1]))
                 return
             }
-            self.p(fmt.sprintf("  vl_set(&%s, vl_closure(%s, F));",
+            // `env(r3,r5)`: the closure captures loop variables, which are
+            // SNAPSHOT into a fresh frame of their own whose parent is this
+            // one (low.lower_closure). The closure holds that frame; ours is
+            // released as soon as the closure has retained it.
+            var env = ""
+            var k = 2
+            while k < len(a) {
+                if str.starts_with(a[k], "env(") { env = a[k] }
+                k += 1
+            }
+            if env == "" {
+                self.p(fmt.sprintf("  vl_set(&%s, vl_closure(%s, F));",
+                                   self.dst(f, a[0]),
+                                   c_func_name(self.fnIdx[a[1]])))
+                return
+            }
+            let regs = parse_args(env[3..len(env)])
+            self.p(fmt.sprintf("  \{ VlFrame *E%d = vl_frame_new(%d, F);",
+                               seq, len(regs)))
+            each i, r in regs {
+                self.p(fmt.sprintf("    vl_set(&E%d->r[%d], vl_retain(%s));",
+                                   seq, i, self.operand(f, r.Reg)))
+            }
+            self.p(fmt.sprintf("    vl_set(&%s, vl_closure(%s, E%d));",
                                self.dst(f, a[0]),
-                               c_func_name(self.fnIdx[a[1]])))
+                               c_func_name(self.fnIdx[a[1]]), seq))
+            self.p(fmt.sprintf("    vl_frame_release(E%d); \}", seq))
 
         case "GRPBEG":
             if len(a) > 0 {
@@ -539,6 +818,9 @@ impl Gen {
 
         case "SELBEG":
             self.selCases = []
+        case "FFI":
+            self.emit_ffi(f, a)
+
         case "SELRECV", "SELSEND", "SELDEF":
             self.selCases.append(ins)
         case "SELEND":
@@ -550,6 +832,90 @@ impl Gen {
     }
 
     // ------------------------------------------------------------ calls
+
+    // ------------------------------------------------------------ ffi
+
+    // ffi_index interns a C signature and returns its prototype's number.
+    func ffi_index(mut self, sig str) int {
+        each i, s in self.ffis {
+            if s == sig { return i }
+        }
+        self.ffis.append(sig)
+        return len(self.ffis) - 1
+    }
+
+    // emit_ffi renders `FFI dst, sig, params…` (low.lower_func_body): unbox
+    // each argument by its C type, call the C function, box the result.
+    //
+    // A VARIADIC tail arrives as one slice. C cannot be handed a run-time
+    // argument list, so every arity and every int/double arrangement up to
+    // FFI_MAX_VARARGS is spelled out as its own call, and a switch on
+    // 128 * count + (a bit per float argument) picks the one that matches —
+    // 127 calls for six. An integer-class vararg travels as a 64-bit integer,
+    // a float as a double: C's default argument promotions, applied by the
+    // run-time kind of each value (ffi.c, vl_ffi_vclass).
+    func emit_ffi(mut self, f ir.Func, a []str) {
+        let sig = parse_ffi_sig(a[1])
+        let pi = self.ffi_index(a[1])
+        let fname = c_quote(sig.name)
+        var fixed = []
+        each i, ct in sig.params {
+            fixed.append(ffi_arg(ct, self.operand(f, a[2 + i]), i + 1,
+                                 fname))
+        }
+        var res = ""
+        if sig.ret != "void" { res = "fr_ = " }
+        self.p(fmt.sprintf("  \{ /* ffi %s */", sig.name))
+        if sig.ret != "void" {
+            self.p(fmt.sprintf("    %s fr_;", ffi_ctype_c(sig.ret)))
+        }
+        if not sig.variadic {
+            self.p(fmt.sprintf("    %svlffi_%d(%s);", res, pi,
+                               str.join(fixed, ", ")))
+        } else {
+            let va = self.operand(f, a[2 + len(sig.params)])
+            self.p(fmt.sprintf("    Value *vp_ = vl_slice_data(%s);", va))
+            self.p(fmt.sprintf("    int64_t vn_ = vl_len(%s);", va))
+            self.p(fmt.sprintf("    if (vn_ > %d) vl_abort(\"ffi %%s: at " ||
+                               "most %d variadic arguments\", %s);",
+                               FFI_MAX_VARARGS, FFI_MAX_VARARGS, fname))
+            self.p(fmt.sprintf("    long long vi_[%d] = \{0\}; double " ||
+                               "vd_[%d] = \{0\}; int vm_ = 0;",
+                               FFI_MAX_VARARGS, FFI_MAX_VARARGS))
+            self.p("    for (int i = 0; i < vn_; i++) \{")
+            self.p("      if (vl_ffi_vclass(vp_[i])) \{ vm_ |= 1 << i; " ||
+                   "vd_[i] = vl_ffi_vdouble(vp_[i]); \}")
+            self.p("      else vi_[i] = vl_ffi_vword(vp_[i]);")
+            self.p("    \}")
+            self.p("    switch ((int)vn_ * 128 + vm_) \{")
+            var n = 0
+            while n <= FFI_MAX_VARARGS {
+                var mask = 0
+                while mask < (1 << n) {
+                    var args = []
+                    each x in fixed { args.append(x) }
+                    var k = 0
+                    while k < n {
+                        if (mask & (1 << k)) != 0 {
+                            args.append(fmt.sprintf("vd_[%d]", k))
+                        } else {
+                            args.append(fmt.sprintf("vi_[%d]", k))
+                        }
+                        k += 1
+                    }
+                    self.p(fmt.sprintf("    case %d: %svlffi_%d(%s); break;",
+                                       n * 128 + mask, res, pi,
+                                       str.join(args, ", ")))
+                    mask += 1
+                }
+                n += 1
+            }
+            self.p("    \}")
+        }
+        self.p(fmt.sprintf("    vl_set(&%s, %s);", self.dst(f, a[0]),
+                           ffi_box(sig.ret)))
+        self.p("  \}")
+    }
 
     // ------------------------------------------------------------ -O3
 
@@ -647,7 +1013,16 @@ impl Gen {
             return true
         }
         if op == "ADD" or op == "SUB" or op == "MUL" {
-            if dt == ir.RT_INT {
+            if dt == ir.RT_INT and len(a) > 3 {
+                // The sized form: the same inline core vl_arith_sz uses.
+                var fn = "vl_iadd_sz"
+                if op == "SUB" { fn = "vl_isub_sz" }
+                if op == "MUL" { fn = "vl_imul_sz" }
+                self.p(fmt.sprintf("  %s = %s(%s, %s, %d);", lhs, fn,
+                                   self.nat(f, a[1], ir.RT_INT),
+                                   self.nat(f, a[2], ir.RT_INT),
+                                   sz_code(a[3])))
+            } else if dt == ir.RT_INT {
                 var fn = "vl_iadd_ck"
                 if op == "SUB" { fn = "vl_isub_ck" }
                 if op == "MUL" { fn = "vl_imul_ck" }
@@ -681,6 +1056,12 @@ impl Gen {
         }
         if op == "IDIV" {
             if self.xty(f, a[1]) == ir.RT_INT and
+               self.xty(f, a[2]) == ir.RT_INT and len(a) > 3 {
+                self.p(fmt.sprintf("  %s = vl_idiv_sz(%s, %s, %d);", lhs,
+                                   self.nat(f, a[1], ir.RT_INT),
+                                   self.nat(f, a[2], ir.RT_INT),
+                                   sz_code(a[3])))
+            } else if self.xty(f, a[1]) == ir.RT_INT and
                self.xty(f, a[2]) == ir.RT_INT {
                 self.p(fmt.sprintf("  %s = vl_ifloordiv(%s, %s);", lhs,
                                    self.nat(f, a[1], ir.RT_INT),
@@ -693,7 +1074,12 @@ impl Gen {
             return true
         }
         if op == "MOD" or op == "POW" {
-            if dt == ir.RT_INT {
+            if dt == ir.RT_INT and op == "POW" and len(a) > 3 {
+                self.p(fmt.sprintf("  %s = vl_ipow_sz(%s, %s, %d);", lhs,
+                                   self.nat(f, a[1], ir.RT_INT),
+                                   self.nat(f, a[2], ir.RT_INT),
+                                   sz_code(a[3])))
+            } else if dt == ir.RT_INT {
                 var fn = "vl_ifloormod"
                 if op == "POW" { fn = "vl_ipow_i" }
                 self.p(fmt.sprintf("  %s = %s(%s, %s);", lhs, fn,
@@ -731,7 +1117,11 @@ impl Gen {
             return true
         }
         if op == "NEG" {
-            if dt == ir.RT_INT {
+            if dt == ir.RT_INT and len(a) > 2 {
+                self.p(fmt.sprintf("  %s = vl_ineg_sz(%s, %d);", lhs,
+                                   self.nat(f, a[1], ir.RT_INT),
+                                   sz_code(a[2])))
+            } else if dt == ir.RT_INT {
                 self.p(fmt.sprintf("  %s = vl_ineg_ck(%s);", lhs,
                                    self.nat(f, a[1], ir.RT_INT)))
             } else {
@@ -785,10 +1175,9 @@ impl Gen {
             // A variant constructor used as a value, or a package function.
             let typ, variant = split_variant(name)
             if self.is_variant(typ, variant) {
-                self.failf(fmt.sprintf("cgen: enum constructors as " ||
-                                       "first-class values are not " ||
-                                       "supported in native builds yet (%s)",
-                                       name))
+                self.p(fmt.sprintf("  vl_set(&%s, vl_closure(%s, NULL));",
+                                   self.dst(f, a[0]),
+                                   self.variant_ctor(typ, variant)))
                 return
             }
         }
@@ -802,9 +1191,35 @@ impl Gen {
                            self.dst(f, a[0]), c_quote(name)))
     }
 
+    // emit_argk emits the run-time argument-kind check of a call to the
+    // native `name` (low.NativeKinds), when it has a kinds row and the call
+    // passes anything. A spread call's vector is a slice's storage, so it
+    // is checked but never unwrapped in place.
+    func emit_argk(mut self, name str, argv str, n str, spec str) {
+        if not (name in self.natKinds) or argv == "NULL" { return }
+        var fix = "true"
+        each x in parse_args(spec) {
+            if x.Spread { fix = "false" }
+        }
+        self.p(fmt.sprintf("  vl_argk(%s, %s, %s, %s, %s);", c_quote(name),
+                           c_quote(self.natKinds[name]), argv, n, fix))
+    }
+
     func emit_call(mut self, f ir.Func, a []str, seq int) {
         let name = a[1]
         let argv, n = self.emit_argv(f, seq, a[2])
+        // `prelude:NAME` is a call the LOWERER synthesised (a set literal's
+        // constructor, an open slice's len): it always means the native, so
+        // it bypasses fnIdx, where a user function of the same name lives.
+        // No user name contains a colon.
+        if str.starts_with(name, "prelude:") {
+            self.emit_argk(name[8..len(name)], argv, n, a[2])
+            let pidx = self.native(name[8..len(name)])
+            self.p(fmt.sprintf("  vl_set(&%s, NAT[%d](%s, %s, NULL));",
+                               self.dst(f, a[0]), pidx, argv, n))
+            self.release_argv(seq, a[2])
+            return
+        }
         if name in self.fnIdx {
             self.p(fmt.sprintf("  vl_set(&%s, %s(%s, %s, NULL));",
                                self.dst(f, a[0]),
@@ -825,7 +1240,7 @@ impl Gen {
             let base = name[0..br]
             var typ = name[br + 1..len(name)]
             if str.ends_with(typ, "]") { typ = typ[0..len(typ) - 1] }
-            if base != "json.decode" {
+            if base != "json.decode" and base != "sqlite.decode" {
                 // Generics are type-erased everywhere else (§3.7):
                 // cell[int](0) is simply cell(0).
                 if base in self.fnIdx {
@@ -835,13 +1250,15 @@ impl Gen {
                                        n))
                     return
                 }
+                self.emit_argk(base, argv, n, a[2])
                 let bidx = self.native(base)
                 self.p(fmt.sprintf("  vl_set(&%s, NAT[%d](%s, %s, NULL));",
                                    self.dst(f, a[0]), bidx, argv, n))
                 return
             }
-            // json.decode[T] is the one call that keeps its type argument:
-            // the runtime needs T to shape the decoded value.
+            // json.decode[T] keeps its type argument: the runtime needs T
+            // to shape the decoded value. So does sqlite.decode[T], a row
+            // decoded into T by the same machinery (ext/sqlite.c).
             let jidx = self.native(base)
             self.p(fmt.sprintf("  Value ty%d = vl_str(%s);", seq,
                                c_quote(typ)))
@@ -854,6 +1271,7 @@ impl Gen {
             self.p(fmt.sprintf("  vl_release(ty%d);", seq))
             return
         }
+        self.emit_argk(name, argv, n, a[2])
         let idx = self.native(name)
         self.p(fmt.sprintf("  vl_set(&%s, NAT[%d](%s, %s, NULL));",
                            self.dst(f, a[0]), idx, argv, n))
@@ -932,8 +1350,8 @@ impl Gen {
         }
         each i, fd in self.defaults[typ] {
             if fd.Name in given or i < npos or fd.ConstIdx < 0 { continue }
-            self.p(fmt.sprintf("  vl_setfld(%s, %s, vl_retain(K[%d]));", dst,
-                               c_quote(fd.Name), fd.ConstIdx))
+            self.p(fmt.sprintf("  vl_setfld(%s, %s, vl_retain(%s));", dst,
+                               c_quote(fd.Name), fd.Ref))
         }
     }
 

@@ -1,0 +1,39 @@
+-- EC certificate --
+verified -> TLS1.2
+  got: ec: HELLO OVER TLS
+wrong name -> refused: tls: certificate does not match host name "example.org"
+untrusted CA -> refused: tls: certificate is not trusted (unknown certificate authority)
+insecure -> TLS1.2
+  got: ec: HELLO OVER TLS
+by IP -> refused: tls: certificate does not match host name "127.0.0.1"
+  server saw: tls: the peer closed the connection during the handshake
+  server saw: tls: the peer closed the connection during the handshake
+  server saw: tls: the peer closed the connection during the handshake
+-- RSA certificate (PKCS#8 key) --
+verified -> TLS1.2
+  got: rsa: HELLO OVER TLS
+wrong name -> refused: tls: certificate does not match host name "example.org"
+untrusted CA -> refused: tls: certificate is not trusted (unknown certificate authority)
+insecure -> TLS1.2
+  got: rsa: HELLO OVER TLS
+by IP -> refused: tls: certificate does not match host name "127.0.0.1"
+  server saw: tls: the peer closed the connection during the handshake
+  server saw: tls: the peer closed the connection during the handshake
+  server saw: tls: the peer closed the connection during the handshake
+-- a TLS connection is a net.Conn --
+lines: 21
+131072 0123456789abcdef
+tls: the connection already speaks TLS
+-- a connection cut without close_notify --
+partial
+tls: the peer closed the connection without close_notify (the data may be truncated)
+-- a client that does not speak --
+server: tls: the peer closed the connection during the handshake
+-- configuration errors --
+true
+true
+tls: a server needs Config.cert_file and Config.key_file
+true
+tls: client needs Config.server_name to verify the server
+true
+true

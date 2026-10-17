@@ -1,0 +1,11 @@
+// By default the ffi mark is OFF — it is advice nobody asked for on an
+// ordinary build — and a plain `check` of a program that calls C is ok.
+use "std/ffi"
+
+ffi "C" {
+    func getpid() int
+}
+
+func main() {
+    say getpid() > 0
+}

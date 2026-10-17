@@ -1,7 +1,8 @@
 // std/path — file-system paths as text.
 //
 // Every function here is PURELY LEXICAL except `abs`, which needs the working
-// directory. Nothing touches the disk, nothing follows a symlink, and a path
+// directory. (`matches` is the pattern half of a glob; os.glob and os.walk
+// are the halves that read the disk.) Nothing touches the disk, nothing follows a symlink, and a path
 // that names nothing is handled exactly like one that names a file — so the
 // answers do not change under you between the call and the open. When you do
 // want the disk consulted, that is `os.realpath`.
@@ -192,4 +193,102 @@ func clean_trailing(p str) str {
         e -= 1
     }
     return p[0..e]
+}
+
+// matches reports whether `name` matches the shell pattern `pattern`, the
+// lexical half of os.glob (which asks the disk which names exist):
+//
+//   `*`        any run of characters, including none, but never a `/`
+//   `?`        any one character except `/`
+//   `[abc]`    one of the listed characters; `[a-z]` a range; `[!a-z]` (or
+//              `[^a-z]`) any character NOT in the class
+//   `\c`       the character c itself, so `\*` is a literal star
+//
+// The whole of `name` must match. A malformed class (`[a-`) matches nothing.
+// Matching is by character (rune), not byte.
+func matches(pattern str, name str) bool {
+    let p = runes(pattern)
+    let s = runes(name)
+    // The classic greedy wildcard walk with one backtrack point: on a
+    // mismatch, retry from just after the most recent `*`, letting that star
+    // swallow one more character. A star may not swallow a `/`, so once the
+    // character it would take is a separator the backtrack point is dropped.
+    // Each step either advances `si` or moves the star's mark forward, so the
+    // walk is O(len(pattern) * len(name)) at worst and never exponential.
+    var pi = 0
+    var si = 0
+    var star = 0 - 1          // index in p just after the last `*`, or -1
+    var mark = 0              // the si that star last resumed from
+    while si < len(s) {
+        if pi < len(p) and p[pi] == '*' {
+            pi += 1
+            star = pi
+            mark = si
+            continue
+        }
+        if pi < len(p) {
+            let step = match_one(p, pi, s[si])
+            if step > 0 {
+                pi += step
+                si += 1
+                continue
+            }
+        }
+        if star >= 0 and s[mark] != '/' {
+            mark += 1
+            si = mark
+            pi = star
+            continue
+        }
+        return false
+    }
+    while pi < len(p) and p[pi] == '*' { pi += 1 }
+    return pi == len(p)
+}
+
+// match_one tries the single pattern element at p[pi] (not a `*`) against
+// the character c. It returns how many pattern runes the element spans when
+// it matches, and 0 when it does not.
+func match_one(p []rune, pi int, c rune) int {
+    let e = p[pi]
+    if e == '?' {
+        if c == '/' { return 0 }
+        return 1
+    }
+    if e == '\\' and pi + 1 < len(p) {
+        if p[pi + 1] == c { return 2 }
+        return 0
+    }
+    if e != '[' {
+        if e == c { return 1 }
+        return 0
+    }
+    // A class: find its end, then test c against the members and ranges.
+    var i = pi + 1
+    var neg = false
+    if i < len(p) and (p[i] == '!' or p[i] == '^') {
+        neg = true
+        i += 1
+    }
+    var hit = false
+    var first = true
+    while i < len(p) and (first or p[i] != ']') {
+        first = false
+        var lo = p[i]
+        if lo == '\\' and i + 1 < len(p) {
+            i += 1
+            lo = p[i]
+        }
+        var hi = lo
+        if i + 2 < len(p) and p[i + 1] == '-' and p[i + 2] != ']' {
+            hi = p[i + 2]
+            i += 2
+        }
+        if c >= lo and c <= hi { hit = true }
+        i += 1
+    }
+    if i >= len(p) { return 0 }          // no closing `]`: malformed
+    if c == '/' { return 0 }
+    if hit != neg { return i - pi + 1 }
+    return 0
 }

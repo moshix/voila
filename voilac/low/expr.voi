@@ -75,9 +75,12 @@ impl Lowerer {
     // value.
     func lower_expr(mut self, e int) str throws LowerError {
         if e == 0 {
-            throw LowerError{Msg: "internal: nil expression",
+            throw LowerError{Msg: "internal: nil expression", File: "",
                              Line: self.curLine, Col: 0}
         }
+        // An index a locked write computed before taking the lock
+        // (stmt.voi, assign_to).
+        if e in self.preIdx { return self.preIdx[e] }
         let n = self.T.Get(e)
         let k = n.Kind
 
@@ -131,7 +134,12 @@ impl Lowerer {
             } else if n.Ival == tok.TILDE {
                 op = "BNOT"
             }
-            self.emit(n.Line, op, [rd, ra])
+            let nsz = self.sized_of(e)
+            if op == "NEG" and nsz != "" {
+                self.emit(n.Line, op, [rd, ra, nsz])
+            } else {
+                self.emit(n.Line, op, [rd, ra])
+            }
             return rd
         }
 
@@ -140,6 +148,10 @@ impl Lowerer {
         }
 
         if k == ast.RANGE {
+            if self.T.Kid(e, 0) == 0 or self.T.Kid(e, 1) == 0 {
+                self.fail(e, "a range with an open bound (`a..`, `..b`) " ||
+                             "is only allowed as a slice index")
+            }
             let rlo = self.lower_expr(self.T.Kid(e, 0))
             let rhi = self.lower_expr(self.T.Kid(e, 1))
             var rby = "1"
@@ -154,7 +166,15 @@ impl Lowerer {
         }
 
         if k == ast.CALL      { return self.lower_call(e) }
-        if k == ast.INDEX     { return self.lower_index(e) }
+        if k == ast.INDEX {
+            // An explicit copy, restored after: under the 0.4.1 bootstrap a
+            // map is a reference, and plain assignment would share it.
+            var saveSnap = make(map[str]str)
+            each sk in keys(self.snapOver) { saveSnap[sk] = self.snapOver[sk] }
+            let ri = self.lower_index(e)
+            self.snapOver = saveSnap
+            return ri
+        }
         if k == ast.FIELD     { return self.lower_field(e) }
         if k == ast.COMPOSITE { return self.lower_composite(e) }
 
@@ -166,8 +186,37 @@ impl Lowerer {
             let rd = self.new_reg()
             self.emit(n.Line, "NEWSLICE",
                       [rd, "(" || str.join(regs, ",") || ")"])
+            // `set[T]{a, b}` is `set([a, b])`: the elements are gathered in
+            // a slice and handed to the prelude constructor, which is what
+            // drops the duplicates. The element type is erased (§3.7). The
+            // `prelude:` spelling names the NATIVE whatever the program
+            // declares: a user `func set` must not hijack a literal.
+            if n.Ival != 0 and self.T.Kind(n.Ival) == ast.TSET {
+                let rs = self.new_reg()
+                self.emit(n.Line, "CALL", [rs, "prelude:set", "(" || rd || ")"])
+                return rs
+            }
             return rd
         }
+
+        if k == ast.MAPLIT {
+            // `map[K]V{k: v, …}`: an empty map, then one store per pair, in
+            // source order — so a repeated key keeps its LAST value, exactly
+            // as the same stores written out by hand would.
+            let rd = self.new_reg()
+            self.emit(n.Line, "NEWMAP", [rd])
+            var i = 0
+            while i + 1 < len(n.Kids) {
+                let rk = self.lower_expr(n.Kids[i])
+                let rv = self.lower_expr(n.Kids[i + 1])
+                self.emit(n.Line, "SETIDX", [rd, rk, rv])
+                i += 2
+            }
+            return rd
+        }
+
+        if k == ast.IF    { return self.lower_if_expr(e) }
+        if k == ast.MATCH { return self.lower_match_expr(e) }
 
         if k == ast.TUPLE {
             if len(n.Kids) == 0 {
@@ -187,9 +236,21 @@ impl Lowerer {
         }
 
         if k == ast.CLOSURE {
+            // A closure answers to its own result: one written as plain `T`
+            // cannot carry a failure; none written (inferred) can.
+            let cr = n.Ival
+            let saveFail = self.canFail
+            self.canFail = cr == 0 or self.T.Kind(cr) == ast.TRESULT or
+                           self.T.Kind(cr) == ast.TOPTION
             let cnote = "closure" || self.closure_sig_text(e)
             let ps = self.T.Get(self.T.Kid(e, 1)).Kids
-            let name = self.lower_closure(ps, self.T.Kid(e, 0), cnote, n.Line)
+            // The closure's written result is what its `return`s store
+            // into (a `fn(x int) u8` returns a u8); lower_closure reads it.
+            self.pendResult = ""
+            if cr != 0 { self.pendResult = self.decl_type(cr) }
+            let name = self.lower_closure(e, ps, self.T.Kid(e, 0), cnote,
+                                          n.Line)
+            self.canFail = saveFail
             let rd = self.new_reg()
             let caps = self.T.Get(self.T.Kid(e, 2)).Kids
             if n.Ival2 == 1 and len(caps) > 0 {
@@ -197,20 +258,36 @@ impl Lowerer {
                 each c in caps {
                     cs.append(self.T.Get(c).Sval)
                 }
-                self.emit(n.Line, "MKCLOS",
-                          [rd, name, "own(" || str.join(cs, ",") || ")"])
+                var margs = self.mkclos_args(rd, name)
+                margs.append("own(" || str.join(cs, ",") || ")")
+                self.emit(n.Line, "MKCLOS", margs)
             } else {
-                self.emit(n.Line, "MKCLOS", [rd, name])
+                self.emit(n.Line, "MKCLOS", self.mkclos_args(rd, name))
                 self.note("closure captures enclosing frame by reference")
             }
+            // A literal that may escape its task marks its frame chain at
+            // once, before the value goes anywhere (vl_closure_escapes).
+            if not (e in self.inPlace) { self.emit(n.Line, "ESCAPE", [rd]) }
             return rd
         }
 
         if k == ast.TRYEXPR {
             let ra = self.lower_expr(self.T.Kid(e, 0))
             let rd = self.new_reg()
-            // err/nil propagates as the function's result.
-            self.emit(n.Line, "TRYP", [rd, ra])
+            if self.canFail and len(self.finLoops) == 0 {
+                // err/nil propagates as the function's result.
+                self.emit(n.Line, "TRYP", [rd, ra])
+            } else {
+                // The function cannot return a failure: it is raised as an
+                // exception instead, exactly as `must` does (§8.1).
+                //
+                // Inside a finally it is raised too, even where the
+                // function could return it: propagating would be a hidden
+                // `return` out of the finally, discarding the exception or
+                // the value in flight (escapes_finally); a raise is what a
+                // `throw` there does (§8.2).
+                self.emit(n.Line, "MUST", [rd, ra])
+            }
             return rd
         }
 
@@ -288,8 +365,32 @@ impl Lowerer {
         let n = self.T.Get(e)
         let name = n.Sval
 
+        if name in self.snapOver { return self.snapOver[name] }
         let op = self.lookup(name)
-        if op != "" { return op }
+        if op != "" {
+            // A variable closures capture is read as an OWNED reference —
+            // a snapshot — taken under its frame's lock once the frame is
+            // concurrent (VARREAD, vl_varread): a writer then finds the
+            // value held and copies it rather than write it in place, so
+            // the index, length, iteration or native call that follows
+            // works on a value nothing changes under it. Never a borrowed
+            // load, at any optimisation level: another task may replace
+            // the variable's value and release the old one.
+            if self.captured_name(name, op) {
+                let rs = self.new_reg()
+                // A binding never written after it is made (written_in)
+                // keeps its first value: no write can replace it, so a
+                // plain reference needs no lock ("fixed").
+                if name in self.wNames {
+                    self.emit(n.Line, "VARREAD", [rs, op])
+                } else {
+                    self.emit(n.Line, "VARREAD", [rs, op, "fixed"])
+                }
+                self.lastSnap[name] = rs
+                return rs
+            }
+            return op
+        }
 
         if name in self.globals {
             let rg = self.new_reg()
@@ -312,6 +413,7 @@ impl Lowerer {
            name in self.structs or name in self.enums or
            name in self.exceptions or name in self.aliases or
            name in self.packages {
+            self.refuse_desc_value(e, name)
             let rf = self.new_reg()
             self.emit(n.Line, "LOADFN", [rf, name])
             return rf
@@ -362,6 +464,8 @@ impl Lowerer {
             // lower_stmt. Its value is unit.
             let rch = self.lower_expr(self.T.Kid(e, 0))
             let rv = self.lower_expr(self.T.Kid(e, 1))
+            self.check_store(self.sized_elem(self.T.Kid(e, 0)),
+                             self.T.Kid(e, 1), rv, n.Line)
             self.emit(n.Line, "SEND", [rch, rv])
             let rd = self.new_reg()
             self.emit(n.Line, "LOADK",
@@ -376,7 +480,14 @@ impl Lowerer {
         let ra = self.lower_expr(self.T.Kid(e, 0))
         let rb = self.lower_expr(self.T.Kid(e, 1))
         let rd = self.new_reg()
-        self.emit(n.Line, op, [rd, ra, rb])
+        // Arithmetic whose static type is a SIZED integer carries the type
+        // as a fourth operand, and traps outside its range (sized.voi).
+        let sz = self.sized_of(e)
+        if sz != "" and sized_op(op) {
+            self.emit(n.Line, op, [rd, ra, rb, sz])
+        } else {
+            self.emit(n.Line, op, [rd, ra, rb])
+        }
         return rd
     }
 
@@ -403,12 +514,35 @@ impl Lowerer {
             // The alternative diverges: rd is defined on the success path
             // only.
             self.lower_stmt(self.T.Kid(e, 1))
+        } else if n.Ival2 == 2 {
+            // A block alternative: its final expression is the value, or it
+            // diverges and rd is again defined on the success path only.
+            let rb = self.lower_value_block(self.T.Kid(e, 1),
+                                            "an `else` block")
+            if rb != "" { self.emit(n.Line, "MOVE", [rd, rb]) }
         } else {
             let rv = self.lower_expr(self.T.Kid(e, 1))
             self.emit(n.Line, "MOVE", [rd, rv])
         }
         self.mark(endL)
         return rd
+    }
+
+    // lower_else_stmt lowers `f() else { … }` whose value nobody reads: the
+    // call runs, and on failure the block runs as a plain block.
+    func lower_else_stmt(mut self, e int) throws LowerError {
+        let n = self.T.Get(e)
+        var inner = self.T.Kid(e, 0)
+        if self.T.Kind(inner) == ast.TRYEXPR {
+            inner = self.T.Kid(inner, 0)
+        }
+        let ra = self.lower_expr(inner)
+        let rt = self.new_reg()
+        let endL = self.new_label()
+        self.emit(n.Line, "ISFAIL", [rt, ra])
+        self.emit(n.Line, "JMPF", [rt, endL])
+        self.lower_body(self.T.Kid(e, 1), false)
+        self.mark(endL)
     }
 
     // ------------------------------------------------------------ calls
@@ -449,15 +583,27 @@ impl Lowerer {
                 // not a qualifier (see is_pkg_qualifier).
                 let bound = self.lookup(bn)
                 if self.is_pkg_qualifier(bn) {
-                    let pargs = self.lower_args(x)
+                    let pargs = self.desc_call_args(x, bn || "." || mname, 0)
                     let rp = self.new_reg()
                     self.emit(line, "CALL",
                               [rp, bn || "." || mname, pargs])
+                    self.flush_mut_args(line)
                     return rp
                 }
-                // An associated function on a type: `Point.origin()` (§10).
+                // A static method through a TYPE PARAMETER — `T.default()`
+                // — or through `Self` in a trait default (traitdesc.voi).
+                if bound == "" and (bn in self.curGens or
+                                    (bn == "Self" and self.traitSelf != 0)) {
+                    return self.lower_static_param(x, bn, mname)
+                }
+                // An associated function on a type: `Point.origin()` (§10)
+                // — a struct, an enum or an exception, a NEWTYPE (which takes
+                // impls of its own, §3.8), or any type an impl block gave a
+                // method of that name (`impl Default for int`).
                 if bound == "" and (bn in self.structs or bn in self.enums or
-                                    bn in self.exceptions) {
+                                    bn in self.exceptions or
+                                    bn in self.newtypes or
+                                    (bn || "." || mname) in self.funcParams) {
                     let targs2 = self.lower_args(x)
                     let rt = self.new_reg()
                     self.emit(line, "CALL",
@@ -465,10 +611,123 @@ impl Lowerer {
                     return rt
                 }
             }
-            let robj = self.lower_expr(base)
-            let margs = self.lower_args(x)
+            // `Wrap[int].make()`: a static method of an INSTANTIATED generic
+            // type. Generics are erased (§3.7), so the type arguments say
+            // nothing the call needs, and it is `Wrap.make()`.
+            if self.T.Kind(base) == ast.INDEX {
+                let ib = self.T.Kid(base, 0)
+                if self.T.Kind(ib) == ast.IDENT {
+                    let tn = self.T.Get(ib).Sval
+                    if self.lookup(tn) == "" and not (tn in self.globals) and
+                       (tn in self.structs or tn in self.enums or
+                        tn in self.newtypes) {
+                        let sargs = self.lower_args(x)
+                        let rs = self.new_reg()
+                        self.emit(line, "CALL", [rs, tn || "." || mname, sargs])
+                        return rs
+                    }
+                }
+            }
+            // `xs.append(v)` on a `[]u8`: every appended value is a store
+            // into a u8, checked like any other (sized.voi).
+            if mname == "append" {
+                let ra = self.lower_sized_append(x, base)
+                if ra != "" { return ra }
+            }
+            // `L.set(v)`: a Box's set is copy-on-write (boxcow.voi).
+            if mname == "set" {
+                let rs = self.lower_box_set(x, base)
+                if rs != "" { return rs }
+            }
+            // A method some declaration writes as `mut self` writes its
+            // receiver in place, so an lvalue receiver is made unique first
+            // (boxcow.voi): `var b = a; b.inc()` must not change `a`.
+            var robj = ""
+            var margs = ""
+            var vlock = ""
+            var copyBack = false
+            var preAdded = []
+            let pmark = len(self.pathTemps)
+            // `p.run(f)` on a struct with a FIELD `run` calls the function
+            // the field holds: no method, whatever another type declares.
+            let rty = self.st(base)
+            let fieldCall = rty != "" and (rty || "|" || mname) in self.fieldTy
+            // `xs.map(fn …)` on a builtin collection runs the literal before
+            // it returns, on this task: it does not escape.
+            if coll_type(rty) and sync_builtin(mname) {
+                each a in self.T.Get(self.T.Kid(x, 1)).Kids {
+                    let av = self.T.Kid(a, 0)
+                    if self.T.Kind(av) == ast.CLOSURE { self.inPlace.add(av) }
+                }
+            }
+            if mname in self.mutMethods and not fieldCall {
+                // The ARGUMENTS first, each holding its own reference, and
+                // only then the receiver made unique — so `a.kids.append(a)`
+                // counts `a` twice and appends a copy, never `a` into itself
+                // (the order `L.set(v)` already uses, boxcow.voi).
+                margs = self.lower_set_args(x)
+                // A collection's own growing or reordering method, on a
+                // variable closures capture, runs under the variable's frame
+                // lock, like a store (boxcow.voi, var_root): a closure handed
+                // to tasks that calls it must not copy the receiver on
+                // another's temporaries and lose an append. Only these
+                // runtime methods: user code never runs under a variable's
+                // lock (it could wait on a task that wants another one).
+                // (An unknown static type is taken for a collection: a
+                // user method of one of these names is rare, and it is the
+                // collections' growth that must never race.)
+                if (rty == "" or coll_type(rty)) and lock_writer(mname) {
+                    vlock = self.var_root(base)
+                }
+                // An index on the receiver's path that runs Voilà code is
+                // computed before the lock (stmt.voi pre_index).
+                if vlock != "" or self.var_root(base) != "" {
+                    preAdded = self.pre_index(base)
+                }
+                if vlock != "" { self.emit(line, "VARLOCK", [vlock]) }
+                // Any other writing method on a variable closures capture —
+                // Voilà code, or sort_by's key, which run unlocked — works
+                // on a PRIVATE copy of the receiver, taken under the
+                // variable's lock and stored back under it when the call
+                // returns (COPY-IN, COPY-OUT): it writes in place, and a
+                // task reading the variable meanwhile holds a snapshot
+                // nothing may write in place (vl_varread).
+                let croot = self.var_root(base)
+                // (pre_index has computed every index that calls code, so
+                // the path can be walked again for the copy-out.)
+                if vlock == "" and croot != "" {
+                    copyBack = true
+                    self.emit(line, "VARLOCK", [croot])
+                    robj = self.private_copy(self.recv_path(base), croot, line)
+                    self.emit(line, "VARUNLOCK", [croot])
+                } else {
+                    robj = self.recv_path(base)
+                }
+            } else {
+                robj = self.lower_expr(base)
+                margs = self.lower_args(x)
+            }
             let rd = self.new_reg()
-            self.emit(line, "CALLM", [rd, robj, mname, margs])
+            // A receiver of a SIZED integer type is an `int` at run time;
+            // its own impl (or inherited default) is tried first.
+            let sz = self.sized_of(base)
+            if sz != "" {
+                self.emit(line, "CALLM", [rd, robj, mname, margs, sz])
+            } else {
+                self.emit(line, "CALLM", [rd, robj, mname, margs])
+            }
+            // The path's temporaries go first, so a copy-out walking the path
+            // again counts only real holders and copies nothing in a frame
+            // no closure has captured.
+            self.kill_path(pmark, line)
+            if copyBack {
+                // Copy-out: the receiver as the method left it, stored back
+                // where it came from (assign_to takes the variable's lock).
+                // Without a copy-in it is the very value already there.
+                self.assign_to(base, robj, tok.ASSIGN, line, 0)
+            }
+            if vlock != "" { self.emit(line, "VARUNLOCK", [vlock]) }
+            self.drop_pre(preAdded)
             return rd
         }
 
@@ -476,8 +735,13 @@ impl Lowerer {
         if fk == ast.IDENT {
             let name = self.T.Get(fun).Sval
 
-            let op = self.lookup(name)
+            var op = self.lookup(name)
             if op != "" {
+                // A captured closure is called through its snapshot: another
+                // task may assign the variable and release the old closure.
+                if self.captured_name(name, op) {
+                    op = self.lower_ident_value(fun)
+                }
                 let cargs = self.lower_args(x)
                 let rc = self.new_reg()
                 self.emit(line, "CALLR", [rc, op, cargs])
@@ -486,16 +750,24 @@ impl Lowerer {
 
             if conv_type(name) or name in self.aliases {
                 // A checked conversion (§3.2): int(x), int(s, 16), dec("…").
+                // A NEWTYPE converts by name — the runtime wraps the value
+                // (§3.8) — while an ALIAS is its target: `UserID(5)` for
+                // `type UserID = int` is `int(5)`, and an alias of a type
+                // that is not a conversion target is the value unchanged.
                 if len(args0) == 0 {
                     self.fail(x, name || "() needs an argument")
+                }
+                let target = self.alias_target(name)
+                if not conv_type(target) and not (target in self.newtypes) {
+                    return self.lower_expr(self.T.Kid(args0[0], 0))
                 }
                 let ra = self.lower_expr(self.T.Kid(args0[0], 0))
                 let rd = self.new_reg()
                 if len(args0) > 1 {
                     let rb = self.lower_expr(self.T.Kid(args0[1], 0))
-                    self.emit(line, "CONV", [rd, name, ra, rb])
+                    self.emit(line, "CONV", [rd, target, ra, rb])
                 } else {
-                    self.emit(line, "CONV", [rd, name, ra])
+                    self.emit(line, "CONV", [rd, target, ra])
                 }
                 return rd
             }
@@ -514,10 +786,44 @@ impl Lowerer {
                              "` cannot be called; use a composite literal")
             }
 
+            // The prelude's `append(xs, v…)` writes its first argument in
+            // place, exactly as `xs.append(v…)` does: that slice is made
+            // unique where it lives first (boxcow.voi).
+            if name == "append" and not (name in self.funcs) and
+               name in self.prelude and len(args0) > 0 {
+                var plain = true
+                each a in args0 {
+                    let an = self.T.Get(a)
+                    if an.Ival == 1 or an.Sval != "" { plain = false }
+                }
+                if plain {
+                    // The values first, each owning a reference (see the
+                    // method form), then the slice made unique.
+                    let pmark = len(self.pathTemps)
+                    var vals = []
+                    var ai = 1
+                    while ai < len(args0) {
+                        let av = self.T.Kid(args0[ai], 0)
+                        let rv = self.own_value(av, self.lower_expr(av), line)
+                        self.mark_named(rv)
+                        vals.append(rv)
+                        ai += 1
+                    }
+                    var aregs = [self.recv_path(self.T.Kid(args0[0], 0))]
+                    each rv in vals { aregs.append(rv) }
+                    let ra = self.new_reg()
+                    self.emit(line, "CALL", [ra, name,
+                                             "(" || str.join(aregs, ",") || ")"])
+                    self.kill_path(pmark, line)
+                    return ra
+                }
+            }
+
             if name in self.funcs or name in self.prelude {
-                let fargs = self.lower_args_for(x, name)
+                let fargs = self.desc_call_args(x, name, 0)
                 let rf = self.new_reg()
                 self.emit(line, "CALL", [rf, name, fargs])
+                self.flush_mut_args(line)
                 return rf
             }
 
@@ -530,14 +836,20 @@ impl Lowerer {
         if fk == ast.INDEX {
             let fname, ok = self.generic_func_name(fun)
             if ok {
-                let gargs = self.lower_args(x)
+                // The callee's own name is the instantiation's base:
+                // `make[Point]` calls `make`, `geom.make[P]` `geom.make`.
+                let callee = fname[0..str.index(fname, "[")]
+                let gargs = self.desc_call_args(x, callee, fun)
                 let rg = self.new_reg()
                 self.emit(line, "CALL", [rg, fname, gargs])
+                self.flush_mut_args(line)
                 return rg
             }
         }
 
-        // Anything else: evaluate the callee, call indirectly.
+        // Anything else: evaluate the callee, call indirectly. A closure
+        // literal called at once runs in place (closure_escapes).
+        if fk == ast.CLOSURE { self.inPlace.add(fun) }
         let rfn = self.lower_expr(fun)
         let args = self.lower_args(x)
         let rd = self.new_reg()
@@ -552,6 +864,23 @@ impl Lowerer {
         return self.lower_args_for(x, "")
     }
 
+    // newtype_arg converts an untyped literal or a closure literal passed to
+    // a NEWTYPE parameter of a known top-level function, as a store into a
+    // newtype location converts one (§3.8, sized.voi's store_value).
+    func newtype_arg(mut self, callee str, i int, v int,
+                     r str) str throws LowerError {
+        if not (callee in self.funcDecl) { return r }
+        let ps = self.T.Get(self.T.Kid(self.funcDecl[callee], 1)).Kids
+        if i >= len(ps) { return r }
+        let pn = self.T.Get(ps[i])
+        if (pn.Ival2 & 16) != 0 or pn.Ival == 0 { return r }
+        let want = self.decl_type(pn.Ival)
+        // Only a newtype: a sized parameter is range-checked on entry to
+        // the callee (sized.voi), and a second check here would move it.
+        if not (want in self.newtypes) { return r }
+        return self.store_value(want, v, r, pn.Line)
+    }
+
     func lower_args_for(mut self, x int, callee str) str throws LowerError {
         var regs = []
         var names = []
@@ -559,7 +888,11 @@ impl Lowerer {
         var hasNamed = false
         each a in self.T.Get(self.T.Kid(x, 1)).Kids {
             let an = self.T.Get(a)
-            regs.append(self.lower_expr(self.T.Kid(a, 0)))
+            var r = self.lower_expr(self.T.Kid(a, 0))
+            if an.Sval == "" and an.Ival != 1 and not hasNamed {
+                r = self.newtype_arg(callee, len(regs), self.T.Kid(a, 0), r)
+            }
+            regs.append(r)
             names.append(an.Sval)
             spreads.append(an.Ival == 1)
             if an.Sval != "" { hasNamed = true }
@@ -667,13 +1000,43 @@ impl Lowerer {
     // the base resolves to a function-ish name and the index is a type name.
     func generic_func_name(mut self, ix int) (str, bool) {
         let idx = self.T.Kid(ix, 1)
-        if self.T.Kind(idx) != ast.IDENT {
+        var iname = ""
+        if self.T.Get(ix).Ival2 == 2 {
+            // Type arguments read by the TYPE grammar (`f[[]int, ?str]`):
+            // the kids are type nodes, rendered as written.
+            var tas = []
+            var i = 1
+            while i < self.T.NKids(ix) {
+                tas.append(self.short_type(self.T.Kid(ix, i)))
+                i += 1
+            }
+            iname = str.join(tas, ",")
+        } else if self.T.Kind(idx) != ast.IDENT {
             return "", false
-        }
-        let iname = self.T.Get(idx).Sval
-        if not (conv_type(iname) or iname in self.structs or
-                iname in self.enums or iname in self.aliases) {
-            return "", false
+        } else if self.T.NKids(ix) > 2 {
+            // `mk[str, int]` — several type arguments. A subscript has
+            // exactly one index, so this can only be an instantiation, and
+            // every argument is taken as the type name it is written as
+            // (generic parameters included). Types are erased (§3.7): the
+            // name only has to be well-formed for cg to strip.
+            var targs = []
+            var i = 1
+            while i < self.T.NKids(ix) {
+                let a = self.T.Kid(ix, i)
+                if self.T.Kind(a) != ast.IDENT { return "", false }
+                targs.append(self.T.Get(a).Sval)
+                i += 1
+            }
+            iname = str.join(targs, ",")
+        } else {
+            iname = self.T.Get(idx).Sval
+            // The enclosing function's own type parameter is a type here
+            // too: `make[T]()` forwards T (traitdesc.voi).
+            if not (conv_type(iname) or iname in self.structs or
+                    iname in self.enums or iname in self.aliases or
+                    (iname in self.curGens and self.lookup(iname) == "")) {
+                return "", false
+            }
         }
 
         let base = self.T.Kid(ix, 0)
@@ -704,12 +1067,76 @@ impl Lowerer {
         // A generic instantiation as a VALUE: `cell[int]`, not called here.
         let fname, ok = self.generic_func_name(x)
         if ok {
+            self.refuse_desc_value(x, fname[0..str.index(fname, "[")])
             let rf = self.new_reg()
             self.emit(n.Line, "LOADFN", [rf, fname])
             return rf
         }
+        // Not an instantiation the lowerer recognises, of a function that
+        // needs its type arguments at run time: say so, rather than let the
+        // base fall through to "cannot be used as a value".
+        let b0 = self.T.Kid(x, 0)
+        if self.T.Kind(b0) == ast.IDENT and self.T.Get(b0).Sval in self.descOf and
+           self.lookup(self.T.Get(b0).Sval) == "" {
+            let bn0 = self.T.Get(b0).Sval
+            self.fail(x, "write `" || bn0 || "`'s type arguments as type " ||
+                "names (`" || bn0 || "[Point]`); an instantiated type " ||
+                "argument such as `W[int]` is not accepted here (§3.7)")
+        }
+        if self.T.NKids(x) > 2 or n.Ival2 == 2 {
+            self.fail(x, "a subscript takes one index; several bracketed " ||
+                         "arguments must name a generic function's types")
+        }
+        self.lastSnap = make(map[str]str)
         let rc = self.lower_expr(self.T.Kid(x, 0))
         let idx = self.T.Kid(x, 1)
+        // `out[len(out) - 1]`, `bag.xs[len(bag.xs) - 1]` on a variable
+        // closures capture: the index reads the SAME snapshot of the root
+        // the subscript's path was read from, so another task's append in
+        // between cannot put the index past the snapshot's end. Only when
+        // nothing in the index runs Voilà code (`len` aside): otherwise it
+        // may change the variable, and must see that.
+        var b1 = self.T.Kid(x, 0)
+        while self.T.Kind(b1) == ast.FIELD or
+              (self.T.Kind(b1) == ast.INDEX and self.T.NKids(b1) == 2) {
+            b1 = self.T.Kid(b1, 0)
+        }
+        if self.T.Kind(b1) == ast.IDENT {
+            let bn = self.T.Get(b1).Sval
+            if bn in self.lastSnap and len_only(self.T, idx) and
+               mentions(self.T, idx, bn) {
+                self.snapOver[bn] = self.lastSnap[bn]
+            }
+        }
+        if self.T.Kind(idx) == ast.RANGE and
+           (self.T.Kid(idx, 0) == 0 or self.T.Kid(idx, 1) == 0) {
+            // An open-ended slice, `s[10..]` / `s[..3]` / `s[..]`: a missing
+            // lower bound is 0 and a missing upper one is len(s), read off
+            // the already-evaluated collection so it is evaluated once —
+            // by the NATIVE len (`prelude:`), never a user `func len`.
+            let rn = self.T.Get(idx)
+            var rlo = ""
+            if self.T.Kid(idx, 0) == 0 {
+                rlo = self.new_reg()
+                self.emit(n.Line, "LOADK", [rlo, self.M.Constant(ir.CINT, "0")])
+            } else {
+                rlo = self.lower_expr(self.T.Kid(idx, 0))
+            }
+            var rhi = ""
+            var mode = "excl"
+            if self.T.Kid(idx, 1) == 0 {
+                rhi = self.new_reg()
+                self.emit(n.Line, "CALL", [rhi, "prelude:len", "(" || rc || ")"])
+            } else {
+                rhi = self.lower_expr(self.T.Kid(idx, 1))
+                if rn.Ival2 == 1 { mode = "incl" }
+            }
+            let rr = self.new_reg()
+            self.emit(n.Line, "NEWRANGE", [rr, rlo, rhi, "1", mode])
+            let ro = self.new_reg()
+            self.emit(n.Line, "SLICE", [ro, rc, rr])
+            return ro
+        }
         if self.T.Kind(idx) == ast.RANGE {
             let rr = self.lower_expr(idx)
             let rs = self.new_reg()
@@ -790,9 +1217,20 @@ impl Lowerer {
         }
 
         var fields = []
-        each f in n.Kids {
+        // A field of a sized type is checked as any other store is.
+        let sname = tn.Sval
+        var order = []
+        if sname in self.fieldOrder { order = self.fieldOrder[sname] }
+        each fi, f in n.Kids {
             let fn2 = self.T.Get(f)
-            let r = self.lower_expr(self.T.Kid(f, 0))
+            var r = self.lower_expr(self.T.Kid(f, 0))
+            var fname = fn2.Sval
+            if fname == "" and fi < len(order) { fname = order[fi] }
+            let fkey = sname || "|" || fname
+            if fkey in self.fieldTy {
+                r = self.store_value(self.fieldTy[fkey], self.T.Kid(f, 0), r,
+                                     n.Line)
+            }
             if fn2.Sval != "" {
                 fields.append(fn2.Sval || ":" || r)
             } else {
@@ -828,9 +1266,12 @@ impl Lowerer {
                 let fname = self.T.Get(fun).Sval
                 if self.lookup(fname) == "" and
                    (fname in self.funcs or fname in self.prelude) {
-                    let args = self.lower_args(payload)
+                    // With its type descriptors, if it takes any
+                    // (traitdesc.voi).
+                    let args = self.desc_call_args(payload, fname, 0)
                     let rd = self.new_reg()
                     self.emit(line, "SPAWN", [rd, fname, args])
+                    self.drop_mut_args()
                     return rd
                 }
             }
@@ -839,11 +1280,14 @@ impl Lowerer {
                 if self.T.Kind(base) == ast.IDENT {
                     let bn = self.T.Get(base).Sval
                     if self.is_pkg_qualifier(bn) {
-                        let args = self.lower_args(payload)
+                        let args = self.desc_call_args(payload, bn || "." ||
+                                                       self.T.Get(fun).Sval,
+                                                       0)
                         let rd = self.new_reg()
                         self.emit(line, "SPAWN",
                                   [rd, bn || "." || self.T.Get(fun).Sval,
                                    args])
+                        self.drop_mut_args()
                         return rd
                     }
                 }
@@ -865,12 +1309,29 @@ impl Lowerer {
             body = self.T.Add(ast.BLOCK, n.Line, n.Col, 0, 0, "", [es])
             self.note("spawn args evaluate at task start in this form")
         }
-        let name = self.lower_closure([], body, "spawn body", line)
+        let saveFail = self.canFail
+        self.canFail = true             // a task's body returns to the task
+        let name = self.lower_closure(x, [], body, "spawn body", line)
+        self.canFail = saveFail
         let rc = self.new_reg()
-        self.emit(line, "MKCLOS", [rc, name])
+        self.emit(line, "MKCLOS", self.mkclos_args(rc, name))
+        self.emit(line, "ESCAPE", [rc])          // a task's body escapes
         let rd = self.new_reg()
         self.emit(line, "SPAWNR", [rd, rc])
         return rd
+    }
+
+    // alias_target follows `type X = T` declarations to the type they name
+    // (a chain of them, bounded so a cyclic declaration cannot hang the
+    // lowerer); any other name is returned as it is.
+    func alias_target(self, name str) str {
+        var t = name
+        var hops = 0
+        while t in self.aliasTo and hops < 32 {
+            t = self.aliasTo[t]
+            hops += 1
+        }
+        return t
     }
 
     // ------------------------------------------------------------ rendering
@@ -1026,6 +1487,27 @@ impl Lowerer {
         if pt.Kind == ir.PAT_NIL  { return "nil" }
         if pt.Kind == ir.PAT_LIT  { return pt.Text }
         if pt.Kind == ir.PAT_BIND { return pt.Name }
+        if pt.Kind == ir.PAT_RANGE {
+            var op = ".."
+            if pt.Name == "=" { op = "..=" }
+            return self.pat_inner(pt.Elems[0]) || op ||
+                   self.pat_inner(pt.Elems[1])
+        }
+        if pt.Kind == ir.PAT_FIELD {
+            return pt.Name || ":" || self.pat_inner(pt.Elems[0])
+        }
+        if pt.Kind == ir.PAT_OR or pt.Kind == ir.PAT_STRUCT or
+           pt.Kind == ir.PAT_TUPLE {
+            var subs = []
+            each el in pt.Elems {
+                subs.append(self.pat_inner(el))
+            }
+            if pt.Kind == ir.PAT_OR { return str.join(subs, "|") }
+            if pt.Kind == ir.PAT_TUPLE {
+                return "(" || str.join(subs, ",") || ")"
+            }
+            return pt.Name || "\{" || str.join(subs, ",") || "}"
+        }
         if pt.Kind == ir.PAT_VARIANT {
             if len(pt.Elems) == 0 { return pt.Name }
             var subs = []
@@ -1076,4 +1558,52 @@ impl Lowerer {
         if k == ast.BOOL { return ir.CBOOL, n.Sval }
         return ir.CNIL, "nil"
     }
+}
+
+// coll_type: a static type (short spelling) that is a slice, a map or a set.
+func coll_type(t str) bool {
+    return str.starts_with(t, "[]") or str.starts_with(t, "map[") or
+           str.starts_with(t, "set[")
+}
+
+// lock_writer: a collection's builtin methods that change its length or
+// order in place without running Voilà code (sort_by runs its key, so it is
+// not locked: user code never runs under a variable's lock).
+func lock_writer(m str) bool {
+    return m == "append" or m == "pop" or m == "insert" or m == "remove" or
+           m == "reverse" or m == "add" or m == "delete" or m == "set"
+}
+
+// len_only reports whether an expression runs no Voilà code but the
+// builtin `len`: no other call, spawn, closure, receive or `try`.
+func len_only(T ast.Tree, e int) bool {
+    if e == 0 { return true }
+    let n = T.Get(e)
+    let k = n.Kind
+    if k == ast.CALL {
+        let c = T.Kid(e, 0)
+        if T.Kind(c) != ast.IDENT or T.Get(c).Sval != "len" { return false }
+        each a in T.Get(T.Kid(e, 1)).Kids {
+            if not len_only(T, T.Kid(a, 0)) { return false }
+        }
+        return true
+    }
+    if k == ast.SPAWNEXPR or k == ast.CLOSURE or k == ast.TRYEXPR or
+       k == ast.MUSTEXPR {
+        return false
+    }
+    if k == ast.UNARY and n.Ival == tok.ARROW { return false }
+    each c in n.Kids {
+        if not len_only(T, c) { return false }
+    }
+    return true
+}
+
+// sync_builtin: the builtin collection methods that run a closure argument
+// before they return, on the calling task, and keep no reference to it.
+// Only ever trusted with a receiver whose static type IS a builtin
+// collection (coll_type): a user method of the same name proves nothing.
+func sync_builtin(m str) bool {
+    return m == "map" or m == "filter" or m == "each" or m == "any" or
+           m == "all" or m == "reduce" or m == "sort_by" or m == "sorted"
 }

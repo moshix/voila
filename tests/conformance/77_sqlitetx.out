@@ -1,0 +1,21 @@
+-- a transaction that rolls back --
+A: A gives up
+B: inserted 1
+  B
+-- one that commits --
+D sees 2
+-- by hand --
+sqlite: a transaction is already open on this task (transactions do not nest)
+E: 1
+false
+-- a fault inside a transaction --
+contained: true
+F rolled back: true
+G: 1
+-- a task that ends inside a transaction --
+false
+I: 1
+H rolled back: true
+-- tasks inside a transaction --
+sqlite: deadlock: this task needs a connection whose transaction belongs to a task waiting for this one (a transaction is one task's: pass the work back to it, or open a separate connection)
+J rolled back: true K never ran: true

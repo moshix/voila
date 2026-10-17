@@ -4,5 +4,5 @@ POST /shout -> 200 OK (text/plain; charset=utf-8)
    VOILA
 GET /missing -> 404 Not Found (text/plain; charset=utf-8)
    404 not found
-refused: http: `https://example.com/` is https, and this release has no TLS — std/http speaks plaintext HTTP only. It will not fetch an https URL in the clear. Terminate TLS outside the program and use its http:// address.
+refused: http: unsupported URL scheme `ftp` (std/http speaks http and https)
 server: three requests served

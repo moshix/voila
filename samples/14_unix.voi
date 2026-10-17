@@ -43,7 +43,7 @@ func server(path str, ready chan[int], done chan[str]) {
 }
 
 // serve answers each command line until the client closes the connection.
-func serve(conn net.Conn) {
+func serve(conn mut net.Conn) {
     while true {
         match conn.read_line() {
             Err(e)   => return

@@ -1,0 +1,179 @@
+// std/compress — zip archives, in memory.
+//
+//     let z = try compress.zip_open(try os.read("site.zip"))
+//     each e in z.entries { say e.name, e.size }
+//     let page = try z.read("index.html")
+//     try z.extract_to("out")
+//
+//     var w = try compress.zip_create()
+//     try w.add("hello.txt", "hi\n")
+//     try w.add_dir("docs/")
+//     try os.write("new.zip", try w.finish())
+//
+// Entries are stored DEFLATE-compressed (level 0 stores them as they are).
+// Reading checks each entry's CRC-32. An entry's size as the archive
+// DECLARES it is checked against `max` before anything is inflated, and
+// the extractor never writes past that declared size, so a hostile archive
+// is bounded by the same DEFAULT_MAX as every decoder here. Encrypted
+// entries, and compression methods other than store and deflate, are
+// refused by name.
+package compress
+
+use "std/str"
+
+// ZipH is the C side's archive object, opaque here (as net.Sock is).
+struct ZipH {}
+
+// ZipEntry describes one member. `mtime` is in Unix seconds, as the zip's
+// DOS timestamp (local time, two-second resolution) reads back. `mode` is
+// the Unix mode an archive made on Unix records (0 when it records none);
+// `is_link` says the member is a symbolic link, whose data is its target.
+struct ZipEntry {
+    name       str
+    size       int
+    compressed int
+    is_dir     bool
+    crc32      int
+    mtime      int
+    mode       int
+    is_link    bool
+}
+
+// ZipReader is an open archive and its table of contents.
+struct ZipReader {
+    h       ZipH
+    entries []ZipEntry
+}
+
+// zip_open reads an archive from its bytes.
+func zip_open(data str) ZipReader throws IOError {
+    let h = try compress._zip_open(data)
+    var es = []
+    let n = compress._zip_count(h)
+    var i = 0
+    while i < n {
+        let name, size, csize, isdir, crc, mtime, mode = try compress._zip_entry(h, i)
+        // S_IFLNK in the Unix file-type bits
+        let link = (mode & 61440) == 40960
+        es.append(ZipEntry{name: name, size: size, compressed: csize,
+                           is_dir: isdir, crc32: crc, mtime: mtime,
+                           mode: mode, is_link: link})
+        i += 1
+    }
+    return ZipReader{h: h, entries: es}
+}
+
+impl ZipReader {
+    // names lists the members, in archive order.
+    func names(self) []str {
+        var out = []
+        each e in self.entries { out.append(e.name) }
+        return out
+    }
+
+    // index is the position of the member called `name`, or -1.
+    func index(self, name str) int {
+        each i, e in self.entries {
+            if e.name == name { return i }
+        }
+        return 0 - 1
+    }
+
+    // read returns a member's contents, at most `max` bytes of them.
+    func read(self, name str, max int = DEFAULT_MAX) str throws IOError {
+        try check_max(max)
+        let i = self.index(name)
+        if i < 0 { return errf("compress: zip: no member {name}") }
+        return try compress._zip_read(self.h, i, max)
+    }
+
+    // extract_to writes every member under `dir` (created if missing) and
+    // returns how many files it wrote. The WHOLE archive is checked before
+    // anything is written (compress.plan): names that would escape `dir`,
+    // members that are links or devices, clashing names, a total of
+    // declared sizes over `max` — the bound is on the total, so many small
+    // bombs cannot fill the disk between them — and then every member is
+    // inflated, to nowhere, and its CRC checked. Only then is each member
+    // inflated again, straight into its file. Memory stays at one
+    // inflation buffer however big the members are.
+    func extract_to(self, dir str, max int = DEFAULT_MAX) int throws IOError {
+        try check_max(max)
+        var total = 0
+        each e in self.entries { total += e.size }
+        if max > 0 and total > max {
+            return errf("compress: zip: the members total {total} bytes, " ||
+                        "over the limit of {max}")
+        }
+        var ms = []
+        each e in self.entries {
+            var kind = "file"
+            if e.is_link {
+                kind = "symlink"
+            } else if e.is_dir {
+                kind = "dir"
+            } else if special(e.mode) {
+                kind = "other"
+            }
+            ms.append(Member{name: e.name, kind: kind, data: ""})
+        }
+        let rels = try plan(ms)
+        // pass 1: every CRC, nothing kept
+        each i, m in ms {
+            if m.kind == "file" { try compress._zip_stream(self.h, i, "", max) }
+        }
+        // pass 2: each member inflated again, into its file (compress.place)
+        let h = self.h
+        return try place(ms, rels, dir, fn(i int, to str) unit! {
+            try compress._zip_stream(h, i, to, max)
+            return ()
+        })
+    }
+}
+
+// special says a member's recorded Unix mode is a device, a FIFO or a
+// socket. A file-type of 0 is a REGULAR file: that is how Python's zipfile
+// and many other writers record one (only the permission bits), and how
+// Info-ZIP reads it. (A symbolic link is is_link.)
+func special(mode int) bool {
+    let t = mode & 61440
+    return t == 8192 or t == 24576 or t == 4096 or t == 49152
+}
+
+// ZipWriter builds an archive in memory; finish() returns its bytes.
+struct ZipWriter {
+    h ZipH
+}
+
+// zip_create starts an empty archive.
+func zip_create() ZipWriter throws IOError {
+    return ZipWriter{h: try compress._zip_writer()}
+}
+
+impl ZipWriter {
+    // add stores `data` as member `name`. `mtime` is Unix seconds; 0 (the
+    // default) stamps the current time.
+    func add(self, name str, data str, level int = DEFAULT_LEVEL,
+             mtime int = 0) unit! {
+        try check_level(level)
+        if name == "" or str.ends_with(name, "/") {
+            return errf("compress: zip: {name} is not a file name " ||
+                        "(add_dir makes directories)")
+        }
+        try compress._zip_add(self.h, name, data, level, mtime)
+        return ()
+    }
+
+    // add_dir adds a directory entry; the name gets a trailing "/" if it
+    // has none.
+    func add_dir(self, name str, mtime int = 0) throws IOError {
+        var n = name
+        if not str.ends_with(n, "/") { n = n || "/" }
+        try compress._zip_add(self.h, n, "", 0, mtime)
+    }
+
+    // finish writes the central directory and returns the archive. The
+    // writer is done after it: a later add or finish is an error.
+    func finish(self) str throws IOError {
+        return try compress._zip_finish(self.h)
+    }
+}

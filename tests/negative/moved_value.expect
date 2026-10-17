@@ -1,0 +1,10 @@
+use of moved value `data` (moved on line 15
+use of moved value `bag` (moved on line 18
+use of moved value `m` (moved on line 22
+use of moved value `buf` (moved on line 26
+use of moved value `bag2`
+!use of moved value `p`
+!use of moved value `cur`
+!use of moved value `xs`
+!use of moved value `q`
+!use of moved value `gone`

@@ -1,0 +1,24 @@
+// An in-place write — a `mut self` method, a `mut` argument — needs a
+// writable location (§6.1): not a borrowed parameter, not `self` in a
+// method without `mut self`, not a tuple member (§3.3).
+struct P { x int }
+impl P {
+    func bump(mut self) { self.x += 1 }
+    func peek(self) int {
+        self.bump()
+        return self.x
+    }
+    func lend(self) { bumpp(self) }
+    func fine(mut self) { self.bump(); bumpp(self) }
+}
+func bumpp(p mut P) { p.x += 1 }
+func viap(p P) { bumpp(p) }
+func okp(p mut P) { bumpp(p); p.bump() }
+func main() {
+    var t = (P{x: 1}, 2)
+    t.0.bump()
+    var p = P{x: 1}
+    okp(p)
+    p.fine()
+    say p.peek(), t
+}

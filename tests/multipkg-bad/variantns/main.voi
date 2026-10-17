@@ -1,0 +1,10 @@
+package main
+
+// `Unit` is declared by two enums of package shapes, so the bare name (and
+// `shapes.Unit`) is ambiguous: the enum has to be named.
+use "bad/shapes"
+
+func main() {
+    say Unit
+    say shapes.Unit
+}

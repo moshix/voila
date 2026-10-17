@@ -1,0 +1,145 @@
+// The follow-ups to the fourth batch's second review.
+//
+//  1. NIL NARROWING is flow-sensitive: a name of an optional type is a `T`
+//     only where every path to it has proved it non-nil — a nil test whose
+//     other branch leaves, an assignment of a non-nil value — and that
+//     proof is lost to an assignment of a maybe-nil value, to a loop that
+//     assigns it, and inside a closure (all refused in
+//     tests/negative/narrow.voi). These are the shapes that stay legal.
+//  2. An untyped literal converts to a NEWTYPE wherever the type check
+//     accepts it: a map key, an element of a bare `[…]`, a generic call.
+//  3. A `weak` handle whose `shared` value has been freed upgrades to nil.
+//  4. Float map keys match.
+//  5. A closure that an escaped closure reads through an upvalue survives
+//     the function's return (and is freed with it: run under `leaks`).
+//  6. The new package batch's write paths are copy-on-write too.
+use "std/slices"
+use "std/maps"
+use "std/heap"
+use "std/json"
+
+type Idx int
+type Cel int
+impl Cel { func show(self) str { return "{int(self)}C" } }
+struct Room { t Cel = 21 }
+struct Node { name str }
+struct H { xs []int }
+struct Cfg { name str, tags []str }
+
+func first_pos(xs []int) ?int {
+    each x in xs {
+        if x > 0 { return x }
+    }
+    return nil
+}
+
+func narrowing(xs []int) int {
+    var total = 0
+    let p = first_pos(xs)
+    if p == nil { return 0 }
+    total += p                          // the nil branch returned
+    var o ?int = nil
+    o = 5
+    total += o                          // assigned a non-nil value
+    var q = first_pos([0])
+    if q == nil { q = 7 }
+    total += q                          // both branches end non-nil
+    let r = first_pos(xs)
+    if r != nil and r > 1 { total += r }
+    if r == nil or r < 0 { return total }
+    return total + r
+}
+
+func more(xs []int) int {
+    var total = 0
+    var x ?int = nil
+    var i = 0
+    while x == nil {                    // leaves only with x set
+        i += 1
+        x = first_pos([i])
+    }
+    total += x
+    let y = first_pos(xs)
+    match y {
+        nil => { return total }
+        _ => {}
+    }
+    total += y                          // past the nil arm
+    let z = first_pos(xs)
+    assert(z != nil)
+    total += z
+    let w = first_pos(xs)
+    if w == nil { return total }
+    let later = fn() int { return w * 2 }   // a `let` stays narrowed
+    return total + later()
+}
+
+func pick[T](a T, b T) T { return b }
+
+func warm(c Cel = 30) Cel { return c }
+
+func dangling() weak[Node] {
+    let t = shared(Node{name: "t"})
+    return weak(t)
+}
+
+func counter() fn() int {
+    let step = fn() int { return 1 }
+    var n = 0
+    return fn() int {
+        n += step()
+        return n
+    }
+}
+
+func main() {
+    say "1:", narrowing([0, 2, 3]), narrowing([0]), more([4])
+
+    var m = make(map[Idx]str)
+    m[Idx(1)] = "a"
+    m[2] = "b"
+    let xs []Idx = [5, 6]
+    say "2:", m[1], m[Idx(2)], xs[0] == Idx(5), pick(Idx(3), 4) == Idx(4)
+    let c = Cel(21)
+    switch c {
+    case 21: say "2b: case converts"
+    default: say "2b: no"
+    }
+    say "2c:", Room{}.t, warm()
+
+    let w = dangling()
+    let live = shared(Node{name: "live"})
+    let w2 = weak(live)
+    say "3:", w.upgrade() == nil, w2.upgrade() != nil
+
+    var fm = make(map[float]str)
+    fm[1.5] = "x"
+    let k = 1.5
+    say "4:", fm[1.5], fm[k], len(fm)
+
+    let next = counter()
+    next()
+    say "5:", next(), next()
+
+    var h = H{xs: [1, 2, 3]}
+    let before = h.xs
+    h.xs.insert(0, 9)
+    let mid = h.xs
+    h.xs.remove(1)
+    var arr = [[1, 2]]
+    let a0 = arr[0]
+    arr[0].insert(1, 7)
+    var mp = map[str]int{"x": 1}
+    let merged = maps.merge(mp, map[str]int{"y": 2})
+    mp["z"] = 3
+    var hp = heap.new[int]()
+    hp.push(3)
+    hp.push(1)
+    let hp2 = hp
+    hp.push(0)
+    let cfg = json.decode[Cfg]("\{\"name\": \"a\", \"tags\": [\"t\"]}") else Cfg{name: "", tags: []}
+    var c2 = cfg
+    c2.tags.append("u")
+    say "6:", before, mid, h.xs, a0, arr, slices.insert(before, 1, 5)
+    say "6b:", mp, merged, hp.len(), hp2.len(), hp.pop(), hp2.pop(), cfg, c2
+}

@@ -1,0 +1,7 @@
+// `Self.m()` in a trait default needs a receiver to say which type
+// implements the trait; a static default has none.
+trait Default {
+    func default() Self
+    func fresh() Self = Self.default()
+}
+func main() { }

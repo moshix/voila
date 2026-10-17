@@ -1,0 +1,71 @@
+// 76_tlspolicy — the certificate checks std/tls adds over BearSSL's
+// minimal X.509 engine (runtime/src/ext/tls.c, Policy), on loopback with
+// the test leaves in tests/tls (made by tests/tls/gen.sh): extended key
+// usage, a subjectAltName required (no Common Name fallback), no SHA-1,
+// the wildcard rule (a whole left-most label, two labels after it), IP
+// address SANs, and a clear word for a key usage that forbids the job.
+use "std/tls"
+
+const CA = "tests/tls/ca.pem"
+
+// probe serves `cert` (with tests/tls/server.key) once and reports what a
+// client verifying `name` against the test CA concluded.
+func probe(cert str, name str, addr_host str) str {
+    let lis = must tls.listen(addr_host || ":0", tls.Config{
+        cert_file: "tests/tls/" || cert || ".pem",
+        key_file: "tests/tls/server.key"})
+    let addr = lis.addr()
+    var out = ""
+    group {
+        spawn fn() {
+            match lis.accept() {
+                Ok(c) => {
+                    var cc = c
+                    match cc.write_all("hi\n") { Ok(u) => u
+                                                 Err(e) => e }
+                    cc.close()
+                }
+                Err(e) => ()
+            }
+        }()
+        match tls.connect(addr, tls.Config{server_name: name, ca_file: CA}) {
+            Ok(c) => {
+                var cc = c
+                match cc.read_line() {
+                    Ok(l) => out = "accepted: " || l.trim()
+                    Err(e) => out = "accepted, then: " || e.message()
+                }
+                cc.close()
+            }
+            Err(e) => out = "refused: " || e.message()
+        }
+    }
+    lis.close()
+    return out
+}
+
+func main() {
+    let cases = [("server", "localhost"), ("eku", "localhost"),
+                 ("nosan", "localhost"), ("sha1", "localhost"),
+                 ("ku", "localhost"),
+                 ("wild", "a.test.localhost"), ("wild", "A.TEST.localhost."),
+                 ("wild", "a.b.test.localhost"), ("wild", "test.localhost"),
+                 ("wild", "x.localhost"), ("wild", "example.com"),
+                 ("ipsan", "127.0.0.1"), ("ipsan", "127.0.0.2"),
+                 ("ipsan", "localhost"), ("server", "127.0.0.1")]
+    each c in cases {
+        say c.0, c.1, "=>", probe(c.0, c.1, "127.0.0.1")
+    }
+    // no server_name: the address's host is checked, here an IP SAN
+    say "ipsan by address =>", probe("ipsan", "", "127.0.0.1")
+    // a server name is checked before it is used for anything: SNI and the
+    // verification both read it as a C string, so a NUL would cut it short
+    // ("a.test.localhost" would then be verified against *.test.localhost)
+    each n in ["a.test.localhost\u{0}.evil", "*.test.localhost",
+               "a..test.localhost", ".localhost", "bücher.localhost",
+               "a b.localhost", "localhost.", "a.test.localhost..",
+               "-a.test.localhost", "a-.test.localhost", "a.test.localhost:443",
+               "[::1]"] {
+        say "[" || n.replace("\u{0}", "\\0") || "] =>", probe("wild", n, "127.0.0.1")
+    }
+}

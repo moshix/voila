@@ -1,0 +1,14 @@
+`wrong_result` returns `int`, but `str` is given
+`n` is `int`, but its initialiser is `str`
+cannot assign `str` to `m`, which is `int`
+argument 2 of `addup` is `int`, but `str` is given
+argument 1 of `Stack.push` is `int`, but `str` is given
+`Point` has no field `z` (§3.4)
+`Point` has no method `frobnicate` (§3.6)
+`Point.norm` takes 0 arguments, but 1 is given
+no method `no_such_method` is declared anywhere in this program, and `Describe` is a trait
+!`Point` has no method `norm`
+!`Point` has no field `x`
+!`Point` has no method `describe`
+!`d` is `Describe`
+!has no method `describe`

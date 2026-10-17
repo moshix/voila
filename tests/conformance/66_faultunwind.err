@@ -1,0 +1,5 @@
+http: handler for GET `/locked`: abort: index out of bounds: 6 (len 1)
+http: handler for GET `/locked`: abort: index out of bounds: 7 (len 1)
+http: handler for GET `/defer-faults`: abort: index out of bounds: 7 (len 1)
+http: handler for GET `/throw-then-defer`: abort: index out of bounds: 8 (len 1)
+http: handler for GET `/cell`: abort: index out of bounds: 4 (len 1)

@@ -1,0 +1,11 @@
+GET 200 secure /index
+POST 200 posted 100000 bytes
+PUT 200 secure /thing
+system CA: refused
+by IP ERR tls: certificate does not match host name "127.0.0.1"
+wrong name ERR tls: certificate does not match host name "example.org"
+insecure 200 secure /anyway
+plain: refused
+served
+serve_one 200 secure /one
+true

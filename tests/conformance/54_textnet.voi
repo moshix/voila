@@ -1,0 +1,69 @@
+// The small items: std/str's trim_prefix, trim_suffix and cut; regex named
+// groups `(?P<name>…)` with find_named, names() and `${name}` in a
+// replacement; std/http's percent-decoding — url_decode, url_encode,
+// parse_query, Request.query_params — and Server.serve's graceful stop.
+use "std/regex"
+use "std/http"
+use "std/net"
+
+func hello(req http.Request) http.Response {
+    if req.path == "/boom" { throw RuntimeError{msg: "handler bug"} }
+    let q = req.query_params() else map[str]str{}
+    return http.text(200, "hi {q.get("who", "nobody")} at {req.path}\n")
+}
+
+func main() {
+    // ---- std/str
+    say "v1.2.3".trim_prefix("v"), "v1.2.3".trim_prefix("x"), str.trim_prefix("aaa", "a")
+    say "main.voi".trim_suffix(".voi"), str.trim_suffix("x", "xx"), "".trim_suffix("")
+    say "key=value=more".cut("="), "no-sep".cut("="), "x".cut("")
+    let (k, v, found) = "Content-Type: text/plain".cut(": ")
+    say k, "|", v, found
+
+    // ---- std/regex named groups
+    let re = must regex.compile(`(?P<year>\d{4})-(?P<mon>\d\d)-(\d\d)`)
+    say re.names()
+    let m = re.find_named("released on 2024-06-15, finally") else map[str]str{}
+    say m["0"], m["year"], m["mon"], len(m)
+    say re.find_named("no date here")
+    say regex.find_named(`(?<user>\w+)@(?<host>[\w.]+)`, "mail ada@example.org now")
+    say regex.replace(`(?P<first>\w+) (?P<last>\w+)`, "Ada Lovelace", `${last}, ${first} ($1)`)
+    say regex.find(`(?P<a>x)(y)`, "xy")
+    say regex.compile(`(?P<a>x)(?P<a>y)`)
+    say regex.compile(`(?P<>x)`)
+    say regex.compile(`(?<=x)y`)
+
+    // ---- std/http percent-encoding
+    say must http.url_decode("a%20b+c%2Fd%e2%82%ac"), http.url_decode("bad%2")
+    say http.url_decode("bad%zz")
+    say http.url_encode("a b/c?d=é&~_.-")
+    say must http.url_decode(http.url_encode("round trip: 100% & more"))
+    say must http.parse_query("a=1&b=x+y&a=2&flag&&c=%3D")
+
+    // ---- Server.serve, and its graceful stop
+    var srv = must http.listen("127.0.0.1:0")
+    let addr = srv.addr()
+    let stop = chan[int](1)
+    group {
+        spawn {
+            match srv.serve(hello, stop) {
+                Ok(u)  => say "server stopped cleanly"
+                Err(e) => say "server error:", e.message()
+            }
+        }
+        let r1 = must http.get("http://{addr}/greet?who=ada%20l")
+        say r1.status, r1.body.trim()
+        let r2 = must http.get("http://{addr}/x?q=1")
+        say r2.status, r2.body.trim()
+        // A handler that throws is a 500, and the server keeps serving.
+        let r3 = must http.get("http://{addr}/boom")
+        say r3.status, r3.body.trim()
+        say (must http.get("http://{addr}/after")).status
+        stop <- 1
+    }
+    // The listener is closed once serve has returned.
+    match net.connect(addr) {
+        Ok(c)  => say "still accepting?"
+        Err(e) => say "refused after stop"
+    }
+}

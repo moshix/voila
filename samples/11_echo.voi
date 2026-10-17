@@ -31,7 +31,7 @@ func serve(addr chan[str], done chan[str]) {
 }
 
 // echo_lines reads lines until end of stream, echoing each one back.
-func echo_lines(conn net.Conn) {
+func echo_lines(conn mut net.Conn) {
     while true {
         match conn.read_line() {
             Err(e)   => return

@@ -1,0 +1,122 @@
+// std/slices, std/maps, std/heap and std/chan (§13.4), and the in-place
+// slice methods insert and remove. Every function of the three packages
+// returns a new value and leaves its argument alone; the methods change the
+// `var` they are called on.
+use "std/slices"
+use "std/maps"
+use "std/heap"
+use "std/chan"
+use "std/time"
+
+struct Job { pri int, name str }
+
+struct Ver { major int, minor int }
+impl Ord for Ver {
+    func cmp(self, o Ver) int {
+        if self.major != o.major { return self.major - o.major }
+        return self.minor - o.minor
+    }
+}
+
+func main() {
+    // ---- std/slices
+    let xs = [5, 1, 4, 1, 5, 9, 2, 6]
+    say slices.contains(xs, 4), slices.contains(xs, 7)
+    say slices.index_of(xs, 1), slices.last_index_of(xs, 1), slices.index_of(xs, 8)
+    say slices.index_where(xs, fn(x int) bool { return x > 4 })
+    say slices.count(xs, 5)
+    say slices.reversed(xs)
+    say slices.insert(xs, 2, 99), slices.insert(xs, 8, 0), slices.remove(xs, 0)
+    say xs                                   // untouched by all of the above
+    let s = xs.sorted()
+    say s
+    say slices.binary_search(s, 5), slices.binary_search(s, 3)
+    say slices.binary_search(s, 0), slices.binary_search(s, 10)
+    say slices.binary_search([]int{}, 1)
+    say slices.binary_search_by(s, fn(x int) int { return x - 6 })
+    say slices.compact(s), slices.compact([1, 1, 2, 1]), slices.unique(xs)
+    say slices.chunk(xs, 3), slices.chunk([1, 2], 5)
+    say slices.flatten([[1, 2], [], [3]]), slices.concat([1], [2, 3])
+    say slices.equal([1, 2], [1, 2]), slices.equal([1, 2], [2, 1])
+    say slices.min(xs), slices.max(xs), slices.min([]int{})
+    let vs = [Ver{major: 1, minor: 2}, Ver{major: 0, minor: 9}, Ver{major: 1, minor: 0}]
+    say slices.max(vs), slices.min(vs)
+    let ev, od = slices.partition(xs, fn(x int) bool { return x % 2 == 0 })
+    say ev, od
+    say slices.repeat("ab", 3)
+    try { say slices.insert(xs, 9, 0) } catch e: RangeError { say "caught:", e.message() }
+    try { say slices.chunk(xs, 0) } catch e: RangeError { say "caught:", e.message() }
+
+    // ---- the in-place methods
+    var v = [1, 2, 3]
+    v.insert(0, 0)
+    v.insert(2, 7)
+    v.insert(len(v), 9)
+    say v
+    let r = v.remove(2)
+    say r, v
+    let last = v.remove(len(v) - 1)
+    say last, v
+    try { v.insert(-1, 5) } catch e: RangeError { say "caught:", e.message() }
+    try { v.remove(10) } catch e: RangeError { say "caught:", e.message() }
+
+    // ---- std/maps
+    let m = map[str]int{"b": 2, "a": 1, "c": 3}
+    say maps.keys(m), maps.keys_sorted(m), maps.values(m)
+    say maps.items(m)
+    say maps.merge(m, map[str]int{"a": 10, "z": 26})
+    say maps.filter(m, fn(k str, v int) bool { return v > 1 })
+    say maps.map_values(m, fn(v int) str { return "#{v}" })
+    say maps.invert(m)
+    say maps.from_items([("x", 1), ("y", 2), ("x", 3)])
+    say maps.get_or(m, "a", 0), maps.get_or(m, "q", -1)
+    say maps.equal(m, map[str]int{"c": 3, "a": 1, "b": 2}), maps.equal(m, map[str]int{"a": 1})
+    say m                                    // untouched
+
+    // ---- std/heap
+    var h = heap.new[int]()
+    each x in xs { h.push(x) }
+    say h.len(), h.peek()
+    var out = []
+    while not h.is_empty() { out.append(h.pop() else 0) }
+    say out, h.pop()
+    var q = heap.new_by(fn(a Job, b Job) bool { return a.pri > b.pri })
+    q.push(Job{pri: 1, name: "low"})
+    q.push(Job{pri: 9, name: "high"})
+    q.push(Job{pri: 5, name: "mid"})
+    say q.items_sorted()
+    say q.pop(), q.len()
+    let hv = heap.from(vs)
+    say hv.items_sorted()
+
+    // ---- std/chan (the qualifier is the `chan` keyword's spelling)
+    group {
+        say chan.collect(chan.from([1, 2, 3]))
+        let sq = chan.map(chan.from([1, 2, 3, 4]), fn(n int) int { return n * n })
+        say chan.collect(chan.filter(sq, fn(n int) bool { return n > 1 }))
+        var got = chan.collect(chan.merge([chan.from([1, 2]), chan.from([3]), chan.from([]int{})]))
+        got.sort()
+        say got
+        // fan_out: every value reaches exactly one worker.
+        let outs = chan.fan_out(chan.from([1, 2, 3, 4, 5, 6]), 3)
+        let totals = chan[int](3)
+        each o in outs {
+            let c = o
+            spawn {
+                var t = 0
+                each x in c { t += x }
+                totals <- t
+            }
+        }
+        var sum = 0
+        each i in 0..3 { sum += <-totals }
+        say len(outs), sum
+        let a, b = chan.tee(chan.from(["x", "y"]))
+        let ra = chan[[]str](1)
+        spawn { ra <- chan.collect(a) }
+        say chan.collect(b), <-ra
+        say chan.collect(chan.throttle(chan.from([1, 2, 3]), time.Millisecond))
+    }
+    var lim = chan.limiter(time.Second * 60, 2)
+    say lim.allow(), lim.allow(), lim.allow()
+}

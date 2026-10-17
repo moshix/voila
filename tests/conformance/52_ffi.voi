@@ -1,0 +1,86 @@
+// std/ffi against the C library (§12): an `ffi "C"` block declares C
+// prototypes, a call converts each argument by its C type and the result
+// back, `...` passes C varargs by run-time kind, and ffi.alloc gives raw C
+// memory with sized reads and writes checked against the block's size.
+// (tests/ffi/ holds the libz and libsqlite3 programs, which selftest runs
+// only where those libraries are installed.)
+use "std/ffi"
+
+ffi "C" {
+    func strlen(s *char) usize
+    func getpid() int
+    func labs(n long) long
+    func atof(s *char) double
+    func getenv(name *char) *char
+    func snprintf(buf *void, n usize, fmt *char, args ...) int
+    func memset(p *void, c int, n usize) *void
+    func memcmp(a *void, b *void, n usize) int
+    func strtol(s *char, end *void, base int) long
+    func toupper(c int) int
+    func strchr(s *void, c int) *void
+    func isalpha(c int) int
+}
+
+struct Pair { a i32, b float }
+
+func main() {
+    // Scalars, strings and NULL.
+    say strlen("hello"), strlen(""), labs(-42), atof("2.5"), toupper(97)
+    say getpid() > 0
+    say getenv("VOILA_FFI_SURELY_UNSET"), isalpha(65) != 0
+
+    // A buffer C writes into, and varargs of every kind.
+    let buf = ffi.alloc(64)
+    defer ffi.free(buf)
+    let n = snprintf(buf, 64, "%s|%lld|%.3f|%c|%d", "str", 42, 3.14159, 65,
+                     -7)
+    say n, buf.read_cstr(0)
+    say snprintf(buf, 64, "no varargs"), buf.read_cstr(0)
+
+    // memset/memcmp on raw memory; a returned pointer is a Ptr of unknown size.
+    let p = memset(buf, 66, 4)
+    say buf.read_str(0, 6) == "BBBBar", p.addr == buf.addr, p.size
+    let other = ffi.cstr("BBBB")
+    say memcmp(buf, other, 4), memcmp(buf, other, 5) != 0
+    let hit = strchr(other, 66)
+    say hit.addr - other.addr, strchr(other, 90).is_null()
+    ffi.free(other)
+    say strtol("ff", ffi.null(), 16), strtol("-12", ffi.null(), 10)
+
+    // Sized reads and writes, little-endian on every supported machine.
+    buf.write_u32(8, 0xCAFEBABE)
+    say buf.read_u32(8), buf.read_u8(8), buf.read_u8(11), buf.read_i8(11)
+    buf.write_i16(12, -2)
+    say buf.read_i16(12), buf.read_u16(12)
+    buf.write_f64(16, 1.5)
+    buf.write_f32(24, 0.25)
+    say buf.read_f64(16), buf.read_f32(24)
+    buf.write_i64(32, -9000000000)
+    say buf.read_i64(32)
+    buf.write_ptr(40, buf)
+    say buf.read_ptr(40).addr == buf.addr
+    buf.write_bytes(48, [1, 2, 3])
+    say buf.read_bytes(48, 3), buf.offset(48).read_u8(2), buf.offset(48).size
+
+    // A C struct is memory at offsets: { int a; double b; } is 16 bytes.
+    let s = ffi.alloc(ffi.sizeof("int") + 4 + ffi.sizeof("double"))
+    s.write_i32(0, 7)
+    s.write_f64(8, 2.5)
+    let back = Pair{a: s.read_i32(0), b: s.read_f64(8)}
+    say back, s.size
+    ffi.free(s)
+
+    // The checks that are kept.
+    try { say buf.read_u64(60) } catch e: RangeError { say "caught:", e.message() }
+    try { say buf.read_u8(-1) } catch e: RangeError { say "caught:", e.message() }
+    try { say ffi.null().read_u8(0) } catch e: RuntimeError { say "caught:", e.message() }
+    try { buf.write_u8(0, 300) } catch e: OverflowError { say "caught:", e.message() }
+    try { say buf.offset(65) } catch e: RangeError { say "caught:", e.message() }
+    try { say ffi.alloc(-1) } catch e: RangeError { say "caught:", e.message() }
+    try { say ffi.sizeof("quad") } catch e: ValueError { say "caught:", e.message() }
+    let fb = ffi.from_bytes([104, 105])
+    say fb.read_str(0, 2), fb.size
+    ffi.free(fb)
+    ffi.free(ffi.null())
+    say "done"
+}

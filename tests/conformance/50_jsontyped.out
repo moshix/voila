@@ -1,0 +1,40 @@
+api 7 64 0.5 nil
+["a", "b"] nil Green [Circle(1.5), Rect(2, 3), Dot]
+{"X": 1} {80: "http", 443: "https"} {3, 1} 19.9 4
+db 0.25 Red
+https
+{"name":"api","id":7,"limits":{"max_mb":64,"ratio":0.5,"burst":null},"tags":["a","b"],"nick":null,"color":"Green","shapes":[{"Circle":{"r":1.5}},{"Rect":{"w":2,"h":3}},"Dot"],"env":{"X":1},"ports":{"80":"http","443":"https"},"uniq":[3,1],"price":19.9,"boxed":{"max_mb":1,"ratio":0.5,"burst":4},"peers":[{"name":"db","id":8,"limits":{"max_mb":2,"ratio":0.25,"burst":null},"tags":[],"nick":null,"color":"Red","shapes":[],"env":{},"ports":{},"uniq":[],"price":0,"boxed":{"max_mb":0,"ratio":0.5,"burst":null},"peers":[]}]}
+true
+[1, 2, 3]
+{"a": [true, false]}
+nil Blue
+[0, 255]
+error: name: expected str, got number
+error: limits.max_mb: expected int, got string
+error: limits.max_mb: missing field of type int
+error: id: expected int, got string
+error: expected Svc (an object), got array
+[1].max_mb: expected int, got number
+[1]: `Mauve` is not a variant of Color
+[0].Rect: expected 2 payload values, got 1
+x: expected int, got string
+[1]: 300 is out of range for u8
+[1]: expected str, got null
+["ok", nil]
+Opt{level: 3, name: nil} Opt{level: nil, name: nil}
+[2]: 1114112 is not a Unicode code point
+[0]: expected rune (a one-character string), got string
+bad JSON at line 1, column 9: expected a string
+bad JSON at line 1, column 8: unexpected text after the value
+bad JSON at line 1, column 3: a number may not have a leading zero
+bad JSON at line 1, column 2: control character in a string
+bad JSON at line 1, column 3: unknown escape in a string
+é 😀 /
+123456789012345678901234567890
+"tab\t nl\n ctl\u0001 quote\" back\\"
+{
+  "Rect": {
+    "w": 1,
+    "h": 2
+  }
+}

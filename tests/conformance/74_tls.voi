@@ -1,0 +1,193 @@
+// 74_tls — std/tls on loopback, no network: a server and its clients in one
+// program, with the test-only certificates in tests/tls (a test CA, an EC
+// and an RSA "localhost", and an unrelated CA). Verification must SUCCEED
+// against the right CA and name, and FAIL — saying why — for a wrong host
+// name and for an untrusted authority; `insecure` skips it; a TLS
+// connection is an ordinary net.Conn (read_line, io.reader, timeouts).
+use "std/io"
+use "std/net"
+use "std/tls"
+
+const CA = "tests/tls/ca.pem"
+const OTHER = "tests/tls/other-ca.pem"
+
+// echo answers `n` connections: each sends one line, gets it back
+// upper-cased. A client that fails its handshake is skipped, and what the
+// server saw is sent on `log` — printed after the clients are done, so the
+// two tasks' output cannot interleave differently from run to run.
+func echo(lis tls.Listener, n int, tag str, log chan[str]) {
+    var done = 0
+    while done < n {
+        match lis.accept() {
+            Ok(c) => {
+                var conn = c
+                match conn.read_line() {
+                    Ok(line) => {
+                        match conn.write_all(tag || ": " || line.upper()) {
+                            Ok(u) => u
+                            Err(e) => say "server write:", e.message()
+                        }
+                    }
+                    Err(e) => say "server read:", e.message()
+                }
+                conn.close()
+            }
+            Err(e) => log <- "  server saw: " || e.message()
+        }
+        done += 1
+    }
+}
+
+func talk(what str, addr str, cfg tls.Config) {
+    match tls.connect(addr, cfg) {
+        Ok(c) => {
+            var conn = c
+            say what, "->", tls.version(conn)
+            match conn.write_all("hello over tls\n") {
+                Ok(u) => u
+                Err(e) => say "  write:", e.message()
+            }
+            match conn.read_all() {
+                Ok(s) => say "  got:", s.trim()
+                Err(e) => say "  read:", e.message()
+            }
+            conn.close()
+        }
+        Err(e) => say what, "-> refused:", e.message()
+    }
+}
+
+func serve_pair(cert str, key str, tag str) {
+    let lis = must tls.listen("127.0.0.1:0",
+                              tls.Config{cert_file: cert, key_file: key})
+    let addr = lis.addr()
+    let log = chan[str](16)
+    group {
+        spawn echo(lis, 5, tag, log)
+        talk("verified", addr, tls.Config{server_name: "localhost", ca_file: CA})
+        talk("wrong name", addr, tls.Config{server_name: "example.org", ca_file: CA})
+        talk("untrusted CA", addr, tls.Config{server_name: "localhost", ca_file: OTHER})
+        talk("insecure", addr, tls.Config{insecure: true})
+        // an IP address is not a DNS name the certificate carries
+        talk("by IP", addr, tls.Config{ca_file: CA})
+    }
+    close(log)
+    each m in log { say m }
+    lis.close()
+}
+
+func main() {
+    say "-- EC certificate --"
+    serve_pair("tests/tls/server.pem", "tests/tls/server.key", "ec")
+    say "-- RSA certificate (PKCS#8 key) --"
+    serve_pair("tests/tls/rsa.pem", "tests/tls/rsa.key", "rsa")
+
+    say "-- a TLS connection is a net.Conn --"
+    let lis = must tls.listen("127.0.0.1:0", tls.Config{
+        cert_file: "tests/tls/server.pem", key_file: "tests/tls/server.key"})
+    let addr = lis.addr()
+    group {
+        spawn fn() {
+            var conn = must lis.accept()
+            var r = must io.reader(conn)
+            var n = 0
+            each line in r {
+                n += 1
+                if line.trim() == "bye" { break }
+            }
+            must conn.write_all("lines: " || str(n) || "\n")
+            // a big reply, many records long
+            must conn.write_all(str.repeat("0123456789abcdef", 8192))
+            conn.close()
+        }()
+        // client(): upgrade a plain connection by hand
+        let plain = must net.connect(addr)
+        var conn = must tls.client(plain, tls.Config{server_name: "localhost",
+                                                     ca_file: CA})
+        each i in 0..20 { must conn.write_all("line " || str(i) || "\n") }
+        must conn.write_all("bye\n")
+        say must conn.read_line().trim()
+        let rest = must conn.read_all()
+        say len(rest), rest[0..16]
+        // the same socket cannot be upgraded twice
+        match tls.client(conn, tls.Config{insecure: true}) {
+            Ok(c) => say "??"
+            Err(e) => say e.message()
+        }
+        conn.close()
+    }
+
+    say "-- a connection cut without close_notify --"
+    // shutdown() ends the TCP stream under the session without TLS's own
+    // close: what the client read so far arrives, and then the cut is an
+    // ERROR, never a clean end — an attacker on the path could make one.
+    group {
+        spawn fn() {
+            var c = must lis.accept()
+            must c.write_all("partial\n")
+            c.shutdown()
+            c.close()
+        }()
+        var cl = must tls.connect(addr, tls.Config{server_name: "localhost",
+                                                   ca_file: CA})
+        say must cl.read_line().trim()
+        match cl.read_all() {
+            Ok(s) => say "clean end?!", len(s)
+            Err(e) => say e.message()
+        }
+        cl.close()
+    }
+
+    say "-- a client that does not speak --"
+    lis.set_timeout(0)
+    group {
+        spawn fn() {
+            match lis.accept() {
+                Ok(c) => say "accepted?!"
+                Err(e) => say "server:", e.message()
+            }
+        }()
+        var silent = must net.connect(addr)
+        // the server's handshake times out after its timeout_ms; here it
+        // is the client closing that ends it
+        silent.close()
+    }
+    lis.close()
+
+    say "-- configuration errors --"
+    match tls.listen("127.0.0.1:0", tls.Config{cert_file: "tests/tls/nope.pem",
+                                               key_file: "tests/tls/server.key"}) {
+        Ok(l) => say "??"
+        Err(e) => say e.message().contains("cannot read certificate file")
+    }
+    match tls.listen("127.0.0.1:0", tls.Config{cert_file: "tests/tls/server.pem",
+                                               key_file: "tests/tls/ca.pem"}) {
+        Ok(l) => say "??"
+        Err(e) => say e.message().contains("no RSA or EC private key")
+    }
+    match tls.listen("127.0.0.1:0", tls.Config{}) {
+        Ok(l) => say "??"
+        Err(e) => say e.message()
+    }
+    match tls.connect("127.0.0.1:1", tls.Config{ca_file: "tests/tls/nope.pem",
+                                               server_name: "x"}) {
+        Ok(c) => say "??"
+        Err(e) => say e.message().starts_with("connect:")
+    }
+    match tls.client(must net.connect(addr_of_nothing()), tls.Config{}) {
+        Ok(c) => say "??"
+        Err(e) => say e.message()
+    }
+    say tls.version(must net.connect(addr_of_nothing())) == ""
+    // the platform's CA bundle: found on this machine, or "" (machine-
+    // dependent, so only its shape is printed)
+    let sys = tls.system_ca_file()
+    say sys == "" or sys.starts_with("/")
+}
+
+// addr_of_nothing is a listening plain TCP port that never answers: enough
+// for net.connect to succeed.
+var gPlain = must net.listen("127.0.0.1:0")
+func addr_of_nothing() str {
+    return gPlain.addr()
+}

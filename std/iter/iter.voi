@@ -1,0 +1,33 @@
+// std/iter — the iterator protocol, as a trait.
+//
+// `each` has always iterated a user type by calling its `next(mut self) ?T`
+// until it answers nil, duck-typed through the method table exactly as `say`
+// finds a `show`. That stays true: a type with a `next` needs nothing from
+// here. What this package adds is the protocol's NAME, so a type can promise
+// it — `impl Iterator[int] for Countdown` is checked like any trait impl — and
+// a generic function can ask for it: `[I: Iterator[T]]`.
+//
+// The trait is GENERIC over the item type rather than carrying an associated
+// type (`type Item`): Voilà has no associated types, and a parameter says the
+// same thing in a form the bound syntax already reads (§3.6).
+package iter
+
+// Iterator yields values of type T: `next` returns the next one, or nil when
+// the sequence is exhausted. `each v in it` drives it.
+trait Iterator[T] {
+    func next(mut self) ?T
+}
+
+// collect drains an iterator into a slice, in the order it yields.
+func collect[T, I: Iterator[T]](it mut I) []T {
+    var out = []
+    each v in it { out.append(v) }
+    return out
+}
+
+// count drains an iterator and returns how many values it yielded.
+func count[T, I: Iterator[T]](it mut I) int {
+    var n = 0
+    each v in it { n += 1 }
+    return n
+}

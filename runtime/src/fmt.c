@@ -102,6 +102,10 @@ Value vl_sprintf_v(Value fmtv, Value *argv, int argc) {
   const char *f = vl_cstr(fmtv);
   int64_t fn = vl_strlen(fmtv);
   Value b = vl_builder_new();
+  /* A FormatError thrown mid-format, or a `show` method that throws, would
+   * otherwise leak the builder (err.c, unwind cleanups). */
+  int mark = vl_cleanup_mark();
+  vl_cleanup_slot(&b);
   int ai = 0;
 
   for (int64_t i = 0; i < fn;) {
@@ -309,6 +313,7 @@ Value vl_sprintf_v(Value fmtv, Value *argv, int argc) {
   }
   if (ai < argc)
     vl_throwf("FormatError", "printf: %d extra argument(s)", argc - ai);
+  vl_cleanup_to(mark);
   Value out = vl_builder_done(b);
   vl_release(b);
   return out;
@@ -316,10 +321,13 @@ Value vl_sprintf_v(Value fmtv, Value *argv, int argc) {
 
 void vl_fprint(FILE *f, Value *argv, int argc, bool newline) {
   Value b = vl_builder_new();
+  int mark = vl_cleanup_mark();
+  vl_cleanup_slot(&b);
   for (int i = 0; i < argc; i++) {
     if (i) bput(b, " ");
     vl_builder_write(b, argv[i]);
   }
+  vl_cleanup_to(mark);
   Value s = vl_builder_done(b);
   fwrite(vl_cstr(s), 1, (size_t)vl_strlen(s), f);
   if (newline) fputc('\n', f);

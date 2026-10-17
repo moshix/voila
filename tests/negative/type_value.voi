@@ -1,0 +1,16 @@
+// The name of a type is not a value: `[int]` is no slice of types, and
+// `xs.map(str)` passes no function. A conversion is called (`str(x)`), or
+// wrapped in a closure to be passed; a struct is built (`P{…}`); an enum
+// is one of its variants.
+struct P { x int }
+enum Color { Red, Green }
+func main() {
+    var out = [int]
+    let y = str
+    let xs = [1, 2]
+    say xs.map(str)
+    let p = P
+    let c = Color
+    let ok = xs.map(fn(x int) str { return str(x) })
+    say out, y, p, c, ok, int(2.0)
+}

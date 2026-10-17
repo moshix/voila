@@ -1,0 +1,5 @@
+// std/sqlite is Voilà source grafted by `use`; without the `use`, its
+// functions are not in scope, and the refusal says which `use` is missing.
+func main() {
+    let db = sqlite.open(":memory:")
+}

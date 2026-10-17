@@ -1,66 +1,61 @@
-// chk/expr.voi — expression TYPES, judged for the first time.
+// chk/expr.voi — expression TYPES: the static type check (§3, §5).
 //
-// Everything before this file checked the shape of a program: arities, method
-// sets, binding modes, names that resolve. None of it ever asked the one
-// question a type checker exists to ask — does the value that arrives here
-// fit the hole it is being put into. `var x int = greeting()` where
-// `greeting` returns `str` compiled, ran, and put a string in an `int`.
+// Everything before this file checked the SHAPE of a program: arities, method
+// sets, binding modes, names that resolve. This file asks the question a type
+// checker exists to ask — does the value that arrives here fit the hole it is
+// being put into — at every hole there is:
 //
-// Six questions are asked here, all from one walk:
+//   · an INITIALISER against its annotation, or — for an unannotated `var` —
+//     every later ASSIGNMENT against the type the initialiser gave it
+//                                              `var n = 3; n = "three"`
+//   · an ASSIGNMENT against the target's type  `x = f()`, `p.x = "a"`, `+=`
+//   · an ARGUMENT against the parameter — a function's, a method's at the
+//     receiver's type arguments, a generic one's at the types unification
+//     found, a variant's payload, a struct field in a composite literal
+//   · a RETURNED value against the declared result (a closure's own too)
+//   · an ELEMENT of a typed collection literal, a value appended or added
+//   · a value SENT on a typed channel
+//   · the BRANCHES of an `if`/`match` value: each against the type the
+//     context expects, or — with none expected — against each other (§5.3)
+//   · the OPERANDS of arithmetic, comparison and logic: no `int == str`, no
+//     `"a" + 1`, no truthiness, and a newtype mixes only with itself (§3.8)
+//   · a METHOD's existence on every receiver whose method set is visible:
+//     a struct, an enum, an exception, a newtype, a primitive, a builtin
+//     collection — and a type parameter, judged against its BOUNDS (§3.7)
+//   · a FIELD's existence on a struct
 //
-//   1. an INITIALISER against its annotation      `var x int = f()`
-//   2. an ASSIGNMENT against the target's type    `x = f()`
-//   3. an ARGUMENT against the parameter          `f(1, "a")`
-//   4. a RETURNED value against the result        `return "a"`
-//   5. a FIELD against the struct's declaration   `p.z`
-//   6. a METHOD's existence and arity on a nominal receiver  `p.foo(1)`
+// The inference and the verdict live in chk/infer.voi; its header states the
+// soundness rule this whole file obeys: UNKNOWN FITS EVERYTHING, and every
+// diagnostic here is a positive finding about two types the program spells
+// out. A false error rejects a working program, which is worse than a miss.
 //
-// and, folded into 1–4, the thing that finally makes `[]Describe` mean
-// something: a trait-typed hole accepts only a type that implements the
-// trait, and a trait-typed RECEIVER answers only the trait's own methods.
+// WHAT IS DELIBERATELY NOT JUDGED (each a place where the information is not
+// there, or a check would need flow analysis this release does not have):
 //
-// THE DESIGN RULE, and it governs every line below: THE CHECKER SAYS NOTHING
-// UNLESS IT IS SURE. `ty_of` is a partial function — 0 means "I do not know"
-// — and `mismatch` is written as a positive test for a KNOWN-BAD pair rather
-// than as the negation of an assignability relation. Those are not the same
-// program. A compatibility relation has to be complete to be safe, and any
-// gap in it rejects a working program; a known-bad test has to be sound to be
-// safe, and any gap in it merely loses a diagnostic. The plan's Hazards
-// section records three separate occasions on which a check of the first kind
-// broke a build in this repository, so this file is written the second way.
-//
-// WHAT IS NEVER JUDGED, and why each one is a refusal rather than an omission:
-//
-//   · anything whose type contains a GENERIC PARAMETER. Generics are
-//     type-erased; `T` at a use site stands for a type nothing wrote down.
-//     typ.HasParam is the gate — except where the receiver supplies the
-//     answer, which is what typ.Subst is for (see subst_all).
-//   · anything containing TK_ERROR. chk/sig.voi already reported the name;
-//     a second diagnostic about the same annotation is noise.
-//   · a TRAIT on the value side. A trait-typed value dispatches dynamically
-//     and its dynamic type is unknown here, so it fits any hole.
-//   · a std package's type. `str.Builder` resolves through typ.Resolves'
-//     escape hatch precisely because it has no Voilà source; there is no
-//     declaration to judge it against.
-//   · a name a local binding may have SHADOWED. callsite.voi's discipline,
-//     reused wholesale — the env below IS the scope, so a shadowed module
-//     function simply is not found.
-//   · `?T` and `T!` on either side, unwrapped one layer and then judged on
-//     the payload. They are not sum types (`Some`/`Ok`/`Err` are patterns,
-//     never constructors), so `?int` genuinely accepts an `int` and nil.
+//   · a NAME holding a `?T` used as a `T`. The ordinary way to use an
+//     optional is to narrow it (`if x == nil { return }`), and without
+//     following that flow a check would accuse correct code. The `?T`
+//     arriving STRAIGHT from a call, and `nil` itself, are judged.
+//   · the payload of a TRAIT-typed value — it dispatches on its run-time
+//     type (§3.6), so it fits any hole and answers any method some
+//     declaration in the program spells.
+//   · values of a GENERIC PARAMETER inside the generic body (generics are
+//     erased; `T` stands for nothing written down) beyond their methods.
+//   · natives whose result type no table here states, untyped JSON values,
+//     std packages' opaque types (`str.Builder`), exceptions (`error` and
+//     the predeclared exceptions are related by a subtyping not modelled).
+//   · `shared`/`cell`/`weak` handles, channels' methods, tuples' and
+//     functions' methods.
 //
 // SHADOWING AND SCOPE. `env` maps a name to a type id and is COPIED ON ENTRY
-// to every nested scope, exactly as chk/bind.voi's does and for the same
-// reason: a `var x str` inside a block genuinely shadows an outer `x int`.
-// The copy walks map keys, whose order is nondeterministic; that is safe
-// because the copy is content-only and NO DIAGNOSTIC IS EVER PRODUCED FROM A
-// MAP WALK. Every loop that can reach a report goes over a declaration-
-// ordered slice.
+// to every nested scope, exactly as chk/bind.voi's does. The copy walks map
+// keys, whose order is nondeterministic; that is safe because the copy is
+// content-only and NO DIAGNOSTIC IS EVER PRODUCED FROM A MAP WALK. Every loop
+// that can reach a report goes over a declaration-ordered slice.
 //
-// ROLLOUT. Every diagnostic here is a WARNING under the code `type-mismatch`,
-// not an error. The corpus sweep that justified promoting it is recorded in
-// TESTING.md; see the note at the bottom of this file for what is still not
-// judged and would have to be built before a promotion is honest.
+// SEVERITY. These are ERRORS. The `type-mismatch` warning code, under which
+// the first, partial version of this file reported, is kept so that a
+// command line naming it stays valid; nothing reports under it any more.
 package chk
 
 use "voilac/ast"
@@ -68,18 +63,83 @@ use "voilac/tok"
 use "voilac/typ"
 use "std/str"
 
-// The warning code every diagnostic in this file carries. Spelled once.
+// The warning code the first version of this file reported under. Kept as a
+// valid -W spelling (diag.Codes); no diagnostic carries it now.
 const TYPE_MISMATCH = "type-mismatch"
+
+// The kinds of hole check_hole judges a value against; they decide only the
+// wording of the diagnostic.
+const H_INIT   = 1
+const H_ASSIGN = 2
+const H_ARG    = 3
+const H_RET    = 4
+const H_FIELD  = 5
+const H_ELEM   = 6
+const H_KEY    = 7
+const H_SEND   = 8
+const H_VALUE  = 9
+const H_MVAL   = 10
+
+// The env key prefix marking a BORROWED parameter (see ty_fn). A space can
+// never begin an identifier, so the key cannot collide with a binding.
+const BORROW_MARK = " borrow "
+
+// The env marks that decide whether a name MAY be nil-narrowed: IMM_MARK for
+// a `let` binding (it cannot change, so a closure may keep its narrowing)
+// and LOC_MARK for a binding made inside a function (a module `var` that
+// a function may reassign behind the walk's back is never narrowed).
+const IMM_MARK  = " imm "
+const LOC_MARK  = " loc "
 
 impl Checker {
     func check_expr_types(mut self) {
         self.collect_fields()
+        self.collect_infer_tables()
 
         let decls = self.T.Get(self.T.Kid(self.file, 1)).Kids
 
         // The module scope, WHOLE and first: a function body may name a
         // global declared after it.
         var menv = make(map[str]int)
+        // The method names that may write their receiver (call_mutates):
+        // every `mut self` declaration, and the builtin collection
+        // mutators.
+        each mn in ["append", "pop", "insert", "sort", "sort_by", "reverse",
+                    "set", "delete", "remove", "add"] {
+            self.mutNames.add(mn)
+        }
+        each d in decls {
+            let dk = self.T.Kind(d)
+            var ml = 0
+            if dk == ast.IMPLDEC or dk == ast.TRAITDEC { ml = self.T.Kid(d, 0) }
+            if dk == ast.EXCDEC { ml = self.T.Kid(d, 1) }
+            if ml == 0 { continue }
+            each m in self.T.Get(ml).Kids {
+                if self.T.Kind(m) == ast.FUNC and
+                   (self.T.Get(m).Ival2 & 3) == 3 {
+                    self.mutNames.add(self.T.Get(m).Sval)
+                }
+            }
+        }
+        // The module-level `var`s: never narrowed in a function (set_nn).
+        each d in decls {
+            if self.T.Kind(d) == ast.GLOBAL {
+                let gs = self.T.Kid(d, 0)
+                if self.T.Kind(gs) == ast.VAR or self.T.Get(gs).Ival2 == 2 {
+                    each nm in str.split(self.T.Get(gs).Sval, ",") {
+                        self.gVars.add(nm)
+                    }
+                }
+            }
+        }
+        each s in self.T.Get(self.T.Kid(self.file, 2)).Kids {
+            if self.T.Kind(s) == ast.VAR or (self.T.Kind(s) == ast.LET and
+                                             self.T.Get(s).Ival2 == 2) {
+                each nm in str.split(self.T.Get(s).Sval, ",") {
+                    self.gVars.add(nm)
+                }
+            }
+        }
         each d in decls {
             if self.T.Kind(d) == ast.GLOBAL {
                 self.env_bind_stmt(self.T.Kid(d, 0), menv)
@@ -88,53 +148,86 @@ impl Checker {
         each s in self.T.Get(self.T.Kid(self.file, 2)).Kids {
             self.env_bind_stmt(s, menv)
         }
+        // The module scope's types were inferred while it was still being
+        // built: forget them, so that each node is typed again in the scope
+        // it is judged in (ty_of's memo is per node).
+        self.tyMemo = make(map[int]int)
+
+        // A struct field's DEFAULT is stored into the field.
+        each sname in self.sNames {
+            let sd = self.structs[sname]
+            self.Ty.PushParams(self.decl_params(sname))
+            each f in self.T.Get(self.T.Kid(sd, 0)).Kids {
+                if self.T.Kind(f) != ast.FIELDDECL { continue }
+                let dv = self.T.Kid(f, 0)
+                if dv == 0 { continue }
+                let ft = self.Ty.FromAST(self.T, self.T.Get(f).Ival)
+                // Judged, not rewritten: a field default stays a literal
+                // (the backend converts it — cg's record_defaults).
+                let nc = len(self.convs)
+                self.check_hole(dv, ft, menv, H_FIELD,
+                                sname || "." || self.T.Get(f).Sval, 0, false)
+                while len(self.convs) > nc {
+                    self.convs = self.convs[0..len(self.convs) - 1]
+                }
+            }
+            self.Ty.PopParams()
+        }
 
         each d in decls {
             let n = self.T.Get(d)
             if n.Kind == ast.FUNC {
-                self.ty_fn(d, menv, 0)
+                self.ty_fn(d, menv, 0, 0)
             } else if n.Kind == ast.IMPLDEC {
                 // The impl's generics are in scope for every method in it,
                 // and so is `self` — whose type is the impl TARGET, written
-                // with its own parameters (`Stack[T]`), which is exactly what
-                // makes every method of a generic type unjudgeable rather
-                // than wrongly judged.
+                // with its own parameters (`Stack[T]`).
                 self.Ty.PushParams(self.generic_names(self.T.Kid(d, 1)))
                 let selft = self.Ty.FromAST(self.T, n.Ival)
                 each m in self.T.Get(self.T.Kid(d, 0)).Kids {
-                    self.ty_fn(m, menv, selft)
+                    self.ty_fn(m, menv, selft, self.T.Kid(d, 1))
                 }
                 self.Ty.PopParams()
             } else if n.Kind == ast.EXCDEC {
                 let selft = self.Ty.Nominal(n.Sval)
                 each m in self.T.Get(self.T.Kid(d, 1)).Kids {
-                    self.ty_fn(m, menv, selft)
+                    self.ty_fn(m, menv, selft, 0)
                 }
             } else if n.Kind == ast.TRAITDEC {
-                // A trait DEFAULT body is compiled and run (low's
-                // lower_trait_default), so its expressions are real code. Its
-                // `self` is of no type at all — the body is shared by every
-                // implementor — so it is typed with selft 0 and every check
-                // that needs a receiver stays quiet.
+                // A trait DEFAULT body is compiled and run, so its
+                // expressions are real code. Its `self` is of no type at
+                // all — the body is shared by every implementor.
+                self.Ty.PushParams(self.trait_params(d))
                 each m in self.T.Get(self.T.Kid(d, 0)).Kids {
-                    self.ty_fn(m, menv, 0)
+                    self.ty_fn(m, menv, 0, self.T.Kid(d, 1))
                 }
+                self.Ty.PopParams()
             } else if n.Kind == ast.GLOBAL {
-                // A COPY, and not menv itself. menv was built whole above
-                // precisely so that a body may name a global declared after
-                // it; walking each global back INTO menv re-binds the name as
-                // the walk passes it, and a function declared between two
-                // module-level bindings of one name was then judged against
-                // the first while the runtime uses the second.
+                // A COPY, and not menv itself: a function declared between
+                // two module-level bindings of one name sees the later one.
                 var genv = self.copy_env(menv)
+                self.eGens = make(map[str]int)
+                self.eVolatile = set([])
+                self.collect_volatile(self.T.Kid(d, 0), false, self.eVolatile)
+                self.nn = make(map[str]int)
+                self.dead = false
+                self.lockDepth = 0
                 self.ty_stmt(self.T.Kid(d, 0), genv)
             }
         }
-        // The script statements ARE the module scope, so they are walked in
-        // it rather than in a copy.
+        // The script statements ARE the module scope.
+        self.eVolatile = set([])
+        each s in self.T.Get(self.T.Kid(self.file, 2)).Kids {
+            self.collect_volatile(s, false, self.eVolatile)
+        }
+        self.nn = make(map[str]int)
+        self.dead = false
+        self.lockDepth = 0
         self.eSelf = 0
         self.eRes = 0
+        self.eResList = []
         self.eFn = ""
+        self.eGens = make(map[str]int)
         each s in self.T.Get(self.T.Kid(self.file, 2)).Kids {
             self.ty_stmt(s, menv)
         }
@@ -142,22 +235,13 @@ impl Checker {
 
     // ---------------------------------------------------------- the tables
 
-    // collect_fields records every struct field's declared type node under
-    // "Type|field", plus the field NAMES per type so that "has no field" can
-    // be answered without a second walk. Exceptions are recorded too: their
-    // fields are ordinary struct fields and cg registers them the same way.
-    //
-    // Declaration order (sNames, never the map) — though nothing here can
-    // reach a diagnostic, the walk is ordered anyway so that a later reader
-    // does not have to work out whether it may.
+    // collect_fields records every struct and exception field's declared
+    // type node under "Type|field", and every method NAME the program
+    // declares (mnames). Declaration order (sNames), never the map.
     func collect_fields(mut self) {
         each name in self.sNames {
             self.absorb_fields(name, self.T.Kid(self.structs[name], 0))
         }
-        // … and every method NAME the program declares, from the same
-        // declaration-ordered list. A trait's methods count: a default body
-        // is registered for every implementor, and an abstract one is
-        // somebody's obligation.
         each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
             let n = self.T.Get(d)
             var list = 0
@@ -165,6 +249,7 @@ impl Checker {
                 list = self.T.Kid(d, 0)
             } else if n.Kind == ast.EXCDEC {
                 list = self.T.Kid(d, 1)
+                self.absorb_fields(n.Sval, self.T.Kid(d, 0))
             }
             if list == 0 { continue }
             each m in self.T.Get(list).Kids {
@@ -189,41 +274,907 @@ impl Checker {
     // ---------------------------------------------------------- functions
 
     // ty_fn judges one function or method body against its own signature.
-    func ty_fn(mut self, fn int, outer map[str]int, selft int) {
+    // `glist` is the enclosing impl's or trait's generic list (0 for none),
+    // whose bounds — with the function's own — say what a value of a type
+    // parameter answers.
+    func ty_fn(mut self, fn int, outer map[str]int, selft int, glist int) {
         if self.T.Kind(fn) != ast.FUNC { return }
         let body = self.T.Kid(fn, 0)
         if body == 0 { return }
         let n = self.T.Get(fn)
         self.Ty.PushParams(self.generic_names(self.T.Kid(fn, 3)))
 
-        var env = make(map[str]int)
-        each k in keys(outer) {
-            env[k] = outer[k]
-        }
+        let saveIn = self.inFunc
+        self.inFunc = true
+        var env = self.copy_env(outer)
         each p in self.T.Get(self.T.Kid(fn, 1)).Kids {
             if self.T.Kind(p) != ast.PARAM { continue }
             let pn = self.T.Get(p)
             self.env_put(env, pn.Sval, self.param_ty(p))
+            // A BORROWED parameter is marked, under a key no identifier
+            // can spell, so that a `mut self` method called through it can
+            // be refused (check_mut_recv). Rebinding the name clears it.
+            if (pn.Ival2 & 3) == ast.MODE_BORROW {
+                env[BORROW_MARK || pn.Sval] = 1
+            }
+        }
+
+        // A parameter's DEFAULT is stored into the parameter.
+        each p in self.T.Get(self.T.Kid(fn, 1)).Kids {
+            if self.T.Kind(p) != ast.PARAM { continue }
+            let dv = self.T.Kid(p, 0)
+            if dv != 0 {
+                self.check_hole(dv, self.param_ty(p), env, H_FIELD,
+                                self.T.Get(p).Sval, 0, false)
+            }
         }
 
         let saveSelf = self.eSelf
         let saveRes = self.eRes
+        let saveList = self.eResList
         let saveFn = self.eFn
+        let saveGens = self.eGens
+        self.eGens = make(map[str]int)
+        self.add_gens(glist)
+        self.add_gens(self.T.Kid(fn, 3))
+        let saveSelfW = self.eSelfW
+        let saveNN = self.nn
+        let saveDead = self.dead
+        let saveLockD = self.lockDepth
+        self.nn = make(map[str]int)
+        self.dead = false
+        self.lockDepth = 0
+        let saveVol = self.eVolatile
+        self.eVolatile = set([])
+        self.collect_volatile(body, false, self.eVolatile)
+        // Whether `self` may be written: a `mut self` or `own self`
+        // receiver (FUNC flags 2 and 4), as chk/bind.voi reads them. A
+        // function with no receiver at all has no `self` to judge.
+        self.eSelfW = (n.Ival2 & 1) == 0 or (n.Ival2 & 6) != 0
         self.eSelf = selft
         self.eRes = self.single_result(fn)
+        self.eResList = self.result_list(fn)
         self.eFn = n.Sval
         each s in self.T.Get(body).Kids {
             self.ty_stmt(s, env)
         }
         self.eSelf = saveSelf
         self.eRes = saveRes
+        self.eResList = saveList
         self.eFn = saveFn
+        self.eGens = saveGens
+        self.eSelfW = saveSelfW
+        self.eVolatile = saveVol
+        self.inFunc = saveIn
+        self.nn = saveNN
+        self.dead = saveDead
+        self.lockDepth = saveLockD
         self.Ty.PopParams()
     }
 
+    // ---------------------------------------------------------- narrowing
+    //
+    // FLOW-SENSITIVE NIL NARROWING. A name — or a location under one, `s.v`,
+    // `xs[0]`, `m["a"]` (path_key) — of an optional type `?T` may be used
+    // as a `T` only where it is certainly not nil (direct_opt). The walk
+    // carries the set of narrowed names and paths in self.nn, and whether
+    // it is past a statement that leaves in self.dead. A narrowing is:
+    //
+    //   · SET by a binding or a plain assignment of a certainly non-nil
+    //     value (a non-optional typed value, a non-nil literal, an
+    //     operator's result), and by a condition — `x != nil` holds in the
+    //     branch it guards, `x == nil` in the other, through `and`, `or`
+    //     and `not` — by `assert`, and after a `while` with no `break`;
+    //   · CLEARED by an assignment of anything that may be nil, by a new
+    //     binding of the name, and — for every path BELOW a root — by any
+    //     write through the root: an assignment under it, a method that
+    //     writes its receiver, an argument a call may write; never set for
+    //     a root a closure writes (eVolatile) or a module `var`;
+    //   · MERGED at a join: after an `if`, a `match`, a block, a name is
+    //     narrowed only if it is narrowed at the end of every branch that
+    //     falls through — a branch that leaves (return, throw, break,
+    //     continue, os.exit) does not count, which is what makes
+    //     `if x == nil { return }` narrow `x` below it;
+    //   · DROPPED around loops (and switch, select, try) for everything the
+    //     body assigns or writes through, and inside a closure, a spawned
+    //     or a deferred block for everything but an optional `let`.
+
+    // collect_volatile gathers the names assigned inside any closure of a
+    // body (`in` says the walk is inside one).
+    //
+    // A name the closure itself declares — a parameter, a `let`/`var` inside
+    // it — is the closure's own and is not the outer name.
+    func collect_volatile(self, node int, inClos bool, out mut set[str]) {
+        if node == 0 { return }
+        let n = self.T.Get(node)
+        let k = n.Kind
+        if k == ast.CLOSURE or (k == ast.SPAWNEXPR and n.Ival2 == 1) or
+           (k == ast.DEFERSTMT and n.Ival2 == 1) {
+            var owned = set([])
+            if k == ast.CLOSURE {
+                each p in self.T.Get(self.T.Kid(node, 1)).Kids {
+                    owned.add(self.T.Get(p).Sval)
+                }
+            }
+            self.declared_in(node, owned)
+            var asg = set([])
+            self.assigned_in(node, asg)
+            // … and every root it writes THROUGH (`s.v = nil`, `s.reset()`).
+            self.mutated_roots(node, false, asg)
+            each nm in asg {
+                if not (nm in owned) { out.add(nm) }
+            }
+            return
+        }
+        each c in n.Kids {
+            self.collect_volatile(c, inClos, out)
+        }
+    }
+
+    // declared_in gathers the names a subtree binds with `let`/`var`.
+    func declared_in(self, node int, out mut set[str]) {
+        if node == 0 { return }
+        let n = self.T.Get(node)
+        if n.Kind == ast.LET or n.Kind == ast.VAR {
+            each nm in str.split(n.Sval, ",") { out.add(nm) }
+        }
+        each c in n.Kids {
+            self.declared_in(c, out)
+        }
+    }
+
+    // assigned_of lists the names an assignment TARGET rebinds: a name, or
+    // each name of a parallel target.
+    func assigned_of(self, t int) []str {
+        var out = []
+        if t == 0 { return out }
+        let k = self.T.Kind(t)
+        if k == ast.IDENT { out.append(self.T.Get(t).Sval) }
+        if k == ast.TUPLE {
+            each x in self.T.Get(t).Kids {
+                if self.T.Kind(x) == ast.IDENT { out.append(self.T.Get(x).Sval) }
+            }
+        }
+        return out
+    }
+
+    // assigned_in gathers every name a statement subtree assigns or parses
+    // into (closures included: conservative).
+    func assigned_in(self, node int, out mut set[str]) {
+        if node == 0 { return }
+        let n = self.T.Get(node)
+        if n.Kind == ast.ASSIGN {
+            each nm in self.assigned_of(self.T.Kid(node, 0)) { out.add(nm) }
+        }
+        if n.Kind == ast.PARSETERM and n.Ival == 0 { out.add(n.Sval) }
+        each c in n.Kids {
+            self.assigned_in(c, out)
+        }
+    }
+
+    // set_nn records whether a name is certainly non-nil here. A name a
+    // closure assigns, and a module-level `var` (which any function may
+    // reassign) not shadowed here, is never narrowed. The state lives in
+    // self.nn — the narrowed names of the point the walk is at — rather
+    // than in env: it is small, and a join only touches it.
+    //
+    // `name` may be a PATH (path_key: `s.v`, `xs[0].v`, `m["a"]`): the
+    // rules are its root's — a field of a module `var`, or of a name a
+    // closure writes through, is never narrowed.
+    func set_nn(mut self, env map[str]int, name str, on bool) {
+        if name == "" or name == "_" { return }
+        if on {
+            let root = key_root(name)
+            if root in self.eVolatile { return }
+            if root in self.gVars and not self.marked(env, LOC_MARK || root) and
+               not self.marked(env, IMM_MARK || root) {
+                return
+            }
+            // A location index (`xs[i]`) is only as stable as the names
+            // it reads: one a closure writes, or a module `var`, keeps the
+            // path from being narrowed.
+            if str.contains(name, "[$") {
+                each ir in key_index_roots(name) {
+                    if ir in self.eVolatile { return }
+                    if ir in self.gVars and
+                       not self.marked(env, LOC_MARK || ir) and
+                       not self.marked(env, IMM_MARK || ir) {
+                        return
+                    }
+                }
+                self.idxKeys = true
+            }
+            self.nn[name] = 1
+        } else if name in self.nn {
+            self.nn[name] = 0
+        }
+        // Whatever happens to a NAME (it is rebound, written, or forgotten)
+        // happens to every element it indexes: `xs[i]` is another element
+        // once i changes.
+        if key_root(name) == name { self.forget_index(name) }
+    }
+
+    // forget_index undoes the narrowing of every path indexed by a location
+    // rooted at `root` (`xs[i]`, `m[p.k]` for root i, p).
+    func forget_index(mut self, root str) {
+        if not self.idxKeys or root == "" { return }
+        let a = "[$" || root || "]"
+        let b = "[$" || root || "."
+        let c = "[$" || root || "["
+        each k in keys(self.nn) {
+            if self.nn[k] == 1 and (str.contains(k, a) or str.contains(k, b) or
+                                    str.contains(k, c)) {
+                self.nn[k] = 0
+            }
+        }
+    }
+
+    // path_key is the narrowing key of an expression that names a
+    // LOCATION: a name, `self`, a field of one (`s.v`), an element at a
+    // literal index or key (`xs[0]`, `m["a"]`) or at an index that is
+    // itself a location (`xs[i]`, `m[p.k]`); "" for anything else.
+    //
+    // The index part of a key is spelled so a scan can tell the kinds
+    // apart: `[0]` an int literal, `[#3:abc]` a string literal (its byte
+    // length first, so its text never reads as key syntax), `[$i]` a
+    // location — whose narrowing a write to `i` undoes (forget_index).
+    func path_key(self, e int) str {
+        if e == 0 { return "" }
+        let n = self.T.Get(e)
+        if n.Kind == ast.IDENT { return n.Sval }
+        if n.Kind == ast.SELF { return "self" }
+        if n.Kind == ast.FIELD {
+            let b = self.path_key(self.T.Kid(e, 0))
+            if b == "" { return "" }
+            return b || "." || n.Sval
+        }
+        if n.Kind == ast.INDEX and len(n.Kids) == 2 and n.Ival2 != 2 {
+            let ix = self.T.Get(n.Kids[1])
+            let b = self.path_key(n.Kids[0])
+            if b == "" { return "" }
+            if ix.Kind == ast.STR {
+                return b || "[#" || str(len(ix.Sval)) || ":" || ix.Sval || "]"
+            }
+            if ix.Kind == ast.INT {
+                // By VALUE: `xs[0x1]` and `xs[0_1]` are `xs[1]`.
+                let iv = int_lit_key(ix.Sval)
+                if iv == "" { return "" }
+                return b || "[" || iv || "]"
+            }
+            let ik = self.path_key(n.Kids[1])
+            if ik == "" { return "" }
+            return b || "[$" || ik || "]"
+        }
+        return ""
+    }
+
+    // path_root is the variable a location expression is rooted at, or "".
+    func path_root(self, e int) str {
+        let r = self.lhs_root(e)
+        if self.T.Kind(r) == ast.IDENT { return self.T.Get(r).Sval }
+        if self.T.Kind(r) == ast.SELF { return "self" }
+        return ""
+    }
+
+    // forget_under undoes the narrowing of every path below a root (not
+    // of the root itself): a write somewhere under it may have changed
+    // any of them.
+    func forget_under(mut self, root str) {
+        if root == "" { return }
+        // A write under `p` may change `p.k`, and so which element
+        // `m[p.k]` names.
+        self.forget_index(root)
+        let a = root || "."
+        let b = root || "["
+        each k in keys(self.nn) {
+            if self.nn[k] == 1 and (str.starts_with(k, a) or
+                                    str.starts_with(k, b)) {
+                self.nn[k] = 0
+            }
+        }
+    }
+
+    // type_as_value refuses the NAME of a type where a value is wanted —
+    // an element, an argument, a binding's or a `return`'s value: `[int]`,
+    // `xs.map(str)`, `let t = Point`. A type is no value at run time (code
+    // generation would find no such name), and the likely intent is a
+    // conversion or a constructor call.
+    func type_as_value(mut self, x int, env map[str]int) {
+        if x == 0 or self.T.Kind(x) != ast.IDENT { return }
+        let nm = self.T.Get(x).Sval
+        if nm in env or nm in self.funcs or nm in self.gVars or
+           nm in self.varEnum or nm in self.eGens {
+            return
+        }
+        var kind = ""
+        if conv_name(nm) { kind = "a type" }
+        if nm in self.sNames { kind = "a struct type" }
+        if nm in self.eNames { kind = "an enum type" }
+        if nm in self.excs { kind = "an exception type" }
+        if nm in self.aliasOf { kind = "a type" }
+        if kind == "" { return }
+        if conv_name(nm) {
+            self.report_at(x, "`" || nm || "` is " || kind || ", not a " ||
+                "value — to convert, call it: `" || nm || "(x)`; to pass " ||
+                "the conversion as a function, wrap it: `fn(x) \{ " || nm ||
+                "(x) \}`")
+            return
+        }
+        var how = "write a value of it, `" || nm || "\{…\}`"
+        if nm in self.eNames { how = "use one of its variants" }
+        self.report_at(x, "`" || nm || "` is " || kind || ", not a value " ||
+            "— " || how)
+    }
+
+    // spawn_enter opens a spawned body: the variables visible here are the
+    // ones the task shares with its group (§10). A module-level `var` is
+    // not among them (any function may write one).
+    func spawn_enter(mut self, env map[str]int) {
+        // The environment itself, not a copy of its keys: a closure is
+        // probed on every literal, and the map is shared until written.
+        self.spawnCaps = env
+        self.spawnLocal = set([])
+        self.spawnDepth += 1
+    }
+
+    // is_cap: a name the innermost spawned (or probed) body shares with
+    // its group — visible where it began, not bound since, and no
+    // module-level `var` (any function may write one).
+    func is_cap(self, nm str) bool {
+        if not (nm in self.spawnCaps) or nm in self.spawnLocal { return false }
+        if len(nm) == 0 or nm[0] == ' ' { return false }
+        if nm in self.gVars and
+           not self.marked(self.spawnCaps, LOC_MARK || nm) {
+            return false
+        }
+        return true
+    }
+
+    // shared_root is the variable a path names when it is one a spawned
+    // task shares with its group, and "" otherwise.
+    func shared_root(self, e int) str {
+        let r = self.lhs_root(e)
+        if self.T.Kind(r) != ast.IDENT { return "" }
+        let nm = self.T.Get(r).Sval
+        if self.is_cap(nm) { return nm }
+        return ""
+    }
+
+    // spawn_report reports a spawned-body refusal — once per node (a body
+    // may be walked twice) — or, while a closure is only being PROBED,
+    // marks it task-unsafe instead.
+    func spawn_report(mut self, at int, msg str) {
+        // Inside the user's own critical section (`mu.lock()` … `unlock()`,
+        // a `with_write` closure): their synchronisation, not ours.
+        if self.lockDepth > 0 { return }
+        if self.probe {
+            self.probeHit = true
+            return
+        }
+        if at in self.spawnRep { return }
+        self.spawnRep.add(at)
+        self.report_at(at, msg)
+    }
+
+    // spawn_uses refuses a spawned body's use of a task-unsafe closure it
+    // captures (`let grow = fn() { out.append(1) }; spawn { grow() }`):
+    // running it in a task would break the same rules as writing its body
+    // there.
+    func spawn_uses(mut self, e int) {
+        let nm = self.T.Get(e).Sval
+        if not (nm in self.unsafeNames) { return }
+        if not self.is_cap(nm) { return }
+        self.spawn_report(e, "a spawned task runs `" || nm || "`, a " ||
+            "closure that writes variables it shares with its group in a " ||
+            "way another task's write could race (§10) — let the task " ||
+            "send its results over a channel, or keep the shared value " ||
+            "in a `cell`")
+    }
+
+    // task_args refuses a task-unsafe closure handed to a parameter its
+    // callee runs in a task (task_params): `go(fn() { out.append(1) })`
+    // with `func go(f fn()) { group { spawn { f() } } }` breaks the
+    // spawned-body rules as surely as writing the closure in the spawn.
+    func task_args(mut self, call int, env map[str]int) {
+        let callee = self.T.Kid(call, 0)
+        if self.T.Kind(callee) != ast.IDENT { return }
+        let fnm = self.T.Get(callee).Sval
+        if fnm in env or not (fnm in self.funcs) { return }
+        let tp = self.task_params(fnm)
+        if len(tp) == 0 { return }
+        each i, a in self.T.Get(self.T.Kid(call, 1)).Kids {
+            if not (i in tp) { continue }
+            let v = self.T.Kid(a, 0)
+            var unsafe = v in self.unsafeClos
+            if self.T.Kind(v) == ast.IDENT and
+               self.T.Get(v).Sval in self.unsafeNames {
+                unsafe = true
+            }
+            if not unsafe { continue }
+            self.spawn_report(v, "`" || fnm || "` runs this closure in a " ||
+                "task, and it writes variables it shares with its group in " ||
+                "a way another task's write could race (§10) — let the " ||
+                "task send its results over a channel, or keep the shared " ||
+                "value in a `cell`")
+        }
+    }
+
+    // task_params is the set of positions of a function's parameters that
+    // reach a task: named inside a `spawn` in its body, or handed on to
+    // such a parameter of another function (to a fixed point, memoised).
+    func task_params(mut self, fnm str) set[int] {
+        if fnm in self.taskParams { return self.taskParams[fnm] }
+        self.taskParams[fnm] = set([])          // a recursion sees none
+        let fd = self.funcs[fnm]
+        let params = self.T.Get(self.T.Kid(fd, 1)).Kids
+        var out = set([])
+        each i, p in params {
+            let pn = self.T.Get(p).Sval
+            if pn == "" { continue }
+            if self.reaches_task(self.T.Kid(fd, 0), pn, false) { out.add(i) }
+        }
+        self.taskParams[fnm] = out
+        return out
+    }
+
+    // reaches_task: whether the name is used inside a `spawn` within node,
+    // or passed to a task parameter of a known function.
+    func reaches_task(mut self, node int, name str, inSpawn bool) bool {
+        if node == 0 { return false }
+        let n = self.T.Get(node)
+        if n.Kind == ast.IDENT and n.Sval == name and inSpawn { return true }
+        if n.Kind == ast.CALL and self.T.Kind(self.T.Kid(node, 0)) == ast.IDENT {
+            let cn = self.T.Get(self.T.Kid(node, 0)).Sval
+            if cn in self.funcs {
+                let tp = self.task_params(cn)
+                each i, a in self.T.Get(self.T.Kid(node, 1)).Kids {
+                    let v = self.T.Kid(a, 0)
+                    if i in tp and self.T.Kind(v) == ast.IDENT and
+                       self.T.Get(v).Sval == name {
+                        return true
+                    }
+                }
+            }
+        }
+        let sp = inSpawn or n.Kind == ast.SPAWNEXPR
+        each c in n.Kids {
+            if self.reaches_task(c, name, sp) { return true }
+        }
+        return false
+    }
+
+    // spawn_write refuses, inside a spawned body, an assignment that could
+    // race another task's on a shared variable (§10): one to the variable
+    // itself — `x = …`, `x += 1` (a lost update) — and any store into a
+    // map in it, which may insert a key and grow the table under another
+    // task. A slice element or a field stored (`out[j] = v`, `out[j].x =
+    // v`) goes to its own place, and is allowed.
+    func spawn_write(mut self, s int, env map[str]int) {
+        let lhs = self.T.Kid(s, 0)
+        var targets = [lhs]
+        if self.T.Kind(lhs) == ast.TUPLE { targets = self.T.Get(lhs).Kids }
+        each t in targets {
+            let nm = self.shared_root(t)
+            if nm == "" { continue }
+            if self.T.Kind(t) == ast.IDENT {
+                self.spawn_report(t, "a spawned task assigns `" || nm || "`, " ||
+                    "a variable it shares with its group — tasks would " ||
+                    "overwrite each other (§10); send the result over a " ||
+                    "channel, or keep it in a `cell` or a `shared` value")
+                continue
+            }
+            var x = t
+            while self.T.Kind(x) == ast.FIELD or self.T.Kind(x) == ast.INDEX {
+                if self.T.Kind(x) == ast.INDEX {
+                    let ct = self.ty_of(self.T.Kid(x, 0), env)
+                    if ct != 0 and self.Ty.Kind(ct) == typ.TK_MAP {
+                        self.spawn_report(t, "a spawned task stores into a " ||
+                            "map in `" || nm || "`, a variable it shares " ||
+                            "with its group — a store may add a key and " ||
+                            "grow the map under another task (§10); send " ||
+                            "the entries over a channel, or keep the map " ||
+                            "in a `cell`")
+                        break
+                    }
+                }
+                x = self.T.Kid(x, 0)
+            }
+        }
+    }
+
+    // spawn_call refuses, inside a spawned body, a call that could change
+    // the length or the contents of a shared variable behind the other
+    // tasks' backs (§10): a collection's own growing or reordering method
+    // (`out.append(v)`, `m.delete(k)`), a `mut self` method, and the
+    // variable — or a path in it — handed to a `mut` parameter.
+    func spawn_call(mut self, call int, env map[str]int) {
+        let callee = self.T.Kid(call, 0)
+        if self.T.Kind(callee) == ast.FIELD {
+            let recv = self.T.Kid(callee, 0)
+            let nm = self.shared_root(recv)
+            let m = self.T.Get(callee).Sval
+            if nm != "" {
+                let rt = self.ty_of(recv, env)
+                let rk = self.Ty.Kind(rt)
+                let coll = rt != 0 and (rk == typ.TK_SLICE or
+                                        rk == typ.TK_MAP or rk == typ.TK_SET)
+                // `p.run(f)` on a struct with a FIELD `run` calls the
+                // function it holds: no method, whatever another type
+                // declares.
+                var fieldCall = false
+                if rt != 0 and rk == typ.TK_NAMED {
+                    fieldCall = (self.Ty.Get(rt).Name || "|" || m) in self.flds
+                }
+                if (coll and coll_writer_name(m)) or
+                   (not coll and not fieldCall and m in self.mutNames) {
+                    self.spawn_report(callee, "a spawned task calls `." || m ||
+                        "(…)` on `" || nm || "`, a variable it shares with " ||
+                        "its group — tasks would change it under each " ||
+                        "other (§10); send the values over a channel, or " ||
+                        "keep the collection in a `cell`")
+                }
+            }
+        }
+        // The callee by name: `f(…)`, or a package's `pkg.f(…)` (its flat
+        // name, as the loader files it) — its declaration gives the modes;
+        // a native that writes an argument in place has them listed
+        // (native_writes: `sort.sort`, `append`).
+        var fnm = ""
+        if self.T.Kind(callee) == ast.IDENT {
+            fnm = self.T.Get(callee).Sval
+            if fnm in env { return }
+        } else if self.T.Kind(callee) == ast.FIELD and
+                  self.T.Kind(self.T.Kid(callee, 0)) == ast.IDENT {
+            let qn = self.T.Get(self.T.Kid(callee, 0)).Sval
+            if qn in env { return }
+            fnm = qn || "." || self.T.Get(callee).Sval
+        } else {
+            return
+        }
+        var params = []
+        if fnm in self.funcs {
+            params = self.T.Get(self.T.Kid(self.funcs[fnm], 1)).Kids
+        }
+        let npos = native_writes(fnm)
+        if len(params) == 0 and len(npos) == 0 { return }
+        each i, a in self.T.Get(self.T.Kid(call, 1)).Kids {
+            if len(params) > 0 {
+                if i >= len(params) { break }
+                if (self.T.Get(params[i]).Ival2 & 3) != ast.MODE_MUT {
+                    continue
+                }
+            } else if not (i in npos) {
+                continue
+            }
+            let v = self.T.Kid(a, 0)
+            let nm = self.shared_root(v)
+            if nm == "" { continue }
+            self.spawn_report(v, "a spawned task hands `" || nm || "`, a " ||
+                "variable it shares with its group, to the `mut` " ||
+                "parameter of `" || fnm || "` (§10); pass a copy, or keep " ||
+                "the value in a `cell`")
+        }
+    }
+
+    // forget_written undoes the narrowing a write to the location `lhs`
+    // may break. With a key, exactly the paths that may name the written
+    // location or one below it (may_alias): `s.w = 5` keeps `s.v`, and
+    // `xs[1] = nil` keeps `xs[0]`, but `xs[j] = nil` drops `xs[0]` and
+    // `xs[i]` alike. Without one (`xs[i + 1] = nil`), every path under
+    // the root. Either way, paths indexed by the root (`m[p.k]` after a
+    // write to p) are dropped too.
+    func forget_written(mut self, lhs int) {
+        let root = self.path_root(lhs)
+        if root == "" { return }
+        let key = self.path_key(lhs)
+        if key == "" {
+            self.forget_under(root)
+            return
+        }
+        self.forget_index(root)
+        let ws = key_steps(key)
+        each k in keys(self.nn) {
+            if self.nn[k] == 1 and key_root(k) == root and
+               may_alias(key_steps(k), ws) {
+                self.nn[k] = 0
+            }
+        }
+    }
+
+    // forget_loop undoes, before a loop (or a switch, a select, a try),
+    // the narrowing of every name the body assigns and of every path below
+    // a root the body writes through.
+    func forget_loop(mut self, body int, env map[str]int) {
+        var asg = set([])
+        self.assigned_in(body, asg)
+        self.forget(env, asg)
+        var roots = set([])
+        self.mutated_roots(body, true, roots)
+        each r in roots { self.forget_under(r) }
+    }
+
+    // mutated_roots gathers the roots a subtree writes THROUGH: the root of
+    // every assignment target and of every method call's receiver, and
+    // every name handed to a call (it may be a `mut` argument).
+    //
+    // `args` adds every name handed to a call as an argument (it may be a
+    // `mut` one) — for a loop; a closure's arguments are judged at its
+    // calls (call_mutates), so collect_volatile leaves them out.
+    func mutated_roots(self, node int, args bool, out mut set[str]) {
+        if node == 0 { return }
+        let n = self.T.Get(node)
+        if n.Kind == ast.ASSIGN {
+            let r = self.path_root(self.T.Kid(node, 0))
+            if r != "" { out.add(r) }
+            if self.T.Kind(self.T.Kid(node, 0)) == ast.TUPLE {
+                each t in self.T.Get(self.T.Kid(node, 0)).Kids {
+                    let rt = self.path_root(t)
+                    if rt != "" { out.add(rt) }
+                }
+            }
+        }
+        if n.Kind == ast.CALL {
+            let callee = self.T.Kid(node, 0)
+            if self.T.Kind(callee) == ast.FIELD {
+                let r = self.path_root(self.T.Kid(callee, 0))
+                if r != "" { out.add(r) }
+            }
+            if args {
+                each a in self.T.Get(self.T.Kid(node, 1)).Kids {
+                    let r = self.path_root(self.T.Kid(a, 0))
+                    if r != "" { out.add(r) }
+                }
+            }
+        }
+        each c in n.Kids {
+            self.mutated_roots(c, args, out)
+        }
+    }
+
+    // call_mutates undoes the narrowing a call may break: a method call
+    // writes through its receiver (when some declaration of the name, or a
+    // builtin of that name, writes its receiver), and an argument handed
+    // to a `mut` parameter — or to a callee whose modes are unknown — may
+    // be written through, or set to nil.
+    func call_mutates(mut self, call int, env map[str]int) {
+        let callee = self.T.Kid(call, 0)
+        if self.T.Kind(callee) == ast.FIELD {
+            let mn = self.T.Get(callee).Sval
+            if mn in self.mutNames {
+                self.forget_under(self.path_root(self.T.Kid(callee, 0)))
+            }
+        }
+        var params = []
+        var known = false
+        if self.T.Kind(callee) == ast.IDENT {
+            let fnm = self.T.Get(callee).Sval
+            if not (fnm in env) and fnm in self.funcs {
+                params = self.T.Get(self.T.Kid(self.funcs[fnm], 1)).Kids
+                known = true
+            }
+        }
+        each i, a in self.T.Get(self.T.Kid(call, 1)).Kids {
+            let v = self.T.Kid(a, 0)
+            let r = self.path_root(v)
+            if r == "" { continue }
+            if not known {
+                // Modes unknown (a native, a method, a closure): what lies
+                // under the argument may be written; the value itself is
+                // passed, not rebound.
+                self.forget_under(r)
+                continue
+            }
+            if i < len(params) and
+               (self.T.Get(params[i]).Ival2 & 3) == ast.MODE_MUT {
+                self.forget_under(r)
+                let key = self.path_key(v)
+                if key != "" { self.set_nn(env, key, false) }
+            }
+        }
+    }
+
+    // narrowed reports whether a name is certainly non-nil at this point
+    // of the walk.
+    func narrowed(self, name str) bool {
+        return name in self.nn and self.nn[name] == 1
+    }
+
+    // nonnil reports whether an expression certainly is not nil: a
+    // literal other than nil, a narrowed name, or a value of a known
+    // non-optional type.
+    func nonnil(mut self, e int, env map[str]int) bool {
+        if e == 0 { return false }
+        let k = self.T.Kind(e)
+        if k == ast.NILLIT { return false }
+        if self.is_lit(e) { return true }
+        // An operator's result is never nil (a receive is no operator).
+        if (k == ast.BINARY or k == ast.UNARY) and
+           self.T.Get(e).Ival != tok.ARROW {
+            return true
+        }
+        let key = self.path_key(e)
+        if key != "" and self.narrowed(key) { return true }
+        let t = self.ty_of(e, env)
+        if t == 0 { return false }
+        let tk = self.Ty.Kind(t)
+        return tk != typ.TK_OPTION and tk != typ.TK_PARAM
+    }
+
+    func marked(self, env map[str]int, k str) bool {
+        return k in env and env[k] == 1
+    }
+
+    // cond_facts: the names a condition proves non-nil when it is TRUE
+    // (`t`) and when it is FALSE (`f`).
+    func cond_facts(self, c int, t mut []str, f mut []str) {
+        if c == 0 { return }
+        let n = self.T.Get(c)
+        if n.Kind == ast.BINARY and (n.Ival == tok.EQ or n.Ival == tok.NE) {
+            let a = self.T.Kid(c, 0)
+            let b = self.T.Kid(c, 1)
+            var nm = ""
+            if self.T.Kind(b) == ast.NILLIT { nm = self.path_key(a) }
+            if self.T.Kind(a) == ast.NILLIT { nm = self.path_key(b) }
+            if nm == "" { return }
+            if n.Ival == tok.NE { t.append(nm) } else { f.append(nm) }
+            return
+        }
+        if n.Kind == ast.BINARY and n.Ival == tok.AND {
+            var junk = []
+            self.cond_facts(self.T.Kid(c, 0), t, junk)
+            self.cond_facts(self.T.Kid(c, 1), t, junk)
+            return
+        }
+        if n.Kind == ast.BINARY and n.Ival == tok.OR {
+            var junk = []
+            self.cond_facts(self.T.Kid(c, 0), junk, f)
+            self.cond_facts(self.T.Kid(c, 1), junk, f)
+            return
+        }
+        if n.Kind == ast.UNARY and n.Ival == tok.NOT {
+            self.cond_facts(self.T.Kid(c, 0), f, t)
+        }
+    }
+
+    // has_break reports whether a loop body breaks out of THIS loop: an
+    // unlabelled `break` not inside a nested loop, or any labelled one
+    // (conservatively).
+    func has_break(self, node int) bool {
+        if node == 0 { return false }
+        let n = self.T.Get(node)
+        if n.Kind == ast.BREAK { return true }
+        if n.Kind == ast.CLOSURE { return false }
+        if n.Kind == ast.WHILE or n.Kind == ast.FOR or n.Kind == ast.EACH {
+            // A nested loop's own breaks do not leave this one, unless
+            // labelled.
+            return self.labelled_break(node)
+        }
+        each c in n.Kids {
+            if self.has_break(c) { return true }
+        }
+        return false
+    }
+
+    func labelled_break(self, node int) bool {
+        if node == 0 { return false }
+        let n = self.T.Get(node)
+        if n.Kind == ast.BREAK and n.Sval != "" { return true }
+        each c in n.Kids {
+            if self.labelled_break(c) { return true }
+        }
+        return false
+    }
+
+    // nn_copy is the narrowing state as it stands — to restore after a
+    // branch, or to start each branch of a join from.
+    func nn_copy(self) map[str]int {
+        var out = make(map[str]int)
+        each k in keys(self.nn) {
+            if self.nn[k] == 1 { out[k] = 1 }
+        }
+        return out
+    }
+
+    // nn_enter starts a branch: from `base`, with `facts` narrowed, alive.
+    func nn_enter(mut self, env map[str]int, base map[str]int, facts []str) {
+        self.nn = self.copy_env(base)
+        self.dead = false
+        each nm in facts { self.set_nn(env, nm, true) }
+    }
+
+    // forget clears the narrowing of every name in a set.
+    func forget(mut self, env map[str]int, names set[str]) {
+        each nm in names { self.set_nn(env, nm, false) }
+    }
+
+    // end_state lists the names narrowed at the end of a branch. A name the
+    // branch itself DECLARED (`list` its statements; `binds` any other names
+    // it binds, a pattern's) is the branch's own binding: for it the
+    // OUTER state (`base`) stands.
+    func end_state(self, list int, binds []str, base map[str]int) []str {
+        var decl = set([])
+        each nm in binds { decl.add(nm) }
+        if list != 0 {
+            each s in self.T.Get(list).Kids {
+                let k = self.T.Kind(s)
+                if k == ast.LET or k == ast.VAR {
+                    each nm in str.split(self.T.Get(s).Sval, ",") { decl.add(nm) }
+                }
+            }
+        }
+        // A key ROOTED at a declared name (the name, or a path under it)
+        // is the branch's binding's: the outer state is taken for it.
+        // So is one INDEXED by a declared name (`xs[i]` for the branch's i).
+        var out = []
+        each k in keys(self.nn) {
+            if self.nn[k] == 1 and not key_uses(k, decl) { out.append(k) }
+        }
+        each k in keys(base) {
+            if base[k] == 1 and key_uses(k, decl) { out.append(k) }
+        }
+        return out
+    }
+
+    // merge_ends joins branch end states: a name is narrowed after the join
+    // iff it is in every end that falls through; the join is dead iff every
+    // end is. self.nn is rebuilt from the ends alone.
+    func merge_ends(mut self, ends [][]str, deads []bool) {
+        var alive = 0
+        each d in deads {
+            if not d { alive += 1 }
+        }
+        var out = make(map[str]int)
+        if alive == 0 {
+            self.nn = out
+            self.dead = true
+            return
+        }
+        var count = make(map[str]int)
+        each i, e in ends {
+            if deads[i] { continue }
+            var seen = set([])
+            each nm in e {
+                if nm in seen { continue }
+                seen.add(nm)
+                if nm in count {
+                    count[nm] = count[nm] + 1
+                } else {
+                    count[nm] = 1
+                }
+            }
+        }
+        each nm in keys(count) {
+            if count[nm] == alive { out[nm] = 1 }
+        }
+        self.nn = out
+        self.dead = false
+    }
+
+    // nn_later is the state a closure, a spawned or a deferred block starts
+    // from: it may run at any later time, so only the narrowing of a `let`
+    // (which cannot change) survives.
+    func nn_later(self, env map[str]int) map[str]int {
+        var out = make(map[str]int)
+        each k in keys(self.nn) {
+            if self.nn[k] == 1 and self.marked(env, IMM_MARK || k) {
+                out[k] = 1
+            }
+        }
+        return out
+    }
+
+    // add_gens records a generic list's parameters, name → GENERIC node.
+    func add_gens(mut self, list int) {
+        if list == 0 { return }
+        each g in self.T.Get(list).Kids {
+            if self.T.Kind(g) != ast.GENERIC { continue }
+            let gn = str.split(self.T.Get(g).Sval, "|")[0]
+            self.eGens[gn] = g
+        }
+    }
+
     // param_ty is a parameter's declared type, with the VARIADIC rule
-    // applied: `args …str` binds `args` to a `[]str`, not to a `str`, and a
-    // checker that missed that would accuse every use of the name.
+    // applied: `args …str` binds `args` to a `[]str`.
     func param_ty(mut self, p int) int {
         let pn = self.T.Get(p)
         let base = self.Ty.FromAST(self.T, pn.Ival)
@@ -232,10 +1183,8 @@ impl Checker {
         return self.Ty.MkSlice(base)
     }
 
-    // single_result is a function's result type when it declares EXACTLY one,
-    // and 0 otherwise. Two results are a tuple the callers of this file are
-    // not equipped to take apart, and `unit` is the empty type — chk/sig.voi's
-    // result_count explains why counting the annotation is wrong.
+    // single_result is a function's result type when it declares EXACTLY
+    // one, and 0 otherwise (`unit` is the empty type).
     func single_result(mut self, fn int) int {
         let list = self.T.Kid(fn, 2)
         if self.T.NKids(list) != 1 { return 0 }
@@ -245,71 +1194,266 @@ impl Checker {
         return self.Ty.FromAST(self.T, r)
     }
 
+    // result_list is a function's results when it declares SEVERAL.
+    func result_list(mut self, fn int) []int {
+        var out = []
+        let list = self.T.Kid(fn, 2)
+        if self.T.NKids(list) < 2 { return out }
+        each r in self.T.Get(list).Kids {
+            out.append(self.Ty.FromAST(self.T, r))
+        }
+        return out
+    }
+
     // ---------------------------------------------------------- statements
 
-    // ty_stmt walks a statement, judging what it can and binding what it
-    // learns. It mirrors chk/bind.voi's bind_stmt construct for construct —
-    // deliberately, because that walker's scope handling is the one that has
-    // been proved right against this corpus.
+    // ty_stmt walks a statement: the HOLES of the statement are judged
+    // first (which marks the `if`/`match` values they push a type into),
+    // then its expressions are walked for the checks hanging off calls,
+    // operators and selections, and finally the names it binds are entered.
     func ty_stmt(mut self, s int, env mut map[str]int) {
         if s == 0 { return }
         let n = self.T.Get(s)
         let k = n.Kind
 
         if k == ast.LET or k == ast.VAR {
-            self.ty_exprs(self.T.Kid(s, 0), env)
             self.check_init(s, env)
+            self.check_destructure(s, env)
+            self.type_as_value(self.T.Kid(s, 0), env)
+            self.ty_exprs(self.T.Kid(s, 0), env)
+            let uv = self.T.Kid(s, 0)
+            self.note_move(self.T.Kid(s, 0), env)
+            // A single name bound to a certainly non-nil value is narrowed
+            // (judged before the binding: the value is the outer scope's).
+            let v = self.T.Kid(s, 0)
+            let on = v != 0 and self.nonnil(v, env)
             self.env_bind_stmt(s, env)
+            if not str.contains(n.Sval, ",") and v != 0 {
+                self.set_nn(env, n.Sval, on)
+            }
+            // A name bound to a task-unsafe closure (probed above).
+            if uv != 0 and uv in self.unsafeClos and
+               not str.contains(n.Sval, ",") {
+                self.unsafeNames.add(n.Sval)
+            }
         } else if k == ast.ASSIGN {
+            self.check_assign(s, env)
+            self.type_as_value(self.T.Kid(s, 1), env)
+            if self.T.Kind(self.T.Kid(s, 0)) == ast.IDENT and
+               self.T.Kid(s, 1) in self.unsafeClos {
+                self.unsafeNames.add(self.T.Get(self.T.Kid(s, 0)).Sval)
+            }
+            if self.spawnDepth > 0 { self.spawn_write(s, env) }
             self.ty_exprs(self.T.Kid(s, 0), env)
             self.ty_exprs(self.T.Kid(s, 1), env)
-            self.check_assign(s, env)
+            if n.Ival == tok.ASSIGN { self.note_move(self.T.Kid(s, 1), env) }
+            let lhs = self.T.Kid(s, 0)
+            // `x = v` (or `x.f = v`, `xs[0] = v`) narrows the target exactly
+            // when v is certainly not nil; a compound `x += v` leaves a
+            // number. Any write under a root undoes the narrowing of every
+            // path below it (`s = S{…}` and `s.v`).
+            let on = n.Ival != tok.ASSIGN or self.nonnil(self.T.Kid(s, 1), env)
+            if self.T.Kind(lhs) == ast.TUPLE {
+                each t in self.T.Get(lhs).Kids {
+                    self.forget_written(t)
+                    let tk = self.path_key(t)
+                    if tk != "" { self.set_nn(env, tk, false) }
+                }
+            } else {
+                self.forget_written(lhs)
+                let key = self.path_key(lhs)
+                if key != "" { self.set_nn(env, key, on) }
+            }
         } else if k == ast.RETURN {
+            self.check_return(s, env)
+            each a in n.Kids { self.type_as_value(a, env) }
             each a in n.Kids {
                 self.ty_exprs(a, env)
             }
-            self.check_return(s, env)
+            self.dead = true
+        } else if k == ast.BREAK or k == ast.CONTINUE {
+            self.dead = true
         } else if k == ast.BLOCK {
-            self.ty_block(s, env)
-        } else if k == ast.EXPRSTMT or k == ast.DROP {
-            self.ty_exprs(self.T.Kid(s, 0), env)
-        } else if k == ast.IF {
-            self.ty_exprs(self.T.Kid(s, 0), env)
-            // `if let` binds into the THEN branch only. Pattern binds carry
-            // no type this release can work out, so they enter as unknown —
-            // which also, and importantly, SHADOWS any outer name of the same
-            // spelling instead of leaving a stale type behind.
+            let base = self.nn_copy()
             var inner = self.copy_env(env)
-            self.env_bind_pattern(n.Ival, inner)
+            self.ty_stmts_in(s, inner)
+            self.merge_ends([self.end_state(s, [], base)], [self.dead])
+        } else if k == ast.EXPRSTMT or k == ast.DROP {
+            let x = self.T.Kid(s, 0)
+            self.ty_exprs(x, env)
+            // `mu.lock() … mu.unlock()`: the user's own critical section,
+            // which the spawned-body rules leave to them (spawn_report).
+            // Only a lock the tasks share — one the body captures — counts:
+            // a fresh `sync.mutex()` made per call protects nothing.
+            if self.T.Kind(x) == ast.CALL and
+               self.T.Kind(self.T.Kid(x, 0)) == ast.FIELD and
+               self.shared_root(self.T.Kid(self.T.Kid(x, 0), 0)) != "" {
+                let mn = self.T.Get(self.T.Kid(x, 0)).Sval
+                if mn == "lock" or mn == "write_lock" {
+                    self.lockDepth += 1
+                } else if (mn == "unlock" or mn == "write_unlock") and
+                          self.lockDepth > 0 {
+                    self.lockDepth -= 1
+                }
+            }
+            // `os.exit(n)` never comes back; `assert(c)` comes back only
+            // where c holds.
+            if self.diverging_call(x) { self.dead = true }
+            if x != 0 and self.T.Kind(x) == ast.CALL and
+               self.T.Kind(self.T.Kid(x, 0)) == ast.IDENT and
+               self.T.Get(self.T.Kid(x, 0)).Sval == "assert" and
+               not ("assert" in env) and not ("assert" in self.funcs) {
+                let al = self.T.Get(self.T.Kid(x, 1)).Kids
+                if len(al) > 0 {
+                    var at = []
+                    var af = []
+                    self.cond_facts(self.T.Kid(al[0], 0), at, af)
+                    each nm in at { self.set_nn(env, nm, true) }
+                }
+            }
+            // `ch <- v` moves v (manual 8.2).
+            if x != 0 and self.T.Kind(x) == ast.BINARY and
+               self.T.Get(x).Ival == tok.ARROW {
+                self.note_move(self.T.Kid(x, 1), env)
+            }
+        } else if k == ast.IF {
+            let c = self.T.Kid(s, 0)
+            self.ty_exprs(c, env)
+            var tf = []
+            var ff = []
+            if n.Ival == 0 { self.cond_facts(c, tf, ff) }
+            let base = self.nn_copy()
+            var inner = self.copy_env(env)
+            self.nn_enter(env, base, tf)
+            if n.Ival != 0 {
+                // `if let P = v`: the pattern binds into the THEN branch,
+                // typed by v where the pattern says how.
+                self.env_bind_pattern_typed(n.Ival, self.ty_of(c, env), inner)
+            } else {
+                self.check_cond(c, env, "an `if`")
+            }
             self.ty_stmts_in(self.T.Kid(s, 1), inner)
-            self.ty_stmt(self.T.Kid(s, 2), env)
+            // An `if let` pattern's binds are the branch's own names.
+            var pb = []
+            self.pattern_names(n.Ival, pb)
+            let tend = self.end_state(self.T.Kid(s, 1), pb, base)
+            let tdead = self.dead
+            // The else branch, from the same state with the opposite facts.
+            var other = self.copy_env(env)
+            self.nn_enter(env, base, ff)
+            let el = self.T.Kid(s, 2)
+            if el != 0 {
+                if self.T.Kind(el) == ast.BLOCK {
+                    self.ty_stmts_in(el, other)
+                } else {
+                    self.ty_stmt(el, other)
+                }
+            }
+            var elist = 0
+            if el != 0 and self.T.Kind(el) == ast.BLOCK { elist = el }
+            let eend = self.end_state(elist, [], base)
+            self.merge_ends([tend, eend], [tdead, self.dead])
         } else if k == ast.EACH or k == ast.FOR {
             let it = self.T.Kid(s, 0)
             self.ty_exprs(it, env)
+            self.check_iterable(it, env)
+            // What the body assigns is not narrowed in it (a later
+            // iteration sees the assignment) nor after it.
+            self.forget_loop(self.T.Kid(s, 1), env)
+            let base = self.nn_copy()
             var inner = self.copy_env(env)
-            self.bind_loop_vars(n.Sval, it, inner, k == ast.EACH)
+            self.bind_loop_vars(n.Sval, it, inner, k == ast.EACH, env)
             self.ty_stmts_in(self.T.Kid(s, 1), inner)
-        } else if k == ast.WHILE or k == ast.GROUP {
+            self.nn = base
+            self.dead = false
+        } else if k == ast.WHILE {
+            self.forget_loop(self.T.Kid(s, 1), env)
             self.ty_exprs(self.T.Kid(s, 0), env)
+            self.check_cond(self.T.Kid(s, 0), env, "a `while`")
+            var tf = []
+            var ff = []
+            self.cond_facts(self.T.Kid(s, 0), tf, ff)
+            let base = self.nn_copy()
+            var inner = self.copy_env(env)
+            self.nn_enter(env, base, tf)
+            self.ty_stmts_in(self.T.Kid(s, 1), inner)
+            self.nn = base
+            self.dead = false
+            // With no `break` out of it, the loop ends only when its
+            // condition is false: `while x == nil { x = … }` leaves x set.
+            if not self.has_break(self.T.Kid(s, 1)) {
+                each nm in ff { self.set_nn(env, nm, true) }
+            }
+        } else if k == ast.GROUP {
+            self.ty_exprs(self.T.Kid(s, 0), env)
+            self.forget_loop(self.T.Kid(s, 1), env)
+            let gbase = self.nn_copy()
             self.ty_block(self.T.Kid(s, 1), env)
+            self.nn = gbase
+            self.dead = false
         } else if k == ast.SWITCH {
             self.ty_exprs(self.T.Kid(s, 0), env)
+            // Each case value is compared with the subject: it is a value
+            // of the subject's type (and a literal one converts to it).
+            let swt = self.ty_of(self.T.Kid(s, 0), env)
+            if swt != 0 {
+                each c in self.T.Get(self.T.Kid(s, 1)).Kids {
+                    each v in self.T.Get(self.T.Kid(c, 0)).Kids {
+                        if self.T.Kind(v) != ast.RANGE {
+                            self.check_hole(v, swt, env, H_VALUE, "", 0, false)
+                        }
+                    }
+                }
+            }
+            // A case may fall through into the next: joining is not
+            // attempted; whatever a case assigns is forgotten.
+            self.forget_loop(self.T.Kid(s, 1), env)
+            let sbase = self.nn_copy()
             each c in self.T.Get(self.T.Kid(s, 1)).Kids {
                 each v in self.T.Get(self.T.Kid(c, 0)).Kids {
                     self.ty_exprs(v, env)
                 }
                 var inner = self.copy_env(env)
+                self.nn_enter(env, sbase, [])
                 self.ty_stmt_list(self.T.Kid(c, 1), inner)
             }
+            self.nn = sbase
+            self.dead = false
         } else if k == ast.MATCH {
-            self.ty_exprs(self.T.Kid(s, 0), env)
+            let subj = self.T.Kid(s, 0)
+            self.ty_exprs(subj, env)
+            self.check_match_subject(s, env)
+            let st = self.ty_of(subj, env)
+            var ends = []
+            var deads = []
+            // Past an unguarded `nil` arm, a NAME subject is not nil.
+            var nilSeen = false
+            let sname = self.path_key(subj)
+            let mbase = self.nn_copy()
             each a in self.T.Get(self.T.Kid(s, 1)).Kids {
                 var inner = self.copy_env(env)
-                self.env_bind_pattern(self.T.Get(a).Ival, inner)
+                self.nn_enter(env, mbase, [])
+                if nilSeen and sname != "" { self.set_nn(inner, sname, true) }
+                let ap = self.T.Get(a).Ival
+                if ap != 0 and self.T.Kind(ap) == ast.PNIL and
+                   self.T.Kid(a, 0) == 0 {
+                    nilSeen = true
+                }
+                self.env_bind_pattern_typed(self.T.Get(a).Ival, st, inner)
                 self.ty_exprs(self.T.Kid(a, 0), inner)
                 self.ty_stmt_list(self.T.Kid(a, 1), inner)
+                // The pattern's binds are the arm's own names.
+                var pb = []
+                self.pattern_names(self.T.Get(a).Ival, pb)
+                ends.append(self.end_state(self.T.Kid(a, 1), pb, mbase))
+                deads.append(self.dead)
             }
+            self.nn = mbase
+            self.dead = false
+            if len(ends) > 0 { self.merge_ends(ends, deads) }
         } else if k == ast.SELECTSTMT {
+            self.forget_loop(s, env)
+            let selbase = self.nn_copy()
             each c in self.T.Get(self.T.Kid(s, 0)).Kids {
                 self.ty_exprs(self.T.Kid(c, 0), env)
                 self.ty_exprs(self.T.Kid(c, 1), env)
@@ -317,13 +1461,22 @@ impl Checker {
                 each nm in str.split(self.T.Get(c).Sval, ",") {
                     self.env_put(inner, nm, 0)
                 }
+                self.nn_enter(env, selbase, [])
                 self.ty_stmt_list(self.T.Kid(c, 2), inner)
             }
+            self.nn = selbase
+            self.dead = false
         } else if k == ast.PARSESTMT {
             self.ty_exprs(self.T.Kid(s, 0), env)
             each term in self.T.Get(self.T.Kid(s, 1)).Kids {
                 let tn = self.T.Get(term)
-                if tn.Ival == 0 { self.env_put(env, tn.Sval, 0) }
+                // A parse target receives a str (§7.4) — but a name parsed
+                // into may have been declared of another type and is then
+                // converted; it is entered as unknown.
+                if tn.Ival == 0 {
+                    self.env_put(env, tn.Sval, 0)
+                    self.set_nn(env, tn.Sval, true)   // a str, never nil
+                }
             }
         } else if k == ast.SAY {
             each a in n.Kids {
@@ -332,20 +1485,35 @@ impl Checker {
         } else if k == ast.THROW {
             self.ty_exprs(self.T.Kid(s, 0), env)
             self.ty_exprs(self.T.Kid(s, 1), env)
+            self.dead = true
         } else if k == ast.DEFERSTMT {
+            // Runs at the scope's exit: no narrowing of here holds there
+            // but a `let`'s.
+            let dbase = self.nn_copy()
+            self.nn = self.nn_later(env)
             if n.Ival2 == 1 {
                 self.ty_block(self.T.Kid(s, 0), env)
             } else {
                 self.ty_exprs(self.T.Kid(s, 0), env)
             }
+            self.nn = dbase
+            self.dead = false
         } else if k == ast.TRYCATCH {
+            // An exception may leave the body anywhere: whatever the
+            // statement assigns is forgotten, before and after it.
+            self.forget_loop(s, env)
+            let tbase = self.nn_copy()
             self.ty_block(self.T.Kid(s, 0), env)
             each cc in self.T.Get(self.T.Kid(s, 1)).Kids {
                 var inner = self.copy_env(env)
                 self.env_put(inner, self.T.Get(cc).Sval, 0)
+                self.nn_enter(env, tbase, [])
                 self.ty_block(self.T.Kid(cc, 0), inner)
             }
+            self.nn_enter(env, tbase, [])
             self.ty_block(self.T.Kid(s, 2), env)
+            self.nn = tbase
+            self.dead = false
         }
     }
 
@@ -357,9 +1525,7 @@ impl Checker {
         }
     }
 
-    // ty_stmts_in walks a BLOCK whose scope has ALREADY been opened by the
-    // caller (an `if let` branch, a loop body with its variables bound), so
-    // it must not open a second one and lose them.
+    // ty_stmts_in walks a BLOCK whose scope the caller already opened.
     func ty_stmts_in(mut self, b int, env mut map[str]int) {
         if b == 0 { return }
         each s in self.T.Get(b).Kids {
@@ -367,8 +1533,7 @@ impl Checker {
         }
     }
 
-    // ty_stmt_list walks a bare statement LIST — a match arm's body, a switch
-    // case's — which is not a BLOCK node.
+    // ty_stmt_list walks a bare statement LIST — a match arm's body.
     func ty_stmt_list(mut self, list int, env mut map[str]int) {
         if list == 0 { return }
         each b in self.T.Get(list).Kids {
@@ -376,227 +1541,1289 @@ impl Checker {
         }
     }
 
-    // ty_exprs types an expression for its SIDE EFFECTS — the checks that
-    // hang off a call or a selection — and descends into the statements
-    // hiding inside a closure or a `spawn { … }`.
+    // note_move records a bare NAME handed to a binding, an assignment or a
+    // channel when its type MOVES (is_noncopy): check_moves (checks.voi)
+    // then refuses a later use of that name. The type is what decides, and
+    // only this walk knows it.
+    func note_move(mut self, v int, env map[str]int) {
+        if v == 0 or self.T.Kind(v) != ast.IDENT { return }
+        if not (self.T.Get(v).Sval in env) { return }
+        if self.is_noncopy(self.ty_of(v, env)) { self.moveIdents.add(v) }
+    }
+
+    // ty_exprs walks an expression for the checks that hang off its nodes,
+    // and descends into the statements hiding inside a closure or a
+    // `spawn { … }`.
     func ty_exprs(mut self, e int, env map[str]int) {
         if e == 0 { return }
         let n = self.T.Get(e)
         let k = n.Kind
+        if k == ast.BINARY and (n.Ival == tok.AND or n.Ival == tok.OR) {
+            // `x != nil and x + 1 > 0`: the right operand runs only where
+            // the left one said so (cond_facts).
+            self.check_binary(e, env)
+            let l = self.T.Kid(e, 0)
+            self.ty_exprs(l, env)
+            var tf = []
+            var ff = []
+            self.cond_facts(l, tf, ff)
+            let base = self.nn_copy()
+            let bdead = self.dead
+            if n.Ival == tok.AND {
+                self.nn_enter(env, base, tf)
+            } else {
+                self.nn_enter(env, base, ff)
+            }
+            self.ty_exprs(self.T.Kid(e, 1), env)
+            self.nn = base
+            self.dead = bdead
+            return
+        }
         if k == ast.CLOSURE {
+            // Outside a spawned body, the closure's body is PROBED with the
+            // spawned-body rules (spawn_enter, `probe`): a closure that
+            // would break them is TASK-UNSAFE, and a spawned body may not
+            // run one it captures (spawn_uses).
+            let pSaveCaps = self.spawnCaps
+            let pSaveLocal = self.spawnLocal
+            let pSaveProbe = self.probe
+            let pSaveHit = self.probeHit
+            let probing = self.spawnDepth == 0
+            let saveCS = self.closSelf
+            self.closSelf = false
+            if probing {
+                self.spawn_enter(env)
+                self.probe = true
+                self.probeHit = false
+            }
+            // A closure may run at any later time: no outer narrowing holds
+            // in it.
             var inner = self.copy_env(env)
+            let cbase = self.nn_copy()
+            let cdead = self.dead
+            self.nn = self.nn_later(env)
+            self.dead = false
             each p in self.T.Get(self.T.Kid(e, 1)).Kids {
                 if self.T.Kind(p) != ast.PARAM { continue }
                 self.env_put(inner, self.T.Get(p).Sval, self.param_ty(p))
             }
-            // A closure answers to its OWN result list, not the enclosing
-            // function's — chk/sig.voi refuses to judge one for exactly the
-            // same reason — so the return context is cleared for its body.
+            // A closure answers to its OWN result, not the enclosing
+            // function's.
             let saveRes = self.eRes
+            let saveList = self.eResList
+            let saveFn = self.eFn
             self.eRes = 0
+            self.eResList = []
+            let rt = n.Ival
+            if rt != 0 and not (self.T.Kind(rt) == ast.TNAMED and
+                                self.T.Get(rt).Sval == "unit") {
+                self.eRes = self.Ty.FromAST(self.T, rt)
+                self.eFn = "this closure"
+            }
             each s in self.T.Get(self.T.Kid(e, 0)).Kids {
                 self.ty_stmt(s, inner)
             }
             self.eRes = saveRes
+            self.eResList = saveList
+            self.eFn = saveFn
+            self.nn = cbase
+            self.dead = cdead
+            // `self` of a `mut self` method is written in place by the
+            // method — the caller's value, which no copy-on-write protects —
+            // so a closure may capture it only to be run before the call
+            // that receives it returns (sync_method): anything else could
+            // run it on another task while the method writes (§10).
+            if self.closSelf and self.eSelfW and self.eSelf != 0 and
+               not (e in self.syncClos) {
+                self.report_at(e, "a closure that uses `self` of a `mut " ||
+                    "self` method may only be passed straight to a builtin " ||
+                    "collection method that runs it at once, such as " ||
+                    "`xs.map` or `xs.each` — the method writes `self` in " ||
+                    "place, and a closure kept, sent or handed to anything " ||
+                    "else could read it from another task (§10); copy what " ||
+                    "the closure needs into a local")
+            }
+            self.closSelf = saveCS or self.closSelf
+            if probing {
+                if self.probeHit { self.unsafeClos.add(e) }
+                self.spawnDepth -= 1
+                self.spawnCaps = pSaveCaps
+                self.spawnLocal = pSaveLocal
+                self.probe = pSaveProbe
+                self.probeHit = pSaveHit
+            } else if self.probe and self.probeHit {
+                // Nested in a probed closure: the outer one is unsafe too.
+                self.unsafeClos.add(e)
+            }
             return
         }
-        if k == ast.SPAWNEXPR and n.Ival2 == 1 {
-            self.ty_block(self.T.Kid(e, 0), env)
+        if k == ast.SPAWNEXPR {
+            // The task's body — a block, or the call `spawn f(x)` makes at
+            // task start — shares its group's variables (spawn_enter).
+            let saveCaps = self.spawnCaps
+            let saveLocal = self.spawnLocal
+            let saveProbe = self.probe
+            let saveLock = self.lockDepth
+            self.lockDepth = 0
+            self.spawn_enter(env)
+            self.probe = false                  // a real task: report
+            if n.Ival2 == 1 {
+                let sbase = self.nn_copy()
+                let sdead = self.dead
+                self.nn = self.nn_later(env)
+                self.ty_block(self.T.Kid(e, 0), env)
+                self.nn = sbase
+                self.dead = sdead
+            } else {
+                self.ty_exprs(self.T.Kid(e, 0), env)
+            }
+            self.spawnDepth -= 1
+            self.spawnCaps = saveCaps
+            self.spawnLocal = saveLocal
+            self.probe = saveProbe
+            self.lockDepth = saveLock
+            return
+        }
+        if k == ast.IF or k == ast.MATCH {
+            // A value-position `if`/`match`: the statement walk, in a copy
+            // of the environment so its pattern binds stay inside, and —
+            // unless a hole already pushed a type into it — the branches
+            // must agree among themselves.
+            var inner = self.copy_env(env)
+            self.ty_stmt(e, inner)
+            if not (e in self.holeDone) { self.check_branches(e, env) }
+            return
+        }
+        if k == ast.ELSEEXPR and n.Ival2 == 2 {
+            self.ty_exprs(self.T.Kid(e, 0), env)
+            self.ty_block(self.T.Kid(e, 1), env)
             return
         }
         if k == ast.CALL {
             self.check_call(e, env)
+            self.check_native_kinds(e, env)
+            self.call_mutates(e, env)
+            if self.spawnDepth > 0 { self.spawn_call(e, env) }
             // The callee of `x.m(…)` is a FIELD node, and it is NOT a field
-            // access: descending into it would ask check_field whether `m` is
-            // a field of `x` and report the same missing method twice, once
-            // in each vocabulary. Only the RECEIVER is descended into.
+            // access: only the RECEIVER is descended into.
             let callee = self.T.Kid(e, 0)
             if self.T.Kind(callee) == ast.FIELD {
                 self.ty_exprs(self.T.Kid(callee, 0), env)
             } else {
                 self.ty_exprs(callee, env)
             }
+            // `rw.with_write(fn() { … })`, `cell.update(…)`: a closure the
+            // callee runs holding a lock — the user's critical section.
+            var critical = false
+            if self.T.Kind(callee) == ast.FIELD and
+               self.shared_root(self.T.Kid(callee, 0)) != "" {
+                let mn = self.T.Get(callee).Sval
+                critical = mn == "with" or mn == "with_write" or
+                           mn == "update" or mn == "do"
+            }
+            if critical { self.lockDepth += 1 }
+            // A closure literal handed straight to a builtin collection
+            // method that runs it before returning (`xs.map(fn …)`) cannot
+            // outlive the call — judged by the receiver's static TYPE, never
+            // by the name alone: `chan.map(src, f)` runs f in a task, and a
+            // user method called `each` may keep its argument.
+            var syncRecv = false
+            if self.T.Kind(callee) == ast.FIELD and
+               sync_method(self.T.Get(callee).Sval) {
+                let srt = self.ty_of(self.T.Kid(callee, 0), env)
+                let srk = self.Ty.Kind(srt)
+                syncRecv = srt != 0 and (srk == typ.TK_SLICE or
+                                         srk == typ.TK_MAP or
+                                         srk == typ.TK_SET)
+            }
+            if syncRecv {
+                each a in self.T.Get(self.T.Kid(e, 1)).Kids {
+                    let av = self.T.Kid(a, 0)
+                    if self.T.Kind(av) == ast.CLOSURE { self.syncClos.add(av) }
+                }
+            }
             each a in self.T.Get(self.T.Kid(e, 1)).Kids {
+                self.type_as_value(self.T.Kid(a, 0), env)
                 self.ty_exprs(self.T.Kid(a, 0), env)
             }
+            if critical { self.lockDepth -= 1 }
+            self.task_args(e, env)
             return
         }
-        if k == ast.FIELD {
-            self.check_field(e, env)
+        if k == ast.SLICELIT or k == ast.TUPLE {
+            each x in n.Kids { self.type_as_value(x, env) }
+        }
+        if k == ast.IDENT and self.spawnDepth > 0 { self.spawn_uses(e) }
+        // `self` of a `mut self` method is written in place — the caller's
+        // value, not a copy — so no task may read it while the method may
+        // be writing it (§10).
+        if k == ast.SELF { self.closSelf = true }
+        if k == ast.SELF and self.spawnDepth > 0 and self.eSelfW {
+            self.spawn_report(e, "a spawned task uses `self` of a " ||
+                "`mut self` method, which the method writes in place while " ||
+                "the task may read it (§10) — copy what the task needs " ||
+                "into a local before the `spawn`")
+        }
+        if k == ast.FIELD { self.check_field(e, env) }
+        if k == ast.INDEX {
+            self.check_tuple_index(e, env)
+            self.check_index_key(e, env)
+        }
+        if k == ast.BINARY { self.check_binary(e, env) }
+        if k == ast.UNARY { self.check_unary(e, env) }
+        if k == ast.COMPOSITE { self.check_composite_types(e, env) }
+        if (k == ast.SLICELIT or k == ast.MAPLIT) and n.Ival != 0 {
+            self.check_coll_lit(e, env)
         }
         if (k == ast.ARM or k == ast.IF) and n.Ival != 0 {
             self.ty_exprs(n.Ival, env)
         }
+        if k == ast.COMPOSITE {
+            each f in n.Kids {
+                self.ty_exprs(self.T.Kid(f, 0), env)
+            }
+            return
+        }
         each c in n.Kids {
             self.ty_exprs(c, env)
+        }
+        // `ch <- fn() { out.append(1) }`: whoever receives it may run it in
+        // a task (task_args).
+        if k == ast.BINARY and n.Ival == tok.ARROW and len(n.Kids) == 2 {
+            let v = self.T.Kid(e, 1)
+            var unsafe = v in self.unsafeClos
+            if self.T.Kind(v) == ast.IDENT and
+               self.T.Get(v).Sval in self.unsafeNames {
+                unsafe = true
+            }
+            if unsafe {
+                self.spawn_report(v, "this closure is sent over a channel, " ||
+                    "and it writes variables it shares with its group in a " ||
+                    "way another task's write could race (§10) — send the " ||
+                    "values it would produce instead, or keep the shared " ||
+                    "value in a `cell`")
+            }
+        }
+    }
+
+    // ---------------------------------------------------------- the holes
+
+    // check_hole judges the value e against a hole of type `want`, pushing
+    // the expected type into the forms that take theirs from the context:
+    // an `if`/`match` value (each branch), a bare `[…]` (each element), a
+    // tuple literal (each member), and an `x else alt` (the alternative).
+    // `hk`/`name`/`idx` only word the diagnostic; `lat` says the lattice
+    // check owns this literal's numeric fit (check_init).
+    func check_hole(mut self, e int, want int, env map[str]int, hk int,
+                    name str, idx int, lat bool) {
+        if e == 0 or want == 0 { return }
+        let w = self.canon(want)
+        let k = self.T.Kind(e)
+        if k == ast.IF or k == ast.MATCH {
+            self.holeDone.add(e)
+            each y in self.yields(e) {
+                self.check_hole(y, w, env, hk, name, idx, false)
+            }
+            return
+        }
+        let pw = self.peel(w)
+        if k == ast.SLICELIT and self.T.Get(e).Ival == 0 and pw != 0 and
+           self.Ty.Kind(pw) == typ.TK_SLICE {
+            let el = self.Ty.Get(pw).Elem
+            each x in self.T.Get(e).Kids {
+                self.check_hole(x, el, env, H_ELEM, self.Ty.Text(pw), 0, false)
+            }
+            return
+        }
+        if k == ast.TUPLE and pw != 0 and self.Ty.Kind(pw) == typ.TK_TUPLE and
+           len(self.Ty.Get(pw).Args) == self.T.NKids(e) {
+            let ms = self.Ty.Get(pw).Args
+            each i, x in self.T.Get(e).Kids {
+                self.check_hole(x, ms[i], env, hk, name, idx, false)
+            }
+            return
+        }
+        if k == ast.ELSEEXPR and self.T.Get(e).Ival2 == 0 {
+            // `f() else alt`: the alternative is put in the same hole.
+            self.check_hole(self.T.Kid(e, 1), w, env, hk, name, idx, false)
+        }
+        let got = self.ty_of(e, env)
+        if not self.bad(w, got, e, lat) {
+            self.note_conv(e, w, env)
+            return
+        }
+        self.hole_report(e, w, got, hk, name, idx)
+    }
+
+    // note_conv records an untyped literal (or a closure literal) accepted
+    // into a NEWTYPE hole — `?Newtype` too — for ApplyConversions.
+    //
+    // Not where a binding SHADOWS the newtype's name: the inserted call
+    // `Cel(5)` would call the binding. (The ordinary stores still convert
+    // there, in the lowerer.)
+    func note_conv(mut self, e int, want int, env map[str]int) {
+        let k = self.T.Kind(e)
+        if not self.is_lit(e) and k != ast.CLOSURE { return }
+        let wn = self.named(self.peel(want))
+        if not self.is_newtype(wn) { return }
+        if wn in env { return }
+        if e in self.convSeen { return }
+        self.convSeen.add(e)
+        self.convs.append(str(e) || "|" || wn)
+    }
+
+    // hole_report words a check_hole failure.
+    func hole_report(mut self, e int, want int, got int, hk int, name str,
+                     idx int) {
+        var gs = self.tq(got)
+        if self.T.Kind(e) == ast.NILLIT { gs = "`nil`" }
+        let wn = self.named(self.peel(want))
+        let gn = self.named(got)
+        // Two numbers that do not widen: the lattice's own wording (§3.2).
+        if gn != "" and is_numeric(gn) and is_numeric(wn) and
+           not self.is_lit(e) {
+            self.report_at(e, "{gn} → {wn} may lose information; implicit " ||
+                              "conversion requires exact representability " ||
+                              "(§3.2)")
+            return
+        }
+        var msg = ""
+        let ws = self.tq(want)
+        if hk == H_INIT {
+            msg = "`{name}` is " || ws || ", but its initialiser is " || gs
+        } else if hk == H_ASSIGN {
+            msg = "cannot assign " || gs || " to `{name}`, which is " || ws
+        } else if hk == H_ARG {
+            msg = "argument {idx} of `{name}` is " || ws || ", but " || gs ||
+                  " is given"
+        } else if hk == H_RET {
+            msg = "`{name}` returns " || ws || ", but " || gs || " is given"
+        } else if hk == H_FIELD {
+            msg = "field `{name}` is " || ws || ", but " || gs || " is given"
+        } else if hk == H_ELEM {
+            msg = "an element of `{name}` must be " || ws || ", but " || gs ||
+                  " is given"
+        } else if hk == H_MVAL {
+            msg = "a value of `{name}` must be " || ws || ", but " || gs ||
+                  " is given"
+        } else if hk == H_KEY {
+            msg = "a key of `{name}` must be " || ws || ", but " || gs ||
+                  " is given"
+        } else if hk == H_SEND {
+            msg = "`{name}` carries " || ws || ", but " || gs || " is sent"
+        } else {
+            msg = "this value must be " || ws || ", but " || gs || " is given"
+        }
+        if self.T.Kind(e) == ast.NILLIT {
+            msg = msg || " — only an optional `?T` holds nil (§4)"
+        } else if got != 0 and self.Ty.Kind(got) == typ.TK_OPTION {
+            msg = msg || " — unwrap the optional first, with `must`, " ||
+                  "`else`, `if let` or `match` (§3.5)"
+        } else if self.is_newtype(wn) or self.is_newtype(gn) {
+            msg = msg || " — a newtype converts only explicitly, " ||
+                  "`" || wn || "(x)` (§3.8)"
+        }
+        self.report_at(e, msg)
+    }
+
+    // check_init judges `var x T = e` and `let x T = e`, and a destructuring
+    // `let a, b = (…)` against an annotation member by member.
+    func check_init(mut self, s int, env map[str]int) {
+        let n = self.T.Get(s)
+        if n.Ival == 0 { return }               // no annotation: inferred
+        let v = self.T.Kid(s, 0)
+        if v == 0 { return }                    // `var x T` — the zero value
+        if n.Kind == ast.LET and len(str.split(n.Sval, ",")) != 1 { return }
+        let want = self.Ty.FromAST(self.T, n.Ival)
+        // A literal stored into a PRIMITIVE numeric annotation is the
+        // lattice check's (§3.2: range, truncation, precision).
+        let an = self.T.Get(n.Ival)
+        let lat = an.Kind == ast.TNAMED and is_numeric(an.Sval)
+        self.check_hole(v, want, env, H_INIT, n.Sval, 0, lat)
+    }
+
+    // check_assign judges `x = e` against the target's type — a declared
+    // one, or an unannotated `var`'s inferred one, which it KEEPS — and a
+    // compound `x op= e` by the operator's result.
+    func check_assign(mut self, s int, env map[str]int) {
+        let n = self.T.Get(s)
+        let lhs = self.T.Kid(s, 0)
+        let rhs = self.T.Kid(s, 1)
+        if lhs == 0 or rhs == 0 { return }
+        let lk = self.T.Kind(lhs)
+        if lk == ast.TUPLE {
+            // `a, b = x, y`: member by member, when both are written out.
+            if n.Ival != tok.ASSIGN or self.T.Kind(rhs) != ast.TUPLE { return }
+            if self.T.NKids(rhs) != self.T.NKids(lhs) { return }
+            each i, t in self.T.Get(lhs).Kids {
+                let tt = self.target_ty(t, env)
+                self.check_hole(self.T.Kid(rhs, i), tt, env, H_ASSIGN,
+                                self.lhs_text(t), 0, false)
+            }
+            return
+        }
+        let want = self.target_ty(lhs, env)
+        if want == 0 { return }
+        if n.Ival == tok.ASSIGN {
+            self.check_hole(rhs, want, env, H_ASSIGN, self.lhs_text(lhs), 0,
+                            false)
+            return
+        }
+        // A compound assignment: the operator must take the two, and its
+        // result must fit back into the target.
+        let got = self.ty_of(rhs, env)
+        if got == 0 { return }
+        if n.Ival == tok.CONCATEQ { return }    // `||=`: anything converts
+        // `t += xs[i]` is arithmetic on both sides: neither may be a `?T`
+        // that is not certainly present.
+        if self.opt_operand(lhs, want) or self.opt_operand(rhs, got) { return }
+        let wn = self.named(self.box_inner(want))
+        let gn = self.named(self.box_inner(got))
+        if self.is_newtype(wn) or self.is_newtype(gn) {
+            if wn != gn {
+                self.report_at(rhs, "`" || self.lhs_text(lhs) || "` is " ||
+                    self.tq(want) || ", and " || self.tq(got) || " does " ||
+                    "not mix with it: a newtype's operators take two values " ||
+                    "of the same newtype (§3.8)")
+            }
+            return
+        }
+        if not is_numeric(wn) or not is_numeric(gn) {
+            if (wn != "" and self.solid_name(wn)) and
+               (gn != "" and self.solid_name(gn)) {
+                self.report_at(rhs, "`" || self.lhs_text(lhs) || "` is " ||
+                    self.tq(want) || ", and " || self.tq(got) || " cannot " ||
+                    "be combined with it arithmetically")
+            }
+            return
+        }
+        if self.is_lit(rhs) {
+            // `x += 1.5` on an int: the literal decides.
+            if not self.lit_fits(self.lit_kind(rhs), wn) {
+                self.report_at(rhs, "`" || self.lhs_text(lhs) || "` is " ||
+                    self.tq(want) || ", and the result of this compound " ||
+                    "assignment would not be")
+            }
+            return
+        }
+        if not widens_ok(gn, wn) {
+            self.report_at(rhs, "{gn} → {wn} may lose information; " ||
+                "implicit conversion requires exact representability (§3.2)")
+        }
+    }
+
+    // target_ty is the type of an assignment TARGET: a name's binding, a
+    // field, an element.
+    func target_ty(mut self, t int, env map[str]int) int {
+        let k = self.T.Kind(t)
+        if k == ast.IDENT {
+            let nm = self.T.Get(t).Sval
+            if nm in env { return env[nm] }
+            return 0
+        }
+        if k == ast.FIELD or k == ast.INDEX { return self.ty_of(t, env) }
+        return 0
+    }
+
+    // check_return judges `return e` against the enclosing function's
+    // declared result — one, or several member by member.
+    func check_return(mut self, s int, env map[str]int) {
+        let n = self.T.Get(s)
+        if len(self.eResList) > 0 {
+            if len(n.Kids) == len(self.eResList) {
+                each i, v in n.Kids {
+                    self.check_hole(v, self.eResList[i], env, H_RET, self.eFn,
+                                    0, false)
+                }
+            } else if len(n.Kids) == 1 {
+                let want = self.Ty.MkTuple(self.eResList)
+                self.check_hole(n.Kids[0], want, env, H_RET, self.eFn, 0,
+                                false)
+            }
+            return
+        }
+        if self.eRes == 0 { return }
+        if len(n.Kids) != 1 { return }
+        self.check_hole(n.Kids[0], self.eRes, env, H_RET, self.eFn, 0, false)
+    }
+
+    // check_iterable: `each` walks a string, a collection, a range, a
+    // channel or a type with `next` — never a number or a bool.
+    func check_iterable(mut self, it int, env map[str]int) {
+        if it == 0 { return }
+        let t = self.box_inner(self.ty_of(it, env))
+        let tn = self.named(t)
+        if tn == "" or not typ.IsPrimitive(tn) or tn == "str" { return }
+        if tn == "unit" { return }
+        self.report_at(it, "cannot iterate " || self.tq(t) || ": `each` " ||
+            "walks a string, a collection, a range, a channel or a type " ||
+            "with `next` (§7.2)")
+    }
+
+    // check_destructure: `let a, b = v` takes one name per member of a
+    // tuple of known width.
+    func check_destructure(mut self, s int, env map[str]int) {
+        let n = self.T.Get(s)
+        if n.Kind != ast.LET { return }
+        let names = str.split(n.Sval, ",")
+        if len(names) < 2 { return }
+        let v = self.T.Kid(s, 0)
+        if v == 0 or self.T.Kind(v) == ast.TUPLE { return }  // the lowerer's
+        // `let v, ok = <-ch` is the comma-ok receive, whatever ch carries.
+        if self.T.Kind(v) == ast.UNARY and self.T.Get(v).Ival == tok.ARROW {
+            return
+        }
+        let t = self.ty_of(v, env)
+        if t == 0 or self.Ty.Kind(t) != typ.TK_TUPLE { return }
+        let w = len(self.Ty.Get(t).Args)
+        if w == len(names) { return }
+        self.report_at(v, str(len(names)) || " names but the value is a " ||
+            "tuple of " || str(w) || " members (" || self.tq(t) || ")")
+    }
+
+    // check_cond: a condition is a bool — there is no truthiness (§3.1).
+    func check_cond(mut self, c int, env map[str]int, what str) {
+        if c == 0 { return }
+        let t = self.ty_of(c, env)
+        if t == 0 { return }
+        let tn = self.named(self.box_inner(t))
+        if tn == "bool" { return }
+        if self.is_newtype(tn) {
+            self.report_at(c, what || " condition must be `bool`, but " ||
+                self.tq(t) || " is given — a newtype converts only " ||
+                "explicitly: `bool(x)` (§3.8)")
+            return
+        }
+        if (tn != "" and self.solid_name(tn)) or self.structural(t) {
+            self.report_at(c, what || " condition must be `bool`, but " ||
+                self.tq(t) || " is given — Voilà has no implicit " ||
+                "truthiness (§3.1)")
+        }
+    }
+
+    // structural: a slice, map, set, tuple or function — never a bool.
+    func structural(self, t int) bool {
+        let k = self.Ty.Kind(t)
+        return k == typ.TK_SLICE or k == typ.TK_MAP or k == typ.TK_SET or
+               k == typ.TK_TUPLE or k == typ.TK_FN
+    }
+
+    // check_branches: an `if`/`match` VALUE with no type expected of it
+    // must still have ONE type (§5.3) — two branches yielding two solid,
+    // incompatible types is an error, reported at the second.
+    func check_branches(mut self, e int, env map[str]int) {
+        var first = 0
+        var ft = 0
+        each y in self.yields(e) {
+            let t = self.ty_of(y, env)
+            if t == 0 { return }
+            if first == 0 {
+                first = y
+                ft = t
+                continue
+            }
+            if t == ft { continue }
+            if self.is_lit(first) and self.is_lit(y) and
+               self.lit_kind(first) == self.lit_kind(y) {
+                continue
+            }
+            if self.bad(ft, t, y, false) and self.bad(t, ft, first, false) {
+                var what = "`if`"
+                if self.T.Kind(e) == ast.MATCH { what = "`match`" }
+                self.report_at(y, "the branches of this " || what ||
+                    " value yield " || self.tq(ft) || " and " || self.tq(t) ||
+                    "; a value has one type (§5.3)")
+                return
+            }
+        }
+    }
+
+    // ---------------------------------------------------------- operators
+
+    // check_binary judges an operator's operands.
+    func check_binary(mut self, e int, env map[str]int) {
+        let op = self.T.Get(e).Ival
+        let l = self.T.Kid(e, 0)
+        let r = self.T.Kid(e, 1)
+        if op == tok.CONCAT { return }
+        if op == tok.IN {
+            // `k in m`, `v in s`: the left value is a key or an element of
+            // the right (and a literal one converts to its newtype).
+            let ct = self.box_inner(self.ty_of(r, env))
+            if ct != 0 {
+                let t = self.Ty.Get(ct)
+                if t.Kind == typ.TK_MAP {
+                    self.check_hole(l, t.Key, env, H_KEY, self.Ty.Text(ct),
+                                    0, false)
+                } else if t.Kind == typ.TK_SET or t.Kind == typ.TK_SLICE {
+                    self.check_hole(l, t.Elem, env, H_ELEM, self.Ty.Text(ct),
+                                    0, false)
+                }
+            }
+            return
+        }
+        if op == tok.ARROW {
+            // `ch <- v`: the value against the channel's element.
+            let ct = self.ty_of(l, env)
+            if ct != 0 and self.Ty.Kind(ct) == typ.TK_CHAN {
+                self.check_hole(r, self.Ty.Get(ct).Elem, env, H_SEND,
+                                self.lhs_text(l), 0, false)
+            }
+            return
+        }
+        let lt0 = self.ty_of(l, env)
+        let rt0 = self.ty_of(r, env)
+        if op == tok.AND or op == tok.OR {
+            self.need_bool(l, lt0, op)
+            self.need_bool(r, rt0, op)
+            return
+        }
+        if lt0 == 0 or rt0 == 0 { return }
+        if self.T.Kind(l) == ast.NILLIT or self.T.Kind(r) == ast.NILLIT {
+            return
+        }
+        let isCmp = op == tok.EQ or op == tok.NE or op == tok.LT or
+                    op == tok.LE or op == tok.GT or op == tok.GE
+        // A comparison sees through an optional — `to_int(s) == 5` is
+        // false for nil; arithmetic does not.
+        var lt = self.box_inner(lt0)
+        var rt = self.box_inner(rt0)
+        if isCmp {
+            lt = self.box_inner(self.peel(lt))
+            rt = self.box_inner(self.peel(rt))
+        } else {
+            if self.opt_operand(l, lt0) or self.opt_operand(r, rt0) { return }
+        }
+        if lt == 0 or rt == 0 { return }
+        let ln = self.named(lt)
+        let rn = self.named(rt)
+        let ops = op_text(op)
+        if self.is_newtype(ln) or self.is_newtype(rn) {
+            if ln == rn { return }
+            if self.opaque(lt) or self.opaque(rt) { return }
+            self.report_at(e, "`" || ops || "` between " || self.tq(lt) ||
+                " and " || self.tq(rt) || ": a newtype's operators take " ||
+                "two values of the same newtype — convert explicitly (§3.8)")
+            return
+        }
+        if isCmp {
+            let lc = self.cmp_class(lt)
+            let rc = self.cmp_class(rt)
+            if lc != "" and rc != "" and lc != rc {
+                self.report_at(e, "cannot compare " || self.tq(lt) ||
+                    " with " || self.tq(rt) || " using `" || ops ||
+                    "`: they are different types")
+            }
+            return
+        }
+        // Arithmetic and the bitwise operators take numbers.
+        let lbad = self.not_number(lt)
+        let rbad = self.not_number(rt)
+        if not lbad and not rbad { return }
+        if op == tok.PLUS and (ln == "str" or rn == "str") {
+            self.report_at(e, "`+` does not concatenate: " || self.tq(lt) ||
+                " + " || self.tq(rt) || " — use `||` (§5.1)")
+            return
+        }
+        self.report_at(e, "operator `" || ops || "` needs numbers, but " ||
+            self.tq(lt) || " and " || self.tq(rt) || " are given")
+    }
+
+    // opt_operand reports a `?T` straight from a call used in arithmetic.
+    func opt_operand(mut self, x int, t int) bool {
+        if t == 0 or self.Ty.Kind(t) != typ.TK_OPTION { return false }
+        if not self.direct_opt(x) { return false }
+        self.report_at(x, self.tq(t) || " is used in arithmetic — unwrap " ||
+            "the optional first, with `must`, `else`, `if let` or `match` " ||
+            "(§3.5)")
+        return true
+    }
+
+    // need_bool: `and`/`or`/`not` take bools (§5.1).
+    func need_bool(mut self, x int, t int, op int) {
+        if t == 0 { return }
+        let tn = self.named(self.box_inner(t))
+        if tn == "bool" { return }
+        if (tn != "" and self.solid_name(tn)) or self.structural(t) {
+            self.report_at(x, "`" || op_text(op) || "` needs `bool` " ||
+                "operands, but " || self.tq(t) || " is given (§5.1)")
+        }
+    }
+
+    // not_number: a type that is certainly NOT a number — a solid
+    // non-numeric nominal, or a structural type.
+    func not_number(self, t int) bool {
+        let tn = self.named(t)
+        if tn != "" { return self.solid_name(tn) and not is_numeric(tn) }
+        return self.structural(t)
+    }
+
+    // opaque: a type whose run-time value this checker cannot see (a
+    // trait, an exception, a parameter, a std type, a handle).
+    func opaque(self, t int) bool {
+        let tn = self.named(t)
+        if tn != "" { return not self.solid_name(tn) }
+        return not self.structural(t)
+    }
+
+    // cmp_class sorts a type into what `==` and `<` can relate: two values
+    // of different classes never compare equal, and the comparison is a
+    // mistake. "" for anything not sure.
+    func cmp_class(self, t int) str {
+        let tn = self.named(t)
+        if tn != "" {
+            if not self.solid_name(tn) { return "" }
+            // A rune equals the one-character string it denotes ('A' ==
+            // "A" is true — tests/conformance/11_regressions.voi), and a
+            // number besides: it compares with both.
+            if tn == "rune" { return "" }
+            if is_numeric(tn) { return "number" }
+            return "n:" || tn
+        }
+        let k = self.Ty.Kind(t)
+        if k == typ.TK_SLICE { return "slice" }
+        if k == typ.TK_MAP { return "map" }
+        if k == typ.TK_SET { return "set" }
+        if k == typ.TK_TUPLE { return "tuple" }
+        return ""
+    }
+
+    // check_unary: `not` takes a bool, unary `-` a number.
+    func check_unary(mut self, e int, env map[str]int) {
+        let op = self.T.Get(e).Ival
+        let x = self.T.Kid(e, 0)
+        if op == tok.NOT {
+            self.need_bool(x, self.ty_of(x, env), op)
+            return
+        }
+        if op == tok.MINUS {
+            let t = self.box_inner(self.ty_of(x, env))
+            if t == 0 { return }
+            if self.opt_operand(x, t) { return }
+            if self.not_number(t) {
+                self.report_at(e, "unary `-` needs a number, but " ||
+                    self.tq(t) || " is given")
+            }
+        }
+    }
+
+    // ---------------------------------------------------------- literals
+
+    // check_composite_types judges each field of `T{…}` against the
+    // field's declared type, at the literal's type arguments.
+    func check_composite_types(mut self, e int, env map[str]int) {
+        let n = self.T.Get(e)
+        let ct = self.ty_of(e, env)
+        if ct == 0 { return }
+        let tn = self.named(ct)
+        if tn == "" or not (tn in self.structs or tn in self.excs) { return }
+        let order = self.field_order(tn)
+        let names = self.decl_params(tn)
+        let targs = self.Ty.Get(ct).Args
+        each i, f in n.Kids {
+            let fname0 = self.T.Get(f).Sval
+            var fname = fname0
+            if fname == "" {
+                if i >= len(order) { continue }
+                fname = order[i]
+            }
+            let k = tn || "|" || fname
+            if not (k in self.flds) { continue }
+            self.Ty.PushParams(names)
+            let ft0 = self.Ty.FromAST(self.T, self.T.Get(self.flds[k]).Ival)
+            self.Ty.PopParams()
+            let ft = self.subst_all(ft0, names, targs)
+            self.check_hole(self.T.Kid(f, 0), ft, env, H_FIELD,
+                            tn || "." || fname, 0, false)
+        }
+    }
+
+    // field_order lists a struct's or exception's field names in order.
+    func field_order(self, tn str) []str {
+        if tn in self.structs { return self.struct_fields(tn) }
+        var out = []
+        if not (tn in self.excs) { return out }
+        each f in self.T.Get(self.T.Kid(self.excs[tn], 0)).Kids {
+            if self.T.Kind(f) == ast.FIELDDECL { out.append(self.T.Get(f).Sval) }
+        }
+        return out
+    }
+
+    // check_coll_lit judges the members of a TYPED collection literal —
+    // `[]int{…}`, `set[int]{…}`, `map[str]int{k: v, …}` — against the
+    // element (and key) type it writes.
+    func check_coll_lit(mut self, e int, env map[str]int) {
+        let n = self.T.Get(e)
+        let ct = self.canon(self.Ty.FromAST(self.T, n.Ival))
+        if ct == 0 { return }
+        let t = self.Ty.Get(ct)
+        let tx = self.Ty.Text(ct)
+        if n.Kind == ast.MAPLIT {
+            if t.Kind != typ.TK_MAP { return }
+            var i = 0
+            while i + 1 < len(n.Kids) {
+                self.check_hole(n.Kids[i], t.Key, env, H_KEY, tx, 0, false)
+                self.check_hole(n.Kids[i + 1], t.Elem, env, H_MVAL, tx, 0,
+                                false)
+                i += 2
+            }
+            return
+        }
+        if t.Kind != typ.TK_SLICE and t.Kind != typ.TK_SET { return }
+        each x in n.Kids {
+            self.check_hole(x, t.Elem, env, H_ELEM, tx, 0, false)
         }
     }
 
     // ---------------------------------------------------------- the checks
 
-    // check_init judges `var x T = e` and `let x T = e`.
-    //
-    // Only a SINGLE-name binding is judged. `let a, b = divmod(…)` spreads a
-    // tuple over two names and neither one is the type of the whole value.
-    func check_init(mut self, s int, env map[str]int) {
-        let n = self.T.Get(s)
-        if n.Ival == 0 { return }               // no annotation, nothing to fit
-        let v = self.T.Kid(s, 0)
-        if v == 0 { return }                    // `var x T` — the zero value
-        if n.Kind == ast.LET and len(str.split(n.Sval, ",")) != 1 { return }
-        let want = self.Ty.FromAST(self.T, n.Ival)
-        let got = self.ty_of(v, env)
-        if not self.mismatch(want, got) { return }
-        self.warn_at(v, TYPE_MISMATCH, "`{n.Sval}` is " ||
-            self.tq(want) || ", but its initialiser is " || self.tq(got))
+    // check_native_kinds judges a call to a NATIVE against its argument
+    // kinds (low.NativeKinds): an argument whose static type is KNOWN and
+    // is certainly not of the kind is an ERROR — the call cannot work, and
+    // at run time it would be refused by vl_argk anyway. An argument of an
+    // unknown, nominal or generic type is not judged (it may be a newtype
+    // or a Box over the right kind, which vl_argk unwraps), nor is any call
+    // with a spread or a named argument.
+    func check_native_kinds(mut self, call int, env map[str]int) {
+        let name = self.native_callee_env(self.T.Kid(call, 0), env)
+        if name == "" or not (name in self.natKinds) { return }
+        let kinds = self.natKinds[name]
+        let argl = self.T.Get(self.T.Kid(call, 1)).Kids
+        each a in argl {
+            let an = self.T.Get(a)
+            if an.Ival == 1 or an.Sval != "" { return }
+        }
+        each i, a in argl {
+            var k = kinds[len(kinds) - 1]
+            if i < len(kinds) { k = kinds[i] }
+            let v = self.T.Kid(a, 0)
+            let cls = self.kind_class(self.ty_of(v, env))
+            if cls == "" or kind_accepts(k, cls) { continue }
+            self.report_at(v, "argument " || str(i + 1) || " of `" || name ||
+                "` must be " || kind_word(k) || ", but " ||
+                self.tq(self.ty_of(v, env)) || " is given")
+        }
     }
 
-    // check_assign judges `x = e` — and only a PLAIN assignment: `+=` and its
-    // relatives apply an operator whose result type is the operator's
-    // business, not the operand's.
-    func check_assign(mut self, s int, env map[str]int) {
-        let n = self.T.Get(s)
-        if n.Ival != tok.ASSIGN { return }
-        let lhs = self.T.Kid(s, 0)
-        let rhs = self.T.Kid(s, 1)
-        if lhs == 0 or rhs == 0 { return }
-        if self.T.Kind(lhs) != ast.IDENT and self.T.Kind(lhs) != ast.FIELD {
+    // kind_class sorts a static type into the classes kind_accepts reads:
+    // s str, u rune, i an integer type, n float/dec, b bool, l slice,
+    // m map, e set, c chan, f function, t tuple — or "" when unknown.
+    func kind_class(self, tid int) str {
+        if tid == 0 { return "" }
+        let t = self.Ty.Get(tid)
+        if t.Kind == typ.TK_NAMED {
+            let nm = t.Name
+            if nm == "str" { return "s" }
+            if nm == "rune" { return "u" }
+            if nm == "int" or nm == "i8" or nm == "i16" or nm == "i32" or
+               nm == "i64" or nm == "u8" or nm == "u16" or nm == "u32" or
+               nm == "u64" or nm == "byte" {
+                return "i"
+            }
+            if nm == "float" or nm == "f32" or nm == "dec" { return "n" }
+            if nm == "bool" { return "b" }
+            return ""
+        }
+        if t.Kind == typ.TK_SLICE { return "l" }
+        if t.Kind == typ.TK_MAP { return "m" }
+        if t.Kind == typ.TK_SET { return "e" }
+        if t.Kind == typ.TK_CHAN { return "c" }
+        if t.Kind == typ.TK_FN { return "f" }
+        if t.Kind == typ.TK_TUPLE { return "t" }
+        return ""
+    }
+
+    // check_tuple_index judges a selector by a constant where the tuple's
+    // width is KNOWN (a literal, an annotation, a multi-result call): `t.2`
+    // on a pair is an error, not a run-time abort. The `.N` spelling
+    // (Ival2 = 1) is also refused on a value that is certainly not a tuple —
+    // a slice, a string, a struct — where `[N]` or a field was meant.
+    func check_tuple_index(mut self, e int, env map[str]int) {
+        let n = self.T.Get(e)
+        if n.Ival2 == 2 or len(n.Kids) != 2 { return }
+        let ix = self.T.Get(n.Kids[1])
+        if ix.Kind != ast.INT { return }
+        let at = to_int(ix.Sval)
+        if at == nil { return }
+        var bt = self.ty_of(n.Kids[0], env)
+        if bt == 0 { return }
+        var t = self.Ty.Get(bt)
+        if t.Kind == typ.TK_BORROW {
+            bt = t.Elem
+            if bt == 0 { return }
+            t = self.Ty.Get(bt)
+        }
+        if t.Kind == typ.TK_TUPLE {
+            if at >= len(t.Args) {
+                self.report_at(e, "a tuple of " || str(len(t.Args)) ||
+                    " members has no member " || str(at) || " (`" ||
+                    self.Ty.Text(bt) || "`)")
+            }
             return
         }
-        let want = self.ty_of(lhs, env)
-        let got = self.ty_of(rhs, env)
-        if not self.mismatch(want, got) { return }
-        self.warn_at(rhs, TYPE_MISMATCH, "cannot assign " || self.tq(got) ||
-            " to `" || self.lhs_text(lhs) || "`, which is " || self.tq(want))
+        if n.Ival2 != 1 { return }
+        var certain = t.Kind == typ.TK_SLICE or t.Kind == typ.TK_MAP or
+                      t.Kind == typ.TK_SET or t.Kind == typ.TK_CHAN
+        if t.Kind == typ.TK_NAMED {
+            certain = typ.IsPrimitive(t.Name) or t.Name in self.structs or
+                      t.Name in self.enums
+        }
+        if certain {
+            self.report_at(e, "`." || ix.Sval || "` selects a tuple member, " ||
+                "but this value is `" || self.Ty.Text(bt) || "`")
+        }
     }
 
-    // check_return judges `return e` against the enclosing function's single
-    // declared result. eRes is 0 inside a closure and for every multi-result
-    // signature, so both are silently skipped.
-    func check_return(mut self, s int, env map[str]int) {
-        if self.eRes == 0 { return }
-        let n = self.T.Get(s)
-        if len(n.Kids) != 1 { return }
-        let v = n.Kids[0]
-        let got = self.ty_of(v, env)
-        if not self.mismatch(self.eRes, got) { return }
-        self.warn_at(v, TYPE_MISMATCH, "`" || self.eFn || "` returns " ||
-            self.tq(self.eRes) || ", but " || self.tq(got) || " is given")
+    // check_match_subject judges what only the subject's TYPE can decide:
+    //
+    //   - a tuple pattern must have the subject tuple's width;
+    //   - a `?Enum` subject matched by its bare variants must also say what
+    //     happens to nil — the variants alone never match it.
+    func check_match_subject(mut self, m int, env map[str]int) {
+        let subj = self.T.Kid(m, 0)
+        var width = 0 - 1
+        if self.T.Kind(subj) == ast.TUPLE { width = self.T.NKids(subj) }
+        let st = self.ty_of(subj, env)
+        var opt = false
+        if st != 0 {
+            let t = self.Ty.Get(st)
+            if t.Kind == typ.TK_TUPLE { width = len(t.Args) }
+            opt = t.Kind == typ.TK_OPTION
+        }
+        var nilCovered = false
+        var bareVariant = false
+        each a in self.T.Get(self.T.Kid(m, 1)).Kids {
+            let guarded = self.T.Kid(a, 0) != 0
+            each p in self.top_alternatives(self.T.Get(a).Ival) {
+                let pn = self.T.Get(p)
+                if pn.Kind == ast.PTUPLE and width >= 0 and
+                   len(pn.Kids) != width {
+                    self.report_at(p, "this tuple pattern has " ||
+                        str(len(pn.Kids)) || " members, but the subject " ||
+                        "has " || str(width))
+                }
+                if guarded { continue }
+                if pn.Kind == ast.PNIL or pn.Kind == ast.PWILD or
+                   pn.Kind == ast.PBIND {
+                    nilCovered = true
+                } else if pn.Kind == ast.PVARIANT {
+                    if pn.Sval == "Some" or pn.Sval == "Ok" or
+                       pn.Sval == "Err" {
+                        nilCovered = true       // check_match's business
+                    } else {
+                        bareVariant = true
+                    }
+                }
+            }
+        }
+        if opt and bareVariant and not nilCovered {
+            self.report_at(m, "match on `" || self.Ty.Text(st) || "` is " ||
+                "not exhaustive; missing case: nil")
+        }
     }
 
-    // check_call judges a call's ARGUMENTS, and — when the callee is a
-    // selection — the receiver's method as well.
+    // top_alternatives lists a pattern's top-level alternatives: the pattern
+    // itself, or each alternative of an or-pattern, recursively.
+    func top_alternatives(self, p int) []int {
+        var out = []
+        if p == 0 { return out }
+        if self.T.Kind(p) == ast.POR {
+            each a in self.T.Get(p).Kids {
+                each x in self.top_alternatives(a) { out.append(x) }
+            }
+            return out
+        }
+        out.append(p)
+        return out
+    }
+
+    // ---------------------------------------------------------- calls
+
+    // check_call judges a call's ARGUMENTS against what it calls, and — on
+    // a selection — that the receiver has the method at all.
     func check_call(mut self, call int, env map[str]int) {
         let callee = self.T.Kid(call, 0)
         if callee == 0 { return }
         let ck = self.T.Kind(callee)
         if ck == ast.IDENT {
             let nm = self.T.Get(callee).Sval
-            if nm in env { return }             // shadowed by a local binding
-            if not (nm in self.funcs) { return }
-            let fn = self.funcs[nm]
-            if self.T.NKids(self.T.Kid(fn, 3)) != 0 { return }   // generic
-            self.check_args(call, self.T.Kid(fn, 1), nm, env, [], [])
-        } else if ck == ast.FIELD {
-            self.check_method_call(call, callee, env)
+            if nm in env {
+                // A call through a function VALUE with a written signature:
+                // its arity is a fact, and so are its parameter types.
+                let ft = env[nm]
+                if ft != 0 and self.Ty.Kind(ft) == typ.TK_FN {
+                    self.value_arity(call, nm, len(self.Ty.Get(ft).Args))
+                    self.check_args_tys(call, self.Ty.Get(ft).Args, nm, env)
+                }
+                return
+            }
+            if nm == "len" and not (nm in self.funcs) {
+                self.check_len_arg(call, env)
+            }
+            if nm in self.funcs {
+                let fn = self.funcs[nm]
+                self.note_copy_args(call, fn, env)
+                if self.T.NKids(self.T.Kid(fn, 3)) != 0 {
+                    self.check_generic_call(call, fn, nm, env, 0)
+                    return
+                }
+                self.check_args(call, self.T.Kid(fn, 1), nm, env, [], [])
+                return
+            }
+            if nm in self.varEnum and self.varEnum[nm] != "" {
+                self.check_variant_args(call, nm, env)
+            }
+            return
+        }
+        if ck == ast.INDEX {
+            let ib = self.T.Kid(callee, 0)
+            if self.T.Kind(ib) == ast.IDENT {
+                let nm = self.T.Get(ib).Sval
+                if not (nm in env) and nm in self.funcs and
+                   self.T.NKids(self.T.Kid(self.funcs[nm], 3)) != 0 {
+                    self.check_generic_call(call, self.funcs[nm], nm, env,
+                                            callee)
+                }
+            }
+            return
+        }
+        if ck == ast.FIELD { self.check_method_call(call, callee, env) }
+    }
+
+    // note_copy_args records the NAMES handed to an `own` parameter whose
+    // type is known to be Copy: a Copy value is copied, not moved (§6.4), so
+    // check_moves must not mark them dead.
+    func note_copy_args(mut self, call int, fn int, env map[str]int) {
+        let ps = self.T.Get(self.T.Kid(fn, 1)).Kids
+        let argl = self.T.Get(self.T.Kid(call, 1)).Kids
+        each i, a in argl {
+            if i >= len(ps) { return }
+            if (self.T.Get(ps[i]).Ival2 & 3) != ast.MODE_OWN { continue }
+            let v = self.T.Kid(a, 0)
+            if self.T.Kind(v) != ast.IDENT { continue }
+            let t = self.ty_of(v, env)
+            if t != 0 and not self.is_noncopy(t) { self.copyArgs.add(v) }
+        }
+    }
+
+    // check_generic_call instantiates a generic function at the call by
+    // unification (infer.voi), judges every argument at the types found,
+    // and — where the type arguments were INFERRED rather than written —
+    // judges them against the bounds, as an explicit `f[T]` is (§3.7).
+    func check_generic_call(mut self, call int, fn int, nm str,
+                            env map[str]int, ix int) {
+        let binds = self.instantiate(call, fn, env, ix)
+        let gens = self.generic_names(self.T.Kid(fn, 3))
+        self.Ty.PushParams(gens)
+        let ps = self.T.Get(self.T.Kid(fn, 1)).Kids
+        let argl = self.T.Get(self.T.Kid(call, 1)).Kids
+        each i, a in argl {
+            let an = self.T.Get(a)
+            if an.Ival == 1 or an.Sval != "" { break }
+            if i >= len(ps) { break }
+            let pn = self.T.Get(ps[i])
+            if self.T.Kind(ps[i]) != ast.PARAM or (pn.Ival2 & 16) != 0 {
+                break
+            }
+            let want = self.subst_binds(self.Ty.FromAST(self.T, pn.Ival),
+                                        binds, gens)
+            self.check_hole(self.T.Kid(a, 0), want, env, H_ARG, nm, i + 1,
+                            false)
+            self.check_mut_arg(ps[i], self.T.Kid(a, 0), nm, env)
+        }
+        self.Ty.PopParams()
+        if ix != 0 { return }               // check_inst judges those
+        each g in self.T.Get(self.T.Kid(fn, 3)).Kids {
+            if self.T.Kind(g) != ast.GENERIC { continue }
+            let gn = str.split(self.T.Get(g).Sval, "|")[0]
+            if not (gn in binds) { continue }
+            let bt = self.canon(binds[gn])
+            let bn = self.named(self.box_inner(bt))
+            if bn == "" { continue }
+            self.check_one_bound(call, bn, g, nm)
+        }
+    }
+
+    // value_arity refuses a call through a function value with the wrong
+    // number of positional arguments (a named or spread one: not judged).
+    func value_arity(mut self, call int, nm str, want int) {
+        var given = 0
+        each a in self.T.Get(self.T.Kid(call, 1)).Kids {
+            let an = self.T.Get(a)
+            if an.Ival == 1 or an.Sval != "" { return }
+            given += 1
+        }
+        if given == want { return }
+        self.report_at(call, "`" || nm || "` takes " || str(want) ||
+            plural(want, " argument", " arguments") || ", but " ||
+            str(given) || plural(given, " is", " are") || " given")
+    }
+
+    // check_len_arg: `len` measures a string or a collection, never a
+    // number or a bool.
+    func check_len_arg(mut self, call int, env map[str]int) {
+        let args = self.T.Get(self.T.Kid(call, 1)).Kids
+        if len(args) != 1 { return }
+        let v = self.T.Kid(args[0], 0)
+        let t = self.box_inner(self.ty_of(v, env))
+        let tn = self.named(t)
+        if tn == "" or not typ.IsPrimitive(tn) or tn == "str" { return }
+        self.report_at(v, "`len` takes a string or a collection, but " ||
+            self.tq(t) || " is given")
+    }
+
+    // check_index_key judges what indexes a value: a map's key against the
+    // map's key type, and a slice's or a string's position (not a range)
+    // as an integer.
+    func check_index_key(mut self, e int, env map[str]int) {
+        let n = self.T.Get(e)
+        if n.Ival2 != 0 or len(n.Kids) != 2 { return }
+        let ix = n.Kids[1]
+        if self.T.Kind(ix) == ast.RANGE { return }
+        var bt = self.box_inner(self.ty_of(n.Kids[0], env))
+        let bn = self.named(bt)
+        if self.is_newtype(bn) { bt = self.box_inner(self.underlying(bn)) }
+        if bt == 0 { return }
+        let t = self.Ty.Get(bt)
+        if t.Kind == typ.TK_MAP {
+            self.check_hole(ix, t.Key, env, H_KEY, self.Ty.Text(bt), 0, false)
+            return
+        }
+        if t.Kind == typ.TK_SLICE or (t.Kind == typ.TK_NAMED and
+                                      t.Name == "str") {
+            let it = self.box_inner(self.ty_of(ix, env))
+            let itn = self.named(it)
+            if it == 0 or is_int_type(itn) or itn == "rune" { return }
+            if self.is_lit(ix) and self.lit_kind(ix) == ast.INT { return }
+            if (itn != "" and self.solid_name(itn)) or self.structural(it) {
+                self.report_at(ix, "an index of " || self.tq(bt) ||
+                    " is an integer position, but " || self.tq(it) ||
+                    " is given")
+            }
+        }
+    }
+
+    // check_variant_args judges a variant constructor's payload against the
+    // VARIANTDEC's field types — at no type arguments for a generic enum,
+    // where a payload of a parameter type fits anything.
+    func check_variant_args(mut self, call int, vn str, env map[str]int) {
+        let vd = self.varDecl[vn]
+        let en = self.varEnum[vn]
+        let fs = self.T.Get(self.T.Kid(vd, 0)).Kids
+        self.Ty.PushParams(self.decl_params(en))
+        var tys = []
+        each f in fs {
+            tys.append(self.Ty.FromAST(self.T, self.T.Get(f).Ival))
+        }
+        self.Ty.PopParams()
+        self.check_args_tys(call, tys, vn, env)
+    }
+
+    // check_args_tys pairs a call's POSITIONAL arguments with a list of
+    // parameter types.
+    func check_args_tys(mut self, call int, tys []int, who str,
+                        env map[str]int) {
+        let argl = self.T.Get(self.T.Kid(call, 1)).Kids
+        each i, a in argl {
+            let an = self.T.Get(a)
+            if an.Ival == 1 or an.Sval != "" { return }
+            if i >= len(tys) { return }
+            self.check_hole(self.T.Kid(a, 0), tys[i], env, H_ARG, who, i + 1,
+                            false)
         }
     }
 
     // check_args pairs a call's POSITIONAL arguments with a declared
     // parameter list. A named argument or a spread makes the pairing
-    // meaningless, and the whole call is abandoned — chk/callsite.voi already
-    // refuses to count arity in both cases, for the same reason.
+    // meaningless, and the rest of the call is abandoned.
     //
     // `names`/`args` carry a generic substitution when the receiver supplied
-    // one; they are empty for an ordinary function, which is never generic
-    // here (check_call refuses those).
-    //
-    // The names are PUSHED as a generic scope as well as substituted, and
-    // both steps are needed: without the push, `v T` interns as TK_ERROR —
-    // `T` names no declared type — and mismatch would go silent on the very
-    // parameter the substitution exists to make judgeable.
+    // one. The names are PUSHED as a generic scope as well as substituted:
+    // without the push, `v T` interns as TK_ERROR.
     func check_args(mut self, call int, plist int, who str,
                     env map[str]int, names []str, args []int) {
         self.Ty.PushParams(names)
-        self.check_args_in(call, plist, who, env, names, args)
-        self.Ty.PopParams()
-    }
-
-    func check_args_in(mut self, call int, plist int, who str,
-                       env map[str]int, names []str, args []int) {
         let ps = self.T.Get(plist).Kids
         let argl = self.T.Get(self.T.Kid(call, 1)).Kids
         var i = 0
         while i < len(argl) {
             let an = self.T.Get(argl[i])
-            if an.Ival == 1 { return }          // spread: unpairable
-            if an.Sval != "" { return }         // named: not positional
-            if i >= len(ps) { return }          // arity is callsite.voi's
+            if an.Ival == 1 or an.Sval != "" { break }
+            if i >= len(ps) { break }
             let p = ps[i]
-            if self.T.Kind(p) != ast.PARAM { return }
-            if (self.T.Get(p).Ival2 & 16) != 0 { return }   // variadic tail
+            if self.T.Kind(p) != ast.PARAM { break }
+            if (self.T.Get(p).Ival2 & 16) != 0 {
+                // A variadic tail: every remaining argument is an element.
+                let et = self.subst_all(self.Ty.FromAST(self.T,
+                                                        self.T.Get(p).Ival),
+                                        names, args)
+                while i < len(argl) {
+                    let an2 = self.T.Get(argl[i])
+                    if an2.Ival == 1 or an2.Sval != "" { break }
+                    self.check_hole(self.T.Kid(argl[i], 0), et, env, H_ARG,
+                                    who, i + 1, false)
+                    i += 1
+                }
+                break
+            }
             let want = self.subst_all(self.Ty.FromAST(self.T,
                                                       self.T.Get(p).Ival),
                                       names, args)
-            let v = self.T.Kid(argl[i], 0)
-            let got = self.ty_of(v, env)
-            if self.mismatch(want, got) {
-                self.warn_at(v, TYPE_MISMATCH, "argument " || str(i + 1) ||
-                    " of `" || who || "` is " || self.tq(want) || ", but " ||
-                    self.tq(got) || " is given")
-            }
+            self.check_hole(self.T.Kid(argl[i], 0), want, env, H_ARG, who,
+                            i + 1, false)
+            self.check_mut_arg(p, self.T.Kid(argl[i], 0), who, env)
             i += 1
         }
+        self.Ty.PopParams()
     }
 
-    // check_method_call is the hole the task list called the biggest one
-    // left: `x.m(…)` is resolved entirely at run time, by string, against a
-    // flat table — and `vl_callm` ABORTS when it finds nothing.
-    //
-    // Judged only when the receiver's type is a nominal this program declares
-    // in full. A primitive receiver is not judged (`s.upper()` is
-    // `str.upper(s)` through the method-call duality, and the duality set has
-    // no rows in the method table); nor is a std package's type, nor a box, a
-    // slice, a map — all of which answer methods the runtime provides and no
-    // declaration lists.
+    // check_method_call judges `x.m(…)`: that the method exists where the
+    // receiver's method set is visible, its arity and its arguments.
     func check_method_call(mut self, call int, callee int, env map[str]int) {
         let mn = self.T.Get(callee).Sval
         let recv = self.T.Kid(callee, 0)
+        if self.T.Kind(recv) == ast.IDENT {
+            let qn = self.T.Get(recv).Sval
+            if not (qn in env) {
+                if qn in self.enums {
+                    let full = self.variant_name(qn || "." || mn)
+                    if full in self.varDecl and self.varEnum[full] == qn {
+                        self.check_variant_args(call, full, env)
+                        return
+                    }
+                }
+                // `Type.static(…)`: a static method, judged like a function.
+                if self.solid_name(qn) {
+                    let k = qn || "|" || mn
+                    if k in self.mset {
+                        let m = self.mset[k]
+                        if (self.T.Get(m).Ival2 & 1) == 0 {
+                            self.check_args(call, self.T.Kid(m, 1),
+                                            qn || "." || mn, env, [], [])
+                        }
+                    }
+                    return
+                }
+                if self.ident_ty(qn, env) == 0 { return }  // a package
+            }
+        }
         let rt = self.ty_of(recv, env)
         if rt == 0 { return }
-        let t = self.Ty.Get(rt)
-        if t.Kind != typ.TK_NAMED { return }
-        let tn = t.Name
+        let tn = self.named(self.box_inner(rt))
 
-        // A TRAIT-typed receiver. The obvious rule — "only the trait's own
-        // methods" — IS WRONG, and it was written that way first and caught
-        // by review against a program that runs:
-        //
-        //     var d Describe = Point{x: 1}
-        //     say d.extra()          // an inherent method of Point
-        //
-        // vl_callm resolves by the value's DYNAMIC type name (call.c's
-        // vl_find_method), and the static annotation plays no part whatever.
-        // So every method of the concrete type is reachable through a
-        // trait-typed binding, and this checker does not know the concrete
-        // type.
-        //
-        // What is still a fact is that a name NO declaration in the whole
-        // program spells cannot be dispatched by anything — the flat table
-        // has no row to find and vl_callm aborts. That is the only thing
-        // said here.
-        //
-        // The trait's OWN methods keep their arity and argument checks: the
-        // implementation's shape is judged against the trait's by
-        // chk/traits.voi, so the trait declaration speaks for every
-        // implementor.
+        // A TRAIT-typed receiver dispatches on the value's DYNAMIC type
+        // (call.c's vl_callm), so every method of the concrete type is
+        // reachable through it. What is still a fact is that a name NO
+        // declaration in the whole program spells cannot be dispatched by
+        // anything. The trait's OWN methods keep their arity and argument
+        // checks: chk/traits.voi judges every implementation against them.
         if tn in self.traits {
             let want = self.trait_method(tn, mn)
             if want == 0 {
                 if mn in self.mnames { return }
                 if mn == "str" or mn == "clone" { return }
-                self.warn_at(callee, TYPE_MISMATCH, "no method `" || mn ||
-                    "` is declared anywhere in this program, and `" || tn ||
+                self.report_at(callee, "no method `" || mn || "` is " ||
+                    "declared anywhere in this program, and `" || tn ||
                     "` is a trait — a trait-typed value dispatches on its " ||
                     "runtime type (§3.6)")
                 return
@@ -607,28 +2834,109 @@ impl Checker {
             return
         }
 
-        if not (tn in self.structs) { return }
-        let k = tn || "|" || mn
-        if not (k in self.mset) {
-            // A field holding a callable is dispatched too (call.c step 4),
-            // and `str`/`clone` are answered for every value whatsoever
-            // (step 2). Neither leaves a row anywhere a checker can walk.
-            if k in self.flds { return }
-            if mn == "str" or mn == "clone" { return }
-            self.warn_at(callee, TYPE_MISMATCH, "`" || tn ||
-                "` has no method `" || mn || "` (§3.6)")
+        let mi = self.method_info(rt, mn)
+        if not mi.known { return }
+        if not mi.found {
+            var what = mi.what
+            if what == "" { what = self.Ty.Text(rt) }
+            let pt = self.Ty.Get(self.box_inner(rt))
+            if pt.Kind == typ.TK_PARAM {
+                self.report_at(callee, "no bound of `" || what || "` " ||
+                    "declares a method `" || mn || "`, so a type argument " ||
+                    "need not have one (§3.7)")
+                return
+            }
+            if (tn || "|" || mn) in self.flds {
+                self.report_at(callee, "`" || mn || "` is a field of `" ||
+                    what || "`, not a method, and it does not hold a " ||
+                    "function — read it as `x." || mn || "` (§3.4)")
+                return
+            }
+            self.report_at(callee, "`" || what || "` has no method `" ||
+                mn || "` (§3.6)")
             return
         }
-        let m = self.mset[k]
-        self.method_arity(call, m, tn, mn)
-        let names = self.impl_params(tn, mn)
-        self.check_args(call, self.T.Kid(m, 1), tn || "." || mn, env,
-                        names, t.Args)
+        if mi.fn != 0 {
+            self.check_mut_recv(callee, mi.fn, env)
+            var tname = tn
+            if tname == "" { tname = mi.what }
+            self.method_arity(call, mi.fn, tname, mn)
+            self.check_args(call, self.T.Kid(mi.fn, 1), tname || "." || mn,
+                            env, mi.names, mi.args)
+            return
+        }
+        if mi.elem != 0 {
+            // `xs.append(v)`, `s.add(v)`, `b.set(v)`: every value is an
+            // element of the receiver.
+            let argl = self.T.Get(self.T.Kid(call, 1)).Kids
+            each i, a in argl {
+                let an = self.T.Get(a)
+                if an.Ival == 1 or an.Sval != "" { return }
+                self.check_hole(self.T.Kid(a, 0), mi.elem, env, H_ELEM,
+                                self.Ty.Text(self.box_inner(rt)), 0, false)
+                if mn != "append" { return }
+            }
+        }
     }
 
-    // method_arity is chk/callsite.voi's arity check, which only ever saw
-    // plain function calls: a method's parameter list is reached through the
-    // method table and nothing counted it.
+    // check_mut_recv refuses a `mut self` method called through a BORROWED
+    // parameter (§6.1: a borrow is read-only). The method writes its
+    // receiver in place, and the caller lent the value without `mut` — with
+    // value semantics the write would land in a copy the caller never sees.
+    func check_mut_recv(mut self, callee int, m int, env map[str]int) {
+        if (self.T.Get(m).Ival2 & 3) != 3 { return }
+        let what = "`" || self.T.Get(m).Sval || "` writes its receiver " ||
+                   "(`mut self`)"
+        // A tuple member cannot be written (§3.3), and a member reached
+        // through a path is a copy nobody can store back.
+        var x = self.T.Kid(callee, 0)
+        while self.T.Kind(x) == ast.FIELD or self.T.Kind(x) == ast.INDEX {
+            if self.T.Kind(x) == ast.INDEX and self.T.Get(x).Ival2 == 1 {
+                self.report_at(callee, what || ", but a tuple member " ||
+                    "cannot be written — a tuple is rebuilt, not updated " ||
+                    "(§3.3)")
+                return
+            }
+            x = self.T.Kid(x, 0)
+        }
+        self.check_writable_root(callee, x, env, what)
+    }
+
+    // check_writable_root refuses an in-place write — a `mut self` method,
+    // a `mut` argument — whose ROOT is read-only: a borrowed parameter, or
+    // `self` in a method that does not take `mut self` (§6.1).
+    func check_writable_root(mut self, at int, root int, env map[str]int,
+                             what str) {
+        let rk = self.T.Kind(root)
+        if rk == ast.SELF {
+            if self.eSelfW { return }
+            self.report_at(at, what || ", but `self` is read-only in a " ||
+                "method that does not take `mut self` (§6.1)")
+            return
+        }
+        if rk != ast.IDENT { return }
+        let nm = self.T.Get(root).Sval
+        let bk = BORROW_MARK || nm
+        if not (bk in env) or env[bk] == 0 { return }
+        self.report_at(at, what || ", but `" || nm || "` is a borrowed " ||
+            "parameter, which is read-only — declare it `" || nm ||
+            " mut …` (§6.1)")
+    }
+
+    // check_mut_arg refuses a read-only location handed to a `mut`
+    // parameter, which writes it in place.
+    func check_mut_arg(mut self, p int, v int, who str, env map[str]int) {
+        if (self.T.Get(p).Ival2 & 3) != ast.MODE_MUT { return }
+        let k = self.T.Kind(v)
+        if k != ast.IDENT and k != ast.SELF and k != ast.FIELD and
+           k != ast.INDEX {
+            return
+        }
+        self.check_writable_root(v, self.lhs_root(v), env,
+            "`" || who || "` takes `" || self.T.Get(p).Sval || "` as `mut`")
+    }
+
+    // method_arity checks a method call's argument count.
     func method_arity(mut self, call int, m int, tn str, mn str) {
         var given = 0
         each a in self.T.Get(self.T.Kid(call, 1)).Kids {
@@ -648,148 +2956,40 @@ impl Checker {
         if given >= min and given <= max { return }
         var wants = str(max)
         if min != max { wants = str(min) || " to " || str(max) }
-        self.warn_at(call, TYPE_MISMATCH, "`" || tn || "." || mn ||
+        self.report_at(call, "`" || tn || "." || mn ||
             "` takes " || wants || plural(max, " argument", " arguments") ||
             ", but " || str(given) || plural(given, " is", " are") ||
             " given")
     }
 
     // check_field judges `x.f` where `f` is not being called. A struct has
-    // exactly the fields it declares.
-    //
-    // A name the method table holds is nevertheless EXEMPT, and the reason is
-    // not that a bare method name is a method value — it is not: vl_field
-    // (runtime/src/types.c) has no method fallback and `say p.norm` aborts.
-    // The exemption stands because this walker sees `p.norm` in contexts the
-    // lowerer may yet rewrite, and losing a diagnostic on a spelling that
-    // names something real is the safe direction. The two universals go the
-    // same way.
+    // exactly the fields it declares (a method name, or the universal
+    // pair, is exempt: the lowerer may yet rewrite the selection).
     func check_field(mut self, e int, env map[str]int) {
         let fname = self.T.Get(e).Sval
-        let rt = self.ty_of(self.T.Kid(e, 0), env)
+        var rt = self.box_inner(self.ty_of(self.T.Kid(e, 0), env))
         if rt == 0 { return }
-        let t = self.Ty.Get(rt)
-        if t.Kind != typ.TK_NAMED { return }
-        let tn = t.Name
+        var tn = self.named(rt)
+        if self.is_newtype(tn) { tn = self.named(self.box_inner(
+                                     self.underlying(tn))) }
+        if typ.IsPrimitive(tn) and tn != "unit" {
+            // A primitive has no fields at all (`[1, 2][0].x`).
+            if fname == "str" or fname == "clone" { return }
+            self.report_at(e, "`" || tn || "` has no field `" || fname ||
+                "` — a primitive value has no fields (§3.1)")
+            return
+        }
         if not (tn in self.structs) { return }
         let k = tn || "|" || fname
         if k in self.flds { return }
         if k in self.mset { return }
         if fname == "str" or fname == "clone" { return }
-        self.warn_at(e, TYPE_MISMATCH, "`" || tn || "` has no field `" ||
-            fname || "` (§3.4)")
-    }
-
-    // ------------------------------------------------------------ typing
-
-    // ty_of is the inference, and it is PARTIAL BY DESIGN: 0 means "no idea",
-    // and every caller treats 0 as "say nothing". Only the forms whose type
-    // is written down somewhere — a literal, an annotated binding, a
-    // declared signature, a composite literal — produce an answer.
-    func ty_of(mut self, e int, env map[str]int) int {
-        if e == 0 { return 0 }
-        let n = self.T.Get(e)
-        let k = n.Kind
-
-        if k == ast.INT   { return self.Ty.Nominal("int") }
-        if k == ast.FLOAT { return self.Ty.Nominal("float") }
-        if k == ast.DEC   { return self.Ty.Nominal("dec") }
-        if k == ast.RUNE  { return self.Ty.Nominal("rune") }
-        if k == ast.BOOL  { return self.Ty.Nominal("bool") }
-        if k == ast.STR or k == ast.INTERP { return self.Ty.Nominal("str") }
-        if k == ast.NILLIT { return 0 }
-        if k == ast.SELF  { return self.eSelf }
-        if k == ast.IDENT {
-            if n.Sval in env { return env[n.Sval] }
-            return 0
-        }
-        if k == ast.COMPOSITE { return self.Ty.FromAST(self.T, n.Ival) }
-        if k == ast.UNARY {
-            if n.Ival == tok.NOT { return self.Ty.Nominal("bool") }
-            return 0
-        }
-        if k == ast.BINARY {
-            // COMPARISONS and the logical operators are the only ones whose
-            // result type does not depend on the operands' — `a || b` is
-            // concatenation over strings AND slices, and `a + b` widens
-            // across the numeric lattice (§3.2). Answering 0 for the rest
-            // costs diagnostics and invents none.
-            if is_bool_op(n.Ival) { return self.Ty.Nominal("bool") }
-            return 0
-        }
-        if k == ast.FIELD  { return self.field_ty(e, env) }
-        if k == ast.CALL   { return self.call_ty(e, env) }
-        if k == ast.MUSTEXPR or k == ast.TRYEXPR {
-            // Both unwrap one `?T`/`T!` layer.
-            return self.unwrap(self.ty_of(self.T.Kid(e, 0), env))
-        }
-        return 0
-    }
-
-    // field_ty is the type of `x.f` when the receiver is a struct this
-    // program declares. The receiver's own type ARGUMENTS are substituted
-    // into the field's declared type, so `Stack[int]`'s `items []T` is
-    // `[]int` and not the unjudgeable `[]T`.
-    func field_ty(mut self, e int, env map[str]int) int {
-        let rt = self.ty_of(self.T.Kid(e, 0), env)
-        if rt == 0 { return 0 }
-        let t = self.Ty.Get(rt)
-        if t.Kind != typ.TK_NAMED { return 0 }
-        let k = t.Name || "|" || self.T.Get(e).Sval
-        if not (k in self.flds) { return 0 }
-        self.Ty.PushParams(self.decl_params(t.Name))
-        let ft = self.Ty.FromAST(self.T, self.T.Get(self.flds[k]).Ival)
-        self.Ty.PopParams()
-        return self.subst_all(ft, self.decl_params(t.Name), t.Args)
-    }
-
-    // call_ty is the type of a call's value: a declared function's single
-    // result, a method's single result, or a primitive CONVERSION (`int(x)`,
-    // `str(x)`), which is the one native whose result type is its own name.
-    func call_ty(mut self, e int, env map[str]int) int {
-        let callee = self.T.Kid(e, 0)
-        if callee == 0 { return 0 }
-        let ck = self.T.Kind(callee)
-        if ck == ast.IDENT {
-            let nm = self.T.Get(callee).Sval
-            if nm in env { return 0 }               // shadowed
-            if nm in self.funcs {
-                let fn = self.funcs[nm]
-                if self.T.NKids(self.T.Kid(fn, 3)) != 0 { return 0 }
-                return self.single_result(fn)
-            }
-            // A conversion, but only when nothing else claims the spelling:
-            // `str(x)` is the conversion, while a user function called `str`
-            // was already answered above and an enum VARIANT of that name
-            // must not be read as one.
-            if typ.IsPrimitive(nm) and not (nm in self.natShadow) {
-                return self.Ty.Nominal(nm)
-            }
-            return 0
-        }
-        if ck != ast.FIELD { return 0 }
-        let mn = self.T.Get(callee).Sval
-        let rt = self.ty_of(self.T.Kid(callee, 0), env)
-        if rt == 0 { return 0 }
-        let t = self.Ty.Get(rt)
-        if t.Kind != typ.TK_NAMED { return 0 }
-        if t.Name in self.traits {
-            let tm = self.trait_method(t.Name, mn)
-            if tm == 0 { return 0 }
-            return self.single_result(tm)
-        }
-        let k = t.Name || "|" || mn
-        if not (k in self.mset) { return 0 }
-        let m = self.mset[k]
-        let names = self.impl_params(t.Name, mn)
-        self.Ty.PushParams(names)
-        let r = self.single_result(m)
-        self.Ty.PopParams()
-        return self.subst_all(r, names, t.Args)
+        self.report_at(e, "`" || tn || "` has no field `" || fname ||
+            "` (§3.4)")
     }
 
     // unwrap peels one `?T` or `T!` layer, which is what `must`, `try` and a
-    // successful `else` all do. Anything else is returned untouched.
+    // successful `else` all do.
     func unwrap(mut self, id int) int {
         if id == 0 { return 0 }
         let t = self.Ty.Get(id)
@@ -812,19 +3012,10 @@ impl Checker {
     }
 
     // impl_params names the generic parameters that a METHOD's types are
-    // written in terms of, expressed as the TARGET's positional parameters.
-    //
-    // The distinction matters and is not pedantry: `impl[E] Stack[E]` writes
-    // its methods in `E` while the struct is declared `Stack[T]`, and a
-    // receiver typed `Stack[int]` supplies its argument POSITIONALLY. So the
-    // list returned here is read off the impl block's own TARGET annotation —
-    // position i of `Stack[E]` is `E` — which is exactly what pairs with
-    // position i of the receiver's `Stack[int]`.
-    //
-    // Empty when the method is not found in an impl block at all (an
-    // exception's own method, a trait default), which makes subst_all a
-    // no-op and leaves any `T` in the signature unjudgeable. That is the
-    // right answer: there is no receiver argument to put in its place.
+    // written in terms of, expressed as the TARGET's positional parameters:
+    // `impl[E] Stack[E]` writes its methods in `E` while the struct is
+    // declared `Stack[T]`, and a receiver `Stack[int]` supplies its argument
+    // POSITIONALLY.
     func impl_params(mut self, tn str, mn str) []str {
         let k = tn || "|" || mn
         if k in self.implOf {
@@ -849,8 +3040,7 @@ impl Checker {
     }
 
     // subst_all replaces each named parameter by the receiver's type argument
-    // at the same position. A name that is "" (a target position written with
-    // a concrete type, as in `impl Stack[int]`) substitutes nothing.
+    // at the same position.
     func subst_all(mut self, id int, names []str, args []int) int {
         if id == 0 { return 0 }
         var out = id
@@ -874,117 +3064,6 @@ impl Checker {
         return 0
     }
 
-    // ------------------------------------------------------- the verdict
-
-    // mismatch is the ONE place a type is judged wrong, and it is a positive
-    // test for a KNOWN-BAD pair — never the negation of a compatibility
-    // relation. See this file's header for why the difference is the whole
-    // safety argument.
-    //
-    // It answers true only when both sides are SOLID: a concrete nominal
-    // type, or a slice/map/set of one, with no unknown, no error, no generic
-    // parameter and no trait anywhere inside. Everything else is false, which
-    // is to say silent.
-    func mismatch(mut self, want int, got int) bool {
-        if want == 0 or got == 0 { return false }
-        if self.Ty.HasError(want) or self.Ty.HasError(got) { return false }
-        if self.Ty.HasParam(want) or self.Ty.HasParam(got) { return false }
-        if want == got { return false }
-
-        let w = self.Ty.Get(want)
-        let g = self.Ty.Get(got)
-
-        // A borrow is the same value, lent. `&T` and `T` fit each other's
-        // holes at every site this file checks (§6.1 governs WRITING through
-        // one, which is chk/bind.voi's business).
-        if w.Kind == typ.TK_BORROW { return self.mismatch(w.Elem, got) }
-        if g.Kind == typ.TK_BORROW { return self.mismatch(want, g.Elem) }
-
-        // `?T` accepts a T and accepts nil; `T!` accepts a T and accepts a
-        // thrown error. Neither is a sum type with constructors, so the
-        // payload is the only thing there is to compare.
-        if w.Kind == typ.TK_OPTION or w.Kind == typ.TK_RESULT {
-            return self.mismatch(w.Elem, got)
-        }
-        // The other direction is NOT symmetric — putting a `?int` where an
-        // `int` is wanted is a real error — but recognising it needs the
-        // nil-exclusivity analysis that is still deferred, and `try`/`must`/
-        // `else` are already unwrapped by ty_of. Silent.
-        if g.Kind == typ.TK_OPTION or g.Kind == typ.TK_RESULT { return false }
-
-        // A box is a handle, not the value: `shared[T]` answers `T`'s methods
-        // through the runtime and is written where a `T` is wanted all over
-        // the corpus.
-        if w.Kind == typ.TK_BOX or g.Kind == typ.TK_BOX { return false }
-
-        if w.Kind == typ.TK_SLICE and g.Kind == typ.TK_SLICE {
-            // Extents are not compared: `[3]int` and `[]int` are the same
-            // element type and the lowerer treats them alike.
-            return self.mismatch(w.Elem, g.Elem)
-        }
-        if (w.Kind == typ.TK_SET and g.Kind == typ.TK_SET) or
-           (w.Kind == typ.TK_CHAN and g.Kind == typ.TK_CHAN) {
-            return self.mismatch(w.Elem, g.Elem)
-        }
-        if w.Kind == typ.TK_MAP and g.Kind == typ.TK_MAP {
-            if self.mismatch(w.Key, g.Key) { return true }
-            return self.mismatch(w.Elem, g.Elem)
-        }
-
-        if w.Kind != typ.TK_NAMED or g.Kind != typ.TK_NAMED {
-            // A structural type against something else — a function type, a
-            // tuple, a slice where a nominal is wanted. Every one of those IS
-            // a real mismatch, and not one of them can be produced by ty_of
-            // with enough confidence to say so. Silent.
-            return false
-        }
-        return self.nominal_mismatch(w.Name, g.Name)
-    }
-
-    // nominal_mismatch judges two names. Both must be SOLID — a primitive or
-    // a type this program declares whole — before a difference between them
-    // is a fact rather than an admission of ignorance.
-    func nominal_mismatch(mut self, wn str, gn str) bool {
-        if wn == gn { return false }
-        // `unit` is the empty type: it is what a function with no result
-        // "returns", and nothing is wrong with any value flowing into it.
-        if wn == "unit" or gn == "unit" { return false }
-        // The numeric lattice (§3.2) widens across the integer and float
-        // families and the literals are untyped, so any numeric fits any
-        // numeric hole here. Narrowing is chk/checks.voi's business and it
-        // judges the LITERAL, which is where the information is.
-        if is_numeric(wn) and is_numeric(gn) { return false }
-
-        // A trait-typed hole takes any implementor, and the answer is a fact
-        // only when this program can see the whole method set — judgeable is
-        // chk/traits.voi's, unchanged and deliberately not re-derived.
-        if wn in self.traits {
-            if not self.judgeable(gn) { return false }
-            return self.missing_for(gn, wn) != ""
-        }
-        // A trait on the VALUE side dispatches dynamically: its runtime type
-        // is not written anywhere and may well be the one wanted.
-        if gn in self.traits { return false }
-
-        if not self.solid(wn) or not self.solid(gn) { return false }
-        return true
-    }
-
-    // solid reports whether a nominal name is one this checker knows the
-    // whole story about. A primitive, a struct, an enum or a `type`
-    // declaration qualifies. An EXCEPTION does not: `error` and the
-    // predeclared exceptions are related by a subtyping the checker does not
-    // model, and `throws IOError` catching an `error` is ordinary code. Nor
-    // does a std package's type, which typ.Resolves waves through precisely
-    // because it has no declaration to compare against.
-    func solid(self, name str) bool {
-        if typ.IsPrimitive(name) { return true }
-        if name in self.excs { return false }
-        if name in self.structs { return true }
-        if name in self.enums { return true }
-        return false
-    }
-
     // tq renders a type for a diagnostic, in backticks.
     func tq(self, id int) str {
         return "`" || self.Ty.Text(id) || "`"
@@ -1000,17 +3079,41 @@ impl Checker {
         return out
     }
 
-    // env_put records a name's type, ignoring the ones that are not bindings:
-    // the blank `_`, and the empty half of a "bind,bindok" pair. A name whose
-    // type is unknown is entered ANYWAY, with 0 — that is what makes an inner
-    // binding SHADOW an outer one instead of leaving its type behind.
-    func env_put(self, env mut map[str]int, name str, id int) {
+    // env_put records a name's type, ignoring the blank `_` and the empty
+    // half of a "bind,bindok" pair. A name whose type is unknown is entered
+    // ANYWAY, with 0 — that is what makes an inner binding SHADOW an outer.
+    func env_put(mut self, env mut map[str]int, name str, id int) {
         if name == "" or name == "_" { return }
         env[name] = id
+        // A new binding is not narrowed until something says so, is
+        // mutable until a `let` says otherwise, and is local inside a
+        // function.
+        // … nor is any location under it (`p.age` was the old p's).
+        if name in self.nn { self.nn[name] = 0 }
+        self.forget_under(name)        // also `xs[name]`: forget_index
+        // Bound inside a spawned body: the task's own, not its group's.
+        if self.spawnDepth > 0 { self.spawnLocal.add(name) }
+        // A new binding is no task-unsafe closure until one is bound to it.
+        if name in self.unsafeNames { self.unsafeNames.remove(name) }
+        if name in self.immNames {
+            let ik = IMM_MARK || name
+            if ik in env { env[ik] = 0 }
+        }
+        // A binding shadowing a module `var` is local in a function.
+        if name in self.gVars {
+            if self.inFunc {
+                env[LOC_MARK || name] = 1
+            } else if (LOC_MARK || name) in env {
+                env[LOC_MARK || name] = 0
+            }
+        }
+        let bk = BORROW_MARK || name
+        if bk in env { env[bk] = 0 }
     }
 
     // env_bind_stmt enters the names a LET or VAR introduces, with the type
-    // its annotation gives or the one its value can be inferred to have.
+    // its annotation gives or the one its value is inferred to have. A
+    // destructuring `let a, b = v` takes the members of a tuple-typed v.
     func env_bind_stmt(mut self, s int, env mut map[str]int) {
         if s == 0 { return }
         let n = self.T.Get(s)
@@ -1027,56 +3130,129 @@ impl Checker {
         }
         let names = str.split(n.Sval, ",")
         if len(names) != 1 {
-            // A destructuring `let`: the value is a tuple and no name has its
-            // type. They are entered as unknown so that they still SHADOW.
+            var ms = []
+            if id != 0 and self.Ty.Kind(id) == typ.TK_TUPLE and
+               len(self.Ty.Get(id).Args) == len(names) {
+                ms = self.Ty.Get(id).Args
+            }
+            each i, nm in names {
+                if len(ms) > 0 {
+                    self.env_put(env, nm, ms[i])
+                } else {
+                    self.env_put(env, nm, 0)
+                }
+            }
+        } else {
+            self.env_put(env, names[0], id)
+        }
+        if n.Ival2 != 2 and id != 0 and self.Ty.Kind(id) == typ.TK_OPTION {
+            // An OPTIONAL `let` cannot be reassigned, so a closure may keep
+            // its narrowing (nn_later). (Ival2 2 is the destructuring
+            // `var (a, b) = …`, whose names can.)
             each nm in names {
-                self.env_put(env, nm, 0)
+                if nm != "" and nm != "_" {
+                    env[IMM_MARK || nm] = 1
+                    self.immNames.add(nm)
+                }
+            }
+        }
+    }
+
+    // env_bind_pattern_typed enters a pattern's binds, typed by the
+    // SUBJECT's type where the pattern says how: a bind takes the subject
+    // itself, `Some(x)` the payload of a `?T`, a variant of a declared enum
+    // its payload fields (at the subject's type arguments), a tuple pattern
+    // its members, a struct pattern its fields. Anything else — an
+    // or-pattern, a subject of unknown type — enters its binds as unknown,
+    // which still shadows.
+    func env_bind_pattern_typed(mut self, p int, st0 int, env mut map[str]int) {
+        if p == 0 { return }
+        let n = self.T.Get(p)
+        let st = self.canon(st0)
+        if n.Kind == ast.PBIND {
+            self.env_put(env, n.Sval, st)
+            return
+        }
+        let inner = self.box_inner(st)
+        if n.Kind == ast.PVARIANT and inner != 0 {
+            let t = self.Ty.Get(inner)
+            if (n.Sval == "Some" and t.Kind == typ.TK_OPTION) or
+               (n.Sval == "Ok" and t.Kind == typ.TK_RESULT) {
+                if len(n.Kids) == 1 {
+                    self.env_bind_pattern_typed(n.Kids[0], t.Elem, env)
+                    return
+                }
+            }
+            let vn = self.variant_name(n.Sval)
+            if t.Kind == typ.TK_NAMED and t.Name in self.enums and
+               vn in self.varDecl and self.variant_of(t.Name, vn) {
+                let fs = self.T.Get(self.T.Kid(self.varDecl[vn], 0)).Kids
+                let names = self.decl_params(t.Name)
+                each i, sub in n.Kids {
+                    var ft = 0
+                    if i < len(fs) {
+                        self.Ty.PushParams(names)
+                        let f0 = self.Ty.FromAST(self.T, self.T.Get(fs[i]).Ival)
+                        self.Ty.PopParams()
+                        ft = self.subst_all(f0, names, t.Args)
+                        if self.Ty.HasParam(ft) { ft = 0 }
+                    }
+                    self.env_bind_pattern_typed(sub, ft, env)
+                }
+                return
+            }
+        }
+        if n.Kind == ast.PTUPLE and inner != 0 and
+           self.Ty.Kind(inner) == typ.TK_TUPLE and
+           len(self.Ty.Get(inner).Args) == len(n.Kids) {
+            let ms = self.Ty.Get(inner).Args
+            each i, sub in n.Kids {
+                self.env_bind_pattern_typed(sub, ms[i], env)
             }
             return
         }
-        self.env_put(env, names[0], id)
-    }
-
-    // env_bind_pattern enters a pattern's binds as unknown. A variant's
-    // payload type is decidable — it is a VARIANTDEC's field list — but the
-    // enum the pattern belongs to is not known without the subject's type,
-    // and guessing it from the global variant namespace would be exactly the
-    // kind of confident wrong answer this file refuses to give.
-    func env_bind_pattern(mut self, p int, env mut map[str]int) {
-        if p == 0 { return }
-        let n = self.T.Get(p)
-        if n.Kind == ast.PBIND {
-            self.env_put(env, n.Sval, 0)
+        if n.Kind == ast.PSTRUCT and n.Sval in self.structs and
+           len(self.decl_params(n.Sval)) == 0 {
+            each pf in n.Kids {
+                if self.T.Kind(pf) != ast.PFIELD { continue }
+                let k = n.Sval || "|" || self.T.Get(pf).Sval
+                var ft = 0
+                if k in self.flds {
+                    ft = self.Ty.FromAST(self.T, self.T.Get(self.flds[k]).Ival)
+                }
+                self.env_bind_pattern_typed(self.T.Kid(pf, 0), ft, env)
+            }
             return
         }
         each sub in n.Kids {
-            self.env_bind_pattern(sub, env)
+            self.env_bind_pattern_typed(sub, 0, env)
         }
     }
 
-    // bind_loop_vars enters a loop's variables, and the SHAPE of an `each`
-    // is per-iterable rather than uniform — this was checked against the
-    // runtime rather than assumed, because guessing it wrong is a false
-    // positive on every use of the variable:
+    // variant_of reports whether the variant `vn` belongs to enum `en`.
+    func variant_of(self, en str, vn str) bool {
+        each v in self.T.Get(self.T.Kid(self.enums[en], 0)).Kids {
+            if self.T.Get(v).Sval == vn { return true }
+        }
+        return false
+    }
+
+    // bind_loop_vars enters a loop's variables. The SHAPE of an `each` is
+    // per-iterable (checked against the runtime):
     //
     //     each x in xs        a slice yields ELEMENTS
     //     each i, x in xs     … and an index alongside them
     //     each v in m         a map yields VALUES, not keys
     //     each k, v in m      … and the key alongside them
     //     each e in s         a set yields its elements
+    //     each i in a..b      a range of ints yields ints
     //
-    // Anything else — a range, a channel, a reader, a string, a struct with
-    // `next()` — binds unknown. Binding a name to 0 still SHADOWS an outer
-    // name of the same spelling, which is the point of doing it at all.
+    // Anything else — a channel, a reader, a string, a struct with `next()`
+    // — binds unknown, which still SHADOWS an outer name.
     func bind_loop_vars(mut self, sval str, iter int, env mut map[str]int,
-                        is_each bool) {
+                        is_each bool, outer map[str]int) {
         // Sval is "a,b|label" and the parser writes the comma ALWAYS, so a
-        // one-variable `each` arrives as "q," — the empty half has to be
-        // dropped before the count means anything. Reading it as two names
-        // bound `q` to the INDEX of a slice instead of its element, and every
-        // use of `q` was then reported against the wrong type. (chk/bind.voi
-        // and chk/callsite.voi both split the same string and are unaffected:
-        // they enter every half into a set, and "" is ignored on the way in.)
+        // one-variable `each` arrives as "q," — the empty half is dropped.
         var names = []
         each part in str.split(str.split(sval, "|")[0], ",") {
             if part != "" { names.append(part) }
@@ -1084,7 +3260,9 @@ impl Checker {
         var et = 0      // the value bound by the LAST name
         var ft = 0      // the index or key bound by the first of two
         if is_each and iter != 0 {
-            let it = self.ty_of(iter, env)
+            var it = self.box_inner(self.ty_of(iter, outer))
+            let itn = self.named(it)
+            if self.is_newtype(itn) { it = self.box_inner(self.underlying(itn)) }
             if it != 0 {
                 let t = self.Ty.Get(it)
                 if t.Kind == typ.TK_SLICE {
@@ -1095,6 +3273,12 @@ impl Checker {
                     ft = t.Key
                 } else if t.Kind == typ.TK_SET or t.Kind == typ.TK_CHAN {
                     et = t.Elem
+                }
+            } else if self.T.Kind(iter) == ast.RANGE {
+                let lo = self.ty_of(self.T.Kid(iter, 0), outer)
+                let hi = self.ty_of(self.T.Kid(iter, 1), outer)
+                if self.named(lo) == "int" and self.named(hi) == "int" {
+                    et = lo
                 }
             }
         }
@@ -1122,45 +3306,244 @@ func is_bool_op(op int) bool {
            op == tok.IN
 }
 
-// ---------------------------------------------------------------------------
-// WHAT IS STILL NOT JUDGED, and what a promotion to a hard error would need.
-//
-// The sweep behind this file is recorded in TESTING.md: 156 programs, one
-// report, and that one is a negative fixture whose program genuinely cannot
-// run. The code is a WARNING and DEFAULTS OFF all the same, and the reason is
-// not the measurement — it is that everything below is a place where the
-// inference is silent rather than right, and a check that has never been
-// wrong in a corpus it was written against has not yet been tested.
-//
-//   · `?T` NIL-EXCLUSIVITY. `var x int = maybe()` where maybe returns `?int`
-//     is a real error and is not reported: mismatch unwraps the option on the
-//     VALUE side and says nothing. Reporting it needs to know where a `?T`
-//     has been narrowed — `if x != nil`, `match`, `else`, `must` — and a
-//     version without that narrowing would reject the ordinary way of using
-//     an option.
-//   · MULTIPLE RESULTS. A function declaring two results is skipped entirely
-//     (single_result answers 0), so `let a, b = f()` types neither name and
-//     `return f()` forwarding a tuple is not judged. It needs a tuple type
-//     flowing through the destructuring, which nothing here builds.
-//   · ENUM VARIANT PAYLOADS. A pattern's binds enter as unknown. The payload
-//     types are written down — a VARIANTDEC's field list — but the enum they
-//     belong to is only knowable from the subject's type, and the variant
-//     namespace is global, so guessing from the name would be a confident
-//     wrong answer.
-//   · ENUM and EXCEPTION receivers. Method existence is judged for STRUCTS
-//     only. An exception answers `message` and `trace` from err_method with
-//     no row anywhere, and the subtyping between `error` and the predeclared
-//     exceptions is not modelled (see solid).
-//   · COLLECTION LITERALS. `[]`, `[1, 2]`, `make(map[…])` and `set([…])` all
-//     type as unknown; only an annotation gives a collection a type here.
-//   · OPERATORS. Only the comparisons and the logical operators are typed.
-//     `a || b` concatenates strings AND slices and `a + b` widens across the
-//     numeric lattice, and neither is worth guessing at.
-//   · CLOSURE and FUNCTION-TYPED values. A `fn(int) int` in a hole expecting
-//     something else is a real mismatch that mismatch declines to make (see
-//     its last arm), because ty_of never produces a TK_FN to compare.
-//
-// A promotion to SEV_ERROR wants two things this release does not have: a
-// release's worth of field exposure with the warning on, and the option
-// narrowing above — because the first thing anyone will do with `--strict` is
-// write `?T` code, and being silent there is far better than being wrong.
+// op_text spells an operator for a diagnostic.
+func op_text(op int) str {
+    if op == tok.PLUS { return "+" }
+    if op == tok.MINUS { return "-" }
+    if op == tok.STAR { return "*" }
+    if op == tok.SLASH { return "/" }
+    if op == tok.FLOORDIV { return "~/" }
+    if op == tok.PERCENT { return "%" }
+    if op == tok.POWER { return "**" }
+    if op == tok.SHL { return "<<" }
+    if op == tok.SHR { return ">>" }
+    if op == tok.AMP { return "&" }
+    if op == tok.PIPE { return "|" }
+    if op == tok.CARET { return "^" }
+    if op == tok.LT { return "<" }
+    if op == tok.LE { return "<=" }
+    if op == tok.GT { return ">" }
+    if op == tok.GE { return ">=" }
+    if op == tok.EQ { return "==" }
+    if op == tok.NE { return "!=" }
+    if op == tok.AND { return "and" }
+    if op == tok.OR { return "or" }
+    if op == tok.NOT { return "not" }
+    return "?"
+}
+
+// kind_accepts reports whether a value of static class `cls` (kind_class)
+// is of native argument kind `k` (low.NativeKinds).
+func kind_accepts(k rune, cls str) bool {
+    if k == 'a' { return true }
+    if k == 's' { return cls == "s" }
+    if k == 'r' { return cls == "s" or cls == "u" }
+    if k == 'i' { return cls == "i" or cls == "u" }
+    if k == 'n' { return cls == "i" or cls == "u" or cls == "n" }
+    if k == 'l' { return cls == "l" }
+    if k == 'q' { return cls == "l" or cls == "e" }
+    if k == 'm' { return cls == "m" or cls == "e" }
+    if k == 'c' { return cls == "c" }
+    if k == 'f' { return cls == "f" }
+    if k == 'b' { return cls == "b" }
+    return true
+}
+
+// kind_word spells a native argument kind for a diagnostic.
+func kind_word(k rune) str {
+    if k == 's' { return "a str" }
+    if k == 'r' { return "a str or a rune" }
+    if k == 'i' { return "an int" }
+    if k == 'n' { return "a number" }
+    if k == 'l' { return "a slice" }
+    if k == 'q' { return "a slice or a set" }
+    if k == 'm' { return "a map or a set" }
+    if k == 'c' { return "a channel" }
+    if k == 'f' { return "a function" }
+    if k == 'b' { return "a bool" }
+    return "anything"
+}
+
+// int_lit_key is an integer literal's value in decimal — the spelling a
+// narrowing key uses, so two spellings of one index are one key: `0x1f`,
+// `0o37`, `0b11111`, `3_1` and `31`. "" for a literal too long to be sure
+// of (the location is then not narrowed).
+func int_lit_key(t str) str {
+    var digits = ""
+    var base = 10
+    var i = 0
+    if len(t) > 2 and t[0] == '0' {
+        let p = t[1]
+        if p == 'x' or p == 'X' { base = 16 }
+        if p == 'o' or p == 'O' { base = 8 }
+        if p == 'b' or p == 'B' { base = 2 }
+        if base != 10 { i = 2 }
+    }
+    var v = 0
+    var n = 0
+    while i < len(t) {
+        let c = t[i]
+        i += 1
+        if c == '_' { continue }
+        var d = 0 - 1
+        if c >= '0' and c <= '9' { d = int(c - '0') }
+        if c >= 'a' and c <= 'f' { d = int(c - 'a') + 10 }
+        if c >= 'A' and c <= 'F' { d = int(c - 'A') + 10 }
+        if d < 0 or d >= base { return "" }
+        n += 1
+        if n > 15 { return "" }
+        v = v * base + d
+    }
+    if n == 0 { return "" }
+    return str(v)
+}
+
+// key_steps splits a narrowing key (path_key) into its steps: the root,
+// then each `.field` and `[index]` — `xs[$i].v` is `xs`, `[$i]`, `.v`.
+// An index step is matched by its brackets: a string literal's text is
+// skipped by its length, a location index may nest further brackets.
+func key_steps(k str) []str {
+    var out = []
+    var start = 0
+    var i = 0
+    while i < len(k) {
+        let c = k[i]
+        if (c == '.' or c == '[') and i > start {
+            out.append(k[start..i])
+            start = i
+        }
+        if c == '[' {
+            i = key_bracket_end(k, i)
+            out.append(k[start..i])
+            start = i
+            continue
+        }
+        i += 1
+    }
+    if start < len(k) { out.append(k[start..len(k)]) }
+    return out
+}
+
+// key_bracket_end is the index just past the `]` that closes the index
+// step opening at k[i] == '['.
+func key_bracket_end(k str, i int) int {
+    var j = i + 1
+    if j < len(k) and k[j] == '#' {
+        // `[#n:text]`: n bytes of text, whatever they are.
+        var n = 0
+        j += 1
+        while j < len(k) and k[j] != ':' {
+            n = n * 10 + int(k[j] - '0')
+            j += 1
+        }
+        return j + 1 + n + 1
+    }
+    var depth = 1
+    while j < len(k) {
+        if k[j] == '[' {
+            j = key_bracket_end(k, j)
+            continue
+        }
+        if k[j] == ']' {
+            depth -= 1
+            if depth == 0 { return j + 1 }
+        }
+        j += 1
+    }
+    return j
+}
+
+// may_alias reports whether the path k may name the written location w or
+// a location below it: k is at least as long as w, and each step of w is
+// either k's step at that position or an index that may equal it (a
+// location index `[$i]` on either side; two different literals never do).
+func may_alias(k []str, w []str) bool {
+    if len(k) < len(w) { return false }
+    each i, st in w {
+        if st == k[i] { continue }
+        if str.starts_with(st, "[") and str.starts_with(k[i], "[") and
+           (str.starts_with(st, "[$") or str.starts_with(k[i], "[$")) {
+            continue
+        }
+        return false
+    }
+    return true
+}
+
+// key_index_roots lists the roots of the location indices in a key:
+// i and p for `xs[$i].v[$p.k]`. (A string key's text may produce a
+// spurious name; that only makes the caller more careful.)
+func key_index_roots(k str) []str {
+    var out = []
+    var i = 0
+    while i + 1 < len(k) {
+        if k[i] == '[' and k[i + 1] == '$' {
+            var j = i + 2
+            while j < len(k) and k[j] != '.' and k[j] != '[' and k[j] != ']' {
+                j += 1
+            }
+            out.append(k[i + 2..j])
+            i = j
+        } else {
+            i += 1
+        }
+    }
+    return out
+}
+
+// key_uses reports whether a key is rooted at, or indexed by, one of the
+// names in decl.
+func key_uses(k str, decl set[str]) bool {
+    if key_root(k) in decl { return true }
+    if not str.contains(k, "[$") { return false }
+    each r in key_index_roots(k) {
+        if r in decl { return true }
+    }
+    return false
+}
+
+// key_root is the variable a narrowing key (path_key) is rooted at.
+func key_root(k str) str {
+    var i = 0
+    while i < len(k) {
+        if k[i] == '.' or k[i] == '[' { return k[0..i] }
+        i += 1
+    }
+    return k
+}
+
+// coll_writer_name: a collection's builtin methods that change its length
+// or order in place (runtime/src/call.c, coll_writer).
+func coll_writer_name(m str) bool {
+    return m == "append" or m == "pop" or m == "insert" or m == "remove" or
+           m == "reverse" or m == "sort" or m == "sort_by" or m == "add" or
+           m == "delete" or m == "set" or m == "clear"
+}
+
+// conv_name: the builtin type names, which are also conversions in call
+// position (`int(x)`) — the lowerer's conv_type.
+func conv_name(n str) bool {
+    return n == "int" or n == "i8" or n == "i16" or n == "i32" or
+           n == "i64" or n == "u8" or n == "u16" or n == "u32" or
+           n == "u64" or n == "byte" or n == "float" or n == "f32" or
+           n == "dec" or n == "str" or n == "rune" or n == "bool"
+}
+
+// native_writes lists the argument positions a native writes in place —
+// the lowerer's native_mut_positions: `sort.sort` and `sort.sort_by`
+// reorder their slice, the prelude `append` grows its own.
+func native_writes(fnm str) []int {
+    if fnm == "sort.sort" or fnm == "sort.sort_by" or fnm == "append" {
+        return [0]
+    }
+    return []
+}
+
+// sync_method: the builtin collection methods that run a closure argument
+// before they return, on the calling task, and never keep it — trusted only
+// with a receiver whose static type is a builtin collection (the lowerer's
+// sync_builtin).
+func sync_method(m str) bool {
+    return m == "map" or m == "filter" or m == "each" or m == "any" or
+           m == "all" or m == "reduce" or m == "sort_by" or m == "sorted"
+}

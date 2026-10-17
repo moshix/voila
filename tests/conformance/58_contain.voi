@@ -1,0 +1,86 @@
+// std/http's server CONTAINS an abort in a handler — an index out of
+// bounds, a field of nil, a call of a non-function, a failed assert — to
+// the one request: it is answered 500, reported on standard error, and the
+// server goes on serving. A throw is a 500 too. A `catch` inside the handler
+// does not see the abort (§8.6: aborts are not exceptions), but its `defer`s
+// run. serve_for bounds the graceful stop: a connection still open when the
+// grace runs out is shut down.
+use "std/http"
+use "std/net"
+use "std/time"
+
+func handler(r http.Request) http.Response {
+    if r.path == "/oob" {
+        let xs = [1]
+        return http.text(200, str(xs[len(r.path)]))
+    }
+    if r.path == "/assert" {
+        assert(r.path == "/never", "the handler's own invariant")
+        return http.text(200, "?")
+    }
+    if r.path == "/caught" {
+        defer say "the handler's defer ran"
+        try {
+            let xs = []int{}
+            return http.text(200, str(xs[3]))
+        } catch e {
+            return http.text(200, "a catch saw the abort")
+        }
+    }
+    if r.path == "/throw" { throw RuntimeError{msg: "plain throw"} }
+    return http.text(200, "ok {r.path}")
+}
+
+func get(addr str, p str) str {
+    match http.get("http://{addr}{p}") {
+        Ok(resp) => return "{resp.status} {resp.body.trim()}"
+        Err(e)   => return "error " || e.message()
+    }
+    return "?"
+}
+
+func main() {
+    var srv = must http.listen("127.0.0.1:0")
+    let addr = srv.addr()
+    let stop = chan[int](1)
+    group {
+        spawn {
+            match srv.serve(handler, stop) {
+                Ok(u)  => say "server stopped cleanly"
+                Err(e) => say "server error:", e.message()
+            }
+        }
+        say get(addr, "/a")
+        say get(addr, "/oob")
+        say get(addr, "/assert")
+        say get(addr, "/caught")
+        say get(addr, "/throw")
+        say get(addr, "/b")
+        stop <- 1
+    }
+
+    // serve_for: a client that connects and says nothing would hold serve
+    // open until its read timeout; with a grace it is shut down.
+    var srv2 = must http.listen("127.0.0.1:0")
+    let addr2 = srv2.addr()
+    let stop2 = chan[int](1)
+    let started = time.now()
+    let outcome = chan[str](1)
+    group {
+        spawn {
+            match srv2.serve_for(handler, stop2, time.Millisecond * 200) {
+                Ok(u)  => outcome <- "serve_for returned"
+                Err(e) => outcome <- "serve_for error: " || e.message()
+            }
+        }
+        let idle = must net.connect(addr2)
+        time.sleep(time.Millisecond * 150)
+        stop2 <- 1
+        let rest = idle.read_all() else ""
+        say "the idle client was cut off:", rest.contains("HTTP/1.1") or rest == ""
+        idle.close()
+    }
+    say <-outcome
+    say "within the grace, not the 30 s read timeout:",
+        time.since(started).millis() < 10000
+}

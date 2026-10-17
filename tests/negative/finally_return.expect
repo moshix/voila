@@ -1,0 +1,4 @@
+control flow out of a finally block is not allowed: `return` would leave it
+!finally_return.voi:13
+!finally_return.voi:14
+!finally_return.voi:16

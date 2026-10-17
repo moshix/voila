@@ -1,0 +1,141 @@
+// std/heap — a binary min-heap, the priority queue (§13.4).
+//
+// `heap.new[T]()` orders by the language's own `<` — numbers, strings, and a
+// user type's `cmp` (the Ord protocol, §3.6) — so the SMALLEST element comes
+// out first. `heap.new_by(less)` takes the ordering as a function instead:
+// pass `fn(a T, b T) bool { return a > b }` for a max-heap, or compare one
+// field of a struct to make a priority queue of jobs.
+//
+//     var q = heap.new[int]()
+//     q.push(5); q.push(1); q.push(3)
+//     while not q.is_empty() { say q.pop() }      // 1, 3, 5
+//
+// push and pop are O(log n), peek and len O(1). Elements of equal priority
+// come out in no particular order: a heap is not a stable sort.
+package heap
+
+// Heap is the queue. Its storage is the classic implicit binary tree: the
+// children of index i sit at 2i+1 and 2i+2, and every element is no greater
+// (by `less`) than its children — so the minimum is always items[0].
+struct Heap[T] {
+    items []T
+    less  fn(T, T) bool
+}
+
+// new is an empty min-heap ordered by `<`.
+func new[T]() Heap[T] {
+    return Heap[T]{items: [], less: natural_less}
+}
+
+// natural_less is `<`. It is a top-level function rather than a closure
+// written in `new`, because a closure would capture new's frame — and the
+// frame holds the Heap being returned, whose field holds the closure: a
+// cycle that leaked both.
+func natural_less[T](a T, b T) bool { return a < b }
+
+// new_by is an empty heap ordered by `less`: the element for which `less`
+// holds against every other comes out first.
+func new_by[T](less fn(T, T) bool) Heap[T] {
+    return Heap[T]{items: [], less: less}
+}
+
+// from builds a min-heap holding every element of xs, in O(n).
+func from[T](xs []T) Heap[T] {
+    var h = new[T]()
+    each x in xs { h.items.append(x) }
+    h.heapify()
+    return h
+}
+
+impl[T] Heap[T] {
+    // len is the number of queued elements.
+    func len(self) int { return len(self.items) }
+
+    // is_empty reports whether nothing is queued.
+    func is_empty(self) bool { return len(self.items) == 0 }
+
+    // peek is the first element pop would return, without removing it, or
+    // nil when the heap is empty.
+    func peek(self) ?T {
+        if len(self.items) == 0 { return nil }
+        return self.items[0]
+    }
+
+    // push queues v.
+    func push(mut self, v T) {
+        self.items.append(v)
+        self.up(len(self.items) - 1)
+    }
+
+    // pop removes and returns the first element, or nil when empty.
+    func pop(mut self) ?T {
+        let n = len(self.items)
+        if n == 0 { return nil }
+        let top = self.items[0]
+        // Move the last leaf to the root, shrink, and sift it down: the
+        // standard O(log n) removal that keeps the tree complete.
+        let last = self.items.pop()
+        if n > 1 {
+            self.items[0] = last
+            self.down(0)
+        }
+        return top
+    }
+
+    // items_sorted drains a COPY of the heap, so the queue itself is
+    // unchanged: every element in the order pop would return them.
+    func items_sorted(self) []T {
+        var h = Heap[T]{items: [], less: self.less}
+        each x in self.items { h.items.append(x) }
+        var out = []
+        // By index, not by pop()'s ?T: an element may itself be nil.
+        while len(h.items) > 0 {
+            out.append(h.items[0])
+            h.pop()
+        }
+        return out
+    }
+
+    // up restores the heap order from leaf i towards the root: while the
+    // element is less than its parent, swap the two.
+    func up(mut self, i0 int) {
+        var i = i0
+        while i > 0 {
+            let p = (i - 1) ~/ 2
+            if not self.less(self.items[i], self.items[p]) { break }
+            let t = self.items[i]
+            self.items[i] = self.items[p]
+            self.items[p] = t
+            i = p
+        }
+    }
+
+    // down restores the heap order from node i towards the leaves: swap the
+    // element with its smaller child until neither child is less than it.
+    func down(mut self, i0 int) {
+        let n = len(self.items)
+        var i = i0
+        while true {
+            let l = 2 * i + 1
+            let r = l + 1
+            var m = i
+            if l < n and self.less(self.items[l], self.items[m]) { m = l }
+            if r < n and self.less(self.items[r], self.items[m]) { m = r }
+            if m == i { break }
+            let t = self.items[i]
+            self.items[i] = self.items[m]
+            self.items[m] = t
+            i = m
+        }
+    }
+
+    // heapify establishes the heap order over items in O(n), sifting down
+    // every internal node from the last one back to the root.
+    func heapify(mut self) {
+        var i = len(self.items) ~/ 2 - 1
+        while i >= 0 {
+            self.down(i)
+            i -= 1
+        }
+    }
+}

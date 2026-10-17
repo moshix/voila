@@ -1,0 +1,28 @@
+package main
+
+// Per-enum variant namespaces across a package boundary: the importer names
+// an ambiguous variant through package AND enum, a unique one bare or
+// qualified, and the entry file's own enums repeat a short name as well.
+use "enums/shapes"
+
+enum Light { Red, Green }
+enum Flag { Red, White }
+
+func main() {
+    say shapes.Name(shapes.Shape.Unit)
+    say shapes.Name(shapes.Unit1())
+    say shapes.Name(Circle(1.5))
+    say shapes.Name(shapes.Shape.Circle(2.5))
+    say shapes.Weigh(shapes.Size.Unit)
+    say shapes.Weigh(shapes.Size.Big(7))
+    say shapes.Weigh(shapes.Unit2())
+    match shapes.Unit2() {
+        shapes.Size.Unit   => say "matched shapes.Size.Unit"
+        shapes.Size.Big(n) => say n
+    }
+    let l = Light.Red
+    let f = Flag.Red
+    match l { Light.Red => say "light red"; Green => say "green" }
+    match f { Flag.Red => say "flag red"; White => say "white" }
+    say l, f, White
+}

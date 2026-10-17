@@ -1,0 +1,11 @@
+// -Wall prints the ffi mark without failing the check; the block is a use
+// of std/ffi even with no pointer in it, so the import is not unused.
+use "std/ffi"
+
+ffi "C" {
+    func getpid() int
+}
+
+func main() {
+    say getpid() > 0
+}

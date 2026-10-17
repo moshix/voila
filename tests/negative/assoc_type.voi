@@ -1,0 +1,6 @@
+// Voilà has no associated types: a generic trait says the same thing.
+trait Iterator {
+    type Item
+    func next(mut self) ?int
+}
+func main() { }

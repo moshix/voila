@@ -1,0 +1,6 @@
+// A tuple member cannot be assigned.
+func main() {
+    var t = (1, 2)
+    t.0 = 5
+    say t
+}

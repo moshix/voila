@@ -1,0 +1,13 @@
+t1: integer overflow: 124 + 4 is out of range for i8
+t1: integer overflow: 124 + 4 is out of range for i8
+t2: integer overflow: 1 - 2 is out of range for u8
+t3: integer overflow: 200 * 200 is out of range for i16
+t4: integer overflow: 65535 + 1 is out of range for u16
+t5: integer overflow: -2147483648 - 1 is out of range for i32
+t6: integer overflow: 4294967295 + 1 is out of range for u32
+t7: integer overflow: 9223372036854775807 + 1 is out of range for u64
+t8: integer overflow: -(-128) is out of range for i8
+t9: integer overflow: -128 ~/ -1 is out of range for i8
+t10: integer overflow: 3 ** 5 is out of range for i8
+t11: integer overflow: 1000 is out of range for u8
+sized traps done 124 1

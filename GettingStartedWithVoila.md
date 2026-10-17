@@ -6,7 +6,7 @@
 
 ### A Programming Guide for the New User
 
-**Program Number 5799-VLA · Version 0.5.0**
+**Program Number 5799-VLA · Version 0.6.0**
 
 *First Edition*
 
@@ -105,7 +105,7 @@ $ ./build.sh
 ==> bootstrap: prebuilt binary  bin/voila  (0.4.1)
   ✓ fixpoint: C(voilac-1) == C(voilac-2)
   ✓ optimized fixpoint: C(-O3, gen1) == C(-O3, gen2)
-  ✓ ./voila  ->  bin/voila-0.5.0
+  ✓ ./voila  ->  bin/voila-0.6.0
 ==> done — ./voila is ready
 ```
 
@@ -130,7 +130,7 @@ What just happened, on both paths: a working compiler compiled the real
 compiler from its Voilà source, and *that* compiler compiled itself once more.
 The two generations emitted byte-identical C — the classical proof that a
 self-hosted compiler is not quietly mistranslating itself. The binary is named
-for its version — `bin/voila-0.5.0` — with `bin/voila` and `./voila` as
+for its version — `bin/voila-0.6.0` — with `bin/voila` and `./voila` as
 symlinks to it. Put `voila` on your PATH, or call it as `./voila`.
 
 ## 1.3 The First Program
@@ -930,39 +930,34 @@ Three workers, eight jobs, one queue. Nobody assigns work to anybody: each
 worker takes the next job when it is free, which is the whole point of a
 pool.
 
-> ### Programming Note 5 — a task must not capture the loop variable
+> ### Programming Note 5 — a task and the loop variable
 >
 > This is the mistake everyone makes, in every language that has closures:
 >
 > ```voila
 > for row in 0..n {
->     spawn { search(row) }           // ← REFUSED by the compiler
+>     spawn { search(row) }
 > }
 > ```
 >
-> Each iteration of the loop is a fresh binding of `row`, but a task that
-> *captures* it captures the enclosing frame — and by the time the task
-> runs, the loop may have moved on. Languages that permit this ship with a
-> famous footgun.
+> In many languages every one of those tasks would share ONE `row`, and by
+> the time a task runs the loop may have moved on. In Voilà each iteration
+> is a fresh binding of `row` (as in Go 1.22): a task, or any closure,
+> created in an iteration receives its own copy of the loop variables it
+> names, taken when it is created. So the loop above does what it says.
 >
-> Voilà **refuses to compile it**, and names the variable:
+> The one thing the compiler refuses is a loop variable that is ASSIGNED
+> after a closure has copied it — the assignment would silently not be
+> shared — and it names the variable and the closure:
 >
 > ```console
-> $ voila build parqueens.voi
-> main$fn1 captures `row`, which is declared inside a loop.
->   Each iteration of the loop is a SEPARATE binding of `row`, but a
->   closure captures the enclosing frame, and a frame is per procedure —
->   so every closure would end up sharing the LAST value. Rather than
->   answer differently from the specification, the compiler refuses.
->
->   Write a helper that takes the value as a parameter, so the closure
->   owns its own copy:
->
->       for row in 0..n { spawn branch(n, row, out) }
+> $ voila build counter.voi
+> counter.voi:4:17: this closure captures `c`, which is declared inside a
+> loop and assigned to there. …
 > ```
 >
-> The remedy is the one the compiler names — make the value a *parameter*,
-> so the task owns its own copy:
+> Passing the value as a *parameter* is still the clearest way to say that
+> a task owns what it works on:
 >
 > ```voila
 > for row in 0..n {
@@ -1002,9 +997,8 @@ methods are exactly those of Chapter 7. Only the driver is new:
 
 ```voila
 // branch counts every solution whose first queen stands on `row`. It is a
-// plain function: a task's body must not capture the loop variable that
-// produced it (Programming Note 5), so the row is a PARAMETER, and the
-// task owns everything it touches.
+// plain function, and the row is a PARAMETER (Programming Note 5), so the
+// task visibly owns everything it touches.
 func branch(n int, row int, out chan[int]) {
     var s = Search{n: n, board: make([]int, n), count: 0}
     for c in 0..n {
@@ -1172,7 +1166,7 @@ returns an empty string at end of stream — and writes back the upper-cased
 line:
 
 ```voila
-func shout(conn net.Conn) {
+func shout(conn mut net.Conn) {
     while true {
         match conn.read_line() {
             Err(e)   => return

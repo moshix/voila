@@ -1,0 +1,76 @@
+// std/ffi against the system SQLite (§12): an opaque handle returned
+// through a `sqlite3 **` out-parameter, a statement stepped row by row,
+// `*char` results copied into strs, and an error message C allocated and
+// C frees. selftest runs this only where libsqlite3 is installed.
+use "std/ffi"
+
+ffi "C" {
+    link "sqlite3"
+    func sqlite3_libversion_number() int
+    func sqlite3_open(name *char, db *void) int
+    func sqlite3_close(db *void) int
+    func sqlite3_exec(db *void, sql *char, cb *void, arg *void, err *void) int
+    func sqlite3_prepare_v2(db *void, sql *char, n int, stmt *void, tail *void) int
+    func sqlite3_bind_text(stmt *void, i int, s *char, n int, dtor *void) int
+    func sqlite3_bind_int64(stmt *void, i int, v long) int
+    func sqlite3_step(stmt *void) int
+    func sqlite3_reset(stmt *void) int
+    func sqlite3_column_int64(stmt *void, col int) long
+    func sqlite3_column_double(stmt *void, col int) double
+    func sqlite3_column_text(stmt *void, col int) *char
+    func sqlite3_finalize(stmt *void) int
+    func sqlite3_errmsg(db *void) *char
+    func sqlite3_free(p *void)
+}
+
+const SQLITE_OK = 0
+const SQLITE_ROW = 100
+const SQLITE_DONE = 101
+
+// SQLITE_TRANSIENT, (sqlite3_destructor_type)-1: SQLite copies the text.
+func transient() ffi.Ptr { return ffi.at(-1) }
+
+func exec(db ffi.Ptr, sql str) str {
+    let errp = ffi.alloc(8)
+    defer ffi.free(errp)
+    if sqlite3_exec(db, sql, ffi.null(), ffi.null(), errp) == SQLITE_OK {
+        return "ok"
+    }
+    let msg = errp.read_ptr(0)
+    let text = msg.read_cstr(0)
+    sqlite3_free(msg)
+    return "error: " || text
+}
+
+func main() {
+    say sqlite3_libversion_number() >= 3000000
+    let slot = ffi.alloc(8)
+    defer ffi.free(slot)
+    say sqlite3_open(":memory:", slot) == SQLITE_OK
+    let db = slot.read_ptr(0)
+    say exec(db, "create table people(id integer primary key, name text, score real)")
+    say exec(db, "this is not sql")
+
+    // A prepared insert, its parameters bound and the statement reused.
+    say sqlite3_prepare_v2(db, "insert into people(name, score) values (?, ?)",
+                           -1, slot, ffi.null()) == SQLITE_OK
+    let ins = slot.read_ptr(0)
+    each p in [("ada", 9), ("bob", 7), ("cy", 8)] {
+        sqlite3_bind_text(ins, 1, p.0, -1, transient())
+        sqlite3_bind_int64(ins, 2, p.1)
+        say sqlite3_step(ins) == SQLITE_DONE
+        sqlite3_reset(ins)
+    }
+    sqlite3_finalize(ins)
+
+    say sqlite3_prepare_v2(db, "select id, name, score from people order by score desc",
+                           -1, slot, ffi.null()) == SQLITE_OK
+    let q = slot.read_ptr(0)
+    while sqlite3_step(q) == SQLITE_ROW {
+        say sqlite3_column_int64(q, 0), sqlite3_column_text(q, 1),
+            sqlite3_column_double(q, 2)
+    }
+    say sqlite3_finalize(q) == SQLITE_OK
+    say sqlite3_errmsg(db)
+    say sqlite3_close(db) == SQLITE_OK
+}

@@ -1,0 +1,495 @@
+// low/sized.voi — the static half of the sized-integer traps (§3.2, §17).
+//
+// At run time every integer is an int64, and an int64 already traps on
+// overflow. A SIZED type — i8, i16, i32, u8 (byte), u16, u32, u64 — is a
+// range the compiler knows and the runtime does not, so it is the lowerer
+// that has to say where a value must stay inside one. It does so at four
+// kinds of site:
+//
+//   1. ARITHMETIC whose static type is sized: `x + 1` with `x i8` emits
+//      `ADD rd, ra, rb, i8`, and the backend traps on a result outside
+//      i8 (vl_arith_sz / vl_iadd_sz, one message at every -O level);
+//   2. a COMPOUND ASSIGNMENT to a sized location: `x += n` is checked
+//      against x's type whatever n is, because the result is stored there;
+//   3. a STORE of a value whose type is not known to fit — an initialiser,
+//      an assignment, a parameter on entry, a returned value, a struct
+//      field in a literal — emits `CKSZ r, ty`;
+//   4. an integer LITERAL stored into a sized location is judged here, at
+//      compile time (chk reports the annotated-initialiser case first).
+//
+// THE RULE THAT GOVERNS THE INFERENCE: it is sound, not complete. `st`
+// answers a type only when it is certain, and "" otherwise; "" never adds a
+// trap. A sized expression the inference cannot see is still an int64 and
+// still traps at the int64 bounds — what it loses is the narrower trap, never
+// correctness of a program that stays in range. A wrong answer would trap a
+// working program, so every rule below errs toward "".
+package low
+
+use "voilac/ast"
+use "voilac/tok"
+use "std/str"
+
+// LIT is the type of an untyped integer literal: it takes the type of the
+// sized operand beside it (`x + 1`), as Go's untyped constants do.
+const LIT = "#lit"
+
+// sized_norm canonicalises a sized integer type name (`byte` is `u8`), or
+// returns "" for any other type.
+func sized_norm(t str) str {
+    if t == "byte" { return "u8" }
+    if t == "i8" or t == "i16" or t == "i32" or t == "u8" or t == "u16" or
+       t == "u32" or t == "u64" {
+        return t
+    }
+    return ""
+}
+
+func sz_bits(t str) int {
+    if t == "i8" or t == "u8" { return 8 }
+    if t == "i16" or t == "u16" { return 16 }
+    if t == "i32" or t == "u32" { return 32 }
+    return 64
+}
+
+func sz_signed(t str) bool { return t[0] == 'i' }
+
+// sz_fits reports whether every value of sized type `v` is a value of sized
+// type `t` — the widening lattice of §3.2 restricted to the sized types.
+func sz_fits(v str, t str) bool {
+    if v == t { return true }
+    if sz_signed(v) == sz_signed(t) { return sz_bits(v) <= sz_bits(t) }
+    if not sz_signed(v) and sz_signed(t) { return sz_bits(v) < sz_bits(t) }
+    return false
+}
+
+// sz_join is the type of an arithmetic result over two operand types: a
+// literal adopts the other side; two sized types widen to the smaller one
+// both fit in. A join that is int64 (or wider, or not integral) is "": the
+// int64 traps already cover it.
+func sz_join(a str, b str) str {
+    if a == LIT and b == LIT { return LIT }
+    if a == LIT { return sized_norm(b) }
+    if b == LIT { return sized_norm(a) }
+    let x = sized_norm(a)
+    let y = sized_norm(b)
+    if x == "" or y == "" { return "" }
+    if sz_fits(x, y) { return y }
+    if sz_fits(y, x) { return x }
+    // A signed and an unsigned type: the narrowest signed type above both.
+    each c in ["i16", "i32"] {
+        if sz_fits(x, c) and sz_fits(y, c) { return c }
+    }
+    return ""
+}
+
+// sz_in_range reports whether the integer `v` lies in sized type t.
+func sz_in_range(v int, t str) bool {
+    if t == "i8"  { return v >= -128 and v <= 127 }
+    if t == "i16" { return v >= -32768 and v <= 32767 }
+    if t == "i32" { return v >= -2147483648 and v <= 2147483647 }
+    if t == "u8"  { return v >= 0 and v <= 255 }
+    if t == "u16" { return v >= 0 and v <= 65535 }
+    if t == "u32" { return v >= 0 and v <= 4294967295 }
+    return v >= 0
+}
+
+// sized_op reports whether an IR opcode takes the sized-type operand.
+func sized_op(op str) bool {
+    return op == "ADD" or op == "SUB" or op == "MUL" or op == "POW" or
+           op == "IDIV"
+}
+
+// strip_targs drops a type's `[…]` arguments: `Stack[int]` → `Stack`.
+func strip_targs(t str) str {
+    let i = str.index(t, "[")
+    if i <= 0 { return t }
+    return t[0..i]
+}
+
+// type_close finds the `]` that closes the `[` at t[open], counting nested
+// brackets (`map[[]u8]u8`), or -1.
+func type_close(t str, open int) int {
+    var depth = 0
+    var i = open
+    while i < len(t) {
+        if t[i] == '[' { depth += 1 }
+        if t[i] == ']' {
+            depth -= 1
+            if depth == 0 { return i }
+        }
+        i += 1
+    }
+    return 0 - 1
+}
+
+// elem_type is the type of what a collection type text holds, or "": a
+// slice's element, a map's VALUE, a channel's element.
+func elem_type(t str) str {
+    if str.starts_with(t, "[]") { return t[2..len(t)] }
+    if str.starts_with(t, "map[") {
+        let c = type_close(t, 3)
+        if c > 0 { return t[c + 1..len(t)] }
+        return ""
+    }
+    if str.starts_with(t, "chan[") {
+        let c = type_close(t, 4)
+        if c == len(t) - 1 { return t[5..c] }
+    }
+    return ""
+}
+
+// tuple_member is member i of a tuple type text `(a,b,…)` — short_type's
+// spelling, members split at the commas of bracket depth 0 — or "".
+func tuple_member(t str, i int) str {
+    if not str.starts_with(t, "(") or not str.ends_with(t, ")") { return "" }
+    var depth = 0
+    var start = 1
+    var k = 0
+    var j = 1
+    while j < len(t) - 1 {
+        let c = t[j]
+        if c == '[' or c == '(' { depth += 1 }
+        if c == ']' or c == ')' { depth -= 1 }
+        if c == ',' and depth == 0 {
+            if k == i { return t[start..j] }
+            k += 1
+            start = j + 1
+        }
+        j += 1
+    }
+    if k == i { return t[start..len(t) - 1] }
+    return ""
+}
+
+impl Lowerer {
+    // collect_sized fills the declaration tables `st` reads: every function's
+    // and method's single result type, every struct field's type and the
+    // fields' order, and every annotated global.
+    func collect_sized(mut self) {
+        let decls = self.T.Kid(self.file, 1)
+        each d in self.T.Get(decls).Kids {
+            let n = self.T.Get(d)
+            if n.Kind == ast.FUNC {
+                self.note_result(n.Sval, d)
+            } else if n.Kind == ast.IMPLDEC {
+                let tn = strip_targs(self.named_type_name(n.Ival))
+                each m in self.T.Get(self.T.Kid(d, 0)).Kids {
+                    self.note_result(tn || "." || self.T.Get(m).Sval, m)
+                }
+            } else if n.Kind == ast.STRUCTDEC {
+                self.note_fields(n.Sval, self.T.Kid(d, 0))
+            } else if n.Kind == ast.TYPEDEC and self.T.Kid(d, 0) != 0 {
+                self.note_fields(n.Sval, self.T.Kid(self.T.Kid(d, 0), 0))
+            } else if n.Kind == ast.GLOBAL {
+                let s = self.T.Kid(d, 0)
+                let sn = self.T.Get(s)
+                if (sn.Kind == ast.VAR or sn.Kind == ast.LET) and sn.Ival != 0 and
+                   not str.contains(sn.Sval, ",") {
+                    self.globalTy[sn.Sval] = self.decl_type(sn.Ival)
+                }
+            }
+        }
+    }
+
+    func note_result(mut self, name str, fnode int) {
+        let rs = self.T.Get(self.T.Kid(fnode, 2)).Kids
+        if len(rs) == 1 { self.funcResult[name] = self.decl_type(rs[0]) }
+    }
+
+    func note_fields(mut self, sname str, list int) {
+        var order = []
+        each f in self.T.Get(list).Kids {
+            let fd = self.T.Get(f)
+            order.append(fd.Sval)
+            if fd.Ival != 0 {
+                self.fieldTy[sname || "|" || fd.Sval] = self.decl_type(fd.Ival)
+            }
+        }
+        self.fieldOrder[sname] = order
+    }
+
+    // set_param_type records a parameter's declared type (a variadic one
+    // binds a slice of it).
+    func set_param_type(mut self, p int) {
+        let pn = self.T.Get(p)
+        if pn.Ival == 0 { return }
+        var t = self.decl_type(pn.Ival)
+        if (pn.Ival2 & 16) != 0 { t = "[]" || t }
+        self.put_type(len(self.scopes) - 1, pn.Sval, t)
+    }
+
+    // decl_type renders a declared type for the tables, aliases resolved.
+    func decl_type(self, te int) str {
+        if te == 0 { return "" }
+        return self.alias_target(self.short_type(te))
+    }
+
+    // set_type records a binding's static type in the scope it was just
+    // bound in (a module global's in globalTy when $INIT/$SCRIPT binds one).
+    func set_type(mut self, name str, ty str) {
+        if name == "" or name == "_" { return }
+        if self.is_global_bind(name) {
+            self.globalTy[name] = ty
+            return
+        }
+        self.put_type(len(self.scopes) - 1, name, ty)
+    }
+
+    // put_type records `ty` for the binding `name` of scope `i` TOGETHER
+    // with the register it is bound to. A name can be rebound in the same
+    // scope by paths that know nothing of types (a destructuring `let`, a
+    // pattern bind, a `catch`), and a type recorded for the old binding
+    // must not describe the new one: scope_type only answers while the
+    // register still matches.
+    func put_type(mut self, i int, name str, ty str) {
+        if not (name in self.scopes[i].vars) { return }
+        self.scopes[i].types[name] = self.scopes[i].vars[name] || "|" || ty
+    }
+
+    // scope_type is the type put_type recorded for `name` in scope i, or ""
+    // when none was or the name has been rebound since.
+    func scope_type(self, i int, name str) str {
+        if not (name in self.scopes[i].types) { return "" }
+        let rec = self.scopes[i].types[name]
+        let bar = str.index(rec, "|")
+        if bar < 0 or rec[0..bar] != self.scopes[i].vars[name] { return "" }
+        return rec[bar + 1..len(rec)]
+    }
+
+    // name_type is a name's recorded static type, found exactly as lookup
+    // finds its register: innermost scope outward, then the globals.
+    func name_type(self, name str) str {
+        var i = len(self.scopes) - 1
+        while i >= 0 {
+            if name in self.scopes[i].vars { return self.scope_type(i, name) }
+            i -= 1
+        }
+        if name in self.globals and name in self.globalTy {
+            return self.globalTy[name]
+        }
+        return ""
+    }
+
+    // st is the static type of an expression as type text, LIT for an
+    // untyped integer literal, or "" when it is not CERTAIN.
+    func st(self, e int) str {
+        if e == 0 { return "" }
+        let n = self.T.Get(e)
+        let k = n.Kind
+        if k == ast.INT { return LIT }
+        // A typed literal says its type: `[]u8{…}`, `P{…}`.
+        if k == ast.SLICELIT and n.Ival != 0 {
+            return self.alias_target(self.short_type(n.Ival))
+        }
+        if k == ast.COMPOSITE and n.Ival != 0 {
+            return self.T.Get(n.Ival).Sval
+        }
+        // A bare `[a, b]` is a slice of its members' type when EVERY member
+        // certainly has the same one (a literal's is not certain: `[1]`
+        // could be a slice of any integer type) — and that type is not a
+        // sized integer: the checker lets `[a, b]` of `u8`s stand for a
+        // `[]int` too, so calling it `[]u8` would trap a store the program
+        // may legitimately make. A struct's fields are what this is for
+        // (`[p][0].a += n`).
+        if k == ast.SLICELIT and len(n.Kids) > 0 {
+            let et = self.st(n.Kids[0])
+            if et == "" or et == LIT or sized_norm(et) != "" { return "" }
+            each el in n.Kids {
+                if self.st(el) != et { return "" }
+            }
+            return "[]" || et
+        }
+        if k == ast.IDENT { return self.name_type(n.Sval) }
+        if k == ast.SELF { return self.name_type("self") }
+        if k == ast.UNARY {
+            if n.Ival != tok.MINUS { return "" }
+            let x = self.st(self.T.Kid(e, 0))
+            if x == LIT { return LIT }
+            return sized_norm(x)
+        }
+        if k == ast.BINARY {
+            let op = bin_op(n.Ival)
+            if not sized_op(op) { return "" }
+            let l = self.T.Kid(e, 0)
+            let r = self.T.Kid(e, 1)
+            let a = self.st(l)
+            let b = self.st(r)
+            // A literal adopts the sized type beside it only when it FITS in
+            // it: `b + 1000` for a `b u8` is int arithmetic, not a u8 sum
+            // that is certain to trap.
+            if a == LIT and b != LIT and not self.lit_fits(l, b) { return "" }
+            if b == LIT and a != LIT and not self.lit_fits(r, a) { return "" }
+            return sz_join(a, b)
+        }
+        if k == ast.FIELD {
+            let bt = strip_targs(self.st(self.T.Kid(e, 0)))
+            let key = bt || "|" || n.Sval
+            if bt != "" and key in self.fieldTy { return self.fieldTy[key] }
+            return ""
+        }
+        if k == ast.INDEX {
+            if self.T.NKids(e) != 2 { return "" }
+            // `t.0`: a member of a tuple whose type is known.
+            if n.Ival2 == 1 {
+                let iv, ok = self.lit_int(self.T.Kid(e, 1))
+                if not ok { return "" }
+                return tuple_member(self.st(self.T.Kid(e, 0)), iv)
+            }
+            if n.Ival2 != 0 { return "" }
+            if self.T.Kind(self.T.Kid(e, 1)) == ast.RANGE { return "" }
+            // An element of a slice, or a VALUE of a map.
+            let bt = self.st(self.T.Kid(e, 0))
+            if str.starts_with(bt, "[]") or str.starts_with(bt, "map[") {
+                return elem_type(bt)
+            }
+            return ""
+        }
+        if k == ast.CALL {
+            let callee = self.T.Kid(e, 0)
+            let cn = self.T.Get(callee)
+            if cn.Kind == ast.IDENT {
+                if self.found(cn.Sval) { return "" }      // a local closure
+                // `chan[u8](n)`: the constructor names its element type.
+                let targs = self.T.Get(self.T.Kid(e, 2)).Kids
+                if cn.Sval == "chan" and len(targs) == 1 {
+                    return "chan[" || self.decl_type(targs[0]) || "]"
+                }
+                // `make(map[str]u8)`, `make([]u8, n)`: the type is written.
+                if cn.Sval == "make" and len(targs) == 1 {
+                    return self.decl_type(targs[0])
+                }
+                let sz = sized_norm(cn.Sval)
+                if sz != "" { return sz }                 // a conversion
+                if cn.Sval in self.funcResult { return self.funcResult[cn.Sval] }
+                return ""
+            }
+            if cn.Kind == ast.FIELD {
+                let rt = strip_targs(self.st(self.T.Kid(callee, 0)))
+                let key = rt || "." || cn.Sval
+                if rt != "" and key in self.funcResult {
+                    return self.funcResult[key]
+                }
+            }
+            return ""
+        }
+        return ""
+    }
+
+    // sized_elem is the SIZED element type of the collection an expression
+    // certainly is (`[]u8`, `map[str]u8`, `chan[u8]`), or "".
+    func sized_elem(self, e int) str {
+        return sized_norm(elem_type(self.st(e)))
+    }
+
+    // sized_of is st narrowed to a sized type: the operand an arithmetic
+    // instruction carries, or "".
+    func sized_of(self, e int) str {
+        let t = self.st(e)
+        if t == LIT { return "" }
+        return sized_norm(t)
+    }
+
+    // store_value prepares a value for a store into a location of declared
+    // type `want` and returns the register to store: an untyped LITERAL
+    // stored into a NEWTYPE location is converted to it (`var a Age = 5`
+    // is `Age(5)`, as an untyped constant converts in Go — any other value
+    // needs the explicit conversion), and a sized location gets check_store.
+    func store_value(mut self, want str, value int, rv str,
+                     line int) str throws LowerError {
+        if want in self.newtypes and value != 0 and
+           (self.is_lit_node(value) or self.T.Kind(value) == ast.CLOSURE) {
+            let rd = self.new_reg()
+            self.emit(line, "CONV", [rd, want, rv])
+            return rd
+        }
+        self.check_store(want, value, rv, line)
+        return rv
+    }
+
+    // is_lit_node reports whether an expression is a basic literal, or a
+    // negated one.
+    func is_lit_node(self, e int) bool {
+        let n = self.T.Get(e)
+        if is_basic_lit(n.Kind) and n.Kind != ast.NILLIT { return true }
+        if n.Kind == ast.UNARY and n.Ival == tok.MINUS {
+            return self.is_lit_node(self.T.Kid(e, 0))
+        }
+        return false
+    }
+
+    // check_store guards a value about to be stored into a location of type
+    // `want`: a literal is judged now, a value already known to fit costs
+    // nothing, and anything else is range-checked at run time.
+    func check_store(mut self, want0 str, value int, rv str,
+                     line int) throws LowerError {
+        let want = sized_norm(want0)
+        if want == "" { return }
+        if value == 0 {
+            self.emit(line, "CKSZ", [rv, want])     // nothing to judge by
+            return
+        }
+        let vt = self.st(value)
+        if vt == LIT {
+            let v, ok = self.lit_int(value)
+            if ok and not sz_in_range(v, want) {
+                self.fail(value, "literal " || str(v) ||
+                                 " does not fit in " || want)
+            }
+            return
+        }
+        let vs = sized_norm(vt)
+        if vs != "" and sz_fits(vs, want) { return }
+        self.emit(line, "CKSZ", [rv, want])
+    }
+
+    // lit_fits reports whether a literal-typed expression is a literal value
+    // inside sized type t (false when its value cannot be read here).
+    func lit_fits(self, e int, t str) bool {
+        let tt = sized_norm(t)
+        if tt == "" { return true }          // not sized: the join decides
+        let v, ok = self.lit_int(e)
+        return ok and sz_in_range(v, tt)
+    }
+
+    // lit_int reads an integer literal, or its negation; ok is false for
+    // anything else.
+    func lit_int(self, e int) (int, bool) {
+        let n = self.T.Get(e)
+        if n.Kind == ast.INT { return parse_int_lit(n.Sval) }
+        if n.Kind == ast.UNARY and n.Ival == tok.MINUS {
+            let v, ok = self.lit_int(self.T.Kid(e, 0))
+            if ok { return 0 - v, true }
+        }
+        return 0, false
+    }
+
+    // lower_sized_append lowers `xs.append(a, …)` when xs is certainly a
+    // slice of a SIZED type, checking every value as the store into an
+    // element it is. "" when it is not (an unknown receiver, a spread or a
+    // named argument), and the caller lowers the ordinary method call.
+    func lower_sized_append(mut self, x int, base int) str throws LowerError {
+        let et = self.sized_elem(base)
+        if et == "" or not str.starts_with(self.st(base), "[]") { return "" }
+        let args = self.T.Get(self.T.Kid(x, 1)).Kids
+        each a in args {
+            let an = self.T.Get(a)
+            if an.Ival == 1 or an.Sval != "" { return "" }
+        }
+        let line = self.T.Get(x).Line
+        // An append writes its receiver: made unique first (boxcow.voi).
+        let pmark = len(self.pathTemps)
+        let robj = self.recv_path(base)
+        var regs = []
+        each a in args {
+            let v = self.T.Kid(a, 0)
+            let r = self.lower_expr(v)
+            self.check_store(et, v, r, line)
+            regs.append(r)
+        }
+        let rd = self.new_reg()
+        self.emit(line, "CALLM", [rd, robj, "append",
+                                  "(" || str.join(regs, ",") || ")"])
+        self.kill_path(pmark, line)
+        return rd
+    }
+}

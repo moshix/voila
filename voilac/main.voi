@@ -36,8 +36,8 @@ use "std/fmt"
 use "std/str"
 
 // MIN_BOOTSTRAP (build.sh) is 0.4.1 — the oldest voila that can build this
-// source; 0.5.0 is built by any voila >= 0.4.1. See BOOTSTRAP.md.
-const VERSION = "0.5.0"
+// source; 0.6.0 is built by any voila >= 0.4.1. See BOOTSTRAP.md.
+const VERSION = "0.6.0"
 
 // CFLAGS is the single home of the C compilation flags. The runtime-archive
 // cache key hashes it; the program compile and the archive build use it.
@@ -54,6 +54,14 @@ var gNative = false
 // and setjmp-crossing stack frames are only conforming because the runtime
 // archive is a separate translation unit the C optimizer cannot see into.
 const CFLAGS = "-std=c11 -O2"
+
+// VENDOR_CFLAGS compile the runtime EXTENSIONS (vendor_lib): the vendored C
+// libraries behind std/tls, std/compress and std/sqlite, with their glue.
+// No -std: the libraries are written for the compiler's default (GNU)
+// dialect, and SQLite in particular calls POSIX functions that glibc hides
+// under strict ISO C. -w: a vendored library's warnings are not the user's
+// to act on. Like CFLAGS, the extension cache key hashes this string.
+const VENDOR_CFLAGS = "-O2 -w"
 
 func main() {
     let args = os.args()
@@ -234,8 +242,12 @@ func main() {
     // checks all run here (§6, §3.2, §3.5, §13.1).
     var bag = diag.New()
     bag.merge(prog.Diags)
-    bag.merge(chk.Check(prog.T, prog.File))
+    let checked = chk.CheckProgram(prog.T, prog.File)
+    bag.merge(checked.D)
     report_bag(bag, pol, src)
+    // Untyped literals the type check put into newtype holes become the
+    // explicit conversions they stand for (§3.8).
+    chk.ApplyConversions(prog.T, checked.Conv)
 
     // `check` runs the LOWERER too, then stops: the lowerer catches its own
     // class of errors (unknown identifiers, loop-variable capture,
@@ -245,7 +257,9 @@ func main() {
     try {
         lo.LowerModule()
     } catch e: low.LowerError {
-        fmt.eprintf("%s:%d:%d: %s\n", src, e.Line, e.Col, e.Msg)
+        var at = e.File
+        if at == "" { at = src }
+        fmt.eprintf("%s:%d:%d: %s\n", at, e.Line, e.Col, e.Msg)
         os.exit(1)
     }
 
@@ -841,6 +855,13 @@ func compile_c_in(csrc str, out str, keep str, level int) {
     var rtdir = ""
     if keep == "" { rtdir = runtime_lib(cc) }
 
+    // The runtime extensions the program uses (cg's `voila-vendor` lines),
+    // each as an archive: cached like the runtime's, or built here.
+    var vlibs = []
+    each u in vendor_units(csrc) {
+        vlibs.append(vendor_archive(cc, u, dir, keep))
+    }
+
     // Each whitespace-separated flag is its own argv element. `voila build
     // -O3` also raises the C optimizer to -O3 for the PROGRAM translation
     // unit; the runtime archive stays at CFLAGS so all levels share it.
@@ -866,6 +887,12 @@ func compile_c_in(csrc str, out str, keep str, level int) {
         cargs.append("-o")
         cargs.append(out)
         cargs.append(cpath)
+        // Extensions BEFORE libvoila.a: their glue calls into the runtime,
+        // and a one-pass linker (GNU ld) resolves an archive's undefined
+        // symbols only from the archives after it.
+        each a in vlibs {
+            cargs.append(a)
+        }
         cargs.append(path.Join(rtdir, "libvoila.a"))
     } else {
         var cfiles = []
@@ -880,9 +907,17 @@ func compile_c_in(csrc str, out str, keep str, level int) {
         cargs.append("-o")
         cargs.append(out)
         cargs.append(cpath)
+        each a in vlibs {
+            cargs.append(a)
+        }
         each f in cfiles {
             cargs.append(f)
         }
+    }
+    // A program's ffi blocks may `link` libraries (§12); without one the
+    // binary still depends on libc alone.
+    each lf in link_flags(csrc) {
+        cargs.append(lf)
     }
     cargs.append("-lm")
     cargs.append("-lpthread")
@@ -894,6 +929,15 @@ func compile_c_in(csrc str, out str, keep str, level int) {
         fmt.eprintf("voila: link against cached runtime failed; " ||
                     "rebuilding it from source\n")
         os.run("rm", ["-rf", rtdir])
+        // A cached EXTENSION archive may be the culprit just as well: drop
+        // those too, and rebuild each from source beside the runtime.
+        each a in vlibs {
+            os.run("rm", ["-rf", path.Dir(a)])
+        }
+        vlibs = []
+        each u in vendor_units(csrc) {
+            vlibs.append(vendor_archive(cc, u, dir, dir))
+        }
         var cfiles = []
         match rt.WriteTo(dir) {
             Ok(fs) => cfiles = fs
@@ -910,8 +954,14 @@ func compile_c_in(csrc str, out str, keep str, level int) {
         retry.append("-o")
         retry.append(out)
         retry.append(cpath)
+        each a in vlibs {
+            retry.append(a)
+        }
         each f in cfiles {
             retry.append(f)
+        }
+        each lf in link_flags(csrc) {
+            retry.append(lf)
         }
         retry.append("-lm")
         retry.append("-lpthread")
@@ -924,6 +974,159 @@ func compile_c_in(csrc str, out str, keep str, level int) {
     if keep == "" {
         os.run("rm", ["-rf", dir])
     }
+}
+
+// link_flags reads the `/* voila-link: NAME */` lines cg writes in the
+// HEADER of the C for each library an ffi block links (cg.emit_header), and
+// turns each into a `-lNAME` for cc. Only the header is read — the lines up
+// to its first empty line, before any constant of the program — and only a
+// line that is exactly such a comment counts: a string constant spelling
+// the same text further down must never add a library to the link.
+func link_flags(csrc str) []str {
+    let mark = "/* voila-link: "
+    var out = []
+    var at = 0
+    while at < len(csrc) {
+        var nl = str.find_any(csrc, "\n", at)       // the line's end
+        if nl < 0 { nl = len(csrc) }
+        let line = csrc[at..nl]
+        if line == "" { break }
+        if str.starts_with(line, mark) and str.ends_with(line, " */") {
+            out.append("-l" || line[len(mark)..len(line) - 3])
+        }
+        at = nl + 1
+    }
+    return out
+}
+
+// vendor_units reads the `/* voila-vendor: UNIT */` lines cg writes in the
+// header of the C (cg.emit_header), one per runtime extension the program's
+// natives live in. Read exactly as link_flags reads its lines: the header
+// only, and only a line that is the whole comment.
+func vendor_units(csrc str) []str {
+    let mark = "/* voila-vendor: "
+    var out = []
+    var at = 0
+    while at < len(csrc) {
+        var nl = str.find_any(csrc, "\n", at)
+        if nl < 0 { nl = len(csrc) }
+        let line = csrc[at..nl]
+        if line == "" { break }
+        if str.starts_with(line, mark) and str.ends_with(line, " */") {
+            out.append(line[len(mark)..len(line) - 3])
+        }
+        at = nl + 1
+    }
+    return out
+}
+
+// vendor_archive returns the path of the archive holding extension `unit`
+// (libvl_<unit>.a): the cached one when the cache works, else one built in
+// the scratch directory — which is also where `--keep-c` wants it, beside
+// everything else cc consumed. A library that does not compile is fatal:
+// the program calls into it, so there is nothing to fall back to.
+func vendor_archive(cc str, unit str, dir str, keep str) str {
+    if keep == "" {
+        let a = vendor_lib(cc, unit)
+        if a != "" { return a }
+    }
+    let w = path.Join(dir, "vendor-" || unit)
+    let a = vendor_build(cc, unit, w)
+    if a == "" {
+        fmt.eprintf("voila: compiling the %s extension failed; its log is " ||
+                    "%s\n", unit, path.Join(w, "build.log"))
+        os.exit(1)
+    }
+    return a
+}
+
+// vendor_lib is runtime_lib for a runtime EXTENSION: the directory-per-key
+// cache entry ~/.cache/voila/ext-<unit>-<key>/libvl_<unit>.a, built on first
+// use and reused by every later build. "" on any failure, and the caller
+// builds from source instead.
+//
+// The key hashes what determines the object code, as runtime_lib's does: the
+// runtime's HEADERS (the glue includes them; a change to a runtime .c file
+// does not touch the archive), the unit's content digest — computed when the
+// blob was generated, so a warm build never decodes the megabytes behind it
+// — the cc identity and VENDOR_CFLAGS.
+func vendor_lib(cc str, unit str) str {
+    let ccid = cc_identity(cc)
+    if ccid == "" { return "" }
+    var h = -3750763034362895579           // FNV-1a offset basis
+    let names = rt.Names()
+    let data = rt.Data()
+    each i, n in names {
+        if not str.ends_with(n, ".h") { continue }
+        h = fnv_into(h, "\u{0}")
+        h = fnv_into(h, n)
+        h = fnv_into(h, "\u{0}")
+        h = fnv_into(h, data[i])
+    }
+    h = fnv_into(h, "\u{0}" || unit || "\u{0}" || rt.VendorKey(unit))
+    h = fnv_into(h, "\u{0}" || cc || "\u{0}" || ccid)
+    h = fnv_into(h, "\u{0}" || VENDOR_CFLAGS)
+
+    let root = cache_dir()
+    ensure_dir(root)
+    let lib = "libvl_" || unit || ".a"
+    let final = path.Join(root, "ext-" || unit || "-" || fmt.sprintf("%016x", h))
+    if os.exists(path.Join(final, lib)) { return path.Join(final, lib) }
+
+    let tmp = final || ".tmp" || host_tag() || "-" || str(os.pid())
+    if vendor_build(cc, unit, tmp) == "" {
+        os.run("rm", ["-rf", tmp])
+        return ""
+    }
+    // The same claim-then-move install as runtime_lib (see there): mkdir is
+    // the atomic claim, and the archive moves last.
+    let install = stale_sweep(final, lib) ||
+                  "if mkdir " || shq(final) || " 2>/dev/null; then " ||
+                  "mv " || shq(tmp) || "/" || lib || " " || shq(final) ||
+                  "/ || rm -rf " || shq(final) || "; fi; " ||
+                  "rm -rf " || shq(tmp)
+    os.run("bash", ["-c", install])
+    if os.exists(path.Join(final, lib)) { return path.Join(final, lib) }
+    return ""
+}
+
+// vendor_build writes extension `unit` — the runtime headers its glue
+// includes, the glue and the vendored library — into `w` and compiles it into
+// w/libvl_<unit>.a, returning that path, or "" on failure (cc's output is
+// kept in w/build.log). BearSSL is ~280 small files, so they are compiled
+// in parallel, one cc per few files, across the machine's CPUs.
+func vendor_build(cc str, unit str, w str) str {
+    ensure_dir(w)
+    let names = rt.Names()
+    let data = rt.Data()
+    each i, n in names {
+        if not str.ends_with(n, ".h") { continue }
+        match os.write(path.Join(w, n), data[i]) {
+            Ok(u) => u
+            Err(e) => return ""
+        }
+    }
+    var cfiles = []
+    match rt.VendorWriteTo(unit, w) {
+        Ok(fs) => cfiles = fs
+        Err(e) => return ""
+    }
+    var list = str.Builder{}
+    each f in cfiles {
+        list.write(path.Base(f) || "\n")
+    }
+    match os.write(path.Join(w, "units.txt"), list.done()) {
+        Ok(u) => u
+        Err(e) => return ""
+    }
+    let lib = "libvl_" || unit || ".a"
+    let script = "cd " || shq(w) || " && " ||
+                 "n=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4); " ||
+                 "xargs -P \"$n\" -n 8 " || shq(cc) || " " || VENDOR_CFLAGS ||
+                 " -I. -c < units.txt > build.log 2>&1 && " ||
+                 "ar rcs " || lib || " *.o >> build.log 2>&1"
+    if os.run("bash", ["-c", script]) != 0 { return "" }
+    return path.Join(w, lib)
 }
 
 // runtime_lib returns the directory holding libvoila.a and the runtime
@@ -989,7 +1192,8 @@ func runtime_lib(cc str) str {
     // LAST, so a reader that gates on libvoila.a never sees a half-installed
     // cache entry. If the content move fails midway, the claim is torn down
     // too; a headers-only final would block this key forever.
-    let install = "if mkdir " || shq(final) || " 2>/dev/null; then " ||
+    let install = stale_sweep(final, "libvoila.a") ||
+                  "if mkdir " || shq(final) || " 2>/dev/null; then " ||
                   "mv " || shq(tmp) || "/*.h " || shq(final) || "/ && " ||
                   "mv " || shq(tmp) || "/libvoila.a " || shq(final) || "/ " ||
                   "|| rm -rf " || shq(final) || "; fi; " ||
@@ -999,11 +1203,33 @@ func runtime_lib(cc str) str {
     return ""
 }
 
+// stale_sweep is the shell that frees a cache entry whose claimant died:
+// the claim is the directory, made by mkdir, and the archive moves into it
+// LAST — so a directory without its archive is either an install in
+// progress, which takes a moment, or one whose process was killed between
+// the mkdir and the mv, which would block that key forever (every later
+// build failing its own claim, and recompiling from source — all of
+// SQLite, or BearSSL, every time). A claim older than five minutes with no
+// archive is the second kind: remove it, and the claim below is retried.
+func stale_sweep(final str, lib str) str {
+    return "if [ -d " || shq(final) || " ] && [ ! -e " ||
+           shq(path.Join(final, lib)) || " ] && [ -n \"$(find " ||
+           shq(final) || " -maxdepth 0 -mmin +5 2>/dev/null)\" ]; then " ||
+           "rm -rf " || shq(final) || "; fi; "
+}
+
 // cc_identity captures what the compiler IS: its version banner and target
 // triple. This is what invalidates the archive when the compiler is
 // upgraded in place or the architecture differs. "" when it cannot be
 // determined.
 func cc_identity(cc str) str {
+    // One probe per process: runtime_lib and every vendor_lib ask, and the
+    // answer cannot change while this compiler runs.
+    if gCcidFor == cc and gCcid != "" { return gCcid }
+    // The probe's scratch file lives in the cache directory, which a fresh
+    // home does not have yet: without this the probe failed, the identity
+    // came back "", and every build in that home skipped the cache.
+    ensure_dir(cache_dir())
     let tmp = path.Join(cache_dir(), "ccid-" || str(os.pid()))
     let rc = os.run("bash", ["-c",
         shq(cc) || " --version 2>&1 | head -3 > " || shq(tmp) || "; " ||
@@ -1016,8 +1242,13 @@ func cc_identity(cc str) str {
         }
     }
     os.remove(tmp)
+    gCcidFor = cc
+    gCcid = out
     return out
 }
+
+var gCcidFor = ""
+var gCcid = ""
 
 // shq single-quotes a string for a shell command line.
 func shq(s str) str {

@@ -1,0 +1,33 @@
+true true
+child: HELLO
+child: WORLD
+status 0 0
+status 0
+unclosed
+
+status 3
+true
+killed true
+error: kill: the process has already been waited for
+waiter saw true
+error: os.start voila-no-such-program-xyz: No such file or directory
+signal true
+true
+error: os.signals: signal 9 cannot be caught
+walk /a.txt
+walk /b.voi
+walk /src
+walk /src/c.voi
+walk /src/deep
+walk /src/deep/d.voi
+glob /b.voi
+glob /src/c.voi
+0
+walk error true
+true false
+true true
+true false
+true true false
+true false
+true true false
+true false

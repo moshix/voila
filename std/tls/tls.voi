@@ -1,0 +1,201 @@
+// std/tls — TLS 1.2 for std/net connections (§13.4), on the vendored
+// BearSSL (runtime/src/vendor/bearssl), compiled into the program only when
+// it uses this package (std/http does, for https://). BearSSL needs nothing
+// but libc, so the binary still links libc alone.
+//
+//     use "std/tls"
+//
+//     var conn = try tls.connect("example.com:443", tls.Config{})
+//     try conn.write_all("GET / HTTP/1.1\r\nHost: example.com\r\n" ||
+//                        "Connection: close\r\n\r\n")
+//     say try conn.read_all()
+//
+// A TLS connection IS a net.Conn: once the handshake is done the session
+// sits underneath the socket, and read, read_line, write_all, io.reader,
+// set_timeout and close all work on it unchanged — which is how std/http
+// speaks HTTPS without any TLS code of its own.
+//
+// --------------------------------------------------------------- clients
+//
+// A client verifies the server: its certificate chain must lead to a
+// trusted authority, be within its validity dates, and name the host —
+// `cfg.server_name`, or else the host part of the address (also sent as
+// SNI). The authorities are the system's CA bundle (system_ca_file: the
+// usual places on macOS and on each Linux family, or $SSL_CERT_FILE), or
+// `cfg.ca_file` instead. On top of that it applies the Web PKI's rules, as
+// Go does: a subjectAltName is required (no Common Name fallback), a
+// wildcard is a whole left-most label with two labels after it
+// (`*.example.com`, never `*.com`), an IP-address host matches only an
+// IP-address SAN (and is not sent as SNI), an extendedKeyUsage must allow
+// serverAuth, and no certificate may be signed with SHA-1. Failures say
+// why:
+//
+//     tls: certificate is not trusted (unknown certificate authority)
+//     tls: certificate does not match host name "example.org"
+//     tls: certificate has expired or is not yet valid
+//
+// `cfg.insecure` skips verification entirely — the connection is then
+// encrypted but not authenticated, which defeats the point of TLS. It is
+// for tests against a throwaway certificate, and nothing else.
+//
+// --------------------------------------------------------------- servers
+//
+//     var lis = try tls.listen("127.0.0.1:8443",
+//                              tls.Config{cert_file: "srv.pem",
+//                                         key_file: "srv.key"})
+//     var conn = try lis.accept()          // TCP accept + handshake
+//
+// The certificate file is a PEM chain, leaf first; the key a PEM RSA or EC
+// private key (unencrypted: PKCS#1, SEC 1 or PKCS#8). Both are read once and
+// cached, and read again if either file changes, so a renewed certificate
+// is picked up without a restart. `server(conn, cfg)` handshakes a
+// connection accepted some other way — std/http's server does that on each
+// connection's own task, so one slow handshake never stalls the others.
+//
+// --------------------------------------------------------------- limits
+//
+// TLS 1.2 only (BearSSL 0.6 has no TLS 1.3; servers still universally
+// offer 1.2). No client certificates, no session resumption, no
+// revocation checking. A session is a single state machine, so tasks
+// sharing one connection take turns: a read in progress makes a write on
+// another task wait (half-duplex), which is how HTTP/1.1 uses it.
+package tls
+
+use "std/net"
+
+// Config is everything a connection may be told. The zero value is a
+// verifying client with the system's authorities.
+struct Config {
+    server_name str  = ""
+    ca_file     str  = ""
+    insecure    bool = false
+    cert_file   str  = ""
+    key_file    str  = ""
+    timeout_ms  int  = 30000
+}
+
+// connect dials `addr` ("host:port") over TCP and handshakes as a client.
+// The handshake, and every read and write after it, is bounded by
+// cfg.timeout_ms (0: no deadline; Conn.set_timeout changes it later).
+func connect(addr str, cfg Config) net.Conn throws IOError {
+    let host, port = try net.parse_hostport(addr)
+    var c = cfg
+    if c.server_name == "" { c.server_name = host }
+    let conn = try net.connect(addr)
+    match client(conn, c) {
+        Ok(tc) => return tc
+        Err(e) => {
+            conn.close()
+            return e
+        }
+    }
+    return conn
+}
+
+// client handshakes, as a client, over a connection that is already open,
+// and returns it speaking TLS. cfg.server_name is required unless
+// cfg.insecure: there is no other way to know what to verify.
+func client(conn net.Conn, cfg Config) net.Conn throws IOError {
+    if cfg.server_name == "" and not cfg.insecure {
+        return errf("tls: client needs Config.server_name to verify the " ||
+                    "server")
+    }
+    // Said before anything touches the socket: a connection that already
+    // speaks TLS may also be one its peer has since closed, where even the
+    // timeout below would fail, with a less useful message.
+    if tls._version(conn.h) != "" {
+        return errf("tls: the connection already speaks TLS")
+    }
+    try conn.set_timeout(cfg.timeout_ms)
+    try tls._client(conn.h, cfg.server_name, cfg.ca_file, cfg.insecure)
+    return conn
+}
+
+// server handshakes, as a server, over an accepted connection, presenting
+// cfg.cert_file and cfg.key_file.
+func server(conn net.Conn, cfg Config) net.Conn throws IOError {
+    if cfg.cert_file == "" or cfg.key_file == "" {
+        return errf("tls: a server needs Config.cert_file and " ||
+                    "Config.key_file")
+    }
+    if tls._version(conn.h) != "" {
+        return errf("tls: the connection already speaks TLS")
+    }
+    try conn.set_timeout(cfg.timeout_ms)
+    try tls._server(conn.h, cfg.cert_file, cfg.key_file)
+    return conn
+}
+
+// Listener accepts TCP connections and handshakes each as a server.
+struct Listener {
+    lis net.Listener
+    cfg Config
+}
+
+// listen binds `addr` like net.listen, after checking that the certificate
+// and key load — so a bad file is reported now, not by the first client.
+func listen(addr str, cfg Config) Listener throws IOError {
+    try check_server(cfg)
+    let lis = try net.listen(addr)
+    return Listener{lis: lis, cfg: cfg}
+}
+
+// check_server loads cfg's certificate chain and private key, as a server
+// will, and reports the first problem: a missing or unreadable file, PEM
+// that does not parse, no certificate, or no RSA/EC key BearSSL can read.
+func check_server(cfg Config) unit! {
+    if cfg.cert_file == "" or cfg.key_file == "" {
+        return errf("tls: a server needs Config.cert_file and " ||
+                    "Config.key_file")
+    }
+    try tls._check_server(cfg.cert_file, cfg.key_file)
+    return ()
+}
+
+impl Listener {
+    // accept waits for a connection and handshakes it. A client that fails
+    // the handshake is an error here (and its connection is closed): keep
+    // accepting after an error. The handshake runs HERE, so one client that
+    // stalls it holds up the next accept for up to cfg.timeout_ms — a
+    // server that must not wait accepts with net and runs tls.server on
+    // each connection's own task, as std/http's serve does.
+    func accept(self) net.Conn throws IOError {
+        let conn = try self.lis.accept()
+        match server(conn, self.cfg) {
+            Ok(tc) => return tc
+            Err(e) => {
+                conn.close()
+                return e
+            }
+        }
+        return conn
+    }
+
+    // addr is the bound "host:port".
+    func addr(self) str {
+        return self.lis.addr()
+    }
+
+    // set_timeout bounds accept, in milliseconds (0 clears it).
+    func set_timeout(self, ms int) throws IOError {
+        try self.lis.set_timeout(ms)
+    }
+
+    // close stops listening. Idempotent.
+    func close(self) {
+        self.lis.close()
+    }
+}
+
+// version is the protocol a connection negotiated ("TLS1.2"), or "" for a
+// connection that is not TLS.
+func version(conn net.Conn) str {
+    return tls._version(conn.h)
+}
+
+// system_ca_file is the CA bundle a client trusts when Config.ca_file is
+// empty: $SSL_CERT_FILE, else the first of the platform's usual files that
+// exists, else "" (and a verifying connect then fails, saying so).
+func system_ca_file() str {
+    return tls._system_ca()
+}

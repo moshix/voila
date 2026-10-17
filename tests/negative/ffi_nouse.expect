@@ -1,0 +1,1 @@
+an `ffi` block needs `use "std/ffi"` (§12)

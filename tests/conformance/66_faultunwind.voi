@@ -1,0 +1,94 @@
+// An abort in an http handler, contained to its request (§9.5's recovery
+// points), unwinds the way an exception does: `finally` blocks run (so a
+// lock taken around the body is released and the NEXT request can take it),
+// defers run, and no `catch` clause sees it. A defer or a finally that
+// itself aborts — or throws — during that unwinding becomes the request's
+// failure and is contained too. The .err golden pins what the server
+// reports, which never shows the internal `$abort` name.
+use "std/http"
+use "std/sync"
+
+var mu = sync.mutex()
+var hits = 0
+
+func handler(r http.Request) http.Response {
+    if r.path == "/locked" {
+        mu.lock()
+        try {
+            hits += 1
+            let xs = [1]
+            return http.text(200, str(xs[hits + 5]))
+        } catch e {
+            return http.text(200, "a catch saw the abort")
+        } finally {
+            mu.unlock()
+        }
+    }
+    if r.path == "/again" {
+        mu.lock()
+        defer mu.unlock()
+        return http.text(200, "the lock is free")
+    }
+    if r.path == "/defer-faults" {
+        defer {
+            let q = [0]
+            say "server: a second abort, from a defer"
+            say q[7]
+        }
+        let z = [0]
+        return http.text(200, str(z[9]))
+    }
+    if r.path == "/throw-then-defer" {
+        defer {
+            let q = [0]
+            say q[8]
+        }
+        throw RuntimeError{msg: "an ordinary throw"}
+    }
+    if r.path == "/finally-throws" {
+        try {
+            let z = [0]
+            return http.text(200, str(z[4]))
+        } finally {
+            throw RuntimeError{msg: "from a finally"}
+        }
+    }
+    if r.path == "/cell" {
+        let c = cell[int](1)
+        c.update(fn(n int) int { let z = [0]; return z[n + 3] })
+        return http.text(200, "?")
+    }
+    return http.text(200, "ok {r.path}")
+}
+
+func get(addr str, p str) str {
+    match http.get("http://{addr}{p}") {
+        Ok(resp) => return "{p} {resp.status} {resp.body.trim()}"
+        Err(e)   => return "{p} error " || e.message()
+    }
+    return "?"
+}
+
+func main() {
+    var srv = must http.listen("127.0.0.1:0")
+    let addr = srv.addr()
+    let stop = chan[int](1)
+    group {
+        spawn {
+            match srv.serve(handler, stop) {
+                Ok(u)  => say "server stopped cleanly"
+                Err(e) => say "server error:", e.message()
+            }
+        }
+        say get(addr, "/locked")
+        say get(addr, "/again")
+        say get(addr, "/locked")
+        say get(addr, "/again")
+        say get(addr, "/defer-faults")
+        say get(addr, "/throw-then-defer")
+        say get(addr, "/finally-throws")
+        say get(addr, "/cell")
+        say get(addr, "/still-serving")
+        stop <- 1
+    }
+}

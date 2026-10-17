@@ -1,0 +1,45 @@
+// Per-enum variant namespaces (§3.5): a variant may always be written
+// qualified by its enum, as a value, a constructor, a first-class function
+// and a pattern; and two enums may share a variant name, which must then be
+// written qualified.
+
+enum Shape { Circle(r float), Rect(w float, h float), Empty }
+enum A { X, Y }
+enum B { X, Z(n int) }
+
+func area(s Shape) float {
+    return match s {
+        Shape.Circle(r)  => 3.0 * r * r
+        Shape.Rect(w, h) => w * h
+        Shape.Empty      => 0.0
+    }
+}
+
+func main() {
+    // Unit variants as values, bare and qualified.
+    let e = Shape.Empty
+    let e2 = Empty
+    say e, e2, e == e2
+    say area(e), area(Shape.Circle(1.0)), area(Rect(2.0, 3.0))
+
+    // A payload variant as a first-class function.
+    let mk = Shape.Circle
+    let mk2 = Rect
+    say mk(2.0), mk2(1.0, 4.0)
+    let circles = [1.0, 2.0].map(Shape.Circle)
+    say circles
+
+    // A shared short name: each enum is its own namespace.
+    let a = A.X
+    let b = B.X
+    say a, b, Y, Z(4)
+    match a { A.X => say "A.X"; Y => say "Y" }
+    match b { B.X => say "B.X"; Z(n) => say n }
+    match B.Z(9) { B.X => say "B.X"; B.Z(n) => say "B.Z", n }
+    var xs = [A.X, A.Y, A.X]
+    var n = 0
+    each v in xs {
+        if v == A.X { n += 1 }
+    }
+    say n
+}

@@ -1,0 +1,370 @@
+// low/traitdesc.voi — static trait methods through a type parameter.
+//
+// `T.default()` inside `func make[T: Default]() T` names a method of whatever
+// type `T` turns out to be. Generics are ERASED (§3.7): one compiled body
+// serves every instantiation and every value is a boxed Value, so nothing in
+// that body knows what `T` is. A call with a receiver never needed to know —
+// `x.show()` dispatches on x's run-time type — but a STATIC method has no
+// receiver to dispatch on.
+//
+// THE STRATEGY: a hidden TYPE-DESCRIPTOR argument. A type parameter that
+// needs one receives its type at run time as an extra, leading argument: the
+// type's flat name as a `str` (`"Point"`, `"geom.Point"`, `"int"`), which is
+// exactly the key the runtime's flat method table is searched by. Then
+//
+//     T.default()   lowers to   CALLT rd, $T, "default", ()
+//
+// and vl_callt (runtime/src/call.c) looks the method up under that name.
+//
+// WHICH PARAMETERS GET ONE is decided from the SIGNATURE alone, so every call
+// site can work it out without seeing the body: a type parameter of a
+// TOP-LEVEL function whose bounds include a program trait that declares at
+// least one method without `self`. A bound that only has methods with `self`
+// needs nothing — the value carries its type.
+//
+// WHERE THE CALLER GETS IT, in order:
+//
+//   1. an explicit type argument, `make[Point]()` — the name, as a constant
+//      (an alias is resolved to its target, a newtype is its own name);
+//      `make[T]()` inside another function forwards THAT function's
+//      descriptor for its `T`;
+//   2. otherwise a value parameter declared exactly `T` — `fill[T: Default]
+//      (x T)` called as `fill(p)` — whose argument's run-time type is read
+//      with TYPEOF (vl_typedesc);
+//   3. otherwise the call cannot be lowered, and says so with the spelling
+//      that fixes it.
+//
+// The descriptors occupy the callee's LOWEST registers, before the declared
+// parameters, so the rest of the calling convention — defaults (ARGDEF tests
+// the argument count against a register slot), variadic packing, named
+// arguments resolved to positions — is unchanged: every position simply moves
+// up by the number of descriptors, on both sides at once.
+//
+// WHAT IS REFUSED. A method's or an impl block's type parameter has no
+// descriptor: a method is reached by dynamic dispatch (CALLM), whose caller
+// does not know which body it will reach and so could not pass one. A trait's
+// own parameter is the same. And a function with descriptors cannot be taken
+// as a VALUE (`let g = make`), since a call through the value would arrive
+// without them. Each of these is a lowering error naming the alternative.
+//
+// `Self` in a trait DEFAULT is the implementing type, which a default with
+// `self` reads off its receiver (TYPEOF self). A default without `self` has
+// neither a receiver nor a descriptor, so `Self.m()` is refused there.
+package low
+
+use "voilac/ast"
+use "voilac/ir"
+use "std/str"
+
+impl Lowerer {
+    // collect_descs fills traitDecl, funcDecl and descOf. Run from collect,
+    // after every declaration is indexed.
+    func collect_descs(mut self) {
+        let decls = self.T.Get(self.T.Kid(self.file, 1)).Kids
+        each d in decls {
+            let n = self.T.Get(d)
+            if n.Kind == ast.TRAITDEC { self.traitDecl[n.Sval] = d }
+            if n.Kind == ast.FUNC { self.funcDecl[n.Sval] = d }
+        }
+        each d in decls {
+            let n = self.T.Get(d)
+            if n.Kind != ast.FUNC { continue }
+            var ds = []
+            each g in self.T.Get(self.T.Kid(d, 3)).Kids {
+                let parts = str.split(self.T.Get(g).Sval, "|")
+                if len(parts) > 1 and self.bounds_static(parts[1]) {
+                    ds.append(parts[0])
+                }
+            }
+            if len(ds) > 0 { self.descOf[n.Sval] = ds }
+        }
+    }
+
+    // bounds_static reports whether a bound list ("A+B") names a program
+    // trait that declares a method without `self`.
+    func bounds_static(self, bounds str) bool {
+        each b in str.split(bounds, "+") {
+            if not (b in self.traitDecl) { continue }
+            each m in self.T.Get(self.T.Kid(self.traitDecl[b], 0)).Kids {
+                if self.T.Kind(m) != ast.FUNC { continue }
+                if (self.T.Get(m).Ival2 & 1) == 0 { return true }
+            }
+        }
+        return false
+    }
+
+    // bounds_declare reports whether some trait of a bound list declares a
+    // method called `mn` (with or without `self`).
+    func bounds_declare(self, bounds str, mn str) bool {
+        each b in str.split(bounds, "+") {
+            if not (b in self.traitDecl) { continue }
+            each m in self.T.Get(self.T.Kid(self.traitDecl[b], 0)).Kids {
+                if self.T.Kind(m) == ast.FUNC and self.T.Get(m).Sval == mn {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    // set_gens records the type parameters in scope for the body about to be
+    // lowered, name → bounds, and whether they carry descriptors (`hasDesc`: a
+    // top-level function's own list) or not (a method, an impl, a trait).
+    func set_gens(mut self, list int, hasDesc bool) {
+        self.curGens = make(map[str]str)
+        self.curGensDesc = hasDesc
+        if list == 0 { return }
+        each g in self.T.Get(list).Kids {
+            let parts = str.split(self.T.Get(g).Sval, "|")
+            var b = ""
+            if len(parts) > 1 { b = parts[1] }
+            let gn = parts[0]
+            self.curGens[gn] = b
+        }
+    }
+
+    // add_gens adds a second list (an impl block's, around its methods').
+    func add_gens(mut self, list int) {
+        if list == 0 { return }
+        each g in self.T.Get(list).Kids {
+            let parts = str.split(self.T.Get(g).Sval, "|")
+            var b = ""
+            if len(parts) > 1 { b = parts[1] }
+            let gn = parts[0]
+            self.curGens[gn] = b
+        }
+    }
+
+    // lower_static_param lowers `T.m(args)` where `T` is a type parameter
+    // (or `Self` in a trait default). See the header for what is refused.
+    func lower_static_param(mut self, x int, bn str,
+                            mname str) str throws LowerError {
+        let line = self.T.Get(x).Line
+        var rdesc = ""
+        if bn == "Self" and not (bn in self.curGens) {
+            if self.traitSelf != 1 {
+                self.fail(x, "`Self." || mname || "()` in a trait default " ||
+                    "without `self`: there is no receiver to tell which " ||
+                    "type implements the trait. Give the method a `self`, " ||
+                    "or write it in each impl block")
+            }
+            // The type this default was dispatched as, read at entry
+            // (low.voi's prologue, SELFTY); TYPEOF when there is none.
+            rdesc = self.lookup("$Self")
+            if rdesc == "" {
+                rdesc = self.new_reg()
+                self.emit(line, "TYPEOF", [rdesc, self.lookup("self")])
+            }
+        } else {
+            let bounds = self.curGens[bn]
+            if not self.bounds_declare(bounds, mname) {
+                self.fail(x, "`" || bn || "." || mname || "()`: no bound " ||
+                    "of `" || bn || "` declares `" || mname || "` (§3.7)")
+            }
+            rdesc = self.lookup("$" || bn)
+            if rdesc == "" or not self.curGensDesc {
+                self.fail(x, "`" || bn || "." || mname || "()` needs the " ||
+                    "type `" || bn || "` stands for at run time, and only " ||
+                    "a top-level generic function receives that: a " ||
+                    "method's, an impl block's and a trait's type " ||
+                    "parameters do not (§3.7)")
+            }
+        }
+        let args = self.lower_args(x)
+        let rd = self.new_reg()
+        self.emit(line, "CALLT", [rd, rdesc, mname, args])
+        return rd
+    }
+
+    // desc_call_args lowers the arguments of a call to `callee` and, when the
+    // callee takes type descriptors, prepends them. `ix` is the INDEX node of
+    // an explicit instantiation (`make[Point]`), or 0.
+    func desc_call_args(mut self, x int, callee str,
+                        ix int) str throws LowerError {
+        // A `mut` argument that is a path in a captured variable is walked
+        // again under the variable's lock (boxcow.voi, unique_mut_arg): an
+        // index on it that runs Voilà code is computed once, here, first.
+        let myPre = self.pre_mut_indices(x, callee)
+        let fargs = self.lower_args_for(x, callee)
+        // Recorded only now: a call nested in the arguments flushes its own
+        // (boxcow.voi, flush_mut_args) and must not drop these.
+        self.pendPre = myPre
+        // A Box passed by name to a `mut` parameter is made unique first
+        // (boxcow.voi) — any known top-level callee, descriptors or not.
+        if callee in self.funcDecl and fargs != "()" {
+            let cps = self.T.Get(self.T.Kid(self.funcDecl[callee], 1)).Kids
+            var anyMut = false
+            each p in cps {
+                if (self.T.Get(p).Ival2 & 3) == ast.MODE_MUT { anyMut = true }
+            }
+            if anyMut {
+                var mregs = []
+                let inner0 = fargs[1..len(fargs) - 1]
+                if inner0 != "" { mregs = str.split(inner0, ",") }
+                self.unique_mut_args(cps, self.T.Get(self.T.Kid(x, 1)).Kids,
+                                     mregs)
+                if not (callee in self.descOf) {
+                    return "(" || str.join(mregs, ",") || ")"
+                }
+                return self.prepend_descs(x, callee, ix, mregs)
+            }
+        }
+        // A native that writes an argument in place (`sort.sort(xs)`,
+        // `append(xs, v)`) has its writing positions treated as `mut`
+        // parameters (boxcow.voi, unique_native_args).
+        if not (callee in self.funcDecl) and
+           len(native_mut_positions(callee)) > 0 and fargs != "()" {
+            var nregs = []
+            let inner2 = fargs[1..len(fargs) - 1]
+            if inner2 != "" { nregs = str.split(inner2, ",") }
+            self.unique_native_args(callee, self.T.Get(self.T.Kid(x, 1)).Kids,
+                                    nregs)
+            return "(" || str.join(nregs, ",") || ")"
+        }
+        if not (callee in self.descOf) { return fargs }
+        var regs0 = []
+        let inner1 = fargs[1..len(fargs) - 1]
+        if inner1 != "" { regs0 = str.split(inner1, ",") }
+        return self.prepend_descs(x, callee, ix, regs0)
+    }
+
+    // pre_mut_indices runs pre_index (stmt.voi) over each argument of a
+    // call that is a `mut` argument — by the callee's declaration, or a
+    // native's listed positions — and a path in a captured variable.
+    func pre_mut_indices(mut self, x int,
+                         callee str) []int throws LowerError {
+        var added = []
+        var params = []
+        if callee in self.funcDecl {
+            params = self.T.Get(self.T.Kid(self.funcDecl[callee], 1)).Kids
+        }
+        let npos = native_mut_positions(callee)
+        if len(params) == 0 and len(npos) == 0 { return added }
+        each j, a in self.T.Get(self.T.Kid(x, 1)).Kids {
+            let an = self.T.Get(a)
+            if an.Ival == 1 or an.Sval != "" { return added }
+            var isMut = j in npos
+            if j < len(params) {
+                isMut = (self.T.Get(params[j]).Ival2 & 3) == ast.MODE_MUT
+            }
+            if not isMut { continue }
+            let v = self.T.Kid(a, 0)
+            if self.var_root(v) != "" {
+                each k in self.pre_index(v) { added.append(k) }
+            }
+        }
+        return added
+    }
+
+    // prepend_descs computes the descriptors of a call to `callee` and puts
+    // them in front of the already-lowered argument registers.
+    func prepend_descs(mut self, x int, callee str, ix int,
+                       regs []str) str throws LowerError {
+        let fn = self.funcDecl[callee]
+        let gens = self.T.Get(self.T.Kid(fn, 3)).Kids
+        let params = self.T.Get(self.T.Kid(fn, 1)).Kids
+        // The argument NODES, positionally — only when none is named, so
+        // that position j of the call is parameter j.
+        var argNodes = []
+        each a in self.T.Get(self.T.Kid(x, 1)).Kids {
+            if self.T.Get(a).Sval != "" {
+                argNodes = []
+                break
+            }
+            argNodes.append(self.T.Kid(a, 0))
+        }
+        let line = self.T.Get(x).Line
+        var ds = []
+        each dn in self.descOf[callee] {
+            var gi = 0
+            each i, g in gens {
+                if str.split(self.T.Get(g).Sval, "|")[0] == dn { gi = i }
+            }
+            var r = ""
+            // 1. An explicit type argument: kid gi+1 of the INDEX.
+            if ix != 0 and gi + 1 < self.T.NKids(ix) {
+                r = self.desc_of_type(self.T.Kid(ix, gi + 1))
+            }
+            // 2. A value parameter declared exactly `T`.
+            if r == "" {
+                each j, p in params {
+                    if r != "" { break }
+                    let pn = self.T.Get(p)
+                    if (pn.Ival2 & 16) != 0 or pn.Ival == 0 { continue }
+                    let pt = self.T.Get(pn.Ival)
+                    if pt.Kind != ast.TNAMED or pt.Sval != dn or
+                       len(pt.Kids) > 0 {
+                        continue
+                    }
+                    if j >= len(regs) { break }
+                    var spread = false
+                    for k in 0..j + 1 {
+                        if str.ends_with(regs[k], "...") { spread = true }
+                    }
+                    if spread { break }
+                    // An argument declared as one of the ENCLOSING generic
+                    // function's own parameters (`like(x)` inside
+                    // `wrap[T](x T)`) forwards that function's descriptor:
+                    // its run-time type would lose what the caller said —
+                    // a `u8` is an `int` at run time.
+                    if j < len(argNodes) and self.curGensDesc {
+                        let at = self.st(argNodes[j])
+                        if at != "" and at in self.curGens {
+                            r = self.lookup("$" || at)
+                            if r != "" { break }
+                        }
+                    }
+                    r = self.new_reg()
+                    // A SIZED integer is an `int` at run time, so its
+                    // run-time type would name the wrong impl: the static
+                    // type, when it is certain, is the descriptor instead.
+                    var sz = ""
+                    if j < len(argNodes) { sz = self.sized_of(argNodes[j]) }
+                    if sz != "" {
+                        self.emit(line, "LOADK",
+                                  [r, self.M.Constant(ir.CSTR, sz)])
+                    } else {
+                        self.emit(line, "TYPEOF", [r, regs[j]])
+                    }
+                }
+            }
+            if r == "" {
+                self.fail(x, "`" || callee || "` needs to know the type " ||
+                    "`" || dn || "` stands for, and no argument tells it: " ||
+                    "write `" || callee || "[Type](…)` (§3.7)")
+            }
+            ds.append(r)
+        }
+        each r in regs { ds.append(r) }
+        return "(" || str.join(ds, ",") || ")"
+    }
+
+    // desc_of_type is the descriptor an explicit type argument denotes: a
+    // forwarded descriptor for one of the enclosing function's own
+    // parameters, else the type's flat name as a constant. "" when the
+    // argument is a parameter with no descriptor of its own (the caller then
+    // falls back to a value argument).
+    func desc_of_type(mut self, a int) str {
+        let n = self.T.Get(a)
+        if n.Kind != ast.IDENT and n.Kind != ast.TNAMED { return "" }
+        let name = n.Sval
+        if name in self.curGens {
+            return self.lookup("$" || name)
+        }
+        var tn = name
+        if name in self.aliasTo { tn = self.aliasTo[name] }
+        let r = self.new_reg()
+        self.emit(n.Line, "LOADK", [r, self.M.Constant(ir.CSTR, tn)])
+        return r
+    }
+
+    // refuse_desc_value stops a function that takes type descriptors being
+    // used as a value: a call through the value would arrive without them.
+    func refuse_desc_value(self, at int, name str) throws LowerError {
+        if not (name in self.descOf) { return }
+        self.fail(at, "`" || name || "` receives its type arguments at run " ||
+            "time (a bound calls a static trait method), so it cannot be " ||
+            "used as a value; call it inside a closure instead, as in " ||
+            "`fn() \{ return " || name || "[Type]() \}` (§3.7)")
+    }
+}

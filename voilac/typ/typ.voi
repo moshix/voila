@@ -117,6 +117,9 @@ func New() Table {
         t.names.add(n)
     }
     t.names.add("error")
+    // Box[T] (§6.3) is predeclared like the primitives; a program that
+    // declares its own `Box` simply declares the name again.
+    t.names.add("Box")
     return t
 }
 
@@ -489,6 +492,58 @@ impl Table {
     func MkSlice(mut self, elem int) int {
         if elem == 0 { return 0 }
         return self.mk(TK_SLICE, "", elem, 0, 0, [], 0)
+    }
+
+    // Make interns a type from its parts — the structural constructor the
+    // expression checker needs to BUILD types no annotation spells: the
+    // canonical form of an alias, a substituted signature, `Box[T]` for the
+    // value a `Box(v)` holds. The parts are ids already in this table.
+    func Make(mut self, kind int, name str, elem int, keyt int, res int,
+              args []int, flag int) int {
+        return self.mk(kind, name, elem, keyt, res, args, flag)
+    }
+
+    // MkOption interns `?T`, MkMap `map[K]V`, MkSet `set[T]` and MkFn
+    // `fn(P…) R`. Each refuses an unknown (0) payload where the result would
+    // claim more than is known — except MkFn, whose parameters and result
+    // may each be unknown: its ARITY is still a fact.
+    func MkOption(mut self, elem int) int {
+        if elem == 0 { return 0 }
+        return self.mk(TK_OPTION, "", elem, 0, 0, [], 0)
+    }
+
+    func MkMap(mut self, keyt int, val int) int {
+        if keyt == 0 and val == 0 { return 0 }
+        return self.mk(TK_MAP, "", val, keyt, 0, [], 0)
+    }
+
+    func MkSet(mut self, elem int) int {
+        if elem == 0 { return 0 }
+        return self.mk(TK_SET, "", elem, 0, 0, [], 0)
+    }
+
+    func MkFn(mut self, params []int, res int) int {
+        return self.mk(TK_FN, "", 0, 0, res, params, 0)
+    }
+
+    // MkNamed interns a nominal type at type arguments, classified exactly
+    // as Nominal classifies the bare name.
+    func MkNamed(mut self, name str, args []int) int {
+        if len(args) == 0 { return self.Nominal(name) }
+        if self.IsParam(name) { return self.mk(TK_PARAM, name, 0, 0, 0, args, 0) }
+        if self.Resolves(name) { return self.mk(TK_NAMED, name, 0, 0, 0, args, 0) }
+        return self.mk(TK_ERROR, name, 0, 0, 0, args, 0)
+    }
+
+    // MkTuple interns `(T1, T2, …)` from member types the expression typer
+    // inferred. Every member must be known: a tuple with a hole in it would
+    // intern as a type nothing else could ever equal.
+    func MkTuple(mut self, members []int) int {
+        if len(members) < 2 { return 0 }
+        each m in members {
+            if m == 0 { return 0 }
+        }
+        return self.mk(TK_TUPLE, "", 0, 0, 0, members, 0)
     }
 
     // HasParam reports whether a generic parameter appears ANYWHERE inside a

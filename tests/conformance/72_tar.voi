@@ -1,0 +1,146 @@
+// 72_tar — std/compress's tar, in plain Voilà: archives written by Python's
+// tarfile in both of the ways long names are stored (POSIX pax headers and
+// GNU long-name records), a ustar round trip including a name long enough to
+// need the prefix field, a .tar.gz, and the refusals — a bad checksum, a
+// truncated archive, a member past the size bound, a name ustar cannot hold.
+use "std/compress"
+use "std/os"
+use "std/path"
+
+func list(es []compress.TarEntry) {
+    each e in es {
+        printf("  %-8s %4o %d %3d %s", e.kind, e.mode, e.mtime, len(e.data),
+               short(e.name))
+        if e.link != "" { printf(" -> %s", e.link) }
+        say ""
+    }
+}
+
+// short keeps a long name on one line: its head, and its length.
+func short(name str) str {
+    if len(name) <= 40 { return name }
+    return name[0..20] || "...(" || str(len(name)) || " bytes)"
+}
+
+func main() {
+    let long = "deep/" || str.repeat("n", 120) || ".txt"
+    say "-- pax (Python tarfile, PAX_FORMAT) --"
+    let pax = must compress.tar_read(must compress.gunzip(must unhex("1f8b08000000000002ffedd54d0b82301cc7f19d7b157b05bae7d121e8d8b1b73070a4541abac0979f26040556972dc8dfe7a20c6187ffbe2ecbb37cbb77fdcebbc2b7240a36997b32c1e5e3fdbece87254e684f12b876c1b5c3f66499b85cd38b0be5a6f0fe92d73f92853eac08a49762ec63d446cdf7cfb818cea11556f1695d4a2114a10cfd47776aea03adddd923bf45eacaa60de3ef37e21e1ffb67e6b97f668d31e83fd9fcd1fe62b9a26af3c87b8c515baddff4cf5efa37966b4235fa8f7fff57f5912498bf51eafbf973a687cfa94871392d7cfe0000000000000000000000f07f6e6dfa8f9d00280000")))
+    list(pax)
+    say pax[0].name == long, pax[0].data
+    say "-- gnu (Python tarfile, GNU_FORMAT) --"
+    let gnu = must compress.tar_read(must compress.gunzip(must unhex("1f8b08000000000002ffedd74d0a83301446d18cbb8aacc0bcc4fc4cbb00372128adb48d455370f955844205db4e62c17c67a204c1c1e3269a894c1c8bd69f8ac65f581c345bbb9222f5ba9fd79dd38ef1826de0d187b2e39c25aaaaebbbf07f92852130d8fbfca7a8ad5eef9fa4623277ca6939afe7b9b49a7142ffd15dc7ad9ffbf2561fd0428afa73db85c8fbf0d7fec9bef74fce2a8bfe379b3fda4f5659359d88fc8e296a67cc87fe69d1bfb5e3e3dca0fff8e77fbcdfbec5feaf7f9fbf2443e3f79fdae2704a7cfe0000000000000000000000b03f4fab86b86800280000")))
+    list(gnu)
+    say gnu[0].name == long
+
+    say "-- round trip --"
+    let pre = str.repeat("p", 120) || "/" || str.repeat("f", 90)
+    let tarball = must compress.tar_write([
+        compress.TarEntry{name: "top", kind: "dir", mode: 493, mtime: 1700000000},
+        compress.TarEntry{name: "top/a.txt", data: "hello\n", mtime: 1700000000},
+        compress.TarEntry{name: "top/empty", data: ""},
+        compress.TarEntry{name: "top/bin", data: must from_bytes([0, 255, 128, 10])},
+        compress.TarEntry{name: "top/ln", kind: "symlink", link: "a.txt", mode: 511},
+        compress.TarEntry{name: pre, data: str.repeat("x", 1000)},
+    ])
+    say len(tarball) % 512, len(tarball)
+    let back = must compress.tar_read(tarball)
+    list(back)
+    say back[5].name == pre, bytes(back[3].data)
+    // .tar.gz is gzip over tar
+    let tgz = must compress.gzip(tarball)
+    say len(tgz) < len(tarball), len(must compress.tar_read(must compress.gunzip(tgz)))
+    say len(must compress.tar_read("")), len(must compress.tar_read(str.repeat("\u{0}", 1024)))
+
+    say "-- extracting --"
+    let dir = path.join(os.tempdir(), "voila_72_" || str(os.pid()))
+    // the round-trip archive holds a symlink: refused, and nothing written
+    match compress.tar_extract(tarball, dir) {
+        Ok(n) => say "extracted?!", n
+        Err(e) => say e.message()
+    }
+    say os.exists(dir)
+    let plain = must compress.tar_write([
+        compress.TarEntry{name: "top", kind: "dir"},
+        compress.TarEntry{name: "top/a.txt", data: "hello\n"},
+        compress.TarEntry{name: "top/sub/b.txt", data: "deeper\n"}])
+    say must compress.tar_extract(plain, dir)
+    say must os.read(path.join(dir, "top/sub/b.txt")).trim()
+    let evil = must compress.tar_write([
+        compress.TarEntry{name: "fine.txt", data: "x"},
+        compress.TarEntry{name: "../escape.txt", data: "x"}])
+    match compress.tar_extract(evil, path.join(dir, "evil")) {
+        Ok(n) => say "extracted?!", n
+        Err(e) => say e.message()
+    }
+    say os.exists(path.join(dir, "evil"))
+    let clash = must compress.tar_write([
+        compress.TarEntry{name: "a", data: "file"},
+        compress.TarEntry{name: "a/b", data: "under a file"}])
+    match compress.tar_extract(clash, path.join(dir, "clash")) {
+        Ok(n) => say "extracted?!", n
+        Err(e) => say e.message()
+    }
+    // on a case-insensitive file system "D" and "d/x.txt" are one path:
+    // the clash is caught for every file system, before any write
+    let caseclash = must compress.tar_write([
+        compress.TarEntry{name: "D", data: "file"},
+        compress.TarEntry{name: "d/x.txt", data: "under it"}])
+    match compress.tar_extract(caseclash, path.join(dir, "case")) {
+        Ok(n) => say "extracted?!", n
+        Err(e) => say e.message()
+    }
+    say os.exists(path.join(dir, "case"))
+    // a FIFO (Python's tarfile) is refused by what it is
+    let fifo = must compress.gunzip(must unhex("1f8b08000000000002ffedd3310e82401005d0390a27300b21cb792c2c0c0504d784e3b35a190aadb0e1bde6ff4cf3ab99c64b594b1c2a55b9efdf59edb3ea3efaeb3eb4698826c51f3c1fe5bad4c938a7690c4e6cbecfb7a3377effffbee7dcb5d164ff0f00000000000000005f6d58b1e43500280000"))
+    each e in must compress.tar_read(fifo) { say e.kind, e.name }
+    match compress.tar_extract(fifo, path.join(dir, "fifo")) {
+        Ok(n) => say "extracted?!", n
+        Err(e) => say e.message()
+    }
+    match compress.tar_extract(plain, path.join(dir, "small"), 5) {
+        Ok(n) => say "extracted?!", n
+        Err(e) => say e.message()
+    }
+    os.run("rm", ["-rf", dir])
+
+    say "-- refusals --"
+    let bad_sum = "x" || tarball[1..len(tarball)]
+    match compress.tar_read(bad_sum) {
+        Ok(es) => say "??"
+        Err(e) => say e.message()
+    }
+    match compress.tar_read(tarball[0..700]) {
+        Ok(es) => say "??"
+        Err(e) => say e.message()
+    }
+    match compress.tar_read(tarball[0..100]) {
+        Ok(es) => say "??"
+        Err(e) => say e.message()
+    }
+    match compress.tar_read(tarball, 500) {
+        Ok(es) => say "??"
+        Err(e) => say e.message()
+    }
+    match compress.tar_read(str.repeat("garbage!", 64)) {
+        Ok(es) => say "??"
+        Err(e) => say e.message()
+    }
+    let too_long = str.repeat("q", 300)
+    match compress.tar_write([compress.TarEntry{name: too_long, data: "x"}]) {
+        Ok(t) => say "??"
+        Err(e) => say short(e.message())
+    }
+    match compress.tar_write([compress.TarEntry{name: "d", kind: "dir", data: "x"}]) {
+        Ok(t) => say "??"
+        Err(e) => say e.message()
+    }
+    match compress.tar_write([compress.TarEntry{name: "f", kind: "fifo"}]) {
+        Ok(t) => say "??"
+        Err(e) => say e.message()
+    }
+    match compress.tar_write([compress.TarEntry{name: ""}]) {
+        Ok(t) => say "??"
+        Err(e) => say e.message()
+    }
+}

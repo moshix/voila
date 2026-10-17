@@ -1,0 +1,7 @@
+// A literal list of values must match the targets or names in number.
+func main() {
+    var a = 0
+    var b = 0
+    a, b = 1, 2, 3
+    say a, b
+}

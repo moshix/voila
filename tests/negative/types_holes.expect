@@ -1,0 +1,20 @@
+`g` returns `int`, but `str` is given
+`pair` returns `str`, but `int` is given
+argument 1 of `f` is `int`, but `str` is given
+argument 1 of `takep` is `P`, but `Q` is given
+an element of `[]int` must be `int`, but `str` is given
+an element of `[]int` must be `int`, but `float` is given
+a value of `map[str]int` must be `int`, but `str` is given
+a key of `map[str]int` must be `str`, but `int` is given
+an element of `set[int]` must be `int`, but `str` is given
+`ys` is `[]str`, but its initialiser is `[]int`
+an element of `[]str` must be `str`, but `int` is given
+field `P.x` is `int`, but `str` is given
+cannot assign `str` to `n`, which is `int`
+`t` is `int`, but its initialiser is `bool`
+`ch` carries `int`, but `str` is sent
+int → float may lose information
+!argument 1 of `uid`
+!argument 1 of `scale` is `float`, but `u16`
+!u16 → float
+!`ok_pair` returns

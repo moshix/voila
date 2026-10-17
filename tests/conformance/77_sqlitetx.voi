@@ -1,0 +1,148 @@
+// 77_sqlitetx — a transaction takes its connection: while one task holds a
+// transaction open on a SHARED connection, the other tasks' calls on it
+// wait for it to end, so they are neither run inside it nor rolled back
+// with it. The order of events is forced with channels, not timing.
+use "std/http"
+use "std/sqlite"
+use "std/time"
+
+func main() {
+    let db = must sqlite.open(":memory:")
+    must db.exec("CREATE TABLE t (who TEXT)")
+
+    say "-- a transaction that rolls back --"
+    let started = chan[int](1)
+    let resA = chan[str](1)
+    let resB = chan[str](1)
+    group {
+        spawn {
+            let r = db.transaction(fn() unit! {
+                try db.run("INSERT INTO t VALUES ('A1')")
+                started <- 1
+                // give B every chance to slip in: it must not
+                time.sleep(time.Millisecond * 100)
+                try db.run("INSERT INTO t VALUES ('A2')")
+                return err("A gives up")
+            })
+            resA <- "A: " || str(r)
+        }
+        spawn {
+            <-started
+            match db.run("INSERT INTO t VALUES ('B')") {
+                Ok(n) => resB <- "B: inserted " || str(n)
+                Err(e) => resB <- "B: " || e.message()
+            }
+        }
+    }
+    say <-resA
+    say <-resB
+    each row in must db.query("SELECT who FROM t ORDER BY who") { say " ", row.str("who") }
+
+    say "-- one that commits --"
+    must db.exec("DELETE FROM t")
+    let started2 = chan[int](1)
+    group {
+        spawn {
+            must db.transaction(fn() unit! {
+                try db.run("INSERT INTO t VALUES ('C1')")
+                started2 <- 1
+                time.sleep(time.Millisecond * 100)
+                try db.run("INSERT INTO t VALUES ('C2')")
+                return ()
+            })
+        }
+        spawn {
+            <-started2
+            // runs after C's COMMIT: it sees both rows
+            match db.query_one("SELECT count(*) AS n FROM t") {
+                Ok(r) => {
+                    match r {
+                        nil => say "no row"
+                        row => say "D sees", row.int("n")
+                    }
+                }
+                Err(e) => say "D:", e.message()
+            }
+        }
+    }
+
+    say "-- by hand --"
+    must db.begin()
+    match db.begin() {
+        Ok(u) => say "nested?!"
+        Err(e) => say e.message()
+    }
+    must db.rollback()
+    // the gate is open again: another task proceeds at once
+    group {
+        spawn {
+            say "E:", must db.run("INSERT INTO t VALUES ('E')")
+        }
+    }
+    say db.in_transaction()
+
+    say "-- a fault inside a transaction --"
+    // An abort contained by a recovery point (as http's server contains a
+    // handler's) is seen by no catch — but transaction() rolls back in a
+    // defer, which runs on every way out, and gives the connection back.
+    let r = http._contain(fn(n int) int {
+        match db.transaction(fn() unit! {
+            try db.run("INSERT INTO t VALUES ('F')")
+            let xs = [0]
+            say xs[n]
+            return ()
+        }) {
+            Ok(u) => u
+            Err(e) => e
+        }
+        return 0
+    }, 5)
+    say "contained:", r != nil
+    say "F rolled back:", count_of(db, "F") == 0
+    group { spawn { say "G:", must db.run("INSERT INTO t VALUES ('G')") } }
+
+    say "-- a task that ends inside a transaction --"
+    // begin by hand, then the task returns without commit or rollback: the
+    // transaction is rolled back and the connection given back when the
+    // task's thread ends — and in_transaction never waits on the gate.
+    group {
+        spawn {
+            db.begin() else ()
+            db.run("INSERT INTO t VALUES ('H')") else 0
+        }
+    }
+    say db.in_transaction()
+    group { spawn { say "I:", must db.run("INSERT INTO t VALUES ('I')") } }
+    say "H rolled back:", count_of(db, "H") == 0
+
+    say "-- tasks inside a transaction --"
+    // A transaction is ONE task's. Tasks it spawns in a group and waits for
+    // would wait for it in turn — a deadlock — so they fail at once with a
+    // clear error, the group fails, and the transaction rolls back.
+    let tr = db.transaction(fn() unit! {
+        try db.run("INSERT INTO t VALUES ('J')")
+        try group {
+            spawn { try db.run("INSERT INTO t VALUES ('K')") }
+        }
+        return ()
+    })
+    match tr {
+        Ok(u) => say "committed?!"
+        Err(e) => say e.message()
+    }
+    say "J rolled back:", count_of(db, "J") == 0, "K never ran:", count_of(db, "K") == 0
+    db.close()
+}
+
+func count_of(db sqlite.DB, who str) int {
+    match db.query_one("SELECT count(*) AS n FROM t WHERE who = ?", who) {
+        Ok(r) => {
+            match r {
+                nil => return 0 - 1
+                row => return row.int("n")
+            }
+        }
+        Err(e) => return 0 - 1
+    }
+    return 0 - 1
+}

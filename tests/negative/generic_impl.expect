@@ -1,0 +1,6 @@
+`Cel` implements `Into` twice and both write `into`
+`Into` takes 1 type argument, but this impl gives 0 (§3.6)
+`Into` takes 1 type argument, but the bound on `T` gives 0 (§3.7)
+`Q` implements `Into[int]`, not `Into[str]`, required by the bound `T: Into[str]` on `show` (§3.7)
+!`Tag`
+!on `fine`

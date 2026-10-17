@@ -1,0 +1,1 @@
+loopassign2.voi:8:19: this closure captures `k`, which is declared inside a loop and assigned to there

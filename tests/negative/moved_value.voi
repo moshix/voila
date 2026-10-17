@@ -1,0 +1,48 @@
+// A value that owns storage MOVES on assignment (§6.4, manual 8.2): bound
+// to a second name, assigned, or sent on a channel, BY NAME, its old name
+// is dead. A Copy value — a primitive, or a struct, tuple or enum of them —
+// is copied instead, and stays usable (the `!` lines).
+struct P { x int, y int }
+struct Bag { items []int }
+func consume(own p P) int { return p.x }
+func takes(own b Bag) int { return len(b.items) }
+func borrow_alias(xs []int) int {
+    let ys = xs
+    return len(xs) + len(ys)
+}
+func main() {
+    var data = [1, 2, 3]
+    var other = data
+    say data
+    let bag = Bag{items: [1]}
+    let bag2 = bag
+    say bag.items
+    var m = map[str]int{"a": 1}
+    var m2 = make(map[str]int)
+    m2 = m
+    say m["a"]
+    let ch = chan[[]int](1)
+    var buf = [9]
+    ch <- buf
+    say buf
+    var held = takes(bag2)
+    say bag2
+    // Legal: Copy values copy, a re-assignment revives, a borrowed
+    // parameter bound to a second name is a second borrow.
+    let p = P{x: 1, y: 2}
+    let q = p
+    say p.x, q.x, consume(p), p.y
+    var cur = [1]
+    var saved = cur
+    cur = [2]
+    say cur, saved, other, m2, held, borrow_alias([1])
+    // … and a loop variable, a pattern bind or an `if let` that reuses a
+    // moved name is a NEW binding.
+    let gone = [1]
+    let took = gone
+    each gone in [5, 6] { say gone }
+    let o ?int = 3
+    match o { Some(gone) => say gone; nil => say "n" }
+    if let gone = o { say gone }
+    say took
+}

@@ -107,6 +107,14 @@ impl Loader {
         var seen = set([])
         each q in keys(imports) {
             let pi = imports[q]
+            if (str(pi) || "|" || name) in self.ambig {
+                self.rw_error(t, node,
+                              "variant `{name}` is declared by more than " ||
+                              "one enum of package `{self.pkgs[pi].name}`; " ||
+                              "write `{q}.` before one of " ||
+                              self.ambig[str(pi) || "|" || name])
+                return ""
+            }
             if not (name in self.pkgs[pi].globalSet) { continue }
             let pn = self.pkgs[pi].name
             if pn in seen { continue }
@@ -131,6 +139,16 @@ impl Loader {
     // first, then the imports. Every site that may see a bare variant or
     // trait name goes through it.
     func global_name(mut self, t ast.Tree, node int, name str) str {
+        // A variant short name that several enums of THIS scope declare has
+        // no bare meaning (see namespace_variants): say which spellings do.
+        var scope = "main"
+        if self.rwSelf >= 0 { scope = str(self.rwSelf) }
+        if not self.bound(name) and (scope || "|" || name) in self.ambig {
+            self.rw_error(t, node,
+                          "variant `{name}` is declared by more than one " ||
+                          "enum; write " || self.ambig[scope || "|" || name])
+            return ""
+        }
         let here = self.qualify(name)
         if here != "" { return here }
         // The ENTRY file is a package of one whose names stay BARE (Load
@@ -236,6 +254,13 @@ impl Loader {
         let pi = self.rw_import(q)
         if pi < 0 { return "" }
         if self.bound(q) { return "" }
+        if (str(pi) || "|" || name) in self.ambig {
+            self.rw_error(t, node,
+                          "variant `{name}` is declared by more than one " ||
+                          "enum of package `{q}`; write `{q}.` before one " ||
+                          "of " || self.ambig[str(pi) || "|" || name])
+            return ""
+        }
         if not (name in self.pkgs[pi].decls) {
             self.rw_error(t, node, "package `{q}` has no exported `{name}`")
             return ""
@@ -355,9 +380,16 @@ impl Loader {
                 self.fn(t, m)
             }
         } else if n.Kind == ast.TRAITDEC {
+            // A generic trait's parameters, and `Self`, are in scope in every
+            // method: neither may be mistaken for a package type of the same
+            // name and qualified.
+            self.push()
+            self.bind_generics(t, t.Kid(d, 1))
+            self.bind("Self")
             each m in t.Get(t.Kid(d, 0)).Kids {
                 self.fn(t, m)
             }
+            self.pop()
         } else if n.Kind == ast.IMPLDEC {
             self.push()
             self.bind_generics(t, t.Kid(d, 1))
@@ -367,6 +399,16 @@ impl Loader {
             // correctly stays bare.
             let tq = self.trait_ref(t, d, n.Sval)
             if tq != "" { t.Nodes[d].Sval = tq }
+            // The trait as WRITTEN (Kids[2]) carries a generic trait's
+            // arguments; they are types like any other. Its own name is kept
+            // equal to the header's, which is the spelling everything reads.
+            let tw = t.Kid(d, 2)
+            if tw != 0 {
+                t.Nodes[tw].Sval = t.Get(d).Sval
+                each a in t.Get(tw).Kids {
+                    self.typ_node(t, a)
+                }
+            }
             self.typ(t, d, 0 - 1)
             each m in t.Get(t.Kid(d, 0)).Kids {
                 self.fn(t, m)
@@ -407,19 +449,43 @@ impl Loader {
     // bind_generics makes a generic parameter shadow a package type of the same
     // name: in `func F[T](x T)`, `T` is the parameter, not the package's `T`.
     //
-    // It also qualifies the BOUND — `[T: Describe]` is stored as "T|Describe"
-    // — because a bound names a trait and trait names are qualified now. The
-    // bound is resolved BEFORE the parameter is bound, so a parameter called
-    // `T` cannot shadow a trait called `T` in its own bound.
+    // It also qualifies the BOUNDS — `[T: Describe + Into[str]]` is stored as
+    // "T|Describe+Into" with one TNAMED per bound in the Kids — because a
+    // bound names a trait and trait names are qualified now. Three passes,
+    // in this order and for a reason each:
+    //
+    //   1. the bound NAMES, BEFORE any parameter is bound, so a parameter
+    //      called `T` cannot shadow a trait called `T` in its own bound;
+    //   2. the parameter names;
+    //   3. the bounds' type ARGUMENTS, AFTER every parameter is bound, since
+    //      `[T, U: Into[T]]` and `[U: Into[T], T]` both mean the parameter.
     func bind_generics(mut self, t mut ast.Tree, list int) {
         if list == 0 { return }
         each g in t.Get(list).Kids {
             let parts = str.split(t.Get(g).Sval, "|")
-            if len(parts) > 1 and parts[1] != "" {
+            let bs = t.Get(g).Kids
+            if len(bs) > 0 {
+                var names = []
+                each b in bs {
+                    let bq = self.trait_ref(t, b, t.Get(b).Sval)
+                    if bq != "" { t.Nodes[b].Sval = bq }
+                    names.append(t.Get(b).Sval)
+                }
+                t.Nodes[g].Sval = parts[0] || "|" || str.join(names, "+")
+            } else if len(parts) > 1 and parts[1] != "" {
                 let bq = self.trait_ref(t, g, parts[1])
                 if bq != "" { t.Nodes[g].Sval = parts[0] || "|" || bq }
             }
-            self.bind(parts[0])
+        }
+        each g in t.Get(list).Kids {
+            self.bind(str.split(t.Get(g).Sval, "|")[0])
+        }
+        each g in t.Get(list).Kids {
+            each b in t.Get(g).Kids {
+                each a in t.Get(b).Kids {
+                    self.typ_node(t, a)
+                }
+            }
         }
     }
 
@@ -481,9 +547,14 @@ impl Loader {
             } else {
                 // global_name: a bare TNAMED may be an imported TRAIT used as
                 // a type (`[]Describe`), which is a name an import offers
-                // without a qualifier.
-                let q = self.global_name(t, id, n.Sval)
-                if q != "" { t.Nodes[id].Sval = q }
+                // without a qualifier. A name this package declares only as a
+                // FUNCTION or a binding is never a type (Pkg.values), so it
+                // stays the builtin it spells.
+                if not (self.rwSelf >= 0 and
+                        n.Sval in self.pkgs[self.rwSelf].values) {
+                    let q = self.global_name(t, id, n.Sval)
+                    if q != "" { t.Nodes[id].Sval = q }
+                }
             }
             each a in t.Get(id).Kids {
                 self.typ_node(t, a)
@@ -681,17 +752,63 @@ impl Loader {
         let n = t.Get(p)
         if n.Kind == ast.PBIND {
             self.bind(n.Sval)
+        } else if n.Kind == ast.POR or n.Kind == ast.PTUPLE or
+                  n.Kind == ast.PFIELD {
+            each e in t.Get(p).Kids {
+                self.pattern(t, e)
+            }
+        } else if n.Kind == ast.PRANGE {
+            each e in t.Get(p).Kids {
+                self.expr_node(t, e)
+            }
+        } else if n.Kind == ast.PSTRUCT {
+            // A struct pattern names its TYPE, which is qualified exactly as
+            // a composite literal's is: `P{…}` in package geom is
+            // `geom.P`, and `geom.P{…}` in an importer is the same name.
+            let dot = index_of(n.Sval, '.')
+            if dot < 0 {
+                let q = self.global_name(t, p, n.Sval)
+                if q != "" { t.Nodes[p].Sval = q }
+            } else {
+                let flat = self.member(t, p, n.Sval[0..dot],
+                                       n.Sval[dot + 1..len(n.Sval)])
+                if flat != "" { t.Nodes[p].Sval = flat }
+            }
+            each e in t.Get(p).Kids {
+                self.pattern(t, e)
+            }
         } else if n.Kind == ast.PVARIANT {
             let dot = index_of(n.Sval, '.')
             if dot < 0 {
                 let q = self.global_name(t, p, n.Sval)
                 if q != "" { t.Nodes[p].Sval = q }
             } else {
-                let qual = n.Sval[0..dot]
-                let name = n.Sval[dot + 1..len(n.Sval)]
-                if self.rw_import(qual) >= 0 {
+                // Split at the LAST dot: the variant is the last segment, and
+                // what precedes it is a package (`geom.Circle`), an enum
+                // (`Shape.Circle`) or both (`geom.Shape.Circle`).
+                let ld = str.last_index(n.Sval, ".")
+                let qual = n.Sval[0..ld]
+                let name = n.Sval[ld + 1..len(n.Sval)]
+                let qdot = index_of(qual, '.')
+                if qdot < 0 and self.rw_import(qual) >= 0 {
                     let flat = self.member(t, p, qual, name)
                     if flat != "" { t.Nodes[p].Sval = flat }
+                } else {
+                    // The qualifier names an ENUM: resolve it as a type name
+                    // is resolved, then look the variant up in its namespace.
+                    var en = qual
+                    if qdot < 0 {
+                        let q = self.global_name(t, p, qual)
+                        if q != "" { en = q }
+                    } else if self.rw_import(qual[0..qdot]) >= 0 {
+                        let flat = self.member(t, p, qual[0..qdot],
+                                               qual[qdot + 1..len(qual)])
+                        if flat != "" { en = flat }
+                    }
+                    let key = en || "|" || name
+                    if key in self.enumVar {
+                        t.Nodes[p].Sval = self.enumVar[key]
+                    }
                 }
             }
             each e in t.Get(p).Kids {
@@ -724,6 +841,7 @@ impl Loader {
             // the FIELD node becomes an IDENT in place.
             let base = t.Kid(e, 0)
             let bn = t.Get(base)
+            let baseBound = bn.Kind == ast.IDENT and self.bound(bn.Sval)
             if bn.Kind == ast.IDENT and not self.bound(bn.Sval) {
                 let flat = self.member(t, e, bn.Sval, n.Sval)
                 if flat != "" {
@@ -746,6 +864,22 @@ impl Loader {
                 }
             }
             self.expr_node(t, base)
+            // `Shape.Circle` / `geom.Shape.Circle`: a variant named through
+            // its enum (§3.5). The base has just been flattened to the enum's
+            // flat name, so the pair is looked up in the per-enum namespace
+            // and the whole selection becomes the variant's flat IDENT — the
+            // same node a bare `Circle` is, for every later stage. A local
+            // binding that happens to be called `Shape` is a value, not the
+            // enum, and is left alone.
+            let fb = t.Get(base)
+            if not baseBound and fb.Kind == ast.IDENT {
+                let key = fb.Sval || "|" || n.Sval
+                if key in self.enumVar {
+                    t.Nodes[e].Kind = ast.IDENT
+                    t.Nodes[e].Sval = self.enumVar[key]
+                    t.Nodes[e].Kids = []
+                }
+            }
             return
         }
         if k == ast.COMPOSITE {
@@ -806,9 +940,35 @@ impl Loader {
             self.pop()
             return
         }
+        if k == ast.IF or k == ast.MATCH {
+            // An `if` or `match` in value position: the statement walk
+            // already scopes its pattern binds and branch blocks.
+            self.stmt(t, e)
+            return
+        }
+        if k == ast.INDEX and n.Ival2 == 2 {
+            // `f[[]geom.Pt, str](…)`: type arguments read as TYPES.
+            self.expr(t, e, 0)
+            var i = 1
+            while i < len(t.Get(e).Kids) {
+                self.typ_node(t, t.Kid(e, i))
+                i += 1
+            }
+            return
+        }
+        if k == ast.SLICELIT or k == ast.MAPLIT {
+            // A typed literal's element types are written in Ival.
+            if n.Ival != 0 { self.typ_node(t, n.Ival) }
+            each c in t.Get(e).Kids {
+                self.expr_node(t, c)
+            }
+            return
+        }
         if k == ast.ELSEEXPR {
             self.expr(t, e, 0)
-            if n.Ival2 == 1 {
+            if n.Ival2 == 1 or n.Ival2 == 2 {
+                // A diverging statement, or a BLOCK alternative: both are
+                // statements, and stmt() scopes a block's bindings.
                 self.stmt(t, t.Kid(e, 1))
             } else {
                 self.expr(t, e, 1)

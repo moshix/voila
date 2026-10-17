@@ -1,0 +1,17 @@
+// An `if` or `match` VALUE has one type (§5.3): each branch is judged
+// against the type the context expects, and with nothing expected the
+// branches must agree among themselves.
+func pick(c bool) int { return if c { 1 } else { "one" } }
+func main() {
+    let c = true
+    let n = 2
+    let x1 int = match n { 1 => "a", _ => 2 }
+    let x2 int = if c { 1 } else { "s" }
+    let x3 = if c { 1 } else { "s" }
+    let x4 = match n { 1 => true, _ => "no" }
+    // Legal: numeric branches join, a diverging branch decides nothing.
+    let y1 = if c { 1 } else { 2.5 }
+    let y2 int = match n { 1 => 1, _ => return }
+    let y3 = if c { "a" } else { "b" }
+    say x1, x2, x3, x4, y1, y2, y3, pick(c)
+}

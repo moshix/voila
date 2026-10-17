@@ -1,0 +1,159 @@
+// The fourth batch's review follow-ups. Containers have value semantics
+// too (§6.4): a slice, a map or a set held by a struct field, an element
+// or a second name is copied on its first write while another holder still
+// shares it — so no write is ever seen through two names, whatever the path
+// (an element's field, an append, a map store, a `mut` parameter, a value
+// put into a struct literal, a tuple or a collection). Run under `leaks`.
+
+struct P { x int, tags []int }
+struct H { p P, ps []P }
+struct Holder { v []int }
+struct M { x int, m map[str]int }
+struct Q { x int }
+struct HQ { q Q, v []int }
+struct T { v int, kids []Box[T] }
+trait Lab {
+    func label(self) str
+    func show(self) str = "<" || Self.lab() || ">"
+    func lab() str
+}
+struct LA {}
+struct LB {}
+impl Lab for LA { func label(self) str { return "a" } func lab() str { return "A" } }
+impl Lab for LB { func label(self) str { return "b" } func lab() str { return "B" } }
+type Handler fn(str) str
+struct Route { path str, h Handler }
+
+impl Handler { func tag(self) str { return "handler" } }
+
+func touch(p mut P) {
+    p.x = 99
+    p.tags.append(7)
+}
+
+func fill(v mut []int) { v.append(1) }
+
+func bumpq(q mut Q) int {
+    q.x = 2
+    return q.x
+}
+
+func pushv(v mut []int) int {
+    v.append(2)
+    return len(v)
+}
+
+func run(h Handler, s str) str { return h(s) }
+
+func pick[T](a T, b T) T { return b }
+
+trait Default {
+    func default() Self
+    func reset(self) Self = Self.default()
+}
+impl Default for int { func default() int { return 42 } }
+impl Default for u8 { func default() u8 { return 8 } }
+
+func main() {
+    // 1. an element's field, element and append through a shared struct
+    var arr = [P{x: 1, tags: [0]}]
+    let alias = arr[0]
+    arr[0].x = 5
+    arr[0].tags[0] = 9
+    arr[0].tags.append(5)
+    say "1:", alias, arr[0]
+
+    // 2. a map inside a struct inside a slice
+    var ms = [M{x: 1, m: map[str]int{}}]
+    let mcopy = ms[0]
+    ms[0].m["a"] = 1
+    say "2:", mcopy, ms[0]
+
+    // 3. a `mut` parameter given an element
+    var arr2 = [P{x: 1, tags: []}]
+    let alias2 = arr2[0]
+    touch(arr2[0])
+    say "3:", alias2, arr2[0]
+
+    // 4. a container read out of a field, then the field written
+    var h = H{p: P{x: 1, tags: []}, ps: [P{x: 1, tags: []}]}
+    let hps = h.ps
+    h.ps[0].tags.append(3)
+    say "4:", hps, h.ps
+
+    // 5. values put into a literal stay what they were
+    var xs = [1]
+    let hold = Holder{v: xs}
+    xs[0] = 9
+    var ys = [1]
+    let t = (ys, 0)
+    ys.append(2)
+    var zs = [1]
+    let mz = map[str][]int{"a": zs}
+    zs[0] = 3
+    var w = P{x: 1, tags: [0]}
+    let wa = [w]
+    w.tags[0] = 4
+    say "5:", hold.v, xs, t, ys, mz, zs, wa, w
+
+    // 6. nested slices and a field's container
+    var g = [[1]]
+    let g0 = g[0]
+    g[0][0] = 7
+    var hh = Holder{v: [1]}
+    let hv = hh.v
+    hh.v[0] = 4
+    say "6:", g0, g, hv, hh
+
+    // 7. a `mut` slice parameter writes the caller's slice — only it
+    var bag = Holder{v: [0]}
+    let snap = bag.v
+    fill(bag.v)
+    say "7:", snap, bag.v
+
+    // 8. a closure literal where a function newtype is expected
+    let r = Route{path: "/", h: fn(p str) str { return p || "!" }}
+    var h2 Handler = fn(p str) str { return p || "?" }
+    say "8:", r.h("a"), r.h.tag(), run(h2, "b"), run(fn(p str) str {
+        return p
+    }, "c"), h2.tag()
+
+    // 9. nil infers an optional; a sized receiver's Self is its own type
+    let pk = pick(nil, 3)
+    let b u8 = 3
+    let n = 5
+    say "9:", pk, b.reset(), n.reset()
+
+    // 10. a long loop of appends through a field copies nothing
+    var big = Holder{v: []}
+    var i = 0
+    while i < 200000 {
+        big.v.append(i)
+        i += 1
+    }
+    say "10:", len(big.v), big.v[199999]
+
+    // 11. the prelude's `append(xs, v)` is the method's twin
+    var h11 = Holder{v: [1]}
+    let k11 = h11.v
+    append(h11.v, 2)
+    say "11:", k11, h11.v
+
+    // 12. an operand read before a call that writes the same location keeps
+    //     what it read
+    var hq = HQ{q: Q{x: 1}, v: [1]}
+    let t12 = (hq.q, bumpq(hq.q))
+    let u12 = (hq.v, pushv(hq.v))
+    say "12:", t12, hq.q, u12, hq.v
+
+    // 13. a value appended into its own container is a copy, not a cycle
+    var tr = Box(T{v: 7, kids: []})
+    tr.kids.append(tr)
+    say "13:", tr.v, len(tr.kids), len(tr.kids[0].kids)
+
+    // 14. a trait default's `Self` is the type it was dispatched for, after
+    //     any other call
+    let la = LA{}
+    let lb = LB{}
+    say "14:", la.show(), lb.label(), la.show(), lb.show()
+}

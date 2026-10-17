@@ -1,0 +1,119 @@
+// Box[T] has VALUE semantics (§6.3): it is a unique owner, so a second name
+// for a Box is a second Box. The copy is made lazily — copy-on-write — when a
+// Box is written through (`set`, or a field or element assigned through it)
+// while something else still holds it. Two consequences are pinned here: a
+// write is never seen through another owner, and a Box can never be made to
+// contain itself, so no cycle forms and nothing leaks (run under `leaks`).
+
+struct LNode { v int, next ?Box[LNode] }
+struct H { b ?Box[H], name str }
+struct P { x int, y int }
+struct Holder { b Box[int] }
+
+func bump(b Box[int]) int {
+    b.set(b.get() + 100)          // the parameter's own copy
+    return b.get()
+}
+
+func bump_mut(mut b Box[int]) {
+    b.set(b.get() + 1000)         // a `mut` parameter: the caller's Box
+}
+
+func link(mut b Box[LNode]) {
+    b.set(LNode{v: 9, next: b})   // would hold itself: the callee's copy
+}
+
+struct S2 { b Box[int] }
+
+var g = Box(1)
+
+func main() {
+    // A second name is a second Box.
+    let a = Box(1)
+    var b = a
+    b.set(2)
+    say a, b
+    say bump(a), a
+    var m = Box(5)
+    bump_mut(m)
+    say m
+
+    // Fields and elements written through a Box.
+    let pa = Box(P{x: 1, y: 2})
+    var pc = pa
+    pc.x = 10
+    var pd = pa
+    pd.y += 20
+    say pa, pc, pd
+
+    // set() captures the OLD contents: no Box contains itself.
+    var n = Box(LNode{v: 1, next: nil})
+    n.set(LNode{v: 2, next: n})
+    say n.v, n.next.v, n.next.next == nil
+
+    // Nor can two Boxes be made to contain each other.
+    var h = Box(H{b: nil, name: "x"})
+    let k = Box(H{b: h, name: "k"})
+    h.set(H{b: k, name: "h"})
+    say h.name, h.b.name, h.b.b.name, h.b.b.b == nil
+
+    // A Box held in a slice, a map, a struct field and a global.
+    var xs = [Box(1), Box(2)]
+    let first = xs[0]
+    xs[0].set(100)
+    say first, xs
+    var mp = make(map[str]Box[str])
+    mp["k"] = Box("v")
+    let old = mp["k"]
+    mp["k"].set("w")
+    say old, mp["k"]
+    var hd = Holder{b: Box(7)}
+    let hb = hd.b
+    hd.b.set(8)
+    say hb, hd.b
+    let g0 = g
+    g.set(2)
+    say g0, g
+
+    // A closure's captured Box.
+    var cb = Box(0)
+    let keep = cb
+    let inc = fn() { cb.set(cb.get() + 1) }
+    inc()
+    inc()
+    say keep, cb
+
+    // A `mut` parameter's caller sees the write — and only that caller.
+    let ma = Box(1)
+    var mb = ma
+    bump_mut(mb)
+    say ma, mb
+    var ln = Box(LNode{v: 1, next: nil})
+    link(ln)
+    say ln.v, ln.next == nil
+
+    // A name assigned into a field of its own Box: the copy takes it.
+    var self_ref = Box(LNode{v: 1, next: nil})
+    self_ref.next = self_ref
+    say self_ref.v, self_ref.next.v, self_ref.next.next == nil
+
+    // A Box inside a Box: the outer one is copied first.
+    let ob = Box(S2{b: Box(1)})
+    var ob2 = ob
+    ob2.b.set(5)
+    say ob, ob2
+
+    // `set` on a tuple member that is not a Box writes nothing back.
+    let cs = (cell(1), cell(2))
+    cs.1.set(3)
+    say cs.1.get()
+
+    // Many writes through one unshared Box copy nothing.
+    var acc = Box(0)
+    var i = 0
+    while i < 10000 {
+        acc.set(acc.get() + i)
+        i += 1
+    }
+    say acc
+}

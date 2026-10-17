@@ -126,6 +126,9 @@ typedef struct {
   int ngroups;
   int depth; /* nesting, so an adversarial pattern cannot exhaust the stack */
   const char *err; /* first error; parsing stops reporting after one */
+  /* names[g] is capture group g's name from `(?P<name>…)`, or NULL. Owned
+   * here until compilation hands the array to the VlRegex. */
+  char *names[RX_MAX_GROUPS];
 } Parser;
 
 /* A pattern is untrusted input by this file's own design, and parse_atom ->
@@ -276,7 +279,41 @@ static Node *parse_atom(Parser *ps) {
     }
     ps->p++;
     int group = -1;
-    if (ps->p + 1 < ps->end && ps->p[0] == '?' && ps->p[1] == ':') {
+    /* A NAMED group, `(?P<name>…)` (RE2's and Python's spelling) or
+     * `(?<name>…)`: an ordinary capture whose number also has a name, which
+     * find_named and a `${name}` in a replacement read. */
+    const char *nm = NULL;
+    int64_t nmlen = 0;
+    if (ps->p + 2 < ps->end && ps->p[0] == '?' &&
+        (ps->p[1] == '<' || (ps->p[1] == 'P' && ps->p[2] == '<')) &&
+        !(ps->p[1] == '<' && (ps->p[2] == '=' || ps->p[2] == '!'))) {
+      const char *q = ps->p + (ps->p[1] == 'P' ? 3 : 2);
+      const char *s0 = q;
+      while (q < ps->end && (*q == '_' || (*q >= 'a' && *q <= 'z') ||
+                             (*q >= 'A' && *q <= 'Z') ||
+                             (q > s0 && *q >= '0' && *q <= '9')))
+        q++;
+      if (q == s0 || q >= ps->end || *q != '>') {
+        fail(ps, "a group name is letters, digits and `_`, closed by `>`");
+        return node(ps, N_EMPTY);
+      }
+      nm = s0;
+      nmlen = q - s0;
+      for (int g = 1; g <= ps->ngroups; g++) {
+        if (ps->names[g] && (int64_t)strlen(ps->names[g]) == nmlen &&
+            memcmp(ps->names[g], nm, (size_t)nmlen) == 0) {
+          fail(ps, "duplicate group name");
+          return node(ps, N_EMPTY);
+        }
+      }
+      ps->p = q + 1;
+      if (ps->ngroups + 1 >= RX_MAX_GROUPS) {
+        fail(ps, "too many capture groups");
+        return node(ps, N_EMPTY);
+      }
+      group = ++ps->ngroups;
+      ps->names[group] = vl_strdup_n(nm, nmlen);
+    } else if (ps->p + 1 < ps->end && ps->p[0] == '?' && ps->p[1] == ':') {
       ps->p += 2;
     } else if (!at_end(ps) && *ps->p == '?') {
       fail(ps, "only the non-capturing group `(?:` is supported; "
@@ -751,6 +788,7 @@ typedef struct {
   int ngroups; /* not counting slot 0 */
   char *src;   /* the pattern text, for str_into and diagnostics */
   int64_t srclen;
+  char **names; /* names[g] for each group g, NULL when unnamed */
 } VlRegex;
 
 void vl_regex_free(VlObj *o) {
@@ -759,6 +797,18 @@ void vl_regex_free(VlObj *o) {
   free(r->sets);
   free(r->neg);
   free(r->src);
+  if (r->names) {
+    for (int g = 0; g <= r->ngroups; g++) free(r->names[g]);
+    free(r->names);
+  }
+}
+
+/* parser_names_free releases the names a failed compilation collected. */
+static void parser_names_free(Parser *ps) {
+  for (int g = 0; g < RX_MAX_GROUPS; g++) {
+    free(ps->names[g]);
+    ps->names[g] = NULL;
+  }
 }
 
 const char *vl_regex_src(Value v) { return ((VlRegex *)v.u.o)->src; }
@@ -792,6 +842,7 @@ Value vl_regex_compile(Value pat) {
   if (ps.err) {
     const char *why = ps.err;
     arena_free(&arena);
+    parser_names_free(&ps);
     return rx_error(why, p);
   }
 
@@ -811,6 +862,7 @@ Value vl_regex_compile(Value pat) {
     free(e.prog);
     free(e.sets);
     free(e.neg);
+    parser_names_free(&ps);
     return rx_error("pattern is too large after expanding repetition", p);
   }
 
@@ -821,6 +873,14 @@ Value vl_regex_compile(Value pat) {
   r->neg = e.neg;
   r->nsets = e.nsets;
   r->ngroups = ps.ngroups;
+  r->names = NULL;
+  for (int g = 1; g <= ps.ngroups; g++) {
+    if (!ps.names[g]) continue;
+    if (!r->names)
+      r->names = (char **)vl_alloc(sizeof(char *) * (size_t)(ps.ngroups + 1));
+    r->names[g] = ps.names[g]; /* ownership moves to the regex */
+    ps.names[g] = NULL;
+  }
   r->src = (char *)vl_alloc((size_t)plen + 1);
   memcpy(r->src, p, (size_t)plen);
   r->src[plen] = 0;
@@ -1068,6 +1128,51 @@ Value vl_regex_find(Value pat, Value subject) {
   return out;
 }
 
+/* vl_regex_find_named(pattern, s) -> ?map[str]str: the first match, as a
+ * map from each NAMED group to the text it captured ("" when the group did
+ * not take part), plus "0" for the whole match. nil when nothing matches.
+ * Unnamed groups are not in the map; find has them by position. */
+Value vl_regex_find_named(Value pat, Value subject) {
+  Value re, err;
+  if (!as_regex(pat, &re, &err)) return err;
+  VlRegex *r = (VlRegex *)re.u.o;
+  const unsigned char *in = (const unsigned char *)vl_cstr(subject);
+  int64_t len = vl_strlen(subject);
+  int *m = (int *)vl_alloc(sizeof(int) * (size_t)(2 * (r->ngroups + 1)));
+  Value out = vl_nil();
+  if (rx_search(r, in, len, 0, m)) {
+    out = vl_map_new();
+    for (int g = 0; g <= r->ngroups; g++) {
+      const char *nm = g == 0 ? "0" : (r->names ? r->names[g] : NULL);
+      if (!nm) continue;
+      int a = m[2 * g], e = m[2 * g + 1];
+      Value k = vl_str(nm);
+      Value v = (a < 0 || e < a) ? vl_str("")
+                                 : vl_str_n((const char *)in + a, e - a);
+      vl_map_set(out, k, v);
+      vl_release(k);
+    }
+  }
+  free(m);
+  vl_release(re);
+  return out;
+}
+
+/* vl_regex_names(pattern) -> []str: every group's name by position, "" for
+ * an unnamed group; index 0 is the whole match and always "". */
+Value vl_regex_names(Value pat) {
+  Value re, err;
+  if (!as_regex(pat, &re, &err)) return err;
+  VlRegex *r = (VlRegex *)re.u.o;
+  Value out = vl_slice_new(0);
+  for (int g = 0; g <= r->ngroups; g++) {
+    const char *nm = g > 0 && r->names ? r->names[g] : NULL;
+    vl_slice_append(out, vl_str(nm ? nm : ""));
+  }
+  vl_release(re);
+  return out;
+}
+
 Value vl_regex_find_all(Value pat, Value subject) {
   Value re, err;
   if (!as_regex(pat, &re, &err)) return err;
@@ -1101,6 +1206,39 @@ static void expand_repl(Value b, const char *rep, int64_t rlen, VlRegex *r,
         vl_release(s);
         i++;
         continue;
+      }
+      if (n == '{') {
+        /* ${name} (or ${12}): a named group, or any group by number. */
+        int64_t close = i + 2;
+        while (close < rlen && rep[close] != '}') close++;
+        if (close < rlen) {
+          int g = -1;
+          int64_t nl = close - (i + 2);
+          const char *nm = rep + i + 2;
+          bool digits = nl > 0;
+          for (int64_t k = 0; k < nl; k++)
+            if (nm[k] < '0' || nm[k] > '9') digits = false;
+          if (digits) {
+            g = 0;
+            for (int64_t k = 0; k < nl && g <= r->ngroups; k++)
+              g = g * 10 + (nm[k] - '0');
+          } else if (r->names) {
+            for (int k = 1; k <= r->ngroups; k++)
+              if (r->names[k] && (int64_t)strlen(r->names[k]) == nl &&
+                  memcmp(r->names[k], nm, (size_t)nl) == 0)
+                g = k;
+          }
+          if (g >= 0 && g <= r->ngroups) {
+            int a = m[2 * g], e = m[2 * g + 1];
+            if (a >= 0 && e >= a) {
+              Value s = vl_str_n((const char *)in + a, e - a);
+              vl_builder_write(b, s);
+              vl_release(s);
+            }
+            i = close;
+            continue;
+          }
+        }
       }
       if (n >= '0' && n <= '9') {
         int g = n - '0';
@@ -1202,6 +1340,9 @@ Value vl_regex_method(Value self, const char *name, Value *argv, int argc,
   if (eq(name, "replace") && argc >= 2)
     return vl_regex_replace(self, argv[0], argv[1]);
   if (eq(name, "split") && argc >= 1) return vl_regex_split(self, argv[0]);
+  if (eq(name, "find_named") && argc >= 1)
+    return vl_regex_find_named(self, argv[0]);
+  if (eq(name, "names")) return vl_regex_names(self);
   if (eq(name, "source")) return vl_str(((VlRegex *)self.u.o)->src);
   *ok = false;
   return vl_nil();

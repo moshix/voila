@@ -1,0 +1,57 @@
+-- reading a foreign archive --
+docs/ 0 true true
+docs/readme.txt 880 false true
+stored.bin 16 false true
+["docs/", "docs/readme.txt", "stored.bin"]
+true
+[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+2 -1
+compress: zip: no member nope
+compress: zip: docs/readme.txt: output exceeds the limit of 100 bytes
+-- writing --
+compress: zip: bad/ is not a file name (add_dir makes directories)
+compress: zip: the archive is finished
+a.txt 6 false
+big.txt 44000 false
+raw.bin 4 false
+sub/ 0 true
+sub/b.txt 5 false
+alpha
+ 44000 [0, 1, 2, 255]
+true
+true
+-- extracting --
+4
+beta
+ true
+compress: zip: the members total 44015 bytes, over the limit of 1000
+false
+44000
+-- refusals --
+compress: zip: not a readable zip archive: not a ZIP archive
+compress: zip: not a readable zip archive: not a ZIP archive
+compress: zip: cannot extract a.txt: CRC-32 check failed
+["../evil.txt"]
+compress: refusing unsafe member name ../evil.txt
+false false
+compress: refusing unsafe member name /abs
+compress: refusing unsafe member name a/../../b
+compress: refusing unsafe member name a\b
+safe: ok/x
+compress: an archive member has no name
+compress: refusing unsafe member name ..
+-- the whole archive is checked before anything is written --
+ok.txt false 420
+link true 511
+compress: refusing to extract link: a symlink, not a file or a directory
+false
+compress: zip: cannot extract b.txt: CRC-32 check failed
+false
+compress: zip: cannot extract m0: the member's data does not match the archive's directory (corrupt or lying sizes)
+notes/a.txt 600 false
+notes/b.txt 600 false
+2 bravo
+compress: a directory is in the way at DIR/inway/notes/b.txt
+false
+out/a/b.txt
+compress: refusing unsafe member name ../x

@@ -1,0 +1,45 @@
+ada 3 true 2.25
+90s ["first", "second", "--not-a-flag", "-"]
+true true
+world 1 false 250ms []
+false false
+7 8
+0s 7200005ms
+error: unknown flag --nope
+error: unknown flag -x
+error: flag --count: `many` is not an int
+error: flag --count needs an int value
+error: flag --name needs a str value
+error: flag --loud: `yes` is not true or false
+error: flag --pause: `5` needs a unit (ms, s, m, h)
+error: flag --pause: `5 parsecs`: unknown unit ` parsecs`
+error: flag --ratio: `half` is not a number
+error: flag --count: `5%d` is not an int
+error: unknown flag --50%
+error: help requested
+error: help requested
+usage: greet [flags] [args]
+
+say hello to someone
+
+flags:
+  -n, --name str     who to greet (default "world")
+  -c, --count int    how many times (default 1)
+  -l, --loud         shout it
+      --ratio float  how much (default 0.5)
+      --pause dur    wait between greetings (default 250ms)
+  -h, --help         show this help and exit
+
+caught: flag: `count` is declared twice
+caught: flag: the alias of `verbose` must be one letter, not `vv`
+caught: flag: no flag `colour` was declared
+fast false []
+usage: demo [flags] [args]
+
+the default set
+
+flags:
+      --mode str  how to run (default "fast")
+      --dry-run   change nothing
+  -h, --help      show this help and exit
+

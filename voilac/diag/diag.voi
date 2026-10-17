@@ -183,7 +183,7 @@ func after(a Diag, b Diag) bool {
 //
 // A slice, not a set, and never the `enabled` map — see rule 1.
 func Codes() []str {
-    return ["type-mismatch", "unreachable", "unused-import"]
+    return ["ffi", "type-mismatch", "unreachable", "unused-import"]
 }
 
 // DefaultOff lists the codes that stay silent until -W<code> or -Wall asks
@@ -196,16 +196,17 @@ func Codes() []str {
 // `unused-import` fired 6, every one of them a genuinely unused `use` that
 // was then removed. See TESTING.md §9.
 //
-// `type-mismatch` IS here, and the reason is not that it fires on correct
-// code — the same sweep drove it to zero across the whole corpus. It is that
-// it is the youngest and by far the largest check in the compiler, it reasons
-// about a partial inference rather than about a declaration, and the failure
-// mode of getting it wrong is REFUSING A WORKING PROGRAM. Default-off means a
-// false positive discovered in the field costs a puzzled user nothing until
-// they ask for it with -Wall or --strict. Promote it once it has been carried
-// through a release without a report. See chk/expr.voi's header.
+// `ffi` IS here: it marks every `use "std/ffi"` (§12 — what goes through it
+// is outside the safety guarantees), which is advice nobody asked for on an
+// ordinary build and exactly the refusal `--strict` exists to make.
+//
+// `type-mismatch` IS here, and it is VESTIGIAL: it named the first, partial
+// expression type check, whose findings were warnings. That check is now the
+// static type check (chk/expr.voi) and reports ERRORS; the code stays a valid
+// -W spelling so that a build script naming it keeps working, and nothing is
+// reported under it. See TESTING.md §9.
 func DefaultOff() []str {
-    return ["type-mismatch"]
+    return ["ffi", "type-mismatch"]
 }
 
 // Default is whether a code is on when the command line says nothing.

@@ -1,0 +1,61 @@
+// Narrowing of locations at a VARIABLE index or key (§5.5): `xs[i]`,
+// `ss[i].v`, `m[p.k]` are narrowed by a nil test like a name, until a
+// write that may reach them — to the same base at any index that may be
+// equal, or to the index itself. Writes that cannot reach them keep them.
+struct S { v ?int, w ?int }
+struct P { k str }
+
+func slice_elem(i int) int {
+    var xs = []?int{1, 2}
+    if xs[i] != nil { return xs[i] + 1 }
+    return 0
+}
+
+func field_of_elem(i int) int {
+    var ss = [S{v: 1, w: nil}]
+    if ss[i].v == nil { return 0 }
+    ss[i].w = 4                     // a sibling field: ss[i].v stands
+    return ss[i].v + 1
+}
+
+func map_by_path(p P) int {
+    var m = map[str]?int{"a": 1}
+    if m[p.k] != nil { return m[p.k] + 10 }
+    return 0
+}
+
+func rewritten(i int) int {
+    var xs = []?int{1, 2}
+    var t = 0
+    if xs[i] != nil {
+        t = xs[i] + 1
+        xs[i] = 5                   // written non-nil: still narrowed
+        t += xs[i]
+    }
+    return t
+}
+
+func literal_siblings() int {
+    var xs = []?int{1, 2, nil}
+    if xs[0] == nil { return 0 }
+    xs[2] = nil                     // another literal index: xs[0] stands
+    return xs[0] + 100
+}
+
+func compound(i int) int {
+    var xs = []?int{3, 4}
+    var t = 1
+    if xs[i] != nil { t += xs[i] }
+    return t
+}
+
+func spelled() int {
+    var xs = []?int{1, 2}
+    if xs[1] == nil { return 0 }
+    return xs[0x1] + xs[0_1]        // the same location, spelled otherwise
+}
+
+func main() {
+    say slice_elem(1), field_of_elem(0), map_by_path(P{k: "a"})
+    say rewritten(0), literal_siblings(), compound(1), spelled()
+}

@@ -1,0 +1,145 @@
+// 71_zip — std/compress's zip archives: reading one made by another
+// implementation (Python's zipfile), building one and reading it back,
+// extracting to disk, and the refusals — a corrupt archive, a member past
+// the size bound, and a member name that would escape the target directory.
+use "std/compress"
+use "std/os"
+use "std/path"
+
+const FOX = "The quick brown fox jumps over the lazy dog\n"
+
+func main() {
+    say "-- reading a foreign archive --"
+    let z = must compress.zip_open(must unhex("504b03041400000000008318225000000000000000000000000005000000646f63732f504b030414000000080083182250b1977b4236000000700300000f000000646f63732f726561646d652e7478740bc94855282ccd4cce56482aca2fcf5348cbaf50c82acd2d2856c82f4b2d5228014ae72456552aa4e4a773858caa1d553baa9622b500504b03041400000000008318225088e2cece10000000100000000a00000073746f7265642e62696e000102030405060708090a0b0c0d0e0f504b0102140314000000000083182250000000000000000000000000050000000000000000000000800100000000646f63732f504b0102140314000000080083182250b1977b4236000000700300000f0000000000000000000000800123000000646f63732f726561646d652e747874504b010214031400000000008318225088e2cece10000000100000000a000000000000000000000080018600000073746f7265642e62696e504b05060000000003000300a8000000be0000000000"))
+    each e in z.entries {
+        say e.name, e.size, e.is_dir, e.compressed < e.size or e.size == 0 or e.name == "stored.bin"
+    }
+    say z.names()
+    say must z.read("docs/readme.txt") == str.repeat(FOX, 20)
+    say bytes(must z.read("stored.bin"))
+    say z.index("stored.bin"), z.index("nope")
+    match z.read("nope") {
+        Ok(s) => say "??"
+        Err(e) => say e.message()
+    }
+    match z.read("docs/readme.txt", 100) {
+        Ok(s) => say "??"
+        Err(e) => say e.message()
+    }
+
+    say "-- writing --"
+    var w = must compress.zip_create()
+    must w.add("a.txt", "alpha\n")
+    must w.add("big.txt", str.repeat(FOX, 1000), 9)
+    must w.add("raw.bin", must from_bytes([0, 1, 2, 255]), 0, 1600000000)
+    must w.add_dir("sub")
+    must w.add("sub/b.txt", "beta\n")
+    match w.add("bad/", "x") {
+        Ok(u) => say "??"
+        Err(e) => say e.message()
+    }
+    let bytes_out = must w.finish()
+    match w.add("late.txt", "x") {
+        Ok(u) => say "??"
+        Err(e) => say e.message()
+    }
+    let back = must compress.zip_open(bytes_out)
+    each e in back.entries { say e.name, e.size, e.is_dir }
+    say must back.read("a.txt"), len(must back.read("big.txt")), bytes(must back.read("raw.bin"))
+    let rawe = back.entries[back.index("raw.bin")]
+    say rawe.crc32 == compress.crc32(must from_bytes([0, 1, 2, 255]))
+    say len(bytes_out) < 1000 * len(FOX) ~/ 10
+
+    say "-- extracting --"
+    let dir = path.join(os.tempdir(), "voila_71_" || str(os.pid()))
+    say must back.extract_to(dir)
+    say must os.read(path.join(dir, "sub/b.txt")), os.isdir(path.join(dir, "sub"))
+    // the bound is on the TOTAL of the members, checked before any write
+    match back.extract_to(path.join(dir, "small"), 1000) {
+        Ok(n) => say "extracted?!", n
+        Err(e) => say e.message()
+    }
+    say os.exists(path.join(dir, "small"))
+    say len(must os.read(path.join(dir, "big.txt")))
+
+    say "-- refusals --"
+    match compress.zip_open("not a zip archive") {
+        Ok(a) => say "??"
+        Err(e) => say e.message()
+    }
+    match compress.zip_open("") {
+        Ok(a) => say "??"
+        Err(e) => say e.message()
+    }
+    // a corrupted member body fails its CRC check on read
+    let at = str.index(bytes_out, "alpha")
+    let corrupt = bytes_out[0..at] || "ALPHA" || bytes_out[at + 5..len(bytes_out)]
+    let cz = must compress.zip_open(corrupt)
+    match cz.read("a.txt") {
+        Ok(s) => say "??", s
+        Err(e) => say e.message()
+    }
+    // "../evil.txt" must not be written anywhere
+    let slip = must compress.zip_open(must unhex("504b0304140000000000831822508316dc8c01000000010000000b0000002e2e2f6576696c2e74787478504b01021403140000000000831822508316dc8c01000000010000000b00000000000000000000008001000000002e2e2f6576696c2e747874504b05060000000001000100390000002a0000000000"))
+    say slip.names()
+    let dir2 = path.join(dir, "slip")
+    match slip.extract_to(dir2) {
+        Ok(n) => say "extracted?!", n
+        Err(e) => say e.message()
+    }
+    say os.exists(path.join(dir, "evil.txt")), os.exists(dir2)
+    each name in ["/abs", "a/../../b", "a\\b", "./ok/./x", "", ".."] {
+        match compress.safe_path(name) {
+            Ok(p) => say "safe:", p
+            Err(e) => say e.message()
+        }
+    }
+
+    say "-- the whole archive is checked before anything is written --"
+    // a symbolic link member (Python's zipfile, Unix mode 0120777): refused,
+    // and the regular file before it is not written either
+    let zl = must compress.zip_open(must unhex("504b030414000000080083182250af5d682c0700000005000000060000006f6b2e7478744bcbcc4be50200504b030414000000080083182250036b40df1200000010000000040000006c696e6bd3d3d3d7d3d34f2d49d62f482c2e2e4f0100504b0102140314000000080083182250af5d682c0700000005000000060000000000000000000000a481000000006f6b2e747874504b0102140314000000080083182250036b40df1200000010000000040000000000000000000000ffa12b0000006c696e6b504b05060000000002000200660000005f0000000000"))
+    each e in zl.entries { say e.name, e.is_link, e.mode & 4095 }
+    let dl = path.join(dir, "links")
+    match zl.extract_to(dl) {
+        Ok(n) => say "extracted?!", n
+        Err(e) => say e.message()
+    }
+    say os.exists(dl)
+    // a member whose CRC fails, AFTER a good one: still nothing written
+    let zc = must compress.zip_open(must unhex("504b0304140000000800831822503e45977c0b0000001200000005000000612e7478744bcc29c848544844905c00504b030414000000080083182250841081e10b0000001200000005000000622e7478744b2a4a2ccb574842905c00504b01021403140000000800831822503e45977c0b00000012000000050000000000000000000000a48100000000612e747874504b0102140314000000080083182250841081e10b00000012000000050000000000000000000000a4812e000000622e747874504b05060000000002000200660000005c0000000000"))
+    let dc = path.join(dir, "crc")
+    match zc.extract_to(dc) {
+        Ok(n) => say "extracted?!", n
+        Err(e) => say e.message()
+    }
+    say os.exists(dc)
+    // sizes the directory lies about get a real message
+    let zz = must compress.zip_open(must unhex("504b030414000000080083182250e6c9413b0b0000000a000000020000006d30aba81805a360140c770000504b0102140314000000080083182250e6c9413b0b0000000a000000020000000000000000000000a481000000006d30504b05060000000001000100300000002b0000000000"))
+    match zz.read("m0") {
+        Ok(s) => say "read?!", len(s)
+        Err(e) => say e.message()
+    }
+    // Python's zipfile records a file as Unix mode 0600 with NO file-type
+    // bits: that is a regular file (Info-ZIP reads it so too), not a device
+    let zp = must compress.zip_open(must unhex("504b03041400000000004b9b505dec6e609f06000000060000000b0000006e6f7465732f612e747874616c7068610a504b03041400000000004b9b505dafa6baa606000000060000000b0000006e6f7465732f622e747874627261766f0a504b010214031400000000004b9b505dec6e609f06000000060000000b00000000000000000000008001000000006e6f7465732f612e747874504b010214031400000000004b9b505dafa6baa606000000060000000b000000000000000000000080012f0000006e6f7465732f622e747874504b05060000000002000200720000005e0000000000"))
+    each e in zp.entries { printf("%s %o %t\n", e.name, e.mode, e.is_link) }
+    let dp = path.join(dir, "python")
+    say must zp.extract_to(dp), must os.read(path.join(dp, "notes/b.txt")).trim()
+    // the DESTINATION is checked too, before anything is written: here a
+    // directory already stands where notes/b.txt would go
+    let dq = path.join(dir, "inway")
+    must os.mkdir_all(path.join(dq, "notes/b.txt"))
+    match zp.extract_to(dq) {
+        Ok(n) => say "extracted?!", n
+        Err(e) => say e.message().replace(dir, "DIR")
+    }
+    say os.exists(path.join(dq, "notes/a.txt"))
+    // safe_join is the check for a program that extracts by hand
+    say must compress.safe_join("out", "a/./b.txt")
+    match compress.safe_join("out", "../x") {
+        Ok(p) => say "joined?!", p
+        Err(e) => say e.message()
+    }
+    os.run("rm", ["-rf", dir])
+}

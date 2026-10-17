@@ -1,0 +1,15 @@
+// Two enums of one file share a variant name. Each enum is a namespace of its
+// own (§3.5), so both declarations are legal and the qualified spellings
+// work; only the BARE `Red` is ambiguous. `Green` is unique and stays legal
+// bare, and a local binding called `Light` is a value, not the enum.
+enum Light { Red, Green }
+enum Flag { Red, White }
+
+func main() {
+    let a = Light.Red
+    let b = Flag.Red
+    let c = Green
+    let d = Red
+    match a { Red => say "?"; _ => say "other" }
+    say a, b, c, d
+}

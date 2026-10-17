@@ -1,0 +1,6 @@
+// An open-ended range is a slice index, not a value of its own.
+func main() {
+    let xs = [1, 2, 3]
+    let rs = [1..]
+    say xs, rs
+}

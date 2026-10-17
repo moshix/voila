@@ -1,0 +1,65 @@
+// 78_tlsclose — closing a TLS connection whose peer has stopped reading
+// must not block: close_notify is sent best-effort and without waiting,
+// OUTSIDE the lock every close and shutdown in the process shares. Before,
+// one such peer (a "slow loris") held that lock for the whole send timeout
+// and froze every other close in the program, a server's included.
+//
+// The server writes until its send times out (the client reads nothing),
+// then closes; at the same moment another task opens and closes an
+// unrelated plain connection. Both closes must be quick. The bounds are
+// generous (a second, against a 1.5-second send timeout).
+use "std/net"
+use "std/str"
+use "std/time"
+use "std/tls"
+
+func ms() int { return time.now().unix_millis() }
+
+func main() {
+    let lis = must tls.listen("127.0.0.1:0", tls.Config{
+        cert_file: "tests/tls/server.pem", key_file: "tests/tls/server.key",
+        timeout_ms: 1500})
+    let addr = lis.addr()
+    let plain = must net.listen("127.0.0.1:0")
+    let paddr = plain.addr()
+    let stalled = chan[int](1)
+    let tls_ms = chan[int](1)
+    let plain_ms = chan[int](1)
+    group {
+        spawn {
+            var c = must lis.accept()
+            match c.write_all(str.repeat("x", 50000000)) {
+                Ok(u) => say "the peer read it all?!"
+                Err(e) => say "server write:", e.message()
+            }
+            stalled <- 1
+            let t0 = ms()
+            c.close()
+            tls_ms <- ms() - t0
+        }
+        spawn {
+            <-stalled
+            let x = must net.connect(paddr)
+            let t0 = ms()
+            x.close()
+            plain_ms <- ms() - t0
+        }
+        spawn {
+            match plain.accept() {
+                Ok(c) => c.close()
+                Err(e) => ()
+            }
+        }
+        // the client: connects, and never reads
+        var cl = must tls.connect(addr, tls.Config{server_name: "localhost",
+                                                   ca_file: "tests/tls/ca.pem",
+                                                   timeout_ms: 20000})
+        let a = <-tls_ms
+        let b = <-plain_ms
+        say "stalled TLS close was quick:", a < 1000
+        say "unrelated close meanwhile was quick:", b < 1000
+        cl.close()
+    }
+    lis.close()
+    plain.close()
+}

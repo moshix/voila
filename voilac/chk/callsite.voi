@@ -210,6 +210,8 @@ impl Checker {
         let n = self.T.Get(node)
         if n.Kind == ast.COMPOSITE {
             self.check_one_composite(node)
+        } else if n.Kind == ast.PSTRUCT {
+            self.check_struct_pattern(node)
         }
         if (n.Kind == ast.ARM or n.Kind == ast.IF) and n.Ival != 0 {
             self.walk_composites(n.Ival)
@@ -228,6 +230,19 @@ impl Checker {
             decl = self.excs[n.Sval]
         } else {
             return          // enums, generics-in-flight, foreign types
+        }
+
+        // A written type-argument list must match the declaration's.
+        let targs = self.T.NKids(n.Ival)
+        if targs > 0 and self.T.Kind(decl) == ast.STRUCTDEC {
+            let want = self.T.NKids(self.T.Kid(decl, 1))
+            if targs != want {
+                self.report_at(comp, "`" || n.Sval || "` takes " ||
+                    str(want) ||
+                    plural(want, " type argument", " type arguments") ||
+                    ", but " || str(targs) || plural(targs, " is", " are") ||
+                    " given")
+            }
         }
 
         var fields = set([])
@@ -255,6 +270,35 @@ impl Checker {
                 plural(nfields, " field", " fields") || ", but " ||
                 str(positional) || plural(positional, " value is",
                                           " values are") || " given")
+        }
+    }
+}
+
+impl Checker {
+    // check_struct_pattern judges `P{x: 0, y} =>` the way a composite
+    // literal is judged: the type must be a struct this program declares,
+    // and every field the pattern names must be one of its fields. At run
+    // time a missing field would simply never match, which is a bug the
+    // checker can see.
+    func check_struct_pattern(mut self, p int) {
+        let n = self.T.Get(p)
+        if not (n.Sval in self.structs) {
+            self.report_at(p, "`" || n.Sval || "` in a struct pattern is " ||
+                              "not a struct type")
+            return
+        }
+        var fields = set([])
+        each fd in self.T.Get(self.T.Kid(self.structs[n.Sval], 0)).Kids {
+            if self.T.Kind(fd) == ast.FIELDDECL {
+                fields.add(self.T.Get(fd).Sval)
+            }
+        }
+        each pf in n.Kids {
+            let fname = self.T.Get(pf).Sval
+            if not (fname in fields) {
+                self.report_at(pf, "`" || n.Sval || "` has no field `" ||
+                                   fname || "`")
+            }
         }
     }
 }

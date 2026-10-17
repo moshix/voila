@@ -1,0 +1,2 @@
+closurematch.voi:5:31: match on `C` is not exhaustive; missing cases: G, B
+closurematch.voi:6:13: match on `C` is not exhaustive; missing cases: G, B

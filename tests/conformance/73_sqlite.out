@@ -1,0 +1,59 @@
+true
+-- parameters --
+ada ok 1
+bob ok 1
+cy ok 1
+3 1
+stmt ok 1
+stmt ok 1
+stmt ok 1
+stmt ok 1
+stmt ok 1
+closed stmt ERR sqlite: the statement is closed
+-- columns --
+1 ada 36 [1, 0, 255] 9.5 19.99 false
+   {"id":1,"name":"ada","age":36,"pic":[1,0,255],"score":9.5,"price":"19.99"}
+2 bob 0 [] 0  true
+   {"id":2,"name":"bob","age":null,"pic":null,"score":null,"price":null}
+3 cy 1 [] 1  false
+   {"id":3,"name":"cy","age":1,"pic":null,"score":1,"price":null}
+blob [1, 0, 255]
+text ada
+6 6 4 -1
+KeyError: nope
+true
+0
+-- typed rows --
+User{id: 6, name: "user2", age: 22} user2
+User{id: 7, name: "user3", age: 23} user3
+User{id: 8, name: "user4", age: 24} user4
+User{id: 7, name: "zed", age: 0}
+decode: id: expected int, got string
+-- SQL functions --
+4 2020-02-29 ADA real
+decode: sqlite.decode: decodes one sqlite.Row, not a slice (decode each row of a query in turn)
+-- errors --
+syntax ERR sqlite: near "SELEKT": syntax error
+no table ERR sqlite: no such table: nope
+not null ERR sqlite: NOT NULL constraint failed: users.name
+too few ERR sqlite: the statement has 2 parameters, but 1 argument is given
+too many ERR sqlite: the statement has 1 parameter, but 2 arguments are given
+two stmts ERR sqlite: the SQL holds more than one statement (exec runs a script)
+empty ERR sqlite: the SQL holds no statement
+trailing ok ok 0
+exec: sqlite: table users already exists
+readonly: true
+-- transactions --
+changed my mind true false
+threw: boom
+true false
+true
+true
+5
+true
+commit: sqlite: cannot commit - no transaction is active
+-- tasks --
+100
+150
+1:25 2:25 3:25 4:25 5:25 6:25 
+closed db ERR sqlite: the database is closed

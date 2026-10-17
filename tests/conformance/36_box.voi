@@ -1,0 +1,113 @@
+// Box[T] (§6.3): an owned, unique heap indirection. It is what makes a
+// recursive sum type legal under the Acyclicity Rule, and it is transparent
+// to everything that reads a value — printing, equality, arithmetic, fields,
+// methods and pattern matching — while `get()` reads it and `set(v)`
+// replaces it in place. A million-cell list built through Box is freed
+// iteratively, without growing the C stack.
+
+enum Tree[T] { Leaf, Node(v T, l Box[Tree[T]], r Box[Tree[T]]) }
+enum List { Nil, Cons(head int, tail Box[List]) }
+struct LNode { v int, next ?Box[LNode] }
+struct Pt { x int, y int }
+impl Pt { func sum(self) int { return self.x + self.y } }
+
+func insert(t Tree[int], x int) Tree[int] {
+    return match t {
+        Leaf => Node(x, Box(Leaf), Box(Leaf))
+        Node(v, l, r) => if x < v {
+            Node(v, Box(insert(l.get(), x)), r)
+        } else {
+            Node(v, l, Box(insert(r.get(), x)))
+        }
+    }
+}
+
+func walk(t Tree[int], out mut []int) {
+    match t {
+        Leaf => return
+        Node(v, l, r) => {
+            walk(l.get(), out)
+            out.append(v)
+            walk(r.get(), out)
+        }
+    }
+}
+
+func depth(t Tree[int]) int {
+    return match t {
+        Leaf => 0
+        Node(_, l, r) => 1 + max(depth(l.get()), depth(r.get()))
+    }
+}
+
+func len_list(l List) int {
+    var n = 0
+    var cur = l
+    while true {
+        match cur {
+            Nil => break
+            Cons(_, t) => {
+                n += 1
+                cur = t.get()
+            }
+        }
+    }
+    return n
+}
+
+func main() {
+    var t = Leaf
+    each x in [5, 3, 8, 1, 4, 9] { t = insert(t, x) }
+    var xs = []int{}
+    walk(t, xs)
+    say xs, depth(t)
+    say t
+    // Patterns see through the Box at every level.
+    match t {
+        Node(5, Node(3, Node(1, Leaf, Leaf), _), _) => say "deep match"
+        _ => say "no match"
+    }
+
+    // A Box of a scalar and of a struct.
+    let b = Box(41)
+    say b, b.get() + 1, b + 1, b == Box(41), b != Box(40)
+    var bb = Box(1)
+    bb.set(2)
+    say bb.get()
+    let bp = Box(Pt{x: 3, y: 4})
+    say bp.x, bp.sum(), bp
+    let c = bp.clone()
+    say c == bp
+
+    // ?Box: an optional link, nil-terminated.
+    var n = LNode{v: 1, next: nil}
+    n = LNode{v: 2, next: Box(n)}
+    n = LNode{v: 3, next: Box(n)}
+    var total = 0
+    var cur ?Box[LNode] = Box(n)
+    while true {
+        match cur {
+            Some(node) => {
+                total += node.v
+                cur = node.next
+            }
+            nil => break
+        }
+    }
+    say total
+
+    // The zero value of a Box holds its element's zero.
+    var z Box[int]
+    say z
+
+    // A long list, built and dropped: destruction is iterative.
+    var l = Nil
+    var i = 0
+    while i < 1000000 {
+        l = Cons(i, Box(l))
+        i += 1
+    }
+    say len_list(l)
+    l = Nil
+    say "freed"
+}

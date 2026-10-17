@@ -1,0 +1,24 @@
+// Newtypes are distinct (§3.8): only an untyped LITERAL converts into one
+// implicitly, and a newtype's operators take two values of that newtype.
+type Cel int
+type Fah int
+func f(c Cel) int { return int(c) }
+func toint(n int) int { return n }
+func main() {
+    say f(Fah(3))
+    var c Cel = Fah(2)
+    let n = 4
+    let c2 Cel = n
+    let x int = Cel(3)
+    say Cel(1) + Fah(2)
+    say Cel(1) + 1
+    say Cel(1) == 1
+    say toint(Cel(2))
+    var acc = Cel(0)
+    acc += n
+    // Legal: literals convert, same-newtype operators, explicit conversion.
+    var lit Cel = 7
+    lit = 9
+    say f(3), f(Cel(n)), Cel(1) + Cel(2), Cel(5) > Cel(2), int(c2) + 1
+    say c, x, lit, acc
+}

@@ -1,0 +1,19 @@
+`str` has no method `lstrip`
+`str` has no method `len`
+`int` has no method `abs`
+`[]int` has no method `push`
+`map[str]int` has no method `contains`
+`P` has no method `nope`
+`E` has no method `nope`
+`Names` has no method `nope`
+`bump` writes its receiver (`mut self`), but `p` is a borrowed parameter
+!has no method `upper`
+!`[]int` has no method `len`
+!`[]int` has no method `contains`
+!has no method `has`
+!has no method `get`
+!has no method `str`
+!has no method `clone`
+!has no method `name`
+!has no method `join`
+!has no method `round`

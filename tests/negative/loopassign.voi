@@ -1,0 +1,27 @@
+// A closure captures each iteration's OWN copy of a loop variable, taken
+// when the closure is created (§10). A loop variable that is then ASSIGNED —
+// inside the closure or in the loop after it — would silently stop being
+// total, so that one case is refused, at the closure, by name. The
+// captures in `fine` are the legal counterparts: read-only loop variables,
+// a variable declared before the loop (one binding, total), and a `let`
+// copy of the assigned one.
+func fine() {
+    var total = 0
+    for i in 0..3 {
+        var acc = i
+        acc += 1
+        let snap = acc
+        let f = fn() int { total += i; return snap }
+        say f()
+    }
+    say total
+}
+
+func main() {
+    fine()
+    for i in 0..3 {
+        var c = 0
+        let f = fn() { c += 1 }
+        f()
+    }
+}

@@ -1,0 +1,428 @@
+// std/flag — typed command-line flags (§13.4).
+//
+//     use "std/flag"
+//
+//     func main() {
+//         flag.str("name|n", "world", "who to greet")
+//         flag.int("count", 1, "how many times")
+//         flag.bool("loud|l", false, "shout it")
+//         flag.dur("pause", time.Millisecond * 0, "wait between greetings")
+//         let opts = flag.parse()           // os.args(), --help, errors
+//         each i in 0..opts.int("count") {
+//             say "hello,", opts.str("name")
+//         }
+//         say opts.args()                  // the positional arguments
+//     }
+//
+// A flag is declared with a NAME, a DEFAULT and a line of HELP; the name may
+// carry a one-letter alias after a bar, "name|n". The default fixes the
+// flag's type: str, int, bool, float or dur (a duration, written `90s`,
+// `1m30s`, `250ms`). `flag.str` and the rest declare on the program's default
+// set and `flag.parse()` parses os.args() against it; `flag.set(prog, about)`
+// makes an independent Set with the same methods, whose `parse(args)`
+// returns an error VALUE instead of exiting — for tests, and for programs
+// with subcommands.
+//
+// The accepted spellings, for a flag `--name` with the alias `-n`:
+//
+//     --name=value   --name value   -n value   -n=value
+//     --verbose      (a bool alone is true)    --verbose=false   --no-verbose
+//     --             everything after it is positional, even `-x`
+//     -              alone, a positional argument (conventionally stdin)
+//
+// Flags and positional arguments may be interleaved. An undeclared flag, a
+// flag that wants a value and has none, and a value of the wrong type are
+// errors naming the flag. `--help` and `-h` print the usage — generated from
+// the declarations — unless the program declared flags of those names.
+//
+// os.args() does NOT include the program's own name: argument 0 is the first
+// thing the user typed after it, unlike C's argv and Go's os.Args. So the
+// whole of os.args() is what gets parsed, and the name in the usage line is
+// the one given to `flag.set`, or the base name of os.exe() by default.
+package flag
+
+use "std/os"
+use "std/time"
+
+// Flag is one declared flag.
+struct Flag {
+    name  str    // the long name, without dashes
+    short str    // the one-letter alias, or ""
+    kind  str    // "str", "int", "bool", "float" or "dur"
+    dflt  str    // the default, in the form a user would type it
+    help  str
+}
+
+// Set is a group of declared flags, and the program they belong to.
+struct Set {
+    prog  str
+    about str
+    flags []Flag
+}
+
+// Flags is what a parse produced: every flag's value — the default where the
+// command line did not set it — and the positional arguments.
+struct Flags {
+    vals  map[str]str     // long name → the value, as text
+    given set[str]        // the long names the command line set
+    kinds map[str]str     // long name → kind
+    rest  []str
+}
+
+// set makes an empty Set. `prog` is the name the usage line shows; `about`,
+// when not empty, is printed under it.
+func set(prog str, about str) Set {
+    return Set{prog: prog, about: about, flags: []}
+}
+
+// The default set, which the package-level functions declare on.
+var dflt_set = Set{prog: "", about: "", flags: []}
+
+// str declares a string flag on the default set.
+func str(name str, dflt str, help str) { dflt_set.str(name, dflt, help) }
+
+// int declares an integer flag on the default set.
+func int(name str, dflt int, help str) { dflt_set.int(name, dflt, help) }
+
+// bool declares a boolean flag on the default set.
+func bool(name str, dflt bool, help str) { dflt_set.bool(name, dflt, help) }
+
+// float declares a floating-point flag on the default set.
+func float(name str, dflt float, help str) { dflt_set.float(name, dflt, help) }
+
+// dur declares a duration flag on the default set.
+func dur(name str, dflt dur, help str) { dflt_set.dur(name, dflt, help) }
+
+// about sets the line of description the default set's usage prints.
+func about(text str) { dflt_set.about = text }
+
+// program sets the name the default set's usage line shows (the base name of
+// the executable when it is not set — under `voila run` that is the run
+// cache's name for the binary, so a script wants this).
+func program(name str) { dflt_set.prog = name }
+
+// parse parses os.args() against the default set. `--help` prints the usage
+// to standard output and exits 0; an error prints the message and the usage
+// to standard error and exits 2 — the conventional status for a usage error.
+func parse() Flags {
+    if dflt_set.prog == "" { dflt_set.prog = prog_name() }
+    return dflt_set.must_parse(os.args())
+}
+
+// usage is the default set's usage text.
+func usage() str {
+    if dflt_set.prog == "" { dflt_set.prog = prog_name() }
+    return dflt_set.usage()
+}
+
+// prog_name is the base name of the running executable.
+//
+// (This package declares functions named `str`, `int`, `bool` and `float`,
+// which a bare call inside it would reach instead of the conversions — so
+// nothing below converts with those names or qualifies with `str.`; method
+// calls such as `exe.last_index(…)` reach std/str's functions instead.)
+func prog_name() str {
+    let exe = os.exe()
+    let at = exe.last_index("/")
+    return exe[at + 1..len(exe)]
+}
+
+impl Set {
+    // str declares a string flag.
+    func str(mut self, name str, dflt str, help str) {
+        self.declare(name, "str", dflt, help)
+    }
+
+    // int declares an integer flag.
+    func int(mut self, name str, dflt int, help str) {
+        self.declare(name, "int", "{dflt}", help)
+    }
+
+    // bool declares a boolean flag.
+    func bool(mut self, name str, dflt bool, help str) {
+        self.declare(name, "bool", "{dflt}", help)
+    }
+
+    // float declares a floating-point flag.
+    func float(mut self, name str, dflt float, help str) {
+        self.declare(name, "float", "{dflt}", help)
+    }
+
+    // dur declares a duration flag.
+    func dur(mut self, name str, dflt dur, help str) {
+        self.declare(name, "dur", "{dflt}", help)
+    }
+
+    // declare records one flag. Declaring a name twice — or an alias two
+    // flags share — is a program bug, so it throws rather than letting the
+    // later declaration quietly win.
+    func declare(mut self, spec str, kind str, dflt str, help str) {
+        let (long, short, has) = spec.cut("|")
+        if long == "" {
+            throw ValueError{msg: "flag: a flag needs a name"}
+        }
+        if has and rune_len(short) != 1 {
+            throw ValueError{msg: "flag: the alias of `{long}` must be one " ||
+                                  "letter, not `{short}`"}
+        }
+        each f in self.flags {
+            if f.name == long or (short != "" and f.short == short) {
+                throw ValueError{msg: "flag: `{spec}` is declared twice"}
+            }
+        }
+        self.flags.append(Flag{name: long, short: short, kind: kind,
+                               dflt: dflt, help: help})
+    }
+
+    // parse parses `args` (os.args(), or any list) and returns the values,
+    // or an error value naming what was wrong. `--help` is the error
+    // "help requested", which must_parse turns into the usage text.
+    func parse(self, args []str) Flags throws ValueError {
+        var out = Flags{vals: make(map[str]str), given: set[str]{},
+                        kinds: make(map[str]str), rest: []}
+        each f in self.flags {
+            out.vals[f.name] = f.dflt
+            out.kinds[f.name] = f.kind
+        }
+        var i = 0
+        var only_args = false
+        while i < len(args) {
+            let a = args[i]
+            i += 1
+            if only_args or a == "-" or not a.starts_with("-") {
+                out.rest.append(a)
+                continue
+            }
+            if a == "--" {
+                only_args = true
+                continue
+            }
+            // Split `--name=value` / `-n=value`; note which spelling was used.
+            var body = a.trim_prefix("-")
+            var dashes = "-"
+            if body.starts_with("-") {
+                body = body.trim_prefix("-")
+                dashes = "--"
+            }
+            let (nm, inline, has_inline) = body.cut("=")
+            var f = self.find(nm)
+            var negated = false
+            if f.name == "" and nm.starts_with("no-") {
+                let g = self.find(nm.trim_prefix("no-"))
+                if g.kind == "bool" and not has_inline {
+                    f = g
+                    negated = true
+                }
+            }
+            if f.name == "" {
+                if nm == "help" or nm == "h" {
+                    return err("help requested")
+                }
+                return err("unknown flag {dashes}{nm}")
+            }
+            var val = inline
+            if f.kind == "bool" {
+                if negated {
+                    val = "false"
+                } else if not has_inline {
+                    val = "true"
+                }
+            } else if not has_inline {
+                if i >= len(args) {
+                    var article = "a"
+                    if f.kind == "int" { article = "an" }
+                    return err("flag --{f.name} needs {article} {f.kind} value")
+                }
+                val = args[i]
+                i += 1
+            }
+            try check_value(f, val)
+            out.vals[f.name] = val
+            out.given.add(f.name)
+        }
+        return out
+    }
+
+    // must_parse is parse for a program's own command line: `--help` prints
+    // the usage and exits 0, and an error prints itself and the usage to
+    // standard error and exits 2.
+    func must_parse(self, args []str) Flags {
+        match self.parse(args) {
+            Ok(fl) => return fl
+            Err(e) => {
+                if e.message() == "help requested" {
+                    os.stdout.write(self.usage())
+                    os.exit(0)
+                }
+                os.stderr.write("{self.prog}: {e.message()}\n")
+                os.stderr.write(self.usage())
+                os.exit(2)
+            }
+        }
+        return Flags{vals: make(map[str]str), given: set[str]{},
+                     kinds: make(map[str]str), rest: []}
+    }
+
+    // find is the flag a command-line name spells — long or alias — or an
+    // empty Flag.
+    func find(self, nm str) Flag {
+        each f in self.flags {
+            if f.name == nm or (f.short != "" and f.short == nm) { return f }
+        }
+        return Flag{name: "", short: "", kind: "", dflt: "", help: ""}
+    }
+
+    // usage renders the help text: the usage line, the description, and one
+    // aligned line per flag with its type and its default.
+    func usage(self) str {
+        var b = "usage: {self.prog} [flags] [args]\n"
+        if self.about != "" { b = b || "\n{self.about}\n" }
+        var heads = []
+        var width = 0
+        var all = self.flags
+        if self.find("help").name == "" {
+            all.append(Flag{name: "help", short: "h", kind: "bool",
+                            dflt: "false", help: "show this help and exit"})
+        }
+        each f in all {
+            var h = "    "
+            if f.short != "" { h = "-" || f.short || ", " }
+            h = h || "--" || f.name
+            if f.kind != "bool" { h = h || " " || f.kind }
+            heads.append(h)
+            if rune_len(h) > width { width = rune_len(h) }
+        }
+        b = b || "\nflags:\n"
+        each i, f in all {
+            var line = "  " || pad(heads[i], width) || "  " || f.help
+            if f.kind == "str" and f.dflt != "" {
+                line = line || " (default \"" || f.dflt || "\")"
+            } else if f.kind != "str" and f.kind != "bool" {
+                line = line || " (default " || f.dflt || ")"
+            } else if f.kind == "bool" and f.dflt == "true" {
+                line = line || " (default true)"
+            }
+            b = b || line || "\n"
+        }
+        return b
+    }
+}
+
+// check_value refuses a value that is not of its flag's type.
+//
+// Every message in this package is built with `err`, never `errf`: they
+// quote what the user typed, and errf would read a `%` in it as a printf
+// verb and throw a FormatError instead of returning the error.
+func check_value(f Flag, val str) unit! {
+    if f.kind == "int" {
+        match to_int(val) {
+            nil => return err("flag --{f.name}: `{val}` is not an int")
+            n   => return ()
+        }
+    }
+    if f.kind == "float" {
+        match to_float(val) {
+            nil => return err("flag --{f.name}: `{val}` is not a number")
+            x   => return ()
+        }
+    }
+    if f.kind == "bool" {
+        if val != "true" and val != "false" {
+            return err("flag --{f.name}: `{val}` is not true or false")
+        }
+    }
+    if f.kind == "dur" {
+        match parse_dur(val) {
+            Ok(d)  => return ()
+            Err(e) => return err("flag --{f.name}: {e.message()}")
+        }
+    }
+    return ()
+}
+
+// parse_dur reads a duration the way one prints: a sequence of a whole
+// number and a unit — `ns`, `us` (or `µs`), `ms`, `s`, `m`, `h` — such as
+// `1h30m`, `90s` or `250ms`. A bare number has no unit and is refused, since
+// `5` could mean five of anything. `0` alone is allowed.
+func parse_dur(s str) dur throws ValueError {
+    if s == "0" { return time.Nanosecond * 0 }
+    if s == "" { return err("`` is not a duration") }
+    var total = 0
+    var i = 0
+    let bs = bytes(s)
+    while i < len(bs) {
+        var n = 0
+        var digits = 0
+        while i < len(bs) and bs[i] >= 48 and bs[i] <= 57 {
+            n = n * 10 + (bs[i] - 48)
+            digits += 1
+            i += 1
+        }
+        if digits == 0 { return err("`{s}` is not a duration") }
+        // The unit is the run of non-digits that follows, as a byte slice of
+        // s (so `µs`, two bytes in UTF-8, is one unit).
+        let ustart = i
+        while i < len(bs) and (bs[i] < 48 or bs[i] > 57) { i += 1 }
+        let u = s[ustart..i]
+        var scale = 0
+        if u == "ns" { scale = 1 }
+        if u == "us" or u == "µs" { scale = 1000 }
+        if u == "ms" { scale = 1000000 }
+        if u == "s" { scale = 1000000000 }
+        if u == "m" { scale = 60000000000 }
+        if u == "h" { scale = 3600000000000 }
+        if scale == 0 {
+            if u == "" {
+                return err("`{s}` needs a unit (ms, s, m, h)")
+            }
+            return err("`{s}`: unknown unit `{u}`")
+        }
+        total += n * scale
+    }
+    return time.Nanosecond * total
+}
+
+impl Flags {
+    // str is a str flag's value (any flag's value, as typed).
+    func str(self, name str) str { return self.raw(name) }
+
+    // int is an int flag's value.
+    func int(self, name str) int {
+        let v = self.raw(name)
+        return to_int(v) else 0
+    }
+
+    // bool is a bool flag's value.
+    func bool(self, name str) bool { return self.raw(name) == "true" }
+
+    // float is a float flag's value.
+    func float(self, name str) float {
+        let v = self.raw(name)
+        return to_float(v) else 0.0
+    }
+
+    // dur is a dur flag's value.
+    func dur(self, name str) dur {
+        match parse_dur(self.raw(name)) {
+            Ok(d)  => return d
+            Err(e) => return time.Nanosecond * 0
+        }
+        return time.Nanosecond * 0
+    }
+
+    // has reports whether the command line set the flag (rather than its
+    // default standing).
+    func has(self, name str) bool { return name in self.given }
+
+    // args are the positional arguments, in order.
+    func args(self) []str { return self.rest }
+
+    // raw is a flag's value as text. Asking for a flag that was never
+    // declared is a program bug, so it throws.
+    func raw(self, name str) str {
+        if not (name in self.vals) {
+            throw ValueError{msg: "flag: no flag `{name}` was declared"}
+        }
+        return self.vals[name]
+    }
+}

@@ -1,0 +1,5 @@
+// `..=` needs an upper bound; an open slice runs with `..`.
+func main() {
+    let s = "abc"
+    say s[1..=], s[..=]
+}

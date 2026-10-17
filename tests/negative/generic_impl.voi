@@ -1,0 +1,32 @@
+// A generic trait is implemented and bounded at AS MANY arguments as it
+// declares, and a type may implement one generic trait at several arguments
+// only when the impls write different methods: dispatch is by (type, name),
+// so a second `into` could never be reached. A bound naming the trait at
+// arguments the type does not implement it at is refused at the explicit
+// instantiation.
+//
+// Legal, and must stay silent: a marker trait at two arguments, a full
+// impl, a where clause, and the matching instantiation.
+trait Into[T] { func into(self) T }
+trait Tag[T] { }
+
+type Cel int
+struct P { x int }
+
+impl Into[str] for Cel { func into(self) str { return "c" } }
+impl Into[int] for Cel { func into(self) int { return 1 } }
+impl Into for P { func into(self) int { return 2 } }
+impl Into[int] for Q { func into(self) int { return 3 } }
+impl Tag[int] for P { }
+impl Tag[str] for P { }
+
+struct Q { n int }
+
+func show[T: Into[str]](x T) str { return x.into() }
+func bare[T: Into](x T) str { return "" }
+func fine[T](x T) str where T: Into[str] { return x.into() }
+
+func main() {
+    say show[Q](Q{n: 1})
+    say fine[Cel](Cel(1))
+}

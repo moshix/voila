@@ -1,0 +1,7 @@
+narrow.voi:8:12: `?int` is used in arithmetic
+narrow.voi:14:16: `?int` is used in arithmetic
+narrow.voi:23:12: `?int` is used in arithmetic
+narrow.voi:30:12: `?int` is used in arithmetic
+narrow.voi:37:12: `?int` is used in arithmetic
+narrow.voi:46:12: `?int` is used in arithmetic
+!narrow.voi:52:

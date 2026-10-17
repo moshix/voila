@@ -1,0 +1,10 @@
+`link "../evil"` must name a library
+`quad` is not a C type an ffi block knows (§12)
+`void` is not a parameter type
+the only foreign ABI is "C" (§12)
+!`size_t` is not a C type
+!`uint8_t` is not a C type
+!`double` is not a C type
+!`bool` is not a C type
+!`u8` is not a C type
+!`link "z"`

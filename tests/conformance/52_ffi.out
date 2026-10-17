@@ -1,0 +1,25 @@
+5 0 42 2.5 65
+true
+nil true
+17 str|42|3.142|A|-7
+10 no varargs
+true true -1
+0 true
+0 true
+255 -12
+3405691582 190 202 -54
+-2 65534
+1.5 0.25
+-9000000000
+true
+[1, 2, 3] 3 16
+Pair{a: 7, b: 2.5} 16
+caught: ffi: 8 bytes at offset 60 run past a block of 64 bytes
+caught: ffi: negative offset -1
+caught: ffi: NULL pointer dereference
+caught: integer overflow: 300 is out of range for u8
+caught: ffi: offset 65 is outside a block of 64 bytes
+caught: ffi.alloc: a size of -1 bytes
+caught: ffi.sizeof: `quad` is not a C type this package knows
+hi 2
+done

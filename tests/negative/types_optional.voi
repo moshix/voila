@@ -1,0 +1,27 @@
+// `nil` inhabits only `?T` (§4), and a `?T` is not a `T` until it is
+// unwrapped (§3.5). A `?T` straight from a call is judged; a NAME holding
+// one is not (it is ordinarily narrowed first, and the checker does not
+// follow that flow — the `!` lines).
+struct P { x int }
+func maybe(n int) ?int {
+    if n < 0 { return nil }
+    return n
+}
+func want(n int) int { return n }
+func give() int { return nil }
+func pt() P { return maybe(1) }
+func main() {
+    let a int = nil
+    let b int = to_int("5")
+    say want(maybe(3))
+    say maybe(2) + 1
+    var p P = nil
+    // Legal: unwrapped, narrowed, compared, optional holes.
+    let c int = must maybe(4)
+    let d = maybe(5) else 0
+    let e ?int = nil
+    let v = maybe(6)
+    if v != nil { say want(v) }
+    if let Some(w) = maybe(7) { say want(w) }
+    say maybe(8) == 8, a, b, c, d, e, p
+}

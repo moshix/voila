@@ -1,0 +1,15 @@
+// A package that declares a generic trait and a trait with a static method,
+// implements both, and exports generic functions over them — one of which
+// calls the static method through its type parameter, so it takes a hidden
+// type descriptor that an importer's call must supply.
+package kit
+
+trait Make { func make_one() Self }
+trait Conv[T] { func conv(self) T }
+
+struct Gadget { n int }
+impl Make for Gadget { func make_one() Self { return Self{n: 1} } }
+impl Conv[str] for Gadget { func conv(self) str { return "gadget{self.n}" } }
+
+func Build[T: Make]() T { return T.make_one() }
+func Show[T](x T) str where T: Conv[str] { return x.conv() }

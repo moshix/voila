@@ -1,0 +1,6 @@
+// The block after `else` must yield a value or diverge; an empty one does
+// neither.
+func main() {
+    let n = to_int("x") else { }
+    say n
+}

@@ -1,0 +1,48 @@
+-- pax (Python tarfile, PAX_FORMAT) --
+  file      640 1600000000  10 deep/nnnnnnnnnnnnnnn...(129 bytes)
+  file      640 1600000000   6 short.txt
+  dir       755 1600000000   0 adir/
+  symlink   644 1600000000   0 link -> short.txt
+true long name
+
+-- gnu (Python tarfile, GNU_FORMAT) --
+  file      640 1600000000  10 deep/nnnnnnnnnnnnnnn...(129 bytes)
+  file      640 1600000000   6 short.txt
+  dir       755 1600000000   0 adir/
+  symlink   644 1600000000   0 link -> short.txt
+true
+-- round trip --
+0 6144
+  dir       755 1700000000   0 top/
+  file      644 1700000000   6 top/a.txt
+  file      644 0   0 top/empty
+  file      644 0   4 top/bin
+  symlink   777 0   0 top/ln -> a.txt
+  file      644 0 1000 pppppppppppppppppppp...(211 bytes)
+true [0, 255, 128, 10]
+true 6
+0 0
+-- extracting --
+compress: refusing to extract top/ln: a symlink, not a file or a directory
+false
+2
+deeper
+compress: refusing unsafe member name ../escape.txt
+false
+compress: a is both a file and a directory
+compress: d is both a file and a directory
+false
+file ok.txt
+other pipe
+compress: refusing to extract pipe: a special file (a device or a FIFO), not a file or a directory
+compress: tar: members exceed the limit of 5 bytes
+-- refusals --
+compress: tar: header checksum mismatch at byte 0 (corrupt archive, or not a tar archive)
+compress: tar: truncated header at byte 512
+compress: tar: truncated header at byte 0
+compress: tar: members exceed the limit of 500 bytes
+compress: tar: bad octal checksum field
+compress: tar: name ...(340 bytes)
+compress: tar: d: only a file has data
+compress: tar: cannot write a member of kind fifo (f)
+compress: tar: a member has no name

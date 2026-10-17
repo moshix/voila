@@ -1,0 +1,5 @@
+// A tuple position is plain decimal digits.
+func main() {
+    let t = (1, 2)
+    say t.1_0
+}

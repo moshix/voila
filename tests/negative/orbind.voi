@@ -1,0 +1,10 @@
+// Every alternative of an or-pattern must bind the same names: the arm
+// reads `n`, which the second alternative would leave unset.
+enum E { A(n int), B(m int) }
+
+func main() {
+    let e = A(1)
+    match e {
+        A(n) | B(m) => say "one of them"
+    }
+}

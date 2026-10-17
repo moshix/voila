@@ -1,0 +1,148 @@
+// 70_compress — std/compress's codecs: deflate, zlib and gzip, one-shot and
+// streamed, against data made by OTHER implementations (Python's zlib and
+// gzip, i.e. zlib itself) as well as round trips; strict decoding; and the
+// decompression-bomb bound.
+use "std/compress"
+use "std/io"
+use "std/os"
+use "std/path"
+
+const FOX = "The quick brown fox jumps over the lazy dog\n"
+
+func show(what str, r str!) {
+    match r {
+        Ok(s) => say what, "ok", len(s)
+        Err(e) => say what, "ERR", e.message()
+    }
+}
+
+func main() {
+    // ---- interop: streams made by zlib decode here, byte for byte
+    say "-- interop --"
+    say must compress.gunzip(must unhex("1f8b08000000000002ff0bc94855282ccd4cce56482aca2fcf5348cbaf50c82acd2d2856c82f4b2d5228014ae72456552aa4e4a773010038c1936d2c000000")) == FOX
+    say must compress.unzlib(must unhex("789c0bc94855282ccd4cce56482aca2fcf5348cbaf50c82acd2d2856c82f4b2d5228014ae72456552aa4e4a77301006bc00fe4")) == FOX
+    say must compress.inflate(must unhex("0bc94855282ccd4cce56482aca2fcf5348cbaf50c82acd2d2856c82f4b2d5228014ae72456552aa4e4a7730100")) == FOX
+    // two gzip members concatenated read as one stream, as gunzip does
+    say must compress.gunzip(must unhex("1f8b08000000000002ff2b482c2a51c8cf4be502000ca13df9090000001f8b08000000000002ff2b482c2a512829cfe70200e7013d9709000000"))
+    say compress.crc32(FOX), compress.adler32(FOX)
+    // the running forms continue a checksum piece by piece
+    say compress.crc32(FOX[10..len(FOX)], compress.crc32(FOX[0..10])) == compress.crc32(FOX)
+    say compress.adler32(FOX[3..len(FOX)], compress.adler32(FOX[0..3])) == compress.adler32(FOX)
+
+    // ---- round trips at every level, and binary data
+    say "-- round trips --"
+    var bin = []
+    var i = 0
+    while i < 4096 {
+        bin.append((i * 7 + i ~/ 13) % 256)
+        i += 1
+    }
+    let data = must from_bytes(bin) || str.repeat(FOX, 200)
+    var lv = 0
+    while lv <= 9 {
+        let g = must compress.gzip(data, lv)
+        let z = must compress.zlib(data, lv)
+        let d = must compress.deflate(data, lv)
+        say lv, must compress.gunzip(g) == data, must compress.unzlib(z) == data,
+            must compress.inflate(d) == data, len(g) < len(data) or lv == 0
+        lv += 2
+    }
+    // equal input, equal output: the gzip header carries no name or time
+    say must compress.gzip(data) == must compress.gzip(data)
+    say len(must compress.gzip("")), must compress.gunzip(must compress.gzip("")) == ""
+    show("level 10", compress.gzip(data, 10))
+    show("level -1", compress.zlib(data, 0 - 1))
+
+    // ---- strict decoding: every corruption is an error, never a crash
+    say "-- corrupt input --"
+    let g = must compress.gzip(data)
+    show("garbage", compress.gunzip("this is not gzip at all"))
+    show("empty", compress.gunzip(""))
+    show("truncated", compress.gunzip(g[0..len(g) ~/ 2]))
+    show("no trailer", compress.gunzip(g[0..len(g) - 4]))
+    let flipped = g[0..len(g) - 6] || "X" || g[len(g) - 5..len(g)]
+    show("bad crc", compress.gunzip(flipped))
+    show("trailing", compress.unzlib(must compress.zlib(FOX) || "junk"))
+    // (a str is bytes; "\u{ff}" would be the TWO bytes of U+00FF in UTF-8)
+    show("bad zlib", compress.unzlib(must from_bytes([120, 156]) || "nonsense"))
+    show("reserved block type", compress.inflate(must from_bytes([255, 255, 255, 255])))
+    show("truncated block", compress.inflate(must from_bytes([195, 191])))
+    show("gzip as zlib", compress.unzlib(g))
+    var mangled = 0
+    var k = 12
+    while k < len(g) - 8 {
+        // a byte changed anywhere in the body must not crash the decoder
+        let bad = g[0..k] || "\u{0}" || g[k + 1..len(g)]
+        match compress.gunzip(bad) {
+            Ok(s) => if s != data { mangled += 1 }
+            Err(e) => mangled += 1
+        }
+        k += 97
+    }
+    say "mangled copies refused or changed:", mangled > 0
+
+    // ---- the bomb bound: output past max stops with an error
+    say "-- limits --"
+    let bomb = must compress.gzip(str.repeat("\u{0}", 10000000))
+    say len(bomb) < 20000
+    show("bomb, 1 MiB max", compress.gunzip(bomb, 1048576))
+    show("bomb, exact max", compress.gunzip(bomb, 10000000))
+    show("bomb, no limit", compress.gunzip(bomb, 0))
+    show("negative max", compress.gunzip(bomb, 0 - 5))
+    show("inflate max", compress.inflate(must compress.deflate(data), 10))
+
+    // ---- streams: an io.Writer that compresses, an io.Reader that decodes
+    say "-- streams --"
+    let dir = path.join(os.tempdir(), "voila_70_" || str(os.pid()))
+    must os.mkdir_all(dir)
+    let p = path.join(dir, "log.gz")
+    var w = must compress.gzip_writer(must io.writer(must os.create(p)))
+    var n = 0
+    while n < 500 {
+        must w.write_all("line {n}\n")
+        n += 1
+    }
+    must w.flush()
+    must w.close()
+    // the file is a plain gzip file: the one-shot decoder agrees
+    let whole = must compress.gunzip(must os.read(p))
+    say len(whole), whole[0..7]
+    var r = must compress.gunzip_reader(must io.reader(must os.open(p)))
+    var count = 0
+    var last = ""
+    each line in r {
+        count += 1
+        last = line
+    }
+    say count, last
+    // read_all, and the zlib and raw framings through the same machinery
+    var r2 = must compress.unzlib_reader(must io.reader(must os.open(p)))
+    show("gzip file as zlib stream", r2.read_all())
+    let pz = path.join(dir, "data.z")
+    var wz = must compress.zlib_writer(must io.writer(must os.create(pz)), 9)
+    must wz.write_all(data)
+    must wz.close()
+    say must compress.unzlib(must os.read(pz)) == data
+    var rz = must compress.unzlib_reader(must io.reader(must os.open(pz)))
+    say must rz.read_all() == data
+    let pr = path.join(dir, "data.raw")
+    var wr = must compress.deflate_writer(must io.writer(must os.create(pr)))
+    must wr.write_all(data)
+    must wr.close()
+    var rr = must compress.inflate_reader(must io.reader(must os.open(pr)))
+    say must rr.read_all() == data
+    // a write after close is an error, and a second close is harmless
+    match w.write_all("more") {
+        Ok(u) => say "write after close accepted?!"
+        Err(e) => say "write after close:", e.message()
+    }
+    must w.close()
+    // a reader bounded below the data's size stops with an error
+    var rb = must compress.gunzip_reader(must io.reader(must os.open(p)), 100)
+    show("bounded stream", rb.read_all())
+    // a truncated file is an error at the point the data runs out
+    must os.write(p, must os.read(p)[0..40])
+    var rt = must compress.gunzip_reader(must io.reader(must os.open(p)))
+    show("truncated stream", rt.read_all())
+    os.run("rm", ["-rf", dir])
+}

@@ -1,0 +1,1596 @@
+// chk/infer.voi — the expression TYPE INFERENCE and the ONE assignability
+// verdict that chk/expr.voi's checks ask (§3, §5).
+//
+// The design is bidirectional local inference:
+//
+//   · SYNTHESIS (ty_of) works an expression's type out bottom-up — literals,
+//     names, operators, calls, fields, collection and composite literals,
+//     closures, `if`/`match` values — and answers 0, UNKNOWN, wherever the
+//     information is genuinely not there: an untyped JSON value, a native
+//     whose result no table states, a generic parameter nothing pinned down,
+//     a pattern bind the subject does not explain.
+//   · CHECKING (expr.voi's check_hole) pushes an EXPECTED type down into the
+//     forms that have no type of their own until they are put somewhere — an
+//     untyped literal, a bare `[…]`, an `if`/`match` value, a tuple — and
+//     judges everything else by asking `bad(want, got, e)`.
+//
+// UNKNOWN IS COMPATIBLE WITH EVERYTHING. That is the soundness rule, and it
+// points in one direction on purpose: a false error rejects a working
+// program, which is worse than a missed one. So `bad` is a positive test for
+// a KNOWN-bad pair — two types this program can see whole and that §3 says
+// do not fit — and every doubt (a generic parameter, a trait-typed value
+// whose run-time type is not written, a std package's opaque type, an
+// exception, a handle, an unknown) answers "fits".
+//
+// GENERICS are instantiated by UNIFICATION at the call site (instantiate):
+// each parameter type is matched against its argument's type, binding the
+// function's type parameters left to right, and the call's later arguments
+// and its result are judged at the substituted types. A binding taken from
+// an untyped numeric literal is WEAK — a later numeric argument may widen it
+// — because `mx(1, 2.5)` is a float call, not an int call with a bad second
+// argument. Inside a generic body, a parameter's type `T` is compatible with
+// everything; only method calls on it are judged, against its bounds.
+//
+// Inferred types are MEMOISED per node (tyMemo). Each expression node lives
+// in one scope, so its type is a function of the node alone; the cache is
+// what keeps nested calls from re-inferring their arguments once per level.
+package chk
+
+use "voilac/ast"
+use "voilac/low"
+use "voilac/tok"
+use "voilac/typ"
+use "std/str"
+
+// MInfo is what method resolution learns about `recv.m(…)`.
+//
+//   known    the receiver's type is one whose method set this program can
+//            see whole, so "no such method" is a fact
+//   found    the method exists
+//   fn       its FUNC node when it is declared in Voilà (0 for a builtin)
+//   names    the generic parameters the signature is written in, paired
+//   args     … positionally with the receiver's type arguments
+//   res      the result type of a builtin method (0 unknown / declared)
+//   elem     for a builtin collection method, the element type an argument
+//            must fit (0 when nothing is judged)
+//   what     the receiver's type, spelled for a diagnostic
+struct MInfo {
+    known bool
+    found bool
+    fn    int
+    names []str
+    args  []int
+    res   int
+    elem  int
+    what  str
+}
+
+func no_info() MInfo {
+    return MInfo{known: false, found: false, fn: 0, names: [], args: [],
+                 res: 0, elem: 0, what: ""}
+}
+
+impl Checker {
+    // ------------------------------------------------------------ tables
+
+    // collect_infer_tables indexes the declarations the inference consults:
+    // aliases and newtypes (TYPEDEC without a struct), and the variant →
+    // enum map. A variant name two enums declare is AMBIGUOUS bare (§3.5)
+    // and maps to "", which types it as unknown.
+    func collect_infer_tables(mut self) {
+        each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
+            let n = self.T.Get(d)
+            if n.Kind == ast.TYPEDEC and self.T.Kid(d, 0) == 0 {
+                if n.Ival2 == 1 {
+                    self.aliasOf[n.Sval] = n.Ival
+                } else {
+                    self.ntUnder[n.Sval] = n.Ival
+                }
+            }
+        }
+        each en in self.eNames {
+            each v in self.T.Get(self.T.Kid(self.enums[en], 0)).Kids {
+                let vn = self.T.Get(v).Sval
+                if vn in self.varEnum {
+                    if self.varEnum[vn] != en { self.varEnum[vn] = "" }
+                } else {
+                    self.varEnum[vn] = en
+                }
+                self.varDecl[vn] = v
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ canon
+
+    // canon resolves ALIASES anywhere inside a type: `type UserID = int`
+    // makes `[]UserID` the same type as `[]int` (§3.8). A newtype is NOT
+    // resolved — it is a distinct type, and that is the point of it.
+    func canon(mut self, id int) int {
+        if id == 0 { return 0 }
+        if id in self.canonMemo { return self.canonMemo[id] }
+        let t = self.Ty.Get(id)
+        var out = id
+        if t.Kind == typ.TK_NAMED and t.Name in self.aliasOf {
+            // An alias of an alias resolves in turn; a cycle (rejected by
+            // the loader) would recurse, so the entry is primed first.
+            self.canonMemo[id] = id
+            out = self.canon(self.Ty.FromAST(self.T, self.aliasOf[t.Name]))
+            if out == 0 { out = id }
+        } else if t.Kind != typ.TK_ERROR and t.Kind != typ.TK_PARAM {
+            var args = []
+            var changed = false
+            each a in t.Args {
+                let c = self.canon(a)
+                if c != a { changed = true }
+                args.append(c)
+            }
+            let e = self.canon(t.Elem)
+            let k = self.canon(t.Key)
+            let r = self.canon(t.Res)
+            if e != t.Elem or k != t.Key or r != t.Res { changed = true }
+            if changed {
+                out = self.Ty.Make(t.Kind, t.Name, e, k, r, args, t.Flag)
+            }
+        }
+        self.canonMemo[id] = out
+        return out
+    }
+
+    // ------------------------------------------------------------ kinds
+
+    func named(self, id int) str {
+        if id == 0 { return "" }
+        let t = self.Ty.Get(id)
+        if t.Kind != typ.TK_NAMED { return "" }
+        return t.Name
+    }
+
+    func is_newtype(self, name str) bool { return name in self.ntUnder }
+
+    // is_box_named reports whether a nominal is the predeclared Box[T] —
+    // which a program's own `Box` declaration shadows (§6.3).
+    func is_box_named(self, name str) bool {
+        return name == "Box" and not (name in self.structs) and
+               not (name in self.enums)
+    }
+
+    // solid_name: a nominal this checker knows the whole story of — a
+    // primitive, a struct, an enum or a newtype. Not an exception (the
+    // `error` subtyping is not modelled), not a trait, not the builtin Box,
+    // not a std package's opaque type.
+    func solid_name(self, name str) bool {
+        if name == "" { return false }
+        if typ.IsPrimitive(name) { return name != "unit" }
+        if name in self.excs { return false }
+        if name in self.traits { return false }
+        if name in self.structs or name in self.enums { return true }
+        return self.is_newtype(name)
+    }
+
+    func is_num_ty(self, id int) bool { return is_numeric(self.named(id)) }
+
+    // underlying is a newtype's representation type, aliases resolved.
+    func underlying(mut self, name str) int {
+        if not (name in self.ntUnder) { return 0 }
+        return self.canon(self.Ty.FromAST(self.T, self.ntUnder[name]))
+    }
+
+    // ------------------------------------------------------------ literals
+
+    // is_lit reports whether e is an UNTYPED literal (§3.2, §3.8): a number,
+    // a string, a rune or a bool, possibly negated. Its type is settled by
+    // where it is put, not by itself.
+    func is_lit(self, e int) bool {
+        if e == 0 { return false }
+        let k = self.T.Kind(e)
+        if k == ast.INT or k == ast.FLOAT or k == ast.DEC or k == ast.STR or
+           k == ast.RUNE or k == ast.BOOL {
+            return true
+        }
+        if k == ast.UNARY and self.T.Get(e).Ival == tok.MINUS {
+            return self.is_lit(self.T.Kid(e, 0))
+        }
+        return false
+    }
+
+    // lit_kind is the base kind of a literal: INT, FLOAT, DEC, STR, RUNE or
+    // BOOL, through any negation; 0 otherwise.
+    func lit_kind(self, e int) int {
+        if e == 0 { return 0 }
+        let n = self.T.Get(e)
+        if n.Kind == ast.UNARY and n.Ival == tok.MINUS {
+            return self.lit_kind(self.T.Kid(e, 0))
+        }
+        if self.is_lit(e) { return n.Kind }
+        return 0
+    }
+
+    // lit_fits reports whether an untyped literal can be stored where a
+    // value of nominal `want` is expected — the numeric half is the
+    // lattice's (§3.2: an int literal fits every numeric type, its RANGE is
+    // judged by check_lattice), the rest is the literal's own kind.
+    func lit_fits(mut self, lk int, want str) bool {
+        if want in self.ntUnder {
+            // A literal converts to a newtype implicitly when it would fit
+            // the representation (§3.8: `var c Cel = 5`).
+            return self.lit_fits(lk, self.named(self.underlying(want)))
+        }
+        if lk == ast.INT or lk == ast.RUNE { return is_numeric(want) }
+        if lk == ast.FLOAT { return want == "float" or want == "f32" }
+        if lk == ast.DEC { return want == "dec" }
+        if lk == ast.STR { return want == "str" }
+        if lk == ast.BOOL { return want == "bool" }
+        return true
+    }
+
+    // ------------------------------------------------------------ synthesis
+
+    // ty_of is the inferred type of e in env, memoised. 0 is "unknown".
+    func ty_of(mut self, e int, env map[str]int) int {
+        if e == 0 { return 0 }
+        if e in self.tyMemo { return self.tyMemo[e] - 1 }
+        let t = self.canon(self.ty_raw(e, env))
+        self.tyMemo[e] = t + 1
+        return t
+    }
+
+    func ty_raw(mut self, e int, env map[str]int) int {
+        let n = self.T.Get(e)
+        let k = n.Kind
+
+        if k == ast.INT   { return self.Ty.Nominal("int") }
+        if k == ast.FLOAT { return self.Ty.Nominal("float") }
+        if k == ast.DEC   { return self.Ty.Nominal("dec") }
+        if k == ast.RUNE  { return self.Ty.Nominal("rune") }
+        if k == ast.BOOL  { return self.Ty.Nominal("bool") }
+        if k == ast.STR or k == ast.INTERP { return self.Ty.Nominal("str") }
+        if k == ast.NILLIT { return 0 }
+        if k == ast.SELF  { return self.eSelf }
+        if k == ast.IDENT { return self.ident_ty(n.Sval, env) }
+        if k == ast.COMPOSITE { return self.Ty.FromAST(self.T, n.Ival) }
+        if (k == ast.SLICELIT or k == ast.MAPLIT) and n.Ival != 0 {
+            return self.Ty.FromAST(self.T, n.Ival)
+        }
+        if k == ast.SLICELIT {
+            if len(n.Kids) == 0 { return 0 }
+            return self.Ty.MkSlice(self.join_all(n.Kids, env))
+        }
+        if k == ast.TUPLE {
+            var ms = []
+            each el in n.Kids {
+                ms.append(self.ty_of(el, env))
+            }
+            return self.Ty.MkTuple(ms)
+        }
+        if k == ast.UNARY {
+            let op = n.Ival
+            if op == tok.NOT { return self.Ty.Nominal("bool") }
+            let x = self.ty_of(self.T.Kid(e, 0), env)
+            if op == tok.ARROW {
+                // `<-ch` receives the channel's element.
+                if x != 0 and self.Ty.Kind(x) == typ.TK_CHAN {
+                    return self.Ty.Get(x).Elem
+                }
+                return 0
+            }
+            if op == tok.MINUS or op == tok.TILDE {
+                let xn = self.named(x)
+                if is_numeric(xn) or self.is_newtype(xn) { return x }
+            }
+            return 0
+        }
+        if k == ast.BINARY { return self.binary_ty(e, env) }
+        if k == ast.INDEX  { return self.index_ty(e, env) }
+        if k == ast.FIELD  { return self.field_ty(e, env) }
+        if k == ast.CALL   { return self.call_ty(e, env) }
+        if k == ast.CLOSURE { return self.closure_ty(e) }
+        if k == ast.MUSTEXPR or k == ast.TRYEXPR {
+            // Both unwrap one `?T`/`T!` layer.
+            return self.unwrap(self.ty_of(self.T.Kid(e, 0), env))
+        }
+        if k == ast.ELSEEXPR {
+            return self.unwrap(self.ty_of(self.T.Kid(e, 0), env))
+        }
+        if k == ast.IF or k == ast.MATCH {
+            return self.join_all(self.yields(e), env)
+        }
+        return 0
+    }
+
+    // ident_ty: a binding's type, else a top-level function as a VALUE (its
+    // signature, when it is not generic), else a payload-less variant (its
+    // enum), else unknown.
+    func ident_ty(mut self, name str, env map[str]int) int {
+        if name in env { return env[name] }
+        if name in self.funcs {
+            let fn = self.funcs[name]
+            if self.T.NKids(self.T.Kid(fn, 3)) != 0 { return 0 }
+            return self.fn_sig_ty(fn)
+        }
+        if name in self.varEnum and self.varEnum[name] != "" {
+            let vd = self.varDecl[name]
+            if self.T.NKids(self.T.Kid(vd, 0)) == 0 {
+                return self.Ty.Nominal(self.varEnum[name])
+            }
+        }
+        return 0
+    }
+
+    // fn_sig_ty is a declared function's type, `fn(P…) R`. A parameter with
+    // a default or a variadic one makes the arity a range, which a TK_FN
+    // cannot say — unknown then.
+    func fn_sig_ty(mut self, fn int) int {
+        var ps = []
+        each p in self.T.Get(self.T.Kid(fn, 1)).Kids {
+            let pn = self.T.Get(p)
+            if (pn.Ival2 & 16) != 0 or self.T.Kid(p, 0) != 0 { return 0 }
+            ps.append(self.Ty.FromAST(self.T, pn.Ival))
+        }
+        return self.Ty.MkFn(ps, self.results_ty(fn))
+    }
+
+    // results_ty is a function's result as ONE type: its single result, a
+    // tuple for several, 0 for none (or `unit`).
+    func results_ty(mut self, fn int) int {
+        let rl = self.T.Kid(fn, 2)
+        if self.T.NKids(rl) > 1 {
+            var ms = []
+            each r in self.T.Get(rl).Kids {
+                ms.append(self.Ty.FromAST(self.T, r))
+            }
+            return self.Ty.MkTuple(ms)
+        }
+        return self.single_result(fn)
+    }
+
+    // closure_ty: a closure literal's `fn(P…) R`. A closure that writes no
+    // result may still yield one (§10), so its result is unknown, not none.
+    func closure_ty(mut self, e int) int {
+        var ps = []
+        each p in self.T.Get(self.T.Kid(e, 1)).Kids {
+            if self.T.Kind(p) != ast.PARAM { continue }
+            let pn = self.T.Get(p)
+            if (pn.Ival2 & 16) != 0 or self.T.Kid(p, 0) != 0 { return 0 }
+            ps.append(self.Ty.FromAST(self.T, pn.Ival))
+        }
+        let rt = self.T.Get(e).Ival
+        var r = 0
+        if rt != 0 and not (self.T.Kind(rt) == ast.TNAMED and
+                            self.T.Get(rt).Sval == "unit") {
+            r = self.Ty.FromAST(self.T, rt)
+        }
+        return self.Ty.MkFn(ps, r)
+    }
+
+    // ------------------------------------------------------------ joins
+
+    // join_all is the one type several values share — the members of a
+    // bare `[…]`, the branches of an `if`/`match` value — or 0 when any is
+    // unknown or two do not agree. Untyped numeric literals take the type
+    // of the typed members beside them, and numeric types join along the
+    // lattice (§3.2).
+    func join_all(mut self, es []int, env map[str]int) int {
+        var out = 0
+        var litOnly = true
+        var litTy = 0
+        each x in es {
+            let t = self.ty_of(x, env)
+            if t == 0 { return 0 }
+            if self.is_lit(x) {
+                if litTy == 0 {
+                    litTy = t
+                } else if litTy != t {
+                    litTy = self.num_join(litTy, t)
+                    if litTy == 0 { return 0 }
+                }
+                continue
+            }
+            litOnly = false
+            if out == 0 {
+                out = t
+            } else if out != t {
+                out = self.num_join(out, t)
+                if out == 0 { return 0 }
+            }
+        }
+        if litOnly { return litTy }
+        if litTy != 0 and litTy != out {
+            // A literal beside typed members: it takes their type when it
+            // fits (`[x, 1]` with x u8), and is otherwise a disagreement.
+            if self.is_num_ty(litTy) and self.is_num_ty(out) { return out }
+            return 0
+        }
+        return out
+    }
+
+    // num_join widens two numeric types to the one both convert to
+    // implicitly (§3.2), or 0.
+    func num_join(self, a int, b int) int {
+        let an = self.named(a)
+        let bn = self.named(b)
+        if not is_numeric(an) or not is_numeric(bn) { return 0 }
+        if an == bn { return a }
+        // The strict lattice first, so that `u8` and `int` join to `int`.
+        if widens_to(an, bn) { return b }
+        if widens_to(bn, an) { return a }
+        if widens_ok(an, bn) { return b }
+        if widens_ok(bn, an) { return a }
+        return 0
+    }
+
+    // yields lists the expressions an `if`/`match` VALUE yields: the last
+    // statement of each branch or arm, through nested `if`/`match`/blocks,
+    // diverging branches (return/throw/break/continue) left out (§5.3).
+    func yields(self, e int) []int {
+        var out = []
+        self.collect_yields(e, out)
+        return out
+    }
+
+    func collect_yields(self, e int, out mut []int) {
+        if e == 0 { return }
+        let k = self.T.Kind(e)
+        if k == ast.IF {
+            self.yield_of_block(self.T.Kid(e, 1), out)
+            let el = self.T.Kid(e, 2)
+            if el != 0 and self.T.Kind(el) == ast.IF {
+                self.collect_yields(el, out)
+            } else {
+                self.yield_of_block(el, out)
+            }
+            return
+        }
+        if k == ast.MATCH {
+            each a in self.T.Get(self.T.Kid(e, 1)).Kids {
+                self.yield_of_block(self.T.Kid(a, 1), out)
+            }
+        }
+    }
+
+    // yield_of_block appends the value a branch BLOCK (or an arm's statement
+    // LIST) yields — its final statement's.
+    func yield_of_block(self, b int, out mut []int) {
+        if b == 0 { return }
+        let ks = self.T.Get(b).Kids
+        if len(ks) == 0 { return }
+        let last = ks[len(ks) - 1]
+        let k = self.T.Kind(last)
+        if k == ast.EXPRSTMT {
+            out.append(self.T.Kid(last, 0))
+        } else if k == ast.IF or k == ast.MATCH {
+            self.collect_yields(last, out)
+        } else if k == ast.BLOCK {
+            self.yield_of_block(last, out)
+        }
+    }
+
+    // ------------------------------------------------------------ operators
+
+    // binary_ty: comparisons and logic are bool, `||` is str (it converts
+    // both operands to their string form — manual 4.3), `/` is exact
+    // division (a float, or a dec), and the other arithmetic widens along
+    // the lattice; a newtype's arithmetic is the newtype (§3.8).
+    func binary_ty(mut self, e int, env map[str]int) int {
+        let op = self.T.Get(e).Ival
+        if is_bool_op(op) { return self.Ty.Nominal("bool") }
+        if op == tok.CONCAT { return self.Ty.Nominal("str") }
+        if op == tok.ARROW { return 0 }
+        let l = self.T.Kid(e, 0)
+        let r = self.T.Kid(e, 1)
+        let lt = self.ty_of(l, env)
+        let rt = self.ty_of(r, env)
+        if lt == 0 or rt == 0 { return 0 }
+        // An operand that is an optional is a value here — the arithmetic
+        // was judged on it (an unnarrowed `?T` is refused there) — so
+        // `x + 1` for a narrowed `x ?int` is an int.
+        let ln = self.named(self.box_inner(self.peel(lt)))
+        let rn = self.named(self.box_inner(self.peel(rt)))
+        if self.is_newtype(ln) or self.is_newtype(rn) {
+            if ln != rn { return 0 }
+            if op == tok.SLASH {
+                let u = self.named(self.underlying(ln))
+                if u == "dec" { return self.Ty.Nominal("dec") }
+                return self.Ty.Nominal("float")
+            }
+            return self.Ty.Nominal(ln)
+        }
+        if not is_numeric(ln) or not is_numeric(rn) { return 0 }
+        if op == tok.SLASH {
+            if ln == "dec" or rn == "dec" { return self.Ty.Nominal("dec") }
+            return self.Ty.Nominal("float")
+        }
+        if op == tok.SHL or op == tok.SHR or op == tok.AMP or
+           op == tok.PIPE or op == tok.CARET {
+            return self.Ty.Nominal(ln)
+        }
+        // An untyped literal takes the type beside it (§3.2's sized rule).
+        if self.is_lit(l) and not self.is_lit(r) { return self.Ty.Nominal(rn) }
+        if self.is_lit(r) and not self.is_lit(l) { return self.Ty.Nominal(ln) }
+        let j = self.num_join(self.Ty.Nominal(ln), self.Ty.Nominal(rn))
+        if j != 0 { return j }
+        // int with float computes in float (manual 4.2, rule 5).
+        if ln == "float" or rn == "float" {
+            if ln != "dec" and rn != "dec" { return self.Ty.Nominal("float") }
+        }
+        return 0
+    }
+
+    // box_inner looks through Box[T] to T — a Box is transparent to
+    // arithmetic, comparison, fields and methods (§6.3).
+    func box_inner(self, id int) int {
+        if id == 0 { return 0 }
+        let t = self.Ty.Get(id)
+        if t.Kind == typ.TK_NAMED and self.is_box_named(t.Name) and
+           len(t.Args) == 1 {
+            return t.Args[0]
+        }
+        if t.Kind == typ.TK_BORROW { return t.Elem }
+        return id
+    }
+
+    // index_ty: `xs[i]` is the element, `s[i]` a byte (int), `m[k]` the
+    // value, `t.0` the member; a RANGE index slices, keeping the type.
+    func index_ty(mut self, e int, env map[str]int) int {
+        let n = self.T.Get(e)
+        if len(n.Kids) != 2 { return 0 }
+        var bt = self.box_inner(self.ty_of(n.Kids[0], env))
+        if bt == 0 { return 0 }
+        let bn = self.named(bt)
+        if self.is_newtype(bn) { bt = self.box_inner(self.underlying(bn)) }
+        if bt == 0 { return 0 }
+        let t = self.Ty.Get(bt)
+        let ix = n.Kids[1]
+        let isRange = self.T.Kind(ix) == ast.RANGE
+        if t.Kind == typ.TK_TUPLE {
+            if self.T.Kind(ix) != ast.INT { return 0 }
+            let at = to_int(self.T.Get(ix).Sval)
+            if at == nil or at < 0 or at >= len(t.Args) { return 0 }
+            return t.Args[at]
+        }
+        if t.Kind == typ.TK_SLICE {
+            if isRange { return self.Ty.MkSlice(t.Elem) }
+            return t.Elem
+        }
+        if t.Kind == typ.TK_MAP {
+            // An absent key yields nil (manual 5.4); the value is typed as
+            // V all the same — a lookup is ordinarily known to hit, and
+            // calling it `?V` would accuse every one.
+            return t.Elem
+        }
+        if t.Kind == typ.TK_NAMED and t.Name == "str" {
+            if isRange { return bt }
+            return self.Ty.Nominal("int")
+        }
+        return 0
+    }
+
+    // field_ty is the type of `x.f`: a struct's declared field with the
+    // receiver's type arguments substituted (`Stack[int]`'s `items []T` is
+    // `[]int`), through a Box and a newtype over a struct. `Enum.Variant`
+    // written qualified is the enum.
+    func field_ty(mut self, e int, env map[str]int) int {
+        let recv = self.T.Kid(e, 0)
+        let fname = self.T.Get(e).Sval
+        if self.T.Kind(recv) == ast.IDENT {
+            let qn = self.T.Get(recv).Sval
+            if not (qn in env) and qn in self.enums {
+                let full = self.variant_name(qn || "." || fname)
+                if full in self.varDecl { return self.Ty.Nominal(qn) }
+            }
+        }
+        var rt = self.box_inner(self.ty_of(recv, env))
+        if rt == 0 { return 0 }
+        var tn = self.named(rt)
+        if self.is_newtype(tn) {
+            rt = self.box_inner(self.underlying(tn))
+            tn = self.named(rt)
+        }
+        if tn == "" { return 0 }
+        let t = self.Ty.Get(rt)
+        let k = tn || "|" || fname
+        if not (k in self.flds) { return 0 }
+        self.Ty.PushParams(self.decl_params(tn))
+        let ft = self.Ty.FromAST(self.T, self.T.Get(self.flds[k]).Ival)
+        self.Ty.PopParams()
+        return self.subst_all(ft, self.decl_params(tn), t.Args)
+    }
+
+    // ------------------------------------------------------------ calls
+
+    // call_ty is the type of a call's value.
+    func call_ty(mut self, e int, env map[str]int) int {
+        let callee = self.T.Kid(e, 0)
+        if callee == 0 { return 0 }
+        let ck = self.T.Kind(callee)
+        if ck == ast.IDENT {
+            let nm = self.T.Get(callee).Sval
+            if nm in env {
+                let ft = env[nm]
+                if ft != 0 and self.Ty.Kind(ft) == typ.TK_FN {
+                    return self.Ty.Get(ft).Res
+                }
+                return 0
+            }
+            if nm in self.funcs {
+                let fn = self.funcs[nm]
+                if self.T.NKids(self.T.Kid(fn, 3)) == 0 {
+                    return self.results_ty(fn)
+                }
+                let binds = self.instantiate(e, fn, env, 0)
+                return self.subst_binds(self.gen_result(fn), binds,
+                                        self.generic_names(self.T.Kid(fn, 3)))
+            }
+            if nm in self.varEnum and self.varEnum[nm] != "" {
+                return self.Ty.Nominal(self.varEnum[nm])
+            }
+            return self.builtin_call_ty(nm, e, env)
+        }
+        if ck == ast.INDEX {
+            // `f[int](x)`: an explicit instantiation.
+            let ib = self.T.Kid(callee, 0)
+            if self.T.Kind(ib) == ast.IDENT {
+                let nm = self.T.Get(ib).Sval
+                if not (nm in env) and nm in self.funcs {
+                    let fn = self.funcs[nm]
+                    let binds = self.instantiate(e, fn, env, callee)
+                    return self.subst_binds(self.gen_result(fn), binds,
+                                        self.generic_names(self.T.Kid(fn, 3)))
+                }
+            }
+            return 0
+        }
+        if ck != ast.FIELD {
+            // A call through a value: `f(x)(y)`, `fs[0](x)`.
+            let ft = self.ty_of(callee, env)
+            if ft != 0 and self.Ty.Kind(ft) == typ.TK_FN {
+                return self.Ty.Get(ft).Res
+            }
+            return 0
+        }
+        let mn = self.T.Get(callee).Sval
+        let recv = self.T.Kid(callee, 0)
+        if self.T.Kind(recv) == ast.IDENT {
+            let qn = self.T.Get(recv).Sval
+            if not (qn in env) {
+                // `Enum.Variant(…)`, `Type.static()`, `str.upper(s)`.
+                if qn in self.enums {
+                    let full = self.variant_name(qn || "." || mn)
+                    if full in self.varDecl { return self.Ty.Nominal(qn) }
+                }
+                if qn == "str" and not ("str" in self.funcs) {
+                    return self.str_fn_ty(mn)
+                }
+                if self.solid_name(qn) or qn in self.excs {
+                    let k = qn || "|" || mn
+                    if k in self.mset {
+                        return self.self_subst(self.single_result(self.mset[k]),
+                                               qn)
+                    }
+                    return 0
+                }
+                if qn in self.sdC and not (qn in self.sdUser) and
+                   not (qn in self.funcs) and
+                   self.ident_ty(qn, env) == 0 {
+                    // A C-native std package's function: its result type
+                    // where the runtime states one (std_fn_ty).
+                    return self.std_fn_ty(qn || "." || mn)
+                }
+                if not (qn in self.funcs) and self.ident_ty(qn, env) == 0 {
+                    return 0                    // a package member
+                }
+            }
+        }
+        let rt = self.ty_of(recv, env)
+        if rt == 0 { return 0 }
+        let mi = self.method_info(rt, mn)
+        if not mi.found { return 0 }
+        if mi.fn == 0 { return self.builtin_method_res(rt, mn, e, env) }
+        self.Ty.PushParams(mi.names)
+        let r = self.single_result(mi.fn)
+        self.Ty.PopParams()
+        return self.subst_all(r, mi.names, mi.args)
+    }
+
+    // self_subst replaces `Self` — a trait method's own spelling of the
+    // implementing type, which a default body keeps — by the type itself.
+    func self_subst(mut self, id int, tn str) int {
+        if id == 0 { return 0 }
+        return self.Ty.Subst(id, "Self", self.Ty.Nominal(tn))
+    }
+
+    // gen_result is a GENERIC function's result type, read with its own
+    // type parameters in scope so that `T` interns as a parameter.
+    func gen_result(mut self, fn int) int {
+        self.Ty.PushParams(self.generic_names(self.T.Kid(fn, 3)))
+        let r = self.results_ty(fn)
+        self.Ty.PopParams()
+        return r
+    }
+
+    // builtin_call_ty: the conversions (`int(x)`, a newtype's `Cel(x)`, an
+    // alias), `Box(v)`, `make(T)`, and the prelude natives whose result is
+    // a fact of the language rather than of their argument.
+    func builtin_call_ty(mut self, nm str, e int, env map[str]int) int {
+        if nm in self.natShadow and not (nm in self.ntUnder) and
+           not (nm in self.aliasOf) {
+            return 0
+        }
+        if typ.IsPrimitive(nm) or nm in self.ntUnder or nm in self.aliasOf {
+            return self.Ty.Nominal(nm)
+        }
+        let args = self.T.Get(self.T.Kid(e, 1)).Kids
+        var a0 = 0
+        if len(args) > 0 { a0 = self.ty_of(self.T.Kid(args[0], 0), env) }
+        if nm == "Box" and self.is_box_named("Box") {
+            if a0 == 0 { return 0 }
+            return self.Ty.MkNamed("Box", [a0])
+        }
+        if nm == "make" {
+            let tl = self.T.Kid(e, 2)
+            if self.T.NKids(tl) == 0 { return 0 }
+            return self.Ty.FromAST(self.T, self.T.Kid(tl, 0))
+        }
+        if nm == "chan" {
+            // `chan[int](n)`: the element type is the call's type argument.
+            let tl = self.T.Kid(e, 2)
+            if self.T.NKids(tl) != 1 { return 0 }
+            let et = self.Ty.FromAST(self.T, self.T.Kid(tl, 0))
+            if et == 0 { return 0 }
+            return self.Ty.Make(typ.TK_CHAN, "", et, 0, 0, [], 0)
+        }
+        if nm == "set" and a0 != 0 and self.Ty.Kind(a0) == typ.TK_SLICE {
+            return self.Ty.MkSet(self.Ty.Get(a0).Elem)
+        }
+        if nm == "keys" and a0 != 0 and self.Ty.Kind(a0) == typ.TK_MAP {
+            return self.Ty.MkSlice(self.Ty.Get(a0).Key)
+        }
+        if nm == "values" and a0 != 0 and self.Ty.Kind(a0) == typ.TK_MAP {
+            return self.Ty.MkSlice(self.Ty.Get(a0).Elem)
+        }
+        if nm == "len" { return self.Ty.Nominal("int") }
+        if nm == "to_int" { return self.Ty.MkOption(self.Ty.Nominal("int")) }
+        if nm == "to_float" {
+            return self.Ty.MkOption(self.Ty.Nominal("float"))
+        }
+        if nm == "sprintf" { return self.Ty.Nominal("str") }
+        if nm in self.natBare { return self.str_fn_ty(nm) }
+        return 0
+    }
+
+    // str_fn_ty is the result of a std/str function (bare, `str.f(s)` or
+    // `s.f()`): written down here for the ones whose result is a fixed
+    // type, unknown for the rest.
+    func str_fn_ty(mut self, nm str) int {
+        if nm == "upper" or nm == "lower" or nm == "title" or nm == "trim" or
+           nm == "trim_left" or nm == "trim_right" or nm == "strip" or
+           nm == "pad" or nm == "pad_left" or nm == "center" or
+           nm == "substr" or nm == "left" or nm == "right" or nm == "join" or
+           nm == "replace" or nm == "replace_n" or nm == "repeat" or
+           nm == "reverse" or nm == "translate" or nm == "overlay" or
+           nm == "insert" or nm == "delstr" or nm == "word" or
+           nm == "subword" or nm == "delword" or nm == "hex" or
+           nm == "b64" or nm == "from_runes" or nm == "trim_prefix" or
+           nm == "trim_suffix" {
+            return self.Ty.Nominal("str")
+        }
+        if nm == "split" or nm == "split_n" or nm == "lines" or
+           nm == "fields" or nm == "words" {
+            return self.Ty.MkSlice(self.Ty.Nominal("str"))
+        }
+        if nm == "contains" or nm == "starts_with" or nm == "ends_with" or
+           nm == "equal_fold" or nm == "is_digit" or nm == "is_alpha" or
+           nm == "is_space" or nm == "is_upper" or nm == "valid_utf8" {
+            return self.Ty.Nominal("bool")
+        }
+        if nm == "index" or nm == "last_index" or nm == "count" or
+           nm == "rune_len" {
+            return self.Ty.Nominal("int")
+        }
+        if nm == "runes" { return self.Ty.MkSlice(self.Ty.Nominal("rune")) }
+        return 0
+    }
+
+    // std_fn_ty is the result type of a C-native std function, as the
+    // runtime's own header comments state it (runtime/src/std.c), for the
+    // ones whose result is one fixed type; unknown for the rest — a native
+    // whose answer depends on its argument, or returns an opaque handle.
+    func std_fn_ty(mut self, full str) int {
+        let s = self.Ty.Nominal("str")
+        let i = self.Ty.Nominal("int")
+        let b = self.Ty.Nominal("bool")
+        let f = self.Ty.Nominal("float")
+        let ss = self.Ty.MkSlice(s)
+        if full == "os.exists" or full == "os.isdir" or full == "os.isatty" or
+           full == "regex.matches" or full == "crypto.equal" {
+            return b
+        }
+        if full == "os.pid" or full == "os.mtime" or full == "os.size" or
+           full == "os.run" or full == "crypto.random_int" or
+           full == "rand.int" {
+            return i
+        }
+        if full == "os.exe" or full == "os.tempdir" or
+           full == "fmt.sprintf" or full == "fmt.comma" or
+           full == "fmt.pad" or full == "fmt.pad_left" or
+           full == "fmt.center" or full == "fmt.table" or
+           full == "regex.replace" or full == "json.encode" or
+           full == "json.pretty" or full == "uuid.new" or
+           full == "crypto.md5" or full == "crypto.sha1" or
+           full == "crypto.sha256" or full == "crypto.sha512" or
+           full == "crypto.hmac_md5" or full == "crypto.hmac_sha1" or
+           full == "crypto.hmac_sha256" or full == "crypto.hmac_sha512" {
+            return s
+        }
+        if full == "os.args" or full == "regex.find_all" or
+           full == "regex.split" {
+            return ss
+        }
+        if full == "os.env" { return self.Ty.MkOption(s) }
+        if full == "os.environ" { return self.Ty.MkMap(s, s) }
+        if full == "os.read" or full == "os.cwd" or full == "os.hostname" or
+           full == "os.realpath" or full == "os.input" {
+            return self.Ty.Make(typ.TK_RESULT, "", s, 0, 0, [], 0)
+        }
+        if full == "os.listdir" {
+            return self.Ty.Make(typ.TK_RESULT, "", ss, 0, 0, [], 0)
+        }
+        if full == "os.copy" {
+            return self.Ty.Make(typ.TK_RESULT, "", i, 0, 0, [], 0)
+        }
+        if full == "os.run_capture" {
+            let t = self.Ty.MkTuple([i, s, s])
+            return self.Ty.Make(typ.TK_RESULT, "", t, 0, 0, [], 0)
+        }
+        if full == "math.sqrt" or full == "math.sin" or full == "math.cos" or
+           full == "math.tan" or full == "math.asin" or full == "math.acos" or
+           full == "math.atan" or full == "math.ln" or full == "math.log2" or
+           full == "math.log10" or full == "math.exp" or
+           full == "math.pow" or full == "math.hypot" or
+           full == "rand.float" {
+            return f
+        }
+        return 0
+    }
+
+    // ------------------------------------------------------------ generics
+
+    // instantiate unifies a GENERIC function's parameter types with a call's
+    // argument types and returns the bindings, parameter name → type.
+    // `ix` is the INDEX of an explicit instantiation (`f[int](x)`), whose
+    // written arguments bind first. Positional arguments only: a named or a
+    // spread one stops the walk, and what was bound so far stands.
+    func instantiate(mut self, call int, fn int, env map[str]int,
+                     ix int) map[str]int {
+        var binds = make(map[str]int)
+        let gens = self.generic_names(self.T.Kid(fn, 3))
+        if ix != 0 {
+            var i = 1
+            while i < self.T.NKids(ix) and i - 1 < len(gens) {
+                let a = self.T.Kid(ix, i)
+                var at = 0
+                if self.T.Kind(a) == ast.IDENT {
+                    let an = self.T.Get(a).Sval
+                    if self.Ty.Resolves(an) or self.Ty.IsParam(an) {
+                        at = self.Ty.Nominal(an)
+                    }
+                } else {
+                    at = self.Ty.FromAST(self.T, a)
+                }
+                if at != 0 { binds[gens[i - 1]] = self.canon(at) }
+                i += 1
+            }
+        }
+        self.Ty.PushParams(gens)
+        let ps = self.T.Get(self.T.Kid(fn, 1)).Kids
+        let argl = self.T.Get(self.T.Kid(call, 1)).Kids
+        var soft = set([])
+        var nilFor = set([])
+        each i, a in argl {
+            let an = self.T.Get(a)
+            if an.Ival == 1 or an.Sval != "" { break }
+            if i >= len(ps) { break }
+            let pn = self.T.Get(ps[i])
+            if (pn.Ival2 & 16) != 0 { break }
+            let pt = self.Ty.FromAST(self.T, pn.Ival)
+            let v = self.T.Kid(a, 0)
+            if self.T.Kind(v) == ast.NILLIT and pt != 0 and
+               self.Ty.Kind(pt) == typ.TK_PARAM {
+                // `pick(nil, 3)`: nil says the parameter is an OPTIONAL.
+                nilFor.add(self.Ty.Get(pt).Name)
+            }
+            self.unify(pt, self.ty_of(v, env), binds, soft, self.is_lit(v))
+        }
+        self.Ty.PopParams()
+        each g in gens {
+            if g in nilFor and g in binds and
+               self.Ty.Kind(binds[g]) != typ.TK_OPTION {
+                binds[g] = self.Ty.MkOption(binds[g])
+            }
+        }
+        return binds
+    }
+
+    // unify matches a parameter type against an argument type, binding the
+    // generic parameters it finds. A binding is never REPLACED except a
+    // soft one (from an untyped literal) by a wider numeric type.
+    func unify(mut self, pt int, at int, binds mut map[str]int,
+               soft mut set[str], lit bool) {
+        if pt == 0 or at == 0 { return }
+        let p = self.Ty.Get(pt)
+        if p.Kind == typ.TK_PARAM {
+            if len(p.Args) != 0 { return }
+            if not (p.Name in binds) {
+                binds[p.Name] = at
+                if lit { soft.add(p.Name) }
+                return
+            }
+            // A binding an untyped numeric literal made gives way to a
+            // typed number (`mx(1, x)` with x float is a float call), and to
+            // a literal of a wider kind (`mx(1, 2.5)`).
+            let old = binds[p.Name]
+            if p.Name in soft and self.is_num_ty(old) and self.is_num_ty(at) {
+                if not lit {
+                    var j = self.num_join(old, at)
+                    if j == 0 { j = at }
+                    binds[p.Name] = j
+                    soft.remove(p.Name)
+                } else if is_int_type(self.named(old)) and
+                          not is_int_type(self.named(at)) {
+                    binds[p.Name] = at
+                }
+            }
+            return
+        }
+        let a = self.Ty.Get(self.box_inner(at))
+        if p.Kind == typ.TK_BORROW {
+            self.unify(p.Elem, at, binds, soft, lit)
+            return
+        }
+        if p.Kind == typ.TK_OPTION {
+            if a.Kind == typ.TK_OPTION {
+                self.unify(p.Elem, a.Elem, binds, soft, false)
+            } else {
+                self.unify(p.Elem, at, binds, soft, lit)
+            }
+            return
+        }
+        if p.Kind != a.Kind { return }
+        if p.Kind == typ.TK_NAMED and p.Name != a.Name { return }
+        self.unify(p.Elem, a.Elem, binds, soft, false)
+        self.unify(p.Key, a.Key, binds, soft, false)
+        self.unify(p.Res, a.Res, binds, soft, false)
+        var i = 0
+        while i < len(p.Args) and i < len(a.Args) {
+            self.unify(p.Args[i], a.Args[i], binds, soft, false)
+            i += 1
+        }
+    }
+
+    // subst_binds applies instantiate's bindings to a type, in the
+    // generic list's DECLARATION order (`names`) — never the map's, whose
+    // order is nondeterministic: a bound type may itself mention a type
+    // parameter of the caller spelled like one of the callee's, and then
+    // the order of the substitutions is part of the answer.
+    func subst_binds(mut self, id int, binds map[str]int,
+                     names []str) int {
+        if id == 0 { return 0 }
+        var out = id
+        each k in names {
+            if k in binds { out = self.Ty.Subst(out, k, binds[k]) }
+        }
+        return out
+    }
+
+    // ------------------------------------------------------------ methods
+
+    // method_info resolves `m` on a receiver of type rt. See MInfo.
+    // data_field reports whether struct field `k` ("Type|field") is declared
+    // with a type that can never be called: a primitive or a collection. A
+    // function type, a type parameter, a trait, an unknown type all stay
+    // callable as far as the check can tell.
+    func data_field(mut self, k str) bool {
+        let ft = self.Ty.FromAST(self.T, self.T.Get(self.flds[k]).Ival)
+        if ft == 0 { return false }
+        let t = self.Ty.Get(ft)
+        if t.Kind == typ.TK_SLICE or t.Kind == typ.TK_MAP or
+           t.Kind == typ.TK_SET {
+            return true
+        }
+        return t.Kind == typ.TK_NAMED and typ.IsPrimitive(t.Name)
+    }
+
+    func method_info(mut self, rt0 int, mn str) MInfo {
+        var mi = no_info()
+        var rt = self.canon(rt0)
+        if rt == 0 { return mi }
+        var t = self.Ty.Get(rt)
+        if t.Kind == typ.TK_BORROW {
+            rt = t.Elem
+            if rt == 0 { return mi }
+            t = self.Ty.Get(rt)
+        }
+        mi.what = self.Ty.Text(rt)
+        // The universal pair (call.c step 2) answers on every value.
+        if mn == "str" or mn == "clone" {
+            mi.found = true
+            if mn == "str" { mi.res = self.Ty.Nominal("str") }
+            if mn == "clone" { mi.res = rt }
+            mi.known = true
+            return mi
+        }
+        if t.Kind == typ.TK_PARAM { return self.param_method(t.Name, mn, mi) }
+        if t.Kind == typ.TK_SLICE {
+            return self.builtin_set(mi, mn, slice_methods(), t.Elem, "append")
+        }
+        if t.Kind == typ.TK_MAP {
+            return self.builtin_set(mi, mn, map_methods(), 0, "")
+        }
+        if t.Kind == typ.TK_SET {
+            return self.builtin_set(mi, mn, set_methods(), t.Elem, "add")
+        }
+        if t.Kind != typ.TK_NAMED { return mi }
+        let tn = t.Name
+        if self.is_box_named(tn) {
+            if mn == "get" or mn == "set" {
+                mi.known = true
+                mi.found = true
+                if len(t.Args) == 1 {
+                    if mn == "get" { mi.res = t.Args[0] }
+                    if mn == "set" { mi.elem = t.Args[0] }
+                }
+                return mi
+            }
+            if len(t.Args) != 1 { return mi }
+            return self.method_info(t.Args[0], mn)
+        }
+        if tn in self.traits { return mi }       // expr.voi's own rule
+        let k = tn || "|" || mn
+        if k in self.mset {
+            mi.known = true
+            mi.found = true
+            mi.fn = self.mset[k]
+            mi.names = self.impl_params(tn, mn)
+            mi.args = t.Args
+            return mi
+        }
+        if tn in self.structs {
+            mi.known = true
+            // A field holding a callable is dispatched like a method
+            // (call.c step 4) — but only a callable one: a field whose
+            // declared type is plainly data (a primitive, a collection) is
+            // not a method, and `r.path()` on a `path str` would abort.
+            if k in self.flds {
+                mi.found = not self.data_field(k)
+            }
+            return mi
+        }
+        if tn in self.enums {
+            mi.known = true
+            return mi
+        }
+        if tn in self.excs {
+            mi.known = true
+            mi.found = mn == "message" or mn == "cause" or mn == "trace" or
+                       mn == "suppressed"
+            return mi
+        }
+        if self.is_newtype(tn) {
+            // A newtype answers its own methods, then its underlying type's
+            // builtin ones (call.c).
+            let u = self.underlying(tn)
+            if u == 0 { return mi }
+            let ui = self.method_info(u, mn)
+            if ui.known { ui.what = tn }
+            return ui
+        }
+        if tn == "str" {
+            mi.known = true
+            each s in str_method_list() {
+                if s == mn { mi.found = true }
+            }
+            if mi.found { mi.res = self.str_fn_ty(mn) }
+            return mi
+        }
+        if typ.IsPrimitive(tn) {
+            // A user impl on a primitive was found above (the method table
+            // keys it by the type's own name); every integer is an `int` at
+            // run time, so one written for `int` answers a sized receiver.
+            if is_int_type(tn) and ("int|" || mn) in self.mset {
+                mi.known = true
+                mi.found = true
+                mi.fn = self.mset["int|" || mn]
+                return mi
+            }
+            mi.known = true
+            each s in prim_methods(tn) {
+                if s == mn { mi.found = true }
+            }
+            return mi
+        }
+        return mi
+    }
+
+    // builtin_set answers a builtin collection's method from its list.
+    func builtin_set(self, mi0 MInfo, mn str, names []str, elem int,
+                     elemArg str) MInfo {
+        var mi = mi0
+        mi.known = true
+        each s in names {
+            if s == mn { mi.found = true }
+        }
+        if mi.found and mn == elemArg { mi.elem = elem }
+        return mi
+    }
+
+    // builtin_method_res is a builtin method's result type.
+    func builtin_method_res(mut self, rt0 int, mn str, call int,
+                            env map[str]int) int {
+        let rt = self.box_inner(self.canon(rt0))
+        if rt == 0 { return 0 }
+        if mn == "str" { return self.Ty.Nominal("str") }
+        if mn == "clone" { return rt }
+        var t = self.Ty.Get(rt)
+        if t.Kind == typ.TK_NAMED and self.is_newtype(t.Name) {
+            let u = self.box_inner(self.underlying(t.Name))
+            if u == 0 { return 0 }
+            t = self.Ty.Get(u)
+        }
+        if t.Kind == typ.TK_NAMED and t.Name == "str" {
+            return self.str_fn_ty(mn)
+        }
+        let i = self.Ty.Nominal("int")
+        let b = self.Ty.Nominal("bool")
+        if t.Kind == typ.TK_SLICE {
+            if mn == "len" or mn == "index_of" { return i }
+            if mn == "contains" or mn == "any" or mn == "all" { return b }
+            if mn == "pop" or mn == "first" or mn == "last" {
+                return self.Ty.MkOption(t.Elem)
+            }
+            if mn == "remove" { return t.Elem }
+            if mn == "filter" or mn == "sorted" { return rt }
+            if mn == "join" { return self.Ty.Nominal("str") }
+            if mn == "map" {
+                let args = self.T.Get(self.T.Kid(call, 1)).Kids
+                if len(args) == 1 {
+                    let ft = self.ty_of(self.T.Kid(args[0], 0), env)
+                    if ft != 0 and self.Ty.Kind(ft) == typ.TK_FN {
+                        return self.Ty.MkSlice(self.Ty.Get(ft).Res)
+                    }
+                }
+            }
+            return 0
+        }
+        if t.Kind == typ.TK_MAP {
+            if mn == "len" { return i }
+            if mn == "has" { return b }
+            if mn == "keys" { return self.Ty.MkSlice(t.Key) }
+            if mn == "values" { return self.Ty.MkSlice(t.Elem) }
+            return 0
+        }
+        if t.Kind == typ.TK_SET {
+            if mn == "len" { return i }
+            if mn == "has" or mn == "contains" { return b }
+            if mn == "items" { return self.Ty.MkSlice(t.Elem) }
+            return 0
+        }
+        if t.Kind == typ.TK_NAMED and self.is_box_named(t.Name) {
+            if mn == "get" and len(t.Args) == 1 { return t.Args[0] }
+        }
+        return 0
+    }
+
+    // param_method judges `x.m()` where x is of a type PARAMETER `T`,
+    // against T's bounds (§3.7): a method no bound declares cannot be
+    // relied on — the instantiating type need not have it. Judged only when
+    // every bound is a trait whose methods this program can list: a bound
+    // naming nothing known, an unbounded `T` (dispatch is dynamic, §3.7
+    // erases generics) and `Self` stay silent.
+    func param_method(mut self, pn str, mn str, mi0 MInfo) MInfo {
+        var mi = mi0
+        if not (pn in self.eGens) { return mi }
+        let parts = str.split(self.T.Get(self.eGens[pn]).Sval, "|")
+        if len(parts) < 2 or parts[1] == "" { return mi }
+        let bnodes = self.T.Get(self.eGens[pn]).Kids
+        each bi, b in str.split(parts[1], "+") {
+            if b in self.traits {
+                let m = self.trait_method(b, mn)
+                if m != 0 {
+                    mi.known = true
+                    mi.found = true
+                    mi.fn = m
+                    // The trait's own parameters, bound to the bound's
+                    // written arguments (`T: Into[str]` makes `into` a str).
+                    var names = self.generic_names(self.T.Kid(self.traits[b],
+                                                             1))
+                    var args = []
+                    if bi < len(bnodes) {
+                        each ba in self.T.Get(bnodes[bi]).Kids {
+                            args.append(self.Ty.FromAST(self.T, ba))
+                        }
+                    }
+                    names.append("Self")
+                    args.append(self.Ty.Nominal(pn))
+                    mi.names = names
+                    mi.args = args
+                    return mi
+                }
+                continue
+            }
+            if is_builtin_trait(b) {
+                // The predeclared traits' one written method each.
+                if (b == "Ord" and mn == "cmp") or
+                   (b == "Show" and mn == "show") or
+                   (b == "Clone" and mn == "clone") or
+                   (b == "Error" and mn == "message") {
+                    mi.known = true
+                    mi.found = true
+                    return mi
+                }
+                continue
+            }
+            return mi                           // an unknown bound
+        }
+        mi.known = true
+        mi.what = pn
+        return mi
+    }
+
+    // ------------------------------------------------------------ verdict
+
+    // bad is THE assignability verdict: true only when a value of type
+    // `got` — the value e, when there is one — certainly does not fit a
+    // hole of type `want`. See this file's header for why it is a test for
+    // a known-bad pair and not the negation of a compatibility relation.
+    // `lat` says the lattice check (chk/checks.voi) already judges this
+    // literal's numeric fit, so a second diagnostic would be noise.
+    func bad(mut self, want0 int, got0 int, e int, lat bool) bool {
+        var want = self.canon(want0)
+        if want == 0 { return false }
+        if e != 0 and self.T.Kind(e) == ast.NILLIT { return self.nil_bad(want) }
+        // A closure LITERAL stored where a newtype over a function type is
+        // wanted converts implicitly, as an untyped literal does (§3.8):
+        // it is judged against the representation.
+        if e != 0 and self.T.Kind(e) == ast.CLOSURE {
+            let wn0 = self.named(want)
+            if self.is_newtype(wn0) {
+                let u = self.underlying(wn0)
+                if u != 0 and self.Ty.Kind(u) == typ.TK_FN { want = u }
+            }
+        }
+        if e != 0 and self.is_lit(e) {
+            let wn = self.named(self.peel(want))
+            if wn != "" and (self.solid_name(wn) or wn == "unit") {
+                if wn == "unit" { return false }
+                let lk = self.lit_kind(e)
+                if lat and is_numeric(wn) and lk != ast.BOOL { return false }
+                return not self.lit_fits(lk, wn)
+            }
+        }
+        let got = self.canon(got0)
+        if got == 0 or want == got { return false }
+        return self.bad_ty(want, got, e)
+    }
+
+    // peel unwraps the layers a value passes through on its way into a
+    // hole: a borrow, an optional and a fallible result accept their
+    // payload.
+    func peel(self, id int) int {
+        if id == 0 { return 0 }
+        let t = self.Ty.Get(id)
+        if t.Kind == typ.TK_BORROW or t.Kind == typ.TK_OPTION or
+           t.Kind == typ.TK_RESULT {
+            return self.peel(t.Elem)
+        }
+        return id
+    }
+
+    // nil_bad: nil inhabits only `?T` (§4). A hole of a SOLID nominal type
+    // — a primitive, a struct, an enum, a newtype — cannot take it.
+    func nil_bad(mut self, want int) bool {
+        let t = self.Ty.Get(want)
+        if t.Kind == typ.TK_BORROW { return self.nil_bad(t.Elem) }
+        if t.Kind != typ.TK_NAMED { return false }
+        return self.solid_name(t.Name)
+    }
+
+    func bad_ty(mut self, want int, got int, e int) bool {
+        if self.Ty.HasError(want) or self.Ty.HasError(got) { return false }
+        let w = self.Ty.Get(want)
+        let g = self.Ty.Get(got)
+        if w.Kind == typ.TK_BORROW { return self.bad(w.Elem, got, e, false) }
+        if g.Kind == typ.TK_BORROW { return self.bad(want, g.Elem, 0, false) }
+        if w.Kind == typ.TK_PARAM or g.Kind == typ.TK_PARAM { return false }
+        if self.Ty.HasParam(want) or self.Ty.HasParam(got) {
+            // A generic parameter inside: only the SHAPE can be wrong, and
+            // only between two shapes that can never meet.
+            return self.shape_clash(w, g)
+        }
+        if self.named(want) == "unit" or self.named(got) == "unit" {
+            return false
+        }
+        if w.Kind == typ.TK_OPTION {
+            if g.Kind == typ.TK_OPTION { return self.bad(w.Elem, g.Elem, 0, false) }
+            return self.bad(w.Elem, got, e, false)
+        }
+        if w.Kind == typ.TK_RESULT {
+            if g.Kind == typ.TK_RESULT { return self.bad(w.Elem, g.Elem, 0, false) }
+            return self.bad(w.Elem, got, e, false)
+        }
+        if g.Kind == typ.TK_RESULT { return self.bad(want, g.Elem, 0, false) }
+        if g.Kind == typ.TK_OPTION {
+            // A `?T` used as a `T`. Reported only where the optional comes
+            // STRAIGHT from a call: a NAME that holds one is ordinarily
+            // narrowed first (`if x == nil { return }`), and this checker
+            // does not follow that flow — silent, never wrong.
+            if self.direct_opt(e) and self.solid_or_struct(want) {
+                return true
+            }
+            return self.bad(want, g.Elem, 0, false)
+        }
+        if w.Kind == typ.TK_BOX or g.Kind == typ.TK_BOX { return false }
+        if w.Kind == typ.TK_NAMED and self.is_box_named(w.Name) { return false }
+        if g.Kind == typ.TK_NAMED and self.is_box_named(g.Name) { return false }
+
+        if w.Kind == typ.TK_NAMED and g.Kind == typ.TK_NAMED {
+            return self.nominal_bad(want, got, e)
+        }
+        if w.Kind == typ.TK_NAMED {
+            // A structural value where a nominal is wanted: wrong when the
+            // nominal is solid (a slice is not an int, nor a newtype over
+            // one — that takes a conversion, §3.8).
+            return self.solid_name(w.Name)
+        }
+        if g.Kind == typ.TK_NAMED {
+            if g.Name in self.traits or g.Name in self.excs { return false }
+            return self.solid_name(g.Name)
+        }
+        if w.Kind != g.Kind { return true }
+        if w.Kind == typ.TK_SLICE or w.Kind == typ.TK_SET or
+           w.Kind == typ.TK_CHAN {
+            return self.elem_bad(w.Elem, g.Elem)
+        }
+        if w.Kind == typ.TK_MAP {
+            return self.elem_bad(w.Key, g.Key) or self.elem_bad(w.Elem, g.Elem)
+        }
+        if w.Kind == typ.TK_TUPLE {
+            if len(w.Args) != len(g.Args) { return true }
+            var i = 0
+            while i < len(w.Args) {
+                if self.bad(w.Args[i], g.Args[i], 0, false) { return true }
+                i += 1
+            }
+            return false
+        }
+        if w.Kind == typ.TK_FN {
+            // The ARITY of a function value is a fact; its parameter and
+            // result types are compared only when both are written.
+            if len(w.Args) != len(g.Args) { return true }
+            if w.Res != 0 and g.Res != 0 and self.bad(w.Res, g.Res, 0, false) {
+                return true
+            }
+            return false
+        }
+        return false
+    }
+
+    // shape_clash: two types with a generic parameter inside, compared by
+    // their outermost shape alone — a slice is never a map, nor a str.
+    func shape_clash(self, w typ.Type, g typ.Type) bool {
+        if w.Kind == typ.TK_PARAM or g.Kind == typ.TK_PARAM { return false }
+        if w.Kind == typ.TK_BORROW or g.Kind == typ.TK_BORROW { return false }
+        if w.Kind == typ.TK_OPTION or w.Kind == typ.TK_RESULT { return false }
+        if g.Kind == typ.TK_OPTION or g.Kind == typ.TK_RESULT { return false }
+        if w.Kind == typ.TK_BOX or g.Kind == typ.TK_BOX { return false }
+        if w.Kind == typ.TK_NAMED and g.Kind == typ.TK_NAMED {
+            if w.Name == g.Name { return false }
+            return self.solid_name(w.Name) and self.solid_name(g.Name) and
+                   not self.is_box_named(w.Name) and
+                   not self.is_box_named(g.Name)
+        }
+        if w.Kind == typ.TK_NAMED {
+            return self.solid_name(w.Name) and not self.is_box_named(w.Name)
+        }
+        if g.Kind == typ.TK_NAMED {
+            return self.solid_name(g.Name) and not self.is_box_named(g.Name)
+        }
+        return w.Kind != g.Kind
+    }
+
+    // elem_bad compares two ELEMENT types. Collections are not covariant at
+    // run time, but they are not converted either, so the same lattice that
+    // judges a scalar judges an element: a `[]int` is no `[]str`.
+    func elem_bad(mut self, w int, g int) bool {
+        if w == 0 or g == 0 { return false }
+        return self.bad(w, g, 0, false)
+    }
+
+    // direct_opt: e is a call (a function's or a method's) — the one place a
+    // `?T` arrives with nothing having had the chance to narrow it.
+    //
+    // … or a NAME that nothing in the enclosing function ever narrows: no
+    // `x == nil`/`x != nil`, no `if let … = x`, no `match x`, no `x else`,
+    // `must x`, `try x` or `x?` anywhere in it (eNarrow). Such a name is a
+    // `?T` that is certainly used as one; a name that IS narrowed somewhere
+    // is taken to be narrowed where it is used, since the flow is not
+    // followed.
+    func direct_opt(self, e int) bool {
+        if e == 0 { return false }
+        let k = self.T.Kind(e)
+        if k == ast.CALL { return true }
+        if k == ast.IDENT { return not self.narrowed(self.T.Get(e).Sval) }
+        if k == ast.FIELD or k == ast.INDEX {
+            // A location (`s.v`, `xs[i].v`, `m["a"]`) is judged like a name,
+            // under its path key. One whose key cannot be written down
+            // (`xs[i + 1].v`, `f().v`) can never be narrowed, so it is a
+            // `?T` used as one.
+            let key = self.path_key(e)
+            if key == "" { return true }
+            return not self.narrowed(key)
+        }
+        return false
+    }
+
+    func solid_or_struct(self, id int) bool {
+        let t = self.Ty.Get(id)
+        if t.Kind == typ.TK_NAMED { return self.solid_name(t.Name) }
+        return t.Kind == typ.TK_SLICE or t.Kind == typ.TK_MAP or
+               t.Kind == typ.TK_SET or t.Kind == typ.TK_TUPLE
+    }
+
+    // nominal_bad judges two nominal types.
+    func nominal_bad(mut self, want int, got int, e int) bool {
+        let w = self.Ty.Get(want)
+        let g = self.Ty.Get(got)
+        let wn = w.Name
+        let gn = g.Name
+        if wn in self.traits {
+            if gn in self.traits { return false }
+            if not self.judgeable(gn) { return false }
+            return self.missing_for(gn, wn) != ""
+        }
+        if gn in self.traits { return false }
+        if wn in self.excs or gn in self.excs { return false }
+        if wn == "error" or gn == "error" { return false }
+        if not self.solid_name(wn) or not self.solid_name(gn) { return false }
+        if wn == gn {
+            // One declaration at different arguments: `Stack[int]` is no
+            // `Stack[str]`. A side written without arguments (a generic
+            // composite left to inference) fits any.
+            if len(w.Args) == 0 or len(g.Args) == 0 { return false }
+            if len(w.Args) != len(g.Args) { return false }
+            var i = 0
+            while i < len(w.Args) {
+                if self.bad(w.Args[i], g.Args[i], 0, false) { return true }
+                i += 1
+            }
+            return false
+        }
+        if is_numeric(wn) and is_numeric(gn) {
+            return not widens_ok(gn, wn)
+        }
+        return true
+    }
+
+    // ------------------------------------------------------------ Copy
+
+    // is_noncopy reports whether a value of this type MOVES on assignment
+    // (§6.4, manual 8.2): only types that certainly own storage — a slice,
+    // map or set, a channel, a function, or a struct, tuple, enum, newtype
+    // or `?T` holding one. A Box has value semantics of its own (§6.3) and
+    // moves with its contents; the shared handles (`shared`, `cell`, `weak`)
+    // exist to be held twice and are not moved. Unknown is never moved.
+    func is_noncopy(mut self, id0 int) bool {
+        let id = self.canon(id0)
+        if id == 0 { return false }
+        if id in self.copyMemo { return self.copyMemo[id] == 1 }
+        // Primed as Copy: a type reaching itself (only ever through a Box,
+        // which the Acyclicity Rule allows) does not make itself non-Copy.
+        self.copyMemo[id] = 0
+        let r = self.noncopy_raw(id)
+        if r { self.copyMemo[id] = 1 }
+        return r
+    }
+
+    func noncopy_raw(mut self, id int) bool {
+        let t = self.Ty.Get(id)
+        let k = t.Kind
+        if k == typ.TK_SLICE { return t.Name == "" or self.is_noncopy(t.Elem) }
+        if k == typ.TK_MAP or k == typ.TK_SET or k == typ.TK_CHAN or
+           k == typ.TK_FN {
+            return true
+        }
+        if k == typ.TK_OPTION { return self.is_noncopy(t.Elem) }
+        if k == typ.TK_TUPLE {
+            each a in t.Args {
+                if self.is_noncopy(a) { return true }
+            }
+            return false
+        }
+        if k != typ.TK_NAMED { return false }
+        let tn = t.Name
+        if self.is_box_named(tn) {
+            if len(t.Args) != 1 { return false }
+            return self.is_noncopy(t.Args[0])
+        }
+        if tn in self.ntUnder { return self.is_noncopy(self.underlying(tn)) }
+        if len(t.Args) != 0 { return false }  // a generic: unknown fields
+        if tn in self.structs {
+            if self.T.NKids(self.T.Kid(self.structs[tn], 1)) != 0 {
+                return false
+            }
+            each f in self.T.Get(self.T.Kid(self.structs[tn], 0)).Kids {
+                if self.T.Kind(f) != ast.FIELDDECL { continue }
+                let ft = self.Ty.FromAST(self.T, self.T.Get(f).Ival)
+                if self.is_noncopy(ft) { return true }
+            }
+            return false
+        }
+        if tn in self.enums {
+            if self.T.NKids(self.T.Kid(self.enums[tn], 1)) != 0 {
+                return false
+            }
+            each v in self.T.Get(self.T.Kid(self.enums[tn], 0)).Kids {
+                each f in self.T.Get(self.T.Kid(v, 0)).Kids {
+                    let ft = self.Ty.FromAST(self.T, self.T.Get(f).Ival)
+                    if self.is_noncopy(ft) { return true }
+                }
+            }
+        }
+        return false
+    }
+}
+
+// widens_ok is §3.2's implicit conversion between two numeric types, plus
+// the one leniency the runtime makes true: a `rune` IS an integer (vl_int
+// carries int, byte and rune alike), and the corpus compares and stores
+// runes and integers freely.
+//
+// And one rule §3.2 states outright: an INTEGER stored into any integer
+// type is allowed, and range-checked at run time where it is not known to
+// fit (the sized-store list: an initialiser, an assignment, an argument, a
+// returned value, a field, an element, a map value, a sent value) — so
+// `int` → `u8` is a trap at run time, not a compile-time refusal. What is
+// refused is a conversion that can lose information in-range: float → int,
+// dec → anything, i64 → float.
+func widens_ok(from str, to str) bool {
+    if from == to { return true }
+    if widens_to(from, to) { return true }
+    if is_int_type(from) and is_int_type(to) { return true }
+    if from == "rune" { return is_int_type(to) or to == "dec" or to == "float" }
+    if to == "rune" { return is_int_type(from) }
+    return false
+}
+
+// The builtin methods of each collection kind (runtime/src/call.c's
+// slice_method and map_method), plus the universal `str` and `clone`.
+func slice_methods() []str {
+    return ["append", "pop", "first", "last", "len", "map", "filter",
+            "reduce", "each", "any", "all", "sort", "sort_by", "sorted",
+            "contains", "index_of", "reverse", "join", "insert", "remove"]
+}
+
+func map_methods() []str {
+    return ["len", "keys", "values", "has", "get", "set", "delete", "remove"]
+}
+
+func set_methods() []str {
+    return ["len", "add", "remove", "delete", "has", "contains", "items"]
+}
+
+// str_method_list: what a `str` receiver answers — std/str's functions
+// through the method-call duality (low.StrMethodNames), and nothing from
+// the prelude: `s.len()` aborts at run time ("str has no method `len`").
+func str_method_list() []str {
+    return low.StrMethodNames()
+}
+
+// prim_methods: the builtin methods of a non-str primitive (call.c).
+func prim_methods(tn str) []str {
+    if tn == "dec" { return ["round", "floor", "ceil", "abs", "format"] }
+    if tn == "dur" {
+        return ["millis", "micros", "nanos", "seconds", "minutes"]
+    }
+    if tn == "instant" { return ["unix", "unix_millis", "unix_nanos"] }
+    return []
+}

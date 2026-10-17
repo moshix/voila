@@ -1,0 +1,11 @@
+// Tuple mistakes where the width is known are compile-time errors.
+func pair() (int, str) { return 1, "a" }
+func main() {
+    let t = (1, 2)
+    let xs = [1, 2]
+    say t.2, pair().2, xs.1, "hey".0
+    match (1, 2, 3) {
+        (a, b) => say a, b
+        _ => say 0
+    }
+}

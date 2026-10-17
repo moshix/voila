@@ -1,0 +1,11 @@
+// A sum type that contains ITSELF directly is an ownership cycle in the type
+// graph (§6.3). It is not boxed behind the program's back: the spec admits
+// self-reference only through weak[T] or a Box, so the diagnostic names
+// both. `Good` beside it is the legal spelling and must stay silent, as must
+// `Opt`, whose recursion is optional (`?Opt`), and `Chain`, whose is `?Box`.
+enum Tree[T] { Leaf, Node(v T, l Tree[T], r Tree[T]) }
+enum Good[T] { GLeaf, GNode(v T, l Box[Good[T]], r Box[Good[T]]) }
+struct Opt { next ?Opt }
+struct Chain { v int, next ?Box[Chain] }
+
+func main() { say 1 }

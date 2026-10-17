@@ -1,0 +1,91 @@
+// std/os's process control and file-system walkers: os.start runs a program
+// without waiting and hands back a process handle — pid, wait, kill,
+// running, and the child's stdin and stdout as std/io writer and reader;
+// os.signals delivers signals on a channel (the handler only writes to a
+// self-pipe, a dispatcher thread does the rest); os.kill and os.getpid;
+// os.walk and os.glob read the disk, path.matches is the pattern half alone.
+use "std/os"
+use "std/path"
+use "std/time"
+
+func main() {
+    // A filter: write its stdin, read its stdout, wait for its status.
+    var p = must os.start("tr", ["a-z", "A-Z"])
+    say p.pid() > 0, p.running() or not p.running()
+    let w = p.stdin()
+    must w.write("hello\nworld\n")
+    w.close()
+    each line in p.stdout() { say "child:", line }
+    say "status", must p.wait(), must p.wait()
+
+    // wait() closes the child's stdin first, so a filter that reads to the
+    // end of its input finishes even when nobody closed it explicitly.
+    var c = must os.start("cat", [])
+    must c.stdin().write("unclosed\n")
+    say "status", must c.wait()
+    say must c.stdout().read_all()
+
+    // An exit status, and a kill (128 + the signal, as os.run reports it).
+    var f = must os.start("sh", ["-c", "exit 3"])
+    say "status", must f.wait()
+    var s = must os.start("sleep", ["30"])
+    say s.running()
+    must s.kill()
+    say "killed", must s.wait() == 128 + os.SIGTERM
+    match s.kill() {
+        Ok(u)  => say "?"
+        Err(e) => say "error:", e.message()
+    }
+    // kill() while another task is blocked in wait() on the same child.
+    var w2 = must os.start("sleep", ["30"])
+    group {
+        spawn { say "waiter saw", must w2.wait() == 128 + os.SIGTERM }
+        time.sleep(time.Millisecond * 100)
+        must w2.kill()
+    }
+    match os.start("voila-no-such-program-xyz", []) {
+        Ok(q)  => say "?"
+        Err(e) => say "error:", e.message()
+    }
+
+    // Signals arrive on a channel.
+    let sigs = must os.signals(os.SIGUSR1, os.SIGUSR2)
+    must os.kill(os.getpid(), os.SIGUSR2)
+    select {
+    case n := <-sigs:
+        say "signal", n == os.SIGUSR2
+    case <-time.after(time.Second * 5):
+        say "no signal"
+    }
+    say os.getpid() == os.pid()
+    match os.signals(os.SIGKILL) {
+        Ok(ch) => say "?"
+        Err(e) => say "error:", e.message()
+    }
+
+    // os.walk and os.glob over a tree built here.
+    let root = path.join(os.tempdir(), "voila-53-{os.getpid()}")
+    must os.mkdir_all(path.join(root, "src/deep"))
+    must os.write(path.join(root, "a.txt"), "a")
+    must os.write(path.join(root, "b.voi"), "b")
+    must os.write(path.join(root, "src/c.voi"), "c")
+    must os.write(path.join(root, "src/deep/d.voi"), "d")
+    each e in must os.walk(root) { say "walk", e.trim_prefix(root) }
+    each g in must os.glob(path.join(root, "*.voi")) { say "glob", g.trim_prefix(root) }
+    each g in must os.glob(path.join(root, "*/*.voi")) { say "glob", g.trim_prefix(root) }
+    say len(must os.glob(path.join(root, "*.none")))
+    match os.walk(path.join(root, "missing")) {
+        Ok(es) => say "?"
+        Err(e) => say "walk error", e.message().contains("missing")
+    }
+    os.run("rm", ["-rf", root])
+
+    // path.matches: `*`, `?`, classes, escapes — and `*` never crosses `/`.
+    say path.matches("*.voi", "main.voi"), path.matches("*.voi", "src/main.voi")
+    say path.matches("src/*.voi", "src/main.voi"), path.matches("?at", "cat")
+    say path.matches("[bc]at", "bat"), path.matches("[!bc]at", "bat")
+    say path.matches("[a-c]*", "cab"), path.matches("\\*", "*"), path.matches("\\*", "x")
+    say path.matches("a*b*c", "axxbyyc"), path.matches("a*b*c", "axxbyy")
+    say path.matches("", ""), path.matches("*", ""), path.matches("[a-", "a")
+    say path.matches("é?", "éa"), path.matches("*", "a/b")
+}

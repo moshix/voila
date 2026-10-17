@@ -1,0 +1,103 @@
+// 33 — the expression syntax of 31, at the edges a review found: value
+// forms inside brackets and calls, arms ending in commas, generics with
+// any type form as an argument, `else { … }` as a statement, an
+// enum-qualified variant pattern, ranges that refuse a value of another
+// kind, `?` in a function that cannot return a failure, and literals and
+// open slices that a user `len`/`set` must not hijack.
+
+enum Color { Red, Green, Blue }
+enum Shape { Circle(r int), Empty }
+struct P { x int, y int }
+
+// The program's own `len` and `set`: the desugarings must not call these.
+func len(xs []int) int { return -1 }
+func set(xs []int) int { return -2 }
+
+func id(s str) str { return s }
+
+func mk[K, V](k K, v V) map[K]V {
+    var m = make(map[K]V)
+    m[k] = v
+    return m
+}
+
+func size[T](xs []T) int {
+    var n = 0
+    each x in xs { n += 1 }
+    return n
+}
+
+func half(n int) int! {
+    if n % 2 != 0 { return err("odd") }
+    return n ~/ 2
+}
+
+// `?` where the result is a plain int: the failure is RAISED (§8.1).
+func plain(n int) int {
+    return half(n)?
+}
+
+func radius(s Shape) int {
+    match s {
+        Shape.Circle(r) => return r
+        Shape.Empty => return 0
+    }
+}
+
+func name(c ?Color) str {
+    return match c { Some(Red) => "red"; Green => "green"; Blue => "blue"; nil => "none" }
+}
+
+func kind(v int) str {
+    return match v { 0..10 => "small int"; _ => "other" }
+}
+
+func letter(c rune) str {
+    return match c { 'a'..='z' => "letter"; _ => "not a letter" }
+}
+
+func main() {
+    let ok = true
+    var xs = []
+    xs.append(if ok { 1 } else { 2 })
+    say xs, (if ok { "yes" } else { "no" })
+    let n = 3
+    let p = P{x: 4, y: 5}
+    say [match n { 3 => "three", _ => "other" }]
+    say id(match p.x { 4 => "four", _ => "?" })
+    let q = P{x: if ok { 7 } else { 8 }, y: 0}
+    say q.x
+
+    let k = 5
+    let r = match k { 5 => if k > 1 { "big" } else { "small" }, _ => "out" }
+    say r
+    var a = 1
+    var b = 2
+    match 1 { 1 => a, b = b, a, _ => say "unreached" }
+    say a, b
+
+    say [1, 2, 3, 4][1..], "voila"[..]
+    say set[int]{3, 3, 4}
+
+    let m1 = mk[[]int, str]([1, 2], "v")
+    let m2 = mk[str, ?int]("k", nil)
+    let m3 = mk[str, map[str]int]("o", map[str]int{"i": 1})
+    say m2["k"], m3["o"]["i"], size[[]int]([[1], [2]])
+    each kk, vv in m1 { say vv }
+
+    half(3) else { say "failed" }
+    half(4) else { say "not printed" }
+
+    say radius(Circle(6)), radius(Empty)
+    say name(Red), name(Green), name(nil)
+    say kind(5), letter('q'), letter('Q')
+    // A range matches only values of its own kind.
+    let half_unit = 0.5
+    let code = 98
+    say match half_unit { 0..1 => "int range"; _ => "float, no match" }
+    say match code { 'a'..='z' => "rune range"; _ => "int, no match" }
+
+    let got = attempt plain(3)
+    say got else -1
+    say plain(8)
+}

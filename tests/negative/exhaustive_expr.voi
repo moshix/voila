@@ -1,0 +1,42 @@
+// Exhaustiveness of `match` used as a VALUE, and of the nested patterns:
+// or-patterns, tuples, struct patterns and refutable payloads. The legal
+// cases at the bottom must stay silent.
+enum Shape { Circle(r int), Rect(w int, h int), Empty }
+struct P { x int, y int }
+
+func a(s Shape) str {
+    return match s { Circle(r) => "c"; Empty => "e" }
+}
+
+func b(t (int, bool)) str {
+    return match t { (0, true) => "a"; (_, false) => "b" }
+}
+
+func c(o ?int) str {
+    return match o { Some(0) => "zero"; nil => "none" }
+}
+
+func d(p P) str {
+    let v = match p { P{x: 0} => "z" }
+    return v
+}
+
+func e(n int) str {
+    return match n { 0 | 1 => "low"; 2..=9 => "mid" }
+}
+
+// Legal: every case is covered, by nesting, by or-patterns, by a bool pair.
+func ok1(s Shape, o ?Shape, flag bool) str {
+    let u = match flag { true => 1; false => 2 }
+    let w = match o { nil => 0; Circle(r) => r; Rect(w, h) => w; Empty => 3 }
+    let v = match (flag, flag) {
+        (true, _) => 1
+        (false, true) => 2
+        (_, false) => 3
+    }
+    let x = match s { Circle(_) | Rect(_, _) => 1; Empty => 0 }
+    let y = match o { Some(Circle(r)) => r; Some(Rect(w, _)) => w; Some(Empty) | nil => 0 }
+    return "{u}{v}{w}{x}{y}"
+}
+
+func main() { say 1 }

@@ -1,0 +1,6 @@
+type `Tree` forms an ownership cycle through field `l`
+type `Tree` forms an ownership cycle through field `r`
+`Box[…]`/`?Box[…]` for a tree-shaped recursive field
+!`Good`
+!`Opt`
+!`Chain`

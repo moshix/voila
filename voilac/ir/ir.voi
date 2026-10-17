@@ -54,6 +54,11 @@ const PAT_NIL     = 1
 const PAT_LIT     = 2
 const PAT_BIND    = 3
 const PAT_VARIANT = 4
+const PAT_OR      = 5   // Elems = the alternatives
+const PAT_RANGE   = 6   // Elems = lo, hi (PAT_LIT); Name = "=" inclusive
+const PAT_STRUCT  = 7   // Name = struct type; Elems = PAT_FIELD…
+const PAT_FIELD   = 8   // Name = field; Elems[0] = sub-pattern
+const PAT_TUPLE   = 9   // Elems = one sub-pattern per position
 
 struct Pat {
     Kind    int
@@ -110,11 +115,26 @@ struct Func {
     Instrs      []Instr
     SrcLine     int
     Ups         []UpRef   // insertion-ordered, so the IR is deterministic
-    LoopCapture str
+    LoopCapture str       // unused since per-iteration closures; kept ""
+    // The source file the function was written in ("" = the entry file),
+    // for the stack traces of an abort or an uncaught exception.
+    File        str
 
     // Set by the LOWERER: how many leading registers are parameters
     // (self included). The backend ignores it unless the optimizer ran.
     NParams int
+    // Set by the LOWERER: every register a NAME was ever bound to (a
+    // binding, a parameter, a loop variable, a pattern bind). The rest are
+    // temporaries, which low/kill.voi's straight-line rule may drop early.
+    // Duplicates are harmless; the order is the lowering order, so it is
+    // deterministic.
+    Named   []int
+    // … and the named registers whose static type is PLAIN — a value with
+    // no shared handle anywhere inside (low/kill.voi's plain_type): only
+    // those may be dropped before their scope ends, because dropping one
+    // early is invisible, while a `shared` value kept alive by a binding is
+    // what keeps a `weak` handle to it upgradable (§6.3).
+    Plain   []int
 
     // Set only by the OPTIMIZER (voilac/opt). The C backend's new code
     // paths are gated on these, so a build without -O emits byte-identical
@@ -157,11 +177,17 @@ struct Module {
     // 0 until voilac/opt runs; the backend's optimization-only emission
     // paths check it.
     OptLevel int
+
+    // The libraries the program's `ffi` blocks `link` (§12), in first-seen
+    // order without repeats: cg records them in the C it emits and the
+    // driver hands each to cc as -l<name>.
+    Links []str
 }
 
 func NewModule(source str) Module {
     var m = Module{Source: source, Consts: [], Types: [], Funcs: [],
-                   Pats: [], constIdx: make(map[str]int), OptLevel: 0}
+                   Pats: [], constIdx: make(map[str]int), OptLevel: 0,
+                   Links: []}
     // Index 0 of the pattern arena is the nil pattern.
     m.Pats.append(Pat{Kind: PAT_WILD, Name: "", Text: "", Reg: "", Elems: [],
                       LitKind: 0, LitText: "", CName: ""})

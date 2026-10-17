@@ -138,9 +138,11 @@ ok "guide: $gpass programs"
 # One stage per multi-package program that must BUILD and RUN: tests/multipkg
 # is the broad one, tests/multipkg-shared proves two packages may declare the
 # same variant and trait names (they could not before those namespaces were
-# qualified).
+# qualified), and tests/multipkg-enums that two enums of ONE package may (each
+# enum is a variant namespace of its own, §3.5).
 bold "==> multi-package programs"
-for d in tests/multipkg tests/multipkg-shared; do
+for d in tests/multipkg tests/multipkg-shared tests/multipkg-enums \
+         tests/multipkg-traits; do
     name="$(basename "$d")"
     if "$VOILA" build "$d/main.voi" -o "$TMP/mp" >/dev/null 2>&1; then
         "$TMP/mp" < /dev/null > "$TMP/got.txt" 2>&1
@@ -293,6 +295,95 @@ for f in tests/negative-native/*.voi; do
 done
 ok "negative-native: $bpass refused"
 
+# ------------------------------------------------------- ffi: system libraries
+# tests/ffi/*.voi call real C libraries through std/ffi (§12): libz and
+# libsqlite3. Each names its library in <f>.lib, and the stage first asks cc
+# whether that library LINKS here — both ship with macOS, but a Linux box
+# may lack the development package — and SKIPS a fixture whose library is
+# absent, saying so, rather than going red on a machine that is fine. (The
+# libc half of std/ffi is tests/conformance/52_ffi.voi, which always runs.)
+# A produced binary must link the library its ffi block names and nothing
+# else beyond libc; the stage checks that on the platforms that can list a
+# binary's libraries.
+bold "==> ffi: C libraries the system provides (tests/ffi)"
+fpass=0
+fskip=0
+# How this platform lists a binary's libraries: otool on macOS, ldd on Linux.
+LIBLIST=""
+if command -v otool >/dev/null 2>&1; then LIBLIST="otool -L"
+elif command -v ldd >/dev/null 2>&1; then LIBLIST="ldd"; fi
+printf 'int main(void) { return 0; }\n' > "$TMP/probe.c"
+for f in tests/ffi/*.voi; do
+    n="$(basename "${f%.voi}")"
+    lib="$(cat "${f%.voi}.lib" 2>/dev/null)"
+    if [ -z "$lib" ] || ! cc "$TMP/probe.c" -o "$TMP/probe" "-l$lib" >/dev/null 2>&1; then
+        echo "      (skipped $n: lib$lib is not installed)"
+        fskip=$((fskip + 1))
+        continue
+    fi
+    exe="$TMP/ffi_$n"
+    if ! "$VOILA" build "$f" -o "$exe" >"$TMP/build.log" 2>&1; then
+        bad "$n: build failed"
+        head -3 "$TMP/build.log" | sed 's/^/      /'
+        fail=$((fail + 1))
+        continue
+    fi
+    "$exe" < /dev/null > "$TMP/got.txt" 2>&1
+    if ! cmp -s "$TMP/got.txt" "${f%.voi}.out"; then
+        bad "$n: output differs from the golden"
+        diff "${f%.voi}.out" "$TMP/got.txt" | head -6 | sed 's/^/      /'
+        fail=$((fail + 1))
+        continue
+    fi
+    if [ -n "$LIBLIST" ] && ! $LIBLIST "$exe" | grep -q "lib$lib"; then
+        bad "$n: the binary does not link lib$lib"
+        fail=$((fail + 1))
+        continue
+    fi
+    fpass=$((fpass + 1))
+done
+# The other half of the promise: a program WITHOUT an ffi block links libc
+# and nothing else, exactly as before std/ffi existed.
+# (libSystem on macOS; on Linux libc and the pieces glibc splits it into.)
+if [ -n "$LIBLIST" ]; then
+    if "$VOILA" build tests/conformance/01_literals.voi -o "$TMP/plain" >/dev/null 2>&1 &&
+       [ "$($LIBLIST "$TMP/plain" | tail -n +2 |
+            grep -Evc 'libSystem|linux-vdso|ld-linux|/ld64|libc\.so|libm\.so|libpthread|libdl|statically')" = 0 ]; then
+        fpass=$((fpass + 1))
+    else
+        bad "a program with no ffi block links something besides libc"
+        fail=$((fail + 1))
+    fi
+    # The vendored libraries are compiled INTO the binary (runtime/src/vendor):
+    # a program that uses std/sqlite, std/compress and std/tls still links
+    # libc and nothing else — no libsqlite3, no libz, no libssl.
+    printf '%s\n' 'use "std/compress"' 'use "std/sqlite"' 'use "std/tls"' \
+        'func main() {' '    let db = must sqlite.open(":memory:")' \
+        '    say len(must compress.gzip("x")) > 0, tls.system_ca_file() != "?"' \
+        '    db.close()' '}' > "$TMP/vendored.voi"
+    if "$VOILA" build "$TMP/vendored.voi" -o "$TMP/vendored" >"$TMP/vendored.log" 2>&1 &&
+       [ "$("$TMP/vendored")" = "true true" ] &&
+       [ "$($LIBLIST "$TMP/vendored" | tail -n +2 |
+            grep -Evc 'libSystem|linux-vdso|ld-linux|/ld64|libc\.so|libm\.so|libpthread|libdl|statically')" = 0 ]; then
+        fpass=$((fpass + 1))
+    else
+        bad "a program using std/sqlite, std/compress and std/tls links something besides libc"
+        head -3 "$TMP/vendored.log" | sed 's/^/      /'
+        fail=$((fail + 1))
+    fi
+    # …and one that uses none of them carries none of their code: no
+    # SQLite, miniz or BearSSL symbol is linked into a plain program.
+    if command -v nm >/dev/null 2>&1 &&
+       [ "$(nm "$TMP/plain" 2>/dev/null |
+            grep -Ec 'sqlite3_|tdefl_|tinfl_|br_ssl_|vl_ext_(tls|compress|sqlite)$')" = 0 ]; then
+        fpass=$((fpass + 1))
+    elif command -v nm >/dev/null 2>&1; then
+        bad "a plain program carries vendored-library code"
+        fail=$((fail + 1))
+    fi
+fi
+ok "ffi: $fpass passed, $fskip skipped (library not installed)"
+
 # ------------------------------------------------------------------ warnings
 # Warnings are the OTHER severity, and they fail in two directions. One that
 # never fires is invisible; one that fires on working code gets the whole
@@ -401,7 +492,17 @@ fi
 #    the whole directory — so a `voila run` in another terminal cannot flap
 #    this stage.
 bold "==> voila run: the -W state is part of the cache key"
-if [ "$ckhave" -eq 1 ]; then
+# A PRIVATE cache: `voila run` keys its cache under $HOME, and a shared
+# ~/.cache/voila is written by every other voila the machine runs — a build
+# in another terminal adds entries between the snapshots and the delta is
+# no longer the probe's. So this stage gives the probe a HOME of its own,
+# warmed first (the first run there also caches the runtime archive, which
+# is no entry of the probe's), and compares deltas inside it.
+ckhome="$TMP/ckhome"
+mkdir -p "$ckhome/.cache/voila"
+HOME="$ckhome" "$VOILA" run tests/warn/strict.voi >/dev/null 2>&1
+if true; then
+    cache="$ckhome/.cache/voila"
     ck="$TMP/cachekey.voi"
     # The leading comment carries a unique tag, so the probe's CONTENT — which
     # is what source_key hashes — differs from every previous suite run and
@@ -417,10 +518,10 @@ func main() {
 PROBE
     } > "$ck"
     ls "$cache" | sort > "$TMP/ck0.txt"
-    "$VOILA" run "$ck" >/dev/null 2>&1
+    HOME="$ckhome" "$VOILA" run "$ck" >/dev/null 2>&1
     ls "$cache" | sort > "$TMP/ck1.txt"
-    "$VOILA" run -Wno-unreachable "$ck" >/dev/null 2>&1
-    "$VOILA" run -Wno-unreachable "$ck" >/dev/null 2>&1
+    HOME="$ckhome" "$VOILA" run -Wno-unreachable "$ck" >/dev/null 2>&1
+    HOME="$ckhome" "$VOILA" run -Wno-unreachable "$ck" >/dev/null 2>&1
     ls "$cache" | sort > "$TMP/ck2.txt"
     # One entry for the default policy; a SECOND for -Wno-unreachable, and the
     # repeat of it must add none — so the delta is exactly 1 then exactly 2.
@@ -432,9 +533,8 @@ PROBE
         bad "run cache key: new entries were $n1 then $n2, wanted 1 then 2"
         fail=$((fail + 1))
     fi
-else
-    ok "run cache key: skipped (no HOME, so no per-user cache to inspect)"
 fi
+cache="${HOME:-}/.cache/voila"
 
 # Both stages above are done with the cache; take back exactly what they added.
 if [ "$ckhave" -eq 1 ]; then
@@ -600,6 +700,36 @@ sed -n '/^static const Entry table\[\] = {/,/^};/p' runtime/src/std.c \
 sed -n '/^static const Entry str_table\[\] = {/,/^};/p' runtime/src/std.c \
     | grep -v '^#' | grep -o 'E([a-z0-9_]*)' | sed 's/E(\(.*\))/\1/' \
     >> "$TMP/nat_c.txt"
+# The runtime EXTENSIONS (runtime/src/ext/<unit>.c — std/tls, std/compress,
+# std/sqlite over their vendored C libraries) keep their natives out of
+# std.c, in `const VlExtEntry vl_ext_<unit>[]`, and a program registers the
+# tables it uses. They are the same surface, so they join the C side here.
+# Each table must exist and hold only its own package's natives: cg decides
+# which archive to link from the name's package (low.VendorOf), so a native
+# filed in the wrong table would be looked up where it is not.
+next=0
+for x in runtime/src/ext/*.c; do
+    u="$(basename "${x%.c}")"
+    next=$((next + 1))
+    sed -n "/^const VlExtEntry vl_ext_$u\[\] = {/,/^};/p" "$x" \
+        | grep -o '{"[^"]*"' | tr -d '{"' > "$TMP/ext_$u.txt"
+    if [ ! -s "$TMP/ext_$u.txt" ]; then
+        bad "native tables: $x has no vl_ext_$u[] table"
+        fail=$((fail + 1))
+        continue
+    fi
+    stray="$(grep -v "^$u\." "$TMP/ext_$u.txt" || true)"
+    if [ -n "$stray" ]; then
+        bad "native tables: vl_ext_$u[] holds natives of another package:"
+        echo "$stray" | sed 's/^/        /'
+        fail=$((fail + 1))
+    fi
+    cat "$TMP/ext_$u.txt" >> "$TMP/nat_c.txt"
+done
+if [ "$next" -eq 0 ]; then
+    bad "native tables: no runtime extensions found in runtime/src/ext"
+    fail=$((fail + 1))
+fi
 # The compiler side: one list per function. Most of the surface now lives in
 # voilac/low/names.voi rather than cg/instr.voi, because chk/stdpkg.voi judges
 # `pkg.member` against the very same lists and chk must not import cg — so
@@ -742,6 +872,28 @@ else
     ok "str arities: $(wc -l < "$TMP/str_c_ar.txt" | tr -d ' ') bounds agree with the runtime"
 fi
 
+# The argument KINDS are kept twice for the same reason the str arities are:
+# low.NativeKinds drives the compile-time check and the vl_argk call cg emits
+# before a direct native call, and runtime/src/std.c's kinds_table[] is what
+# checks a native called as a VALUE. Two rows that disagreed would accept a
+# call by one road and refuse it by the other.
+bold "==> the compiler and the runtime agree on the native argument kinds"
+nat_low NativeKinds | LC_ALL=C sort > "$TMP/kinds_v.txt"
+sed -n '/^static const KindRow kinds_table\[\] = {/,/^};/p' runtime/src/std.c \
+    | grep -o '{"[^"]*", "[a-z]*"}' \
+    | sed 's/{"\([^"]*\)", "\([a-z]*\)"}/\1|\2/' \
+    | LC_ALL=C sort > "$TMP/kinds_c.txt"
+if [ ! -s "$TMP/kinds_v.txt" ] || [ ! -s "$TMP/kinds_c.txt" ]; then
+    bad "native kinds: extracted nothing; a table must have been renamed"
+    fail=$((fail + 1))
+elif ! diff -q "$TMP/kinds_v.txt" "$TMP/kinds_c.txt" >/dev/null; then
+    bad "low.NativeKinds and runtime/src/std.c's kinds_table[] disagree:"
+    diff "$TMP/kinds_v.txt" "$TMP/kinds_c.txt" | head -8 | sed 's/^/        /'
+    fail=$((fail + 1))
+else
+    ok "native kinds: $(wc -l < "$TMP/kinds_v.txt" | tr -d ' ') rows agree with the runtime"
+fi
+
 # The same trap one level up, on PACKAGE names. The loader decides which `use`
 # is admitted (std_c_packages plus the generated std.Packages); the lowerer
 # decides which dotted name may carry a package qualifier (PackageNames). A
@@ -861,6 +1013,45 @@ else
     fail=$((fail + 1))
 fi
 
+# ------------------------------------------------------- cache self-healing
+# The runtime archive and the extension archives are installed by claiming
+# their cache directory with mkdir and moving the archive in LAST. A build
+# killed in between leaves a claim with no archive, and it used to be
+# permanent: every later build lost the claim, and recompiled from source —
+# all of SQLite or BearSSL — every time. A claim older than five minutes
+# with no archive is now swept and retaken. Both kinds are forged here, in a
+# private HOME, aged with touch, and must come back.
+bold "==> the archive cache heals a claim whose builder died"
+SH="$TMP/stalehome"
+mkdir -p "$SH"
+printf '%s\n' 'use "std/compress"' \
+    'func main() { say len(must compress.gzip("x")) > 0 }' > "$TMP/heal.voi"
+healed=0
+hbad=0
+if HOME="$SH" "$VOILA" build "$TMP/heal.voi" -o "$TMP/heal" >/dev/null 2>&1; then
+    for pat in 'rt-*:libvoila.a' 'ext-compress-*:libvl_compress.a'; do
+        d="$(ls -d "$SH"/.cache/voila/${pat%%:*} 2>/dev/null | head -1)"
+        lib="${pat#*:}"
+        [ -n "$d" ] && [ -f "$d/$lib" ] || continue
+        rm -f "$d/$lib"
+        touch -t 202001010000 "$d"
+        if HOME="$SH" "$VOILA" build "$TMP/heal.voi" -o "$TMP/heal" >/dev/null 2>&1 &&
+           [ -f "$d/$lib" ] && [ "$("$TMP/heal")" = true ]; then
+            healed=$((healed + 1))
+        else
+            bad "a stale claim on $(basename "$d") was not healed"
+            hbad=$((hbad + 1))
+            fail=$((fail + 1))
+        fi
+    done
+fi
+if [ "$healed" -eq 2 ]; then
+    ok "stale claims healed: the runtime's and an extension's"
+elif [ "$hbad" -eq 0 ]; then
+    bad "cache healing: the private-HOME build did not populate the cache"
+    fail=$((fail + 1))
+fi
+
 # ---------------------------------------------------------------- stress
 # tests/stress/churn.voi walks every path where reference counting is easy to
 # get wrong at once — closures capturing frames, exceptions unwinding through
@@ -878,6 +1069,72 @@ elif "$TMP/churn" < /dev/null > "$TMP/churn.out" 2>&1; then
 else
     bad "churn: exited non-zero"
     tail -3 "$TMP/churn.out" | sed 's/^/      /'
+    fail=$((fail + 1))
+fi
+
+# ---------------------------------------------------------------- native writers
+# The lowerer gives `mut`-argument semantics (copy-on-write, and copy-in for a
+# variable other tasks may reach) to the natives that write an argument in
+# place — a hand-kept list, native_mut_positions in voilac/low/boxcow.voi and
+# native_writes in voilac/chk/expr.voi: `sort.sort`, `sort.sort_by` and the
+# prelude `append`. A native added later that writes its argument in place
+# would slip past both, so this stage greps the runtime for the calls that do
+# (a collection writer handed argv[k]) and wants exactly the listed ones. It
+# cannot see a native that pokes a collection's storage directly through a
+# cast of argv[k]; those are rare enough to review by hand (TESTING.md).
+bold "==> native writers: only the listed natives write an argument in place"
+nw_want="std.c:vl_slice_append(argv[0]
+std.c:vl_sort_slice(argv[0]
+std.c:vl_sort_slice(argv[0]"
+nw_got="$(grep -oE '(vl_slice_append|vl_map_set|vl_map_delete|vl_sort_slice|vl_setidx|vl_setfld|vl_box_set)\(argv\[[0-9]+\]' \
+          runtime/src/*.c runtime/src/ext/*.c 2>/dev/null |
+          sed 's|^runtime/src/||; s|^ext/||' | sort)"
+if [ "$nw_got" = "$(printf '%s\n' "$nw_want" | sort)" ]; then
+    ok "native writers: sort.sort, sort.sort_by, append"
+else
+    bad "native writers changed — update native_mut_positions and native_writes"
+    printf '%s\n' "$nw_got" | sed 's/^/      /'
+    fail=$((fail + 1))
+fi
+
+# ---------------------------------------------------------------- shared writes
+# Tasks writing different elements, entries and fields of ONE captured
+# variable (tests/stress/sharedwrites.voi, and 39_loopclosure's tasks): every
+# write must land in the shared value, at every optimisation level. A copy-on-
+# write judged by a reference count other tasks inflate loses writes only now
+# and then, so each binary runs 64 times, 16 at once.
+bold "==> shared captured writes under tasks (64 runs x -O0..-O3)"
+sw_bad=0
+for prog in tests/stress/sharedwrites tests/conformance/39_loopclosure; do
+    for lvl in -O0 -O1 -O2 -O3; do
+        bin_="$TMP/sw_$(basename "$prog")$lvl"
+        if ! "$VOILA" build $lvl "$prog.voi" -o "$bin_" >"$TMP/sw.log" 2>&1; then
+            bad "$(basename "$prog") $lvl: build failed"
+            sw_bad=$((sw_bad + 1))
+            continue
+        fi
+        runs=0
+        lost=0
+        while [ "$runs" -lt 64 ]; do
+            for k in $(seq 1 16); do
+                ( cd "$(dirname "$prog.voi")" && "$bin_" < /dev/null \
+                    > "$TMP/sw_out_$k" 2>&1 ) &
+            done
+            wait
+            for k in $(seq 1 16); do
+                cmp -s "$TMP/sw_out_$k" "$prog.out" || lost=$((lost + 1))
+            done
+            runs=$((runs + 16))
+        done
+        if [ "$lost" -ne 0 ]; then
+            bad "$(basename "$prog") $lvl: $lost of 64 runs differ from the golden"
+            sw_bad=$((sw_bad + 1))
+        fi
+    done
+done
+if [ "$sw_bad" -eq 0 ]; then
+    ok "shared writes: every run of every level matches"
+else
     fail=$((fail + 1))
 fi
 

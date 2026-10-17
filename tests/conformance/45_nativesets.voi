@@ -1,0 +1,26 @@
+// Natives reached as VALUES unwrap a Box or a newtype argument exactly as a
+// direct call does, and the natives that walk a sequence accept a SET as
+// well as a slice — in the set's insertion order (§3.3), skipping what was
+// removed.
+use "std/str"
+use "std/sort"
+
+type Name str
+
+func main() {
+    let up = str.upper
+    say up(Name("bob")), up(Box("y")), up("plain")
+    say [Box("q"), Box("r")].map(str.upper)
+    let j = str.join
+    say j(Box(["a", "b"]), "+")
+
+    let s = set(["c", "a", "b"])
+    say str.join(s, ","), enumerate(s), zip(s, [1, 2])
+    let n = set([3, 1, 2])
+    say sum(n), avg(set([2, 4])), sort.reversed(n)
+    say str.from_bytes(set([104, 105]))
+    var r = set([1, 2, 3, 4])
+    r.remove(2)
+    say sum(r), enumerate(r), sort.reversed(r)
+    say str.join(set([]), ","), sum(set([]))
+}

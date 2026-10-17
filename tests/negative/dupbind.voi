@@ -1,0 +1,6 @@
+// A name is bound once per pattern.
+func main() {
+    match (1, 2) {
+        (a, a) => say a
+    }
+}

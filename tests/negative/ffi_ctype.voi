@@ -1,0 +1,23 @@
+// The C side of an ffi block is checked where it is written: a type the
+// block does not know, `void` as a parameter, a `link` that is not a
+// library name, and an ABI other than "C" (§12). The `!` lines are the
+// spellings that must stay legal beside them.
+use "std/ffi"
+
+ffi "C" {
+    link "z"
+    link "../evil"
+    func f1(x quad) int
+    func f2(v void) int
+    func f3(s *char, p **void, n size_t, u uint8_t, d double, b bool) *u8
+    func f4()
+    func f5(fmt *char, ...) int
+}
+
+ffi "Pascal" {
+    func g() int
+}
+
+func main() {
+    say 1
+}

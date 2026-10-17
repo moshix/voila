@@ -72,6 +72,11 @@ struct Pkg {
     // blob, not the filesystem, so they must NOT enter the run-cache key
     // (which re-opens every path). See the graft loop and source_key.
     embedded bool
+    // The declared names that are FUNCTIONS or package-level bindings — values,
+    // never types. A bare type name is qualified only when it is not one of
+    // these alone: std/flag declares `func str(…)`, and its `name str`
+    // parameters must still be the builtin `str`, not `flag.str`.
+    values set[str]
 }
 
 // Program is a loaded, flattened program.
@@ -124,6 +129,15 @@ struct Loader {
     // qualifier must survive as a qualifier rather than flatten — so it is
     // rebuilt per file by rw_file. See std_alias in rewrite.voi.
     rwStdAlias  map[str]str
+
+    // Per-enum variant namespaces (§3.5): `EnumFlat|Short` → the flat name
+    // the variant carries after namespace_variants, so `Shape.Circle` (and
+    // `geom.Shape.Circle`) resolve to it; and `scope|Short` → the qualified
+    // spellings of a short name more than one enum of that scope declares,
+    // which may then not be written bare. scope is the package index, or
+    // "main" for the entry file. LOOKUP ONLY: neither is ever iterated.
+    enumVar     map[str]str
+    ambig       map[str]str
 }
 
 // Load parses the entry file, pulls in every user package it reaches and
@@ -146,7 +160,8 @@ func Load(entry str, compilerVer str) Program {
         qualifier: make(map[str]str), order: [], stack: [], D: diag.New(),
         Sources: [], Paths: [], at: entry, rwSelf: 0 - 1, rwFile: "",
         mainImports: make(map[str]int), mainDecls: set([]), rwScopes: [],
-        rwStdAlias: make(map[str]str),
+        rwStdAlias: make(map[str]str), enumVar: make(map[str]str),
+        ambig: make(map[str]str),
     }
 
     var prog = Program{T: ast.NewTree(), File: 0, Entry: entry, Src: "",
@@ -200,6 +215,7 @@ func Load(entry str, compilerVer str) Program {
         return prog
     }
     l.check_package_names()
+    l.namespace_variants(p.T, mainRoot)
 
     var mt = ast.NewTree()
     var decls = []
@@ -318,6 +334,16 @@ impl Loader {
 
             let dir, k = self.resolve(ipath)
             if k == KIND_STD { continue }
+            if k == KIND_STDSRC and std_src_base(ipath) == "ffi" {
+                // §12: whatever goes through std/ffi is outside the safety
+                // guarantees, and "it must be marked". Every `use` of it is
+                // marked here, with a code `-Wall` turns on and `--strict`
+                // makes fatal — which is how `voila check --strict` refuses
+                // a program that calls C or touches raw memory.
+                self.warn(un.Line, un.Col, "ffi",
+                          "`std/ffi` steps outside the safety guarantees: " ||
+                          "a foreign call or raw memory is not checked (§12)")
+            }
             if k == KIND_STDSRC {
                 // Load and graft the embedded Voilà source, but do NOT add it
                 // to the imports map: a `net.listen` call must survive as a
@@ -432,6 +458,13 @@ impl Loader {
     func claim(mut self, seen mut map[str]str, name str, what str, pkg str,
                line int, col int) {
         if name == "" { return }
+        // Two VARIANTS of different enums may share a short name: each enum
+        // is a namespace of its own (§3.5), and namespace_variants gives the
+        // pair distinct flat names. Only a clash with another KIND of
+        // declaration is still an error.
+        if name in seen and what == "variant" and seen[name] == "variant" {
+            return
+        }
         if name in seen {
             self.err(line, col,
                      "{what} `{name}` is already declared in package " ||
@@ -440,6 +473,80 @@ impl Loader {
             return
         }
         seen[name] = what
+    }
+
+    // namespace_variants gives every enum its own variant namespace (§3.5).
+    //
+    // A variant used to be one name in its package's flat namespace, so two
+    // enums of one package could not both declare `X`, and `A.X` could not
+    // say which was meant. Now a short name that several enums of ONE scope
+    // (a package, or the entry file) declare is renamed, in the declaration,
+    // to its enum-qualified flat form — `A.X`, or `geom.A.X` in package geom
+    // — and may then only be written qualified; a short name that exactly
+    // one enum declares keeps its old flat name, so every existing program
+    // means what it meant. In both cases `enumVar` records how `A.X` (or
+    // `geom.A.X`) resolves, which the rewriter applies to expressions and
+    // patterns alike.
+    //
+    // Runs before any file is rewritten: decl_name's qualify() leaves the
+    // renamed `geom.A.X` alone (it is not in `decls`), and the unique names
+    // are qualified by it exactly as before.
+    func namespace_variants(mut self, mainT mut ast.Tree, mainRoot int) {
+        each pi in self.order {
+            var owners = make(map[str][]str)
+            var fi = 0
+            while fi < len(self.pkgs[pi].trees) {
+                variant_owners(self.pkgs[pi].trees[fi], self.pkgs[pi].roots[fi],
+                               owners)
+                fi += 1
+            }
+            let pfx = self.pkgs[pi].name || "."
+            fi = 0
+            while fi < len(self.pkgs[pi].trees) {
+                self.apply_namespaces(self.pkgs[pi].trees[fi],
+                                      self.pkgs[pi].roots[fi], owners,
+                                      str(pi), pfx)
+                fi += 1
+            }
+            // An ambiguous short name leaves both bare namespaces: the
+            // package's own (qualify) and the one importers search
+            // (import_global). Spelling it bare is then diagnosed by the
+            // rewriter, with the qualified forms to choose from.
+            each k, ow in owners {
+                if len(ow) > 1 {
+                    if k in self.pkgs[pi].decls { self.pkgs[pi].decls.remove(k) }
+                    if k in self.pkgs[pi].globalSet {
+                        self.pkgs[pi].globalSet.remove(k)
+                    }
+                }
+            }
+        }
+        var mowners = make(map[str][]str)
+        variant_owners(mainT, mainRoot, mowners)
+        self.apply_namespaces(mainT, mainRoot, mowners, "main", "")
+    }
+
+    // apply_namespaces renames the ambiguous variants of one file and records
+    // every variant's enum-qualified spelling. `pfx` is the package qualifier
+    // with its dot ("" for the entry file, whose names stay bare).
+    func apply_namespaces(mut self, t mut ast.Tree, root int,
+                          owners map[str][]str, scope str, pfx str) {
+        each d in t.Get(t.Kid(root, 1)).Kids {
+            if t.Kind(d) != ast.ENUMDEC { continue }
+            let en = t.Get(d).Sval
+            each v in t.Get(t.Kid(d, 0)).Kids {
+                let short = t.Get(v).Sval
+                var flat = pfx || short
+                if short in owners and len(owners[short]) > 1 {
+                    flat = pfx || en || "." || short
+                    t.Nodes[v].Sval = flat
+                    var qs = []
+                    each o in owners[short] { qs.append("`" || o || "." || short || "`") }
+                    self.ambig[scope || "|" || short] = str.join(qs, " or ")
+                }
+                self.enumVar[pfx || en || "|" || short] = flat
+            }
+        }
     }
 
     // report_module_errors renders everything the module graph found: the
@@ -677,7 +784,8 @@ impl Loader {
         var pk = Pkg{name: name, dir: dir, trees: [], roots: [], sources: [],
                      paths: [], imports: make(map[str]int), decls: set([]),
                      globals: [], globalSet: set([]),
-                     foreignImpl: false, hasInit: false, embedded: false}
+                     foreignImpl: false, hasInit: false, embedded: false,
+                     values: set([])}
         // Register BEFORE recursing, so a cycle is caught by the stack check.
         self.pkgs.append(pk)
         let pi = len(self.pkgs) - 1
@@ -707,6 +815,9 @@ impl Loader {
             each d in p.T.Get(p.T.Kid(root, 1)).Kids {
                 each dn in decl_names(p.T, d) {
                     self.pkgs[pi].decls.add(dn)
+                    if p.T.Kind(d) == ast.FUNC or p.T.Kind(d) == ast.GLOBAL {
+                        self.pkgs[pi].values.add(dn)
+                    }
                 }
                 each gn in global_names(p.T, d) {
                     self.pkgs[pi].globals.append(gn)
@@ -779,7 +890,8 @@ impl Loader {
         var pk = Pkg{name: name, dir: ident, trees: [], roots: [], sources: [],
                      paths: [], imports: make(map[str]int), decls: set([]),
                      globals: [], globalSet: set([]),
-                     foreignImpl: false, hasInit: false, embedded: true}
+                     foreignImpl: false, hasInit: false, embedded: true,
+                     values: set([])}
         self.pkgs.append(pk)
         let pi = len(self.pkgs) - 1
         self.byDir[ident] = pi
@@ -800,6 +912,9 @@ impl Loader {
             each d in p.T.Get(p.T.Kid(root, 1)).Kids {
                 each dn in decl_names(p.T, d) {
                     self.pkgs[pi].decls.add(dn)
+                    if p.T.Kind(d) == ast.FUNC or p.T.Kind(d) == ast.GLOBAL {
+                        self.pkgs[pi].values.add(dn)
+                    }
                 }
                 each gn in global_names(p.T, d) {
                     self.pkgs[pi].globals.append(gn)
@@ -883,6 +998,23 @@ func decl_names(t ast.Tree, d int) []str {
         if sn.Kind == ast.VAR { return [sn.Sval] }
     }
     return []
+}
+
+// variant_owners adds, for every enum variant a file declares, the declaring
+// enum's (unqualified) name under the variant's short name, in declaration
+// order.
+func variant_owners(t ast.Tree, root int, owners mut map[str][]str) {
+    each d in t.Get(t.Kid(root, 1)).Kids {
+        if t.Kind(d) != ast.ENUMDEC { continue }
+        let en = t.Get(d).Sval
+        each v in t.Get(t.Kid(d, 0)).Kids {
+            let vn = t.Get(v).Sval
+            var ens = []
+            if vn in owners { ens = owners[vn] }
+            ens.append(en)
+            owners[vn] = ens
+        }
+    }
 }
 
 // decl_kind_word names a declaration kind for a diagnostic, or "" for a node
@@ -1056,8 +1188,7 @@ func is_std_src(name str) bool {
 // the whole value of the list: `use "std/xml"` is a promise not yet kept,
 // `use "std/stf"` is a misspelling, and the two want different advice.
 func std_planned(name str) bool {
-    let planned = ["chan", "ffi", "maps",
-                   "slices", "vm", "xml", "yaml"]
+    let planned = ["vm", "xml", "yaml"]
     each s in planned {
         if s == name { return true }
     }

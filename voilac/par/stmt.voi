@@ -12,6 +12,15 @@ impl Parser {
         // once again ambiguous with the block brace (§15, and the Go parser).
         let saved = self.lev
         self.lev = 0
+        // A comma ends a one-statement match arm, never a statement inside a
+        // nested block (a closure written in such an arm, say).
+        let savedArm = self.armComma
+        self.armComma = 0
+        // Inside braces a composite literal is unambiguous again even when
+        // the block sits in a statement header (an `if` expression's
+        // branch, a closure body): the header's restriction ends here.
+        let savedLit = self.noLit
+        self.noLit = 0
         var ss = []
         while true {
             self.skip_semis()
@@ -20,6 +29,8 @@ impl Parser {
         }
         self.expect(tok.RBRACE)
         self.lev = saved
+        self.armComma = savedArm
+        self.noLit = savedLit
         return self.add(ast.BLOCK, t, 0, 0, "", ss)
     }
 
@@ -71,7 +82,7 @@ impl Parser {
             if not self.at(tok.SEMI) and not self.at(tok.RBRACE) and
                not self.at(tok.EOF) {
                 vs.append(self.expr())
-                while self.accept(tok.COMMA) { vs.append(self.expr()) }
+                while self.list_comma() { vs.append(self.expr()) }
             }
             self.expect_semi()
             return self.add(ast.RETURN, t, 0, 0, "", vs)
@@ -131,6 +142,15 @@ impl Parser {
         var isConst = 0
         if t.Kind == tok.CONST { isConst = 1 }
         self.next()
+        // `let (a, b) = t` is the parenthesised spelling of `let a, b = t`:
+        // both destructure a tuple into one binding per name.
+        if self.at(tok.LPAREN) {
+            let names = self.paren_names()
+            self.expect(tok.ASSIGN)
+            let v = self.expr()
+            self.expect_semi()
+            return self.add(ast.LET, t, 0, isConst, str.join(names, ","), [v])
+        }
         var names = [self.expect(tok.IDENT).Lit]
         while self.accept(tok.COMMA) {
             names.append(self.expect(tok.IDENT).Lit)
@@ -143,8 +163,71 @@ impl Parser {
         return self.add(ast.LET, t, ty, isConst, str.join(names, ","), [v])
     }
 
+    // list_comma consumes the comma between two values of a `say` or
+    // `return` list — unless that statement is a one-statement match arm
+    // and the comma is the one ENDING it: `1 => say "a", 2 => say "b"`.
+    // The arm's comma is told apart by what follows it, another arm, i.e.
+    // a `=>` before the next comma or the end of the statement, at bracket
+    // depth 0. A value cannot contain a bare `=>`, so nothing that parsed
+    // before is lost.
+    func list_comma(mut self) bool {
+        if not self.at(tok.COMMA) { return false }
+        if self.armComma > 0 and self.arm_ahead() { return false }
+        self.next()
+        return true
+    }
+
+    func arm_ahead(self) bool {
+        var j = self.i + 1
+        var depth = 0
+        while j < len(self.ts) {
+            let k = self.ts[j].Kind
+            if k == tok.LPAREN or k == tok.LBRACKET or k == tok.LBRACE {
+                depth += 1
+            } else if k == tok.RPAREN or k == tok.RBRACKET or
+                      k == tok.RBRACE {
+                if depth == 0 { return false }
+                depth -= 1
+            } else if depth == 0 {
+                if k == tok.FATARROW { return true }
+                // Another comma first: this one separates two values, and
+                // the later comma is the one that may end the arm.
+                if k == tok.COMMA or k == tok.SEMI or k == tok.EOF {
+                    return false
+                }
+            }
+            j += 1
+        }
+        return false
+    }
+
+    // paren_names reads `(a, b, …)` — the names of a destructuring binding.
+    func paren_names(mut self) []str {
+        self.expect(tok.LPAREN)
+        var names = []
+        while not self.at(tok.RPAREN) and not self.at(tok.EOF) {
+            names.append(self.expect(tok.IDENT).Lit)
+            if not self.accept(tok.COMMA) { break }
+        }
+        self.expect(tok.RPAREN)
+        if len(names) < 2 {
+            self.error("a destructuring binding needs at least two names")
+        }
+        return names
+    }
+
     func var_stmt(mut self) int {
         let t = self.expect(tok.VAR)
+        if self.at(tok.LPAREN) {
+            // `var (a, b) = f()`: a destructuring LET whose names are
+            // MUTABLE (Ival2 = 2), so it shares the LET lowering and every
+            // checker that already splits a LET's comma-joined names.
+            let names = self.paren_names()
+            self.expect(tok.ASSIGN)
+            let v = self.expr()
+            self.expect_semi()
+            return self.add(ast.LET, t, 0, 2, str.join(names, ","), [v])
+        }
         let n = self.expect(tok.IDENT)
         var ty = 0
         if not self.at(tok.ASSIGN) and not self.at(tok.SEMI) and
@@ -159,7 +242,27 @@ impl Parser {
 
     func simple_stmt(mut self) int {
         let t = self.cur()
-        let x = self.expr()
+        var x = self.expr()
+        if self.at(tok.COMMA) and (self.armComma == 0 or not self.arm_ahead()) {
+            // Parallel assignment, `a, b = b, a`: the targets become one
+            // TUPLE, and so do several values. The lowerer evaluates every
+            // value before it writes any target. (Inside a one-statement
+            // match arm a comma followed by the next arm ends the arm
+            // instead; see list_comma.)
+            var targets = [x]
+            while self.accept(tok.COMMA) { targets.append(self.expr()) }
+            let at = self.cur()
+            self.expect(tok.ASSIGN)
+            var vals = [self.expr()]
+            while self.list_comma() { vals.append(self.expr()) }
+            var rhs = vals[0]
+            if len(vals) > 1 {
+                rhs = self.add(ast.TUPLE, at, 0, 0, "", vals)
+            }
+            self.expect_semi()
+            let lhs = self.add(ast.TUPLE, t, 0, 0, "", targets)
+            return self.add(ast.ASSIGN, t, tok.ASSIGN, 0, "", [lhs, rhs])
+        }
         let k = self.cur().Kind
         if k == tok.ASSIGN or k == tok.PLUSEQ or k == tok.MINUSEQ or
            k == tok.STAREQ or k == tok.SLASHEQ or k == tok.PERCENTEQ or
@@ -209,10 +312,18 @@ impl Parser {
     // header_expr parses a condition or iterable, where a composite literal
     // must be parenthesised (otherwise `if x > 10 {` is ambiguous).
     func header_expr(mut self) int {
+        // The bracket depth is cleared as well: an `if` or `match` used as a
+        // VALUE may sit inside `(…)`, `[…]` or a call, and its header is
+        // still a header — `f(if ok { 1 } else { 2 })` must not read
+        // `ok { 1 }` as a composite literal. Brackets opened inside the
+        // header raise the depth again as usual.
         let saved = self.noLit
+        let savedLev = self.lev
         self.noLit = 1
+        self.lev = 0
         let e = self.expr()
         self.noLit = saved
+        self.lev = savedLev
         return e
     }
 
@@ -297,6 +408,13 @@ impl Parser {
         let t = self.expect(tok.MATCH)
         let subj = self.header_expr()
         self.expect(tok.LBRACE)
+        // The arms are a fresh context, like a block's statements: neither
+        // the brackets around a match EXPRESSION nor the header it may sit
+        // in reach into them.
+        let savedLev = self.lev
+        let savedLit = self.noLit
+        self.lev = 0
+        self.noLit = 0
         var arms = []
         while true {
             self.skip_semis()
@@ -322,17 +440,49 @@ impl Parser {
                 each s in self.T.Get(b).Kids {
                     body.append(s)
                 }
+                self.accept(tok.COMMA)
             } else {
+                // A one-statement arm may end in a comma as well as a
+                // newline or `;` (`A => 1, B => 2`); armComma lets
+                // expect_semi take it, for this one statement only.
+                let savedArm = self.armComma
+                self.armComma = 1
                 body.append(self.stmt())
+                self.armComma = savedArm
+                // A statement that ends in a block (`if`, `match`, `each`)
+                // never reaches expect_semi, so its comma is taken here.
+                self.accept(tok.COMMA)
             }
             arms.append(self.add(ast.ARM, at2, pat, 0, "",
                                  [guard, self.T.List(body)]))
         }
+        self.lev = savedLev
+        self.noLit = savedLit
         self.expect(tok.RBRACE)
         return self.add(ast.MATCH, t, 0, 0, "", [subj, self.T.List(arms)])
     }
 
+    // pattern parses one arm pattern: alternatives separated by `|` (POR),
+    // each of which is a single pattern_one.
     func pattern(mut self) int {
+        let t = self.cur()
+        let first = self.pattern_one()
+        if not self.at(tok.PIPE) { return first }
+        var alts = [first]
+        while self.accept(tok.PIPE) {
+            alts.append(self.pattern_one())
+        }
+        return self.add(ast.POR, t, 0, 0, "", alts)
+    }
+
+    // pattern_lit parses a literal pattern operand: a basic literal, or a
+    // negated number.
+    func pattern_lit(mut self) int {
+        if self.at(tok.MINUS) { return self.unary() }
+        return self.primary()
+    }
+
+    func pattern_one(mut self) int {
         let t = self.cur()
         let k = t.Kind
         if k == tok.NIL {
@@ -340,11 +490,31 @@ impl Parser {
             return self.add(ast.PNIL, t, 0, 0, "", [])
         }
         if k == tok.TRUE or k == tok.FALSE or k == tok.INT or k == tok.FLOAT or
-           k == tok.DEC or k == tok.STR or k == tok.RUNE {
-            return self.add(ast.PLIT, t, 0, 0, "", [self.primary()])
+           k == tok.DEC or k == tok.STR or k == tok.RUNE or k == tok.MINUS {
+            let lo = self.pattern_lit()
+            if self.at(tok.RANGE) or self.at(tok.RANGEEQ) {
+                // `0..=9`, `'a'..='z'`: a RANGE pattern, both bounds literal.
+                var inc = 0
+                if self.next().Kind == tok.RANGEEQ { inc = 1 }
+                let hi = self.pattern_lit()
+                return self.add(ast.PRANGE, t, 0, inc, "", [lo, hi])
+            }
+            return self.add(ast.PLIT, t, 0, 0, "", [lo])
         }
-        if k == tok.MINUS {
-            return self.add(ast.PLIT, t, 0, 0, "", [self.unary()])
+        if k == tok.LPAREN {
+            // `(0, y)`: a TUPLE pattern. One pattern in parentheses with no
+            // trailing comma is just grouping — `(1 | 2)`.
+            self.next()
+            var subs = []
+            var comma = false
+            while not self.at(tok.RPAREN) and not self.at(tok.EOF) {
+                subs.append(self.pattern())
+                if not self.accept(tok.COMMA) { break }
+                comma = true
+            }
+            self.expect(tok.RPAREN)
+            if len(subs) == 1 and not comma { return subs[0] }
+            return self.add(ast.PTUPLE, t, 0, 0, "", subs)
         }
         if k == tok.IDENT {
             var name = self.next().Lit
@@ -369,6 +539,13 @@ impl Parser {
                 self.expect(tok.RPAREN)
                 return self.add(ast.PVARIANT, t, 0, 0, name, subs)
             }
+            if self.at(tok.LBRACE) {
+                // `Self{x: 0}` in an impl block names the target type.
+                if name == "Self" and self.selfName != "" {
+                    name = self.selfName
+                }
+                return self.struct_pattern(t, name)
+            }
             // A capitalised bare name is a payload-less variant; lowercase
             // binds. A dotted name is a variant whatever its case: a binding
             // has no qualifier to spell.
@@ -380,6 +557,37 @@ impl Parser {
         self.error("expected pattern, found {self.show()}")
         self.next()
         return self.add(ast.PWILD, t, 0, 0, "", [])
+    }
+
+    // struct_pattern parses `P{x: 0, y}` after the type name: each field
+    // is `name: pattern`, or a bare `name`, which binds the field to a
+    // variable of the same name. A trailing `..` is accepted and means what
+    // leaving the field out means anyway: the rest are not examined.
+    func struct_pattern(mut self, t tok.Token, name str) int {
+        self.expect(tok.LBRACE)
+        var fs = []
+        while true {
+            self.skip_semis()
+            if self.at(tok.RBRACE) or self.at(tok.EOF) { break }
+            if self.accept(tok.RANGE) {
+                self.skip_semis()
+                break
+            }
+            let ft = self.expect(tok.IDENT)
+            var sub = 0
+            if self.accept(tok.COLON) {
+                sub = self.pattern()
+            } else {
+                sub = self.add(ast.PBIND, ft, 0, 0, ft.Lit, [])
+            }
+            fs.append(self.add(ast.PFIELD, ft, 0, 0, ft.Lit, [sub]))
+            if not self.accept(tok.COMMA) {
+                self.skip_semis()
+                break
+            }
+        }
+        self.expect(tok.RBRACE)
+        return self.add(ast.PSTRUCT, t, 0, 0, name, fs)
     }
 
     func select_stmt(mut self) int {
@@ -526,7 +734,7 @@ impl Parser {
         if not self.at(tok.SEMI) and not self.at(tok.RBRACE) and
            not self.at(tok.EOF) {
             args.append(self.expr())
-            while self.accept(tok.COMMA) { args.append(self.expr()) }
+            while self.list_comma() { args.append(self.expr()) }
         }
         self.expect_semi()
         return self.add(ast.SAY, t, 0, 0, "", args)

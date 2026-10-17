@@ -1,0 +1,113 @@
+// Generic traits (§3.6): a trait may take type parameters, an impl names
+// the arguments, a bound may name a generic trait at arguments, and several
+// bounds join with `+` — inline or in a `where` clause (§3.7). A default
+// method of a generic trait is compiled once and inherited like any other.
+// Also here: std/iter's Iterator[T], which `each` drives, and the `Ord`
+// protocol — a user type's `cmp(self, other) int` orders `<`, `sort` and
+// `max` (§3.6).
+use "std/iter"
+use "std/sort"
+
+trait Into[T] {
+    func into(self) T
+    func twice(self) (T, T) = (self.into(), self.into())
+}
+
+trait Named { func name(self) str }
+
+// A marker trait: implemented at two arguments by one type, which the
+// by-name dispatch allows because neither impl writes a method.
+trait Tag[T] { }
+
+type Cel int
+type Label str
+
+impl Into[str] for Cel { func into(self) str { return "{int(self)}C" } }
+impl Into[int] for Label { func into(self) int { return len(str(self)) } }
+impl Named for Cel { func name(self) str { return "celsius" } }
+impl Tag[int] for Cel { }
+impl Tag[str] for Cel { }
+
+// Two parameters, one of them in the other's bound.
+trait Pair[A, B] { func pair(self) (A, B) }
+impl Pair[str, int] for Label {
+    func pair(self) (str, int) { return str(self), self.into() }
+}
+
+func render[T: Into[str]](x T) str { return "[" || x.into() || "]" }
+
+func both[T: Into[str] + Named](x T) str { return x.name() || "=" || x.into() }
+
+func described[T](x T) str where T: Named + Into[str] {
+    return x.name() || ":" || x.into()
+}
+
+// A where clause on a generic impl block.
+struct Shelf[T] { items []T }
+impl[T] Shelf[T] where T: Into[str] {
+    func line(self) str {
+        var out = []
+        each it in self.items { out.append(it.into()) }
+        return out.join(", ")
+    }
+}
+
+// std/iter: a type promises the protocol; `each` drives it.
+struct Countdown { n int }
+impl iter.Iterator[int] for Countdown {
+    func next(mut self) ?int {
+        if self.n == 0 { return nil }
+        self.n -= 1
+        return self.n + 1
+    }
+}
+
+func total[I: iter.Iterator[int]](it mut I) int {
+    var t = 0
+    each v in it { t += v }
+    return t
+}
+
+// Ord: ordering by the type's own cmp.
+struct Ver { major int, minor int }
+impl Ord for Ver {
+    func cmp(self, o Ver) int {
+        if self.major != o.major { return self.major - o.major }
+        return self.minor - o.minor
+    }
+}
+enum Size { Small, Large(n int) }
+impl Size {
+    func cmp(self, o Size) int { return self.rank() - o.rank() }
+    func rank(self) int {
+        match self {
+            Small => return 0
+            Large(n) => return n
+        }
+    }
+}
+
+func main() {
+    let c = Cel(21)
+    say render(c), render[Cel](Cel(-4))
+    say c.twice(), Label("abc").twice()
+    say both(c), described(c)
+    say Label("hello").pair()
+
+    // A trait at arguments is a type: a slice of it dispatches dynamically.
+    var xs []Into[str] = [Cel(1), Cel(2)]
+    each x in xs { say x.into() }
+
+    say Shelf[Cel]{items: [Cel(1), Cel(30)]}.line()
+
+    each v in (Countdown{n: 3}) { say "tick", v }
+    var cd = Countdown{n: 4}
+    say iter.collect(cd), iter.count(Countdown{n: 5}), total(Countdown{n: 4})
+
+    var vs = [Ver{1, 2}, Ver{0, 9}, Ver{1, 0}]
+    sort.sort(vs)
+    say vs
+    say Ver{1, 2} < Ver{1, 3}, Ver{2, 0} >= Ver{1, 9}, Ver{1, 1} == Ver{1, 1}
+    say max(Ver{1, 1}, Ver{0, 5}), min(Ver{1, 1}, Ver{0, 5})
+    say [Large(5), Small, Large(2)].sorted(), Small < Large(1)
+}

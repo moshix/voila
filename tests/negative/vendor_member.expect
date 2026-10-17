@@ -1,0 +1,2 @@
+package `sqlite` has no member `decod`; did you mean `sqlite.decode`?
+package `tls` has no member `conect`; did you mean `tls.connect`?

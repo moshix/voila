@@ -43,9 +43,8 @@ impl Search {
 }
 
 // branch counts every solution whose first queen stands on `row`. It is a
-// plain function: a task's body must not capture the loop variable that
-// produced it (see the Programming Note in 8.3), so the row is a
-// PARAMETER, and the task owns everything it touches.
+// plain function, and the row is a PARAMETER (see the Programming Note in
+// 8.3), so the task visibly owns everything it touches.
 func branch(n int, row int, out chan[int]) {
     var s = Search{n: n, board: make([]int, n), count: 0}
     for c in 0..n {

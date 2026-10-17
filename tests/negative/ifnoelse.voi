@@ -1,0 +1,5 @@
+// An `if` used as a value must have an `else`: the false path has no value.
+func main() {
+    let x = if true { 1 }
+    say x
+}

@@ -1,0 +1,28 @@
+1: integer overflow: 127 + 1 is out of range for i8
+127
+126
+2: integer overflow: 100 + 100 is out of range for i8
+3: integer overflow: 200 is out of range for i8
+4: integer overflow: 256 is out of range for u8
+255
+5: integer overflow: 255 + 1 is out of range for u8
+250
+6: integer overflow: 250 + 100 is out of range for u8
+7: integer overflow: 70000 is out of range for i16
+8: integer overflow: 300 is out of range for u8
+[1, 2]
+9: integer overflow: -(5) is out of range for u8
+10: integer overflow: 65535 * 2 is out of range for u16
+11: integer overflow: -128 ~/ -1 is out of range for i8
+12: integer overflow: -128 - 1 is out of range for i8
+64
+13: integer overflow: 2 ** 7 is out of range for i8
+14: integer overflow: 2147483647 + 1 is out of range for i32
+15: integer overflow: 0 - 1 is out of range for u32
+1200
+400
+16: integer overflow: 200 + 200 is out of range for u8
+1001 2
+17: ConvError{from: "int", to: "u8", value: "300"}
+44 255
+done

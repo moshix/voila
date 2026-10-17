@@ -1,0 +1,18 @@
+field: integer overflow: 250 + 10 is out of range for u8
+255
+closure: integer overflow: 300 is out of range for u8
+200
+append: integer overflow: 300 is out of range for u8
+[250, 1, 2]
+map: integer overflow: 300 is out of range for u8
+{"k": 9}
+send: integer overflow: 300 is out of range for u8
+7
+tuple: integer overflow: 250 + 10 is out of range for u8
+255 1001
+each: integer overflow: 250 + 10 is out of range for u8
+each 11
+each 12
+1000000
+4000000
+300000

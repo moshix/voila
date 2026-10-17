@@ -1,0 +1,39 @@
+// ffi.free's live-allocation registry survives a long alloc/free churn — the
+// tombstones it leaves are swept, so a probe for an address it does not hold
+// always ends — and a double free after the churn is still the clean abort
+// its .err golden pins, not a hang. Also here: decoding many strings is
+// linear in the input (each string's buffer is its own size).
+use "std/ffi"
+use "std/json"
+use "std/str"
+
+func main() {
+    var hold = []ffi.Ptr{}
+    var i = 0
+    while i < 5000 {
+        hold.append(ffi.alloc(16 + (i * 37) % 500))
+        if len(hold) > 20 {
+            ffi.free(hold[0])
+            hold = hold[1..]
+        }
+        i += 1
+    }
+    each p in hold { ffi.free(p) }
+    say "churned"
+
+    var parts = []
+    i = 0
+    while i < 200000 {
+        parts.append("\"s{i}\"")
+        i += 1
+    }
+    let doc = "[" || str.join(parts, ",") || "]"
+    let xs = must json.decode[[]str](doc)
+    say len(xs), xs[199999]
+
+    let q = ffi.alloc(8)
+    ffi.free(q)
+    say "freeing twice"
+    ffi.free(q)
+    say "not reached"
+}

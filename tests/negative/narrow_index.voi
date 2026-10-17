@@ -1,0 +1,100 @@
+// Nil narrowing of a location at a VARIABLE index or key (`xs[i]`,
+// `ss[i].v`, `m[k]`) is undone by a write through an index that may be
+// equal (`xs[j]`, `ss[0]`, `m["a"]`) and by a write to the index itself
+// (assignment, `+=`, a `mut` argument, a loop, a closure). A location
+// whose key cannot be written down (`xs[i + 1]`) is never narrowed. Each
+// refusal is a program that may reach arithmetic with nil.
+struct S { v ?int }
+struct P { k str }
+func bump(n mut int) { n += 1 }
+func a(i int, j int) int {
+    var xs = []?int{1, 2}
+    if xs[i] != nil { xs[j] = nil; return xs[i] + 1 }
+    return 0
+}
+func b(i int) int {
+    var ss = [S{v: 1}]
+    if ss[i].v != nil { ss[0].v = nil; return ss[i].v + 1 }
+    return 0
+}
+func c(k str) int {
+    var m = map[str]?int{"a": 1}
+    if m[k] != nil { m["a"] = nil; return m[k] + 1 }
+    return 0
+}
+func d(i int) int {
+    var xs = []?int{1, nil}
+    var j = i
+    if xs[j] != nil { j = 1; return xs[j] + 1 }
+    return 0
+}
+func e(i int) int {
+    var xs = []?int{1, nil}
+    var j = i
+    if xs[j] != nil { j += 1; return xs[j] + 1 }
+    return 0
+}
+func f(p P) int {
+    var q = p
+    var m = map[str]?int{"a": 1}
+    if m[q.k] != nil { q.k = "b"; return m[q.k] + 1 }
+    return 0
+}
+func g(i int) int {
+    var xs = []?int{1, nil}
+    var j = i
+    if xs[j] != nil { bump(j); return xs[j] + 1 }
+    return 0
+}
+func h(i int) int {
+    var xs = []?int{1, nil}
+    var j = i
+    var t = 0
+    if xs[j] != nil {
+        while t < 2 { t += xs[j]; j += 1 }
+    }
+    return t
+}
+func k(i int) int {
+    var xs = []?int{1, nil}
+    var j = i
+    let w = fn() { j = 1 }
+    if xs[j] != nil { w(); return xs[j] + 1 }
+    return 0
+}
+func l(i int) int {
+    var xs = []?int{1, nil}
+    let j = 1
+    {
+        let j = 0
+        if xs[j] == nil { return 0 }
+    }
+    return xs[j] + 1
+}
+func n(i int) int {
+    var xs = []?int{1, nil}
+    if xs[i + 1] != nil { return xs[i + 1] + 1 }
+    return 0
+}
+// Two spellings of one literal index are one location.
+func o() int {
+    var xs = []?int{1, 2}
+    if xs[1] == nil { return 0 }
+    xs[0_1] = nil
+    return xs[1] + 1
+}
+func p() int {
+    var xs = []?int{1, 2}
+    if xs[0x1] == nil { return 0 }
+    xs[1] = nil
+    return xs[0x1] + 1
+}
+func ok(i int) int {
+    var xs = []?int{1, nil}
+    if xs[i] == nil { return 0 }
+    return xs[i] + 1
+}
+func main() {
+    say a(0, 0), b(0), c("a"), d(0), e(0), f(P{k: "a"}), g(0), h(0), k(0)
+    say l(0), n(0), o(), p(), ok(0)
+}

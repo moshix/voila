@@ -20,7 +20,7 @@ diagrams, general rules, and usage notes. Read Chapter 1 first;
 thereafter the manual is designed for random access.
 
 **Note.** Where the behavior of the toolchain deliberately differs from
-the *Voilà Language Specification, Version 0.5.0 (Draft)*, the difference
+the *Voilà Language Specification, Version 0.6.0 (Draft)*, the difference
 is recorded in Appendix D. Programs should be written to this manual.
 
 ---
@@ -244,7 +244,27 @@ fn(int, int) int  procedure type
 shared[T]         shared immutable ownership (Section 8.4)
 cell[T]           shared mutable ownership under a lock (Section 10.4)
 weak[T]           non-owning handle; upgrade() yields ?shared[T]
+Box[T]            owned, unique heap indirection (Section 8.4)
 ```
+
+A collection value may be written as a *typed literal*, the type
+followed by the members in braces:
+
+```voila
+[]int{1, 2, 3}                 a slice ([1, 2, 3] also works)
+[]str{}                        an empty slice of a stated type
+map[str]int{"ann": 31, "bob": 42}
+set[int]{3, 1, 3}              duplicates collapse
+```
+
+Members are separated by commas or newlines. In a map literal a
+repeated key keeps its last value. A map literal always names its
+type; a bare brace opens a block.
+
+The members of a tuple are selected by position: `t.0`, `t.1`, and
+`t.0.1` inside a nested tuple. A position is plain decimal digits; a
+member cannot be assigned; and a position past the end of a tuple whose
+width is known is diagnosed at compile time.
 
 ## 3.3 Decimal Arithmetic
 
@@ -271,10 +291,16 @@ point. The conversion `float` → `dec` is always explicit (Section 3.5).
    >>──VAR──<name>──┬─────────────┬──┬──────────────────────┬─────────────><
                     └──<type>─────┘  └──=──<expression>─────┘
 
+   >>──┬─LET─┬──(──<name>──┬───────────┬──)──=──<expression>──────────────><
+       └─VAR─┘             └─,─<name>──┘ (repeated)
+
    >>──CONST──<name>──=──<constant-expression>────────────────────────────><
 ```
 
-A LET binding is immutable; a VAR binding may be reassigned. A VAR
+A LET binding is immutable; a VAR binding may be reassigned. The
+parenthesized form takes a tuple apart, one name per member, `_`
+discarding one: `let (q, r) = divmod(17, 5)`, `var (lo, hi) = (0, 9)`.
+A VAR
 declared without an initializer receives the zero value of its type:
 zero for numbers, the empty string, `false`, `nil` for optionals, the
 empty collection, and a structure whose fields carry their declared
@@ -311,6 +337,66 @@ any value. Arithmetic overflow of the fixed-width integers signals
 OverflowError; it never wraps silently (`wrap_add`, `wrap_mul` wrap on
 request).
 
+**Sized integers.** Every integer is held as an `int` at run time; the
+range of a sized type (`i8` through `u64`) is enforced by the
+translator wherever it knows the type statically:
+
+- arithmetic (`+ - * ** ~/`, unary `-`) whose type is sized. An
+  untyped literal takes the sized type beside it when it fits in it
+  (`x + 1` with `x i8` is an `i8` sum; `x + 1000` is an `int` sum),
+  and two sized operands widen to the narrowest type both fit in;
+- a compound assignment to a sized variable, field or element —
+  an element's field too (`xs[0].a += n`);
+- a store into a sized location of a value not known to fit: an
+  initializer, an assignment, an argument (checked on entry to the
+  procedure; not the elements of a variadic one), a returned value (a
+  typed closure's included), a structure field, an indexed slice
+  element, an appended element (`bs.append(v)` on a `[]u8`), a map
+  value (`m[k] = v`) and a value sent on a sized channel;
+- arithmetic on a tuple member of known type (`t.0`) and on the
+  variable of an EACH over a sized slice;
+- an integer literal stored into one, at translation time.
+
+The condition is OverflowError, with a message naming the operation and
+the type — `integer overflow: 127 + 1 is out of range for i8` —
+identical under every `-O` level. A value whose type the translator
+cannot see is computed as an `int` and checked when it is stored. `u64`
+holds 0 to 2**63 - 1. Shifts and bitwise operators are not
+range-checked.
+
+## 3.6 Type Declarations
+
+```
+   >>──TYPE──<name>──┬──=──<type>─────────────────┬──────────────────────><
+                     ├──<type>────────────────────┤
+                     └──STRUCT──{──<fields>──}────┘
+```
+
+`type X = T` declares an **alias**: X is another name for T,
+interchangeable with it, and `X(v)` is `T(v)`. `type X T` declares a
+**newtype**: a distinct type with T's representation.
+
+```voila
+type UserID = int                 // alias
+type Cel int                      // newtype
+impl Cel { func to_fah(self) float { return float(int(self)) * 1.8 + 32.0 } }
+let c = Cel(21)                   // explicit conversion in
+say c, int(c) + 1, c.to_fah()     // 21 22 69.8 — and out
+```
+
+A newtype has methods and trait implementations of its own, which
+dispatch on the newtype rather than on T. `X(v)` converts v to T first
+(so `type Age u8` keeps the u8 range) and `T(x)` takes the value back
+out; an untyped literal stored where the newtype is declared (`var c
+Cel = 5`) converts implicitly. Between two values of the same newtype,
+T's operators apply and an
+arithmetic result is the newtype again; mixed with any other type, a
+plain `int` included, the operation is refused — convert explicitly. A
+newtype prints as its underlying value unless it implements Show, and
+it is transparent to the builtins that read a value: a newtype over a
+slice indexes, iterates and has `len` and the slice methods; one over a
+procedure type can be called; one over a structure has its fields.
+
 ---
 
 # Chapter 4. Expressions and Operators
@@ -321,7 +407,7 @@ From highest (bound first) to lowest:
 
 | Level | Operators | Association |
 |---|---|---|
-| 11 | `x.f  x[i]  x(...)` | left |
+| 11 | `x.f  x[i]  x(...)  x?  t.0` | left |
 | 10 | unary `-  not  ~  <-` | right |
 | 9 | `**` (power) | right |
 | 8 | `*  /  ~/  %` | left |
@@ -381,6 +467,68 @@ history of this choice.
 
 A range is a first-class value: it may be iterated, tested with `in`,
 and used to slice (Section 5.4).
+
+## 4.6 Conditional Expressions
+
+IF and MATCH may be used where a value is expected:
+
+```voila
+let size = if n < 10 { "small" } else if n < 100 { "medium" } else { "large" }
+let name = match shape { Circle(r) => "circle {r}"; Empty => "empty"; _ => "other" }
+let v    = if let Some(x) = to_int(s) { x } else { 0 }
+```
+
+As a value, IF requires an ELSE. The value of a branch or arm is the
+value of its last statement, which must be an expression; an IF with an
+ELSE, a MATCH, or a block, yielding its value in turn; or a RETURN,
+THROW, BREAK, or CONTINUE, in which case the branch *diverges* and
+produces nothing. Statements may precede the last one. Any other ending
+is diagnosed at compile time.
+
+## 4.7 Parallel Assignment
+
+```voila
+a, b = b, a                    // exchange
+xs[0], xs[1] = xs[1], xs[0]
+q, r = divmod(17, 5)           // a tuple-valued right-hand side
+```
+
+All values on the right are evaluated before any target is assigned.
+
+## 4.8 Static Type Checking
+
+Every expression is typed, and every value is judged against the place it
+is put — the translator refuses the program, with the file and line, rather
+than letting it run into a wrong answer or an abort:
+
+```voila
+func f(a int) int { return a }
+f("s")                      // argument 1 of `f` is `int`, but `str` is given
+var n = 3
+n = "three"                 // an unannotated var KEEPS its type
+let xs = []int{"a"}         // an element of `[]int` must be `int`
+say 1 == "x"                // cannot compare `int` with `str`
+say "a" + 1                 // `+` does not concatenate — use `||`
+if n { … }                  // a condition is a bool: no truthiness
+"x".lstrip("-")             // `str` has no method `lstrip`
+let k int = to_int(s)       // a `?int` is not an `int` until unwrapped
+let c Cel = n               // a newtype takes only a literal implicitly
+```
+
+The rules are those of Section 3.5 and the specification's §5.5. A generic
+procedure is instantiated at each call by matching its parameter types with
+the arguments, so `mx(1, "x")` for `mx[T](a T, b T)` is refused at the second
+argument, and a type argument found that way is held to the bounds as a
+written one is. Inside a generic body a value of a type parameter answers only
+the methods its bounds declare. An IF or MATCH used as a value has one type.
+
+The check is **sound in one direction**: where a type is not written down
+anywhere — an untyped JSON value, a value of a trait type, which dispatches
+at run time, the result of a native whose type no table states — the value
+is accepted wherever it is put, and a *name* holding an optional is taken to
+have been narrowed before it is used (`if x == nil { return }`), since the
+translator does not follow that flow. A missed error is possible; a refused
+working program is the defect the check is built to avoid.
 
 ---
 
@@ -471,8 +619,9 @@ Loops may be labeled; BREAK and CONTINUE accept an optional label.
 
 Indexing `v[i]` checks bounds; a violation is an *abort* (Section 9.5).
 Slicing `s[a..b]` verifies the range and *signals* RangeError on
-violation, permitting recovery. Indexing a map with an absent key
-yields `nil`.
+violation, permitting recovery. Either bound of a slice may be omitted:
+`s[a..]` runs to `len(s)`, `s[..b]` starts at 0, and `s[..]` is all of
+`s`. Indexing a map with an absent key yields `nil`.
 
 ## 5.5 SWITCH
 
@@ -502,9 +651,21 @@ match s {
 
 MATCH must be exhaustive; the translator names any missing cases. An
 arm consists of a pattern, an optional guard (`if <condition>`), the
-arrow `=>`, and one statement or a block. Patterns are literals, `_`,
-`nil`, binding identifiers (lowercase), and variant patterns
-(`Some(v)`, `Ok(v)`, `Err(e)`, and user enumeration variants).
+arrow `=>`, and one statement or a block; a one-statement arm may end
+in a comma. Patterns are literals, `_`, `nil`, binding identifiers
+(lowercase), variant patterns (`Some(v)`, `Ok(v)`, `Err(e)`, and user
+enumeration variants), and the compound forms:
+
+```voila
+0 | 1 | 2              or-pattern; every alternative binds the same names
+3..10   'a'..='z'      range of literals (exclusive / inclusive); only
+                       values of the bounds' own kind match
+P{x: 0, y}             struct pattern; a bare field name binds it; `..` ends
+(0, y)                 tuple pattern
+```
+
+Patterns nest, and exhaustiveness is judged on the nested parts too.
+MATCH may also be used as a value (Section 4.6).
 
 ## 5.7 DEFER and DROP
 
@@ -588,6 +749,52 @@ A closure captures its free variables by reference. When the closure
 must outlive the enclosing scope, the captured values are moved in
 explicitly with a capture list.
 
+**Captured variables and tasks.** A captured variable is one variable,
+shared with every task its procedure spawns: a task may store into a
+slice element or a field of it (`spawn { out[j] = j * 10 }`), and the
+stores of different tasks never undo each other. Its value keeps the
+value semantics of Section 6.4 — `let row = out[0]` is a snapshot,
+whatever the tasks did before. A spawned body may not assign the
+variable itself, store into a map in it, grow, shrink or reorder a
+collection in it, call a `mut self` method on it, or hand it to a `mut`
+parameter: the translator rejects each, and points to a channel, a
+CELL or a SHARED value instead. A closure that would break those rules
+may not be run by a task either — captured by a spawned body, handed to
+a parameter that its callee runs in a task, or sent over a channel.
+Writes inside your own critical section (`mu.lock()` … `mu.unlock()`,
+or a `with_write` closure) are left to you. `tot[0] += 1` from many
+tasks loses no update. Whatever route a closure takes to a task, memory
+stays safe: a read of a captured variable takes a snapshot of its value
+(under its frame's lock once a closure over the frame may escape — one
+that is stored, sent, spawned, returned or handed to anything but a
+builtin collection method that runs it at once), a writer that finds the
+value held copies it first, and a `mut` argument or `mut self` receiver in
+such a variable works on a copy stored back after the call. A variable
+never written after it is made is read without the lock. Reading a
+captured variable in a tight loop costs a lock and a reference count per
+read; take one snapshot (`let t = table`) and read that. A closure that
+uses `self` in a `mut self` method may only be handed straight to a
+builtin collection method that runs it at once, such as `xs.map`.
+
+**Loop variables.** Each iteration of a loop is a fresh binding of the
+variables declared in it — the loop variable and those of the body —
+as in Go 1.22. A closure created in an iteration, whether called at
+once, stored, deferred or spawned, keeps that iteration's values:
+
+```voila
+var fs = []
+for i in 1..4 { fs.append(fn() int { return i }) }
+each f in fs { say f() }               // 1, 2, 3
+```
+
+The closure receives its own copy of each such variable, made when the
+closure is created; a variable declared before the loop is one binding
+shared by all iterations and closures. A loop variable that is
+assigned after a closure copied it — in the loop or in the closure —
+would silently stop being shared, and is diagnosed at translation time,
+by name: declare it before the loop to share it, or copy it into a LET
+to capture its value.
+
 ## 6.4 Methods
 
 ```voila
@@ -637,6 +844,24 @@ destructures it (Section 5.6). The optional and fallible types are
 enumerations in disguise: `?T` ≡ `Some(T) | nil`, `T!` ≡ `Ok(T) |
 Err(error)`.
 
+A variant may always be qualified by its enumeration — `Shape.Empty`,
+`Shape.Circle(2.0)`, `Shape.Circle` as a procedure value, and
+`Shape.Circle(r)` in a pattern; from another package,
+`geom.Shape.Circle`. Each enumeration is a namespace of its own, so two
+enumerations may declare the same variant name:
+
+```voila
+enum Light { Red, Green }
+enum Flag  { Red, White }
+let a = Light.Red                 // qualified: always legal
+let g = Green                     // bare: legal, Green is unique
+let r = Red                       // ERROR: Light.Red or Flag.Red?
+```
+
+A variant name that one enumeration of its package declares may be
+written bare; one that several declare must be qualified. A variant
+name still may not coincide with another declaration of the package.
+
 ## 7.3 Traits
 
 ```voila
@@ -680,8 +905,96 @@ is on the receiver's run-time type, so a default that calls
 `self.title()` reaches the implementor's own `title`. Writing the method
 overrides the default — including in an inherent `impl T { ... }` block,
 which the flat method table cannot tell apart from a trait one. When two
-traits implemented by one type default the same method name, the earlier
-IMPL block wins.
+traits implemented by one type default the same method name and the type
+writes it in neither, the program is refused: one default would silently
+answer for both traits. Write the method for the type.
+
+A method a program writes for a BUILTIN type — `impl Show for int`, or a
+trait default inherited by `str` — answers in method-call form like any
+other (`n.show()`), after the type's own builtin methods. Every integer is
+an `int` at run time, so an impl for a sized integer type is reached by
+a call the run time sees on an `int` only when `int` has the method too.
+
+### 7.3.1 Generic Traits
+
+A trait may take type parameters. An IMPL names the arguments — as many
+as the trait declares — and a default method of a generic trait is
+compiled once and inherited like any other:
+
+```voila
+trait Into[T] {
+    func into(self) T
+    func twice(self) (T, T) = (self.into(), self.into())
+}
+
+impl Into[str] for Cel { func into(self) str { return "{int(self)}C" } }
+
+var xs []Into[str] = [Cel(1), Cel(2)]   // a trait at arguments is a type
+```
+
+Dispatch is by the receiver's run-time type and the method NAME, never
+by trait argument. One type may therefore implement one generic trait
+at several arguments only when those IMPLs write different methods; two
+IMPLs that both write `into` are refused (the second could never be
+reached). A marker trait, or one whose methods all have defaults, may be
+implemented at any number of arguments.
+
+There are no associated types. Where a trait would carry `type Item`,
+make the trait generic over it: `trait Iterator[T] { func next(mut
+self) ?T }`. A generic parameter says the same thing, and the bound
+syntax already reads it (`[I: Iterator[int]]`).
+
+### 7.3.2 Self and Static Methods
+
+Inside a trait, `Self` is the implementing type. Inside an IMPL it is
+an alias for the target, wherever a type or a type's name may appear:
+
+```voila
+trait Default {
+    func default() Self                    // static: no self
+    func reset(self) Self = Self.default() // Self, through the receiver
+}
+
+impl Default for Point {
+    func default() Self { return Self{x: 0, y: 0} }
+}
+
+say Point.default()                        // on the type
+func make[T: Default]() T { return T.default() }   // through a parameter
+say make[Point]()
+```
+
+A method without `self` is STATIC. It is called on a type —
+`Point.default()`, `Cel.default()` for a newtype, `int.default()` after
+`impl Default for int`, `Wrap[int].make()` on an instantiated generic type
+(whose arguments, generics being erased, say nothing the call needs) — or
+through a type parameter, `T.default()`,
+inside a generic procedure bounded by the trait (7.4). In a trait
+default with a receiver, `Self.m()` calls `m` of the receiver's
+run-time type; a default WITHOUT a receiver cannot write `Self.m()`,
+having no way to know which type implements the trait.
+
+### 7.3.3 Ordering and Iteration
+
+The `Ord` constraint's method is `cmp(self, other Self) int`, answering
+negative, zero or positive. A structure or enumeration that provides
+one is ordered by it: the comparison operators, `min`, `max`, `sort`
+and `sorted` consult it. Equality stays structural, and a newtype keeps
+its underlying type's order.
+
+```voila
+impl Ord for Ver {
+    func cmp(self, o Ver) int { return self.major - o.major }
+}
+sort.sort(versions)                       // by cmp
+```
+
+EACH iterates a user type by calling its `next(mut self) ?T` until it
+answers nil. `std/iter` names that protocol as the trait
+`iter.Iterator[T]`, with `iter.collect(it)` and `iter.count(it)`, so a
+type can promise it and a generic procedure can require it. A trait of
+a Voilà-source standard package is spelled with its qualifier:
+`impl iter.Iterator[int] for Countdown`.
 
 ## 7.4 Generic Declarations
 
@@ -700,15 +1013,65 @@ Constraints name traits. The translator erases type parameters and the
 runtime checks representations; a later monomorphizing pass will change
 the cost, not the observable behavior.
 
+A parameter may carry several bounds joined by `+`, inline or in a
+WHERE clause after the signature; the two spellings combine. An IMPL
+block takes a WHERE clause before its brace. `where` is contextual: it
+is a keyword only as `where NAME :` in that position.
+
+```voila
+func both[T: Show + Into[str]](x T) str { ... }
+func same[T](x T) str where T: Show + Into[str] { ... }
+impl[T] Shelf[T] where T: Into[str] { ... }
+```
+
+**Type descriptors.** Erasure leaves one compiled body per generic
+procedure, so `T.default()` — a static method through a type parameter
+— has no receiver to dispatch on. The translator therefore passes the
+TYPE. Each type parameter of a top-level procedure whose bounds include
+a trait that declares a static method receives a hidden, leading
+argument: the type's name as a string, which is exactly the key the
+run-time method table is searched by. `T.default()` becomes a lookup of
+`default` under that name (`vl_callt`). The caller supplies the
+descriptor
+
+1. from an explicit type argument — `make[Point]()`; inside another
+   generic procedure `make[T]()` forwards that procedure's own;
+2. else from a value argument declared `T`, by its run-time type —
+   `like(p)` for `func like[T: Default](x T) T`; a Box is looked
+   through, and an argument of a known sized integer type passes that
+   type, since every integer is an `int` at run time — while an argument
+   declared as the ENCLOSING generic procedure's own parameter forwards
+   that procedure's descriptor, so `like(x)` inside `wrap[T](x T)` keeps
+   the `u8` that `wrap`'s caller passed;
+3. else the call is refused at compile time: write `make[Type](...)`.
+
+The descriptor occupies the callee's lowest registers, ahead of the
+declared parameters, so defaults, named and variadic arguments are
+unaffected. Two consequences follow, both diagnosed: a procedure that
+takes descriptors cannot be used as a value (wrap the call in a
+closure), and the type parameters of a method, an IMPL block or a trait
+carry none, so `T.m()` is refused there (D.11). Bounds whose traits
+have only methods WITH a receiver need no descriptor: the value carries
+its type.
+
 A constraint is enforced wherever an ACTUAL type is written in place of
 the parameter: a composite literal `Stack[Point]{}`, an annotation
 `var s Stack[Point]`, and an explicit instantiation `max[Point](a, b)`.
-The argument must provide the constraint's methods, and a method counts
-wherever the program writes it — the flat method table does not tell an
+The argument must provide each bound's methods — and, where it
+implements a generic trait explicitly, at the bound's arguments: a type
+implementing only `Into[int]` does not satisfy `T: Into[str]` — and a
+method counts wherever the program writes it — the flat method table does not tell an
 inherent `impl T { ... }` apart from an `impl Trait for T`. The six
 PREDECLARED constraints have no method set of their own, so nothing is
-judged against one. A type argument may itself be an instantiation:
-`Stack[Box[int]]`.
+judged against one. A type argument that is INFERRED from a call's
+arguments (Section 4.8) is held to the bounds in the same way —
+`show(3.5)` is refused when `float` lacks a bound's method — and inside
+the generic body a value of a bounded parameter answers only the methods
+its bounds declare. A type argument may itself be an instantiation:
+`Stack[Box[int]]`. A declaration with several parameters takes its
+arguments in one bracket, in order: `mk[str, int](k, v)`,
+`Lru[str, int]{cap: 8}`, `var c Lru[str, int]`. Any type form may be
+an argument (`mk[[]int, ?str](...)`), and the count must match.
 
 ---
 
@@ -736,6 +1099,27 @@ say data                      // ERROR: use of moved value `data`
 
 An explicit deep copy is always available as `x.clone()`.
 
+A move happens BY NAME, and only for a binding the procedure owns (a LET,
+a VAR or an `own` parameter): `let b = a`, `b = a` and `ch <- a` move `a`
+when its type owns storage — a slice, map, set, channel or procedure, or a
+structure, tuple, enumeration or optional holding one. A Copy value is
+copied, and a borrowed parameter bound to a second name is a second borrow.
+The translator follows moves straight-line: within one block, into the
+blocks nested in it, and up to a re-assignment, which revives the name.
+
+A copied structure is copied LAZILY: the two names share it until one of
+them writes it — a field or an element assigned through any path, a
+`mut self` method called, a `mut` parameter given it — and the writer then
+gets its own. Each level of a path is copied only when another holder still
+shares it, so a structure only one name holds is always written in place.
+Slices, maps and sets are values in the same way, wherever they are held —
+a field, an element, a map value, a literal they were put into: a write
+through one holder (an element stored, an append, a map store) is never
+seen through another. A value read by an earlier expression and never read
+again (`len(self.items)` in a loop condition) is dropped once it is dead,
+so it is not counted as a holder, and a loop of appends through a field
+copies nothing.
+
 ## 8.3 Borrows Do Not Escape
 
 A borrow (the default parameter mode) may not be stored in a structure
@@ -759,8 +1143,45 @@ unrepresentable:
 > `shared`, `cell`, and collection elements — the type graph must be a
 > directed acyclic graph. A type that reaches itself through a scalar
 > owning edge is rejected at translation time. Self-reference is legal
-> through `weak[T]`, and through collection edges, which are tree-
-> shaped by construction.
+> through `weak[T]`, through `Box[T]` and `?Box[T]`, and through
+> optional and collection edges, which are tree-shaped by construction.
+
+**Box.** `Box[T]` is an owned, unique heap indirection, and the way a
+recursive enumeration or structure is written:
+
+```voila
+enum Tree[T] { Leaf, Node(v T, l Box[Tree[T]], r Box[Tree[T]]) }
+
+func insert(t Tree[int], x int) Tree[int] {
+    return match t {
+        Leaf => Node(x, Box(Leaf), Box(Leaf))
+        Node(v, l, r) => if x < v { Node(v, Box(insert(l.get(), x)), r) }
+                         else { Node(v, l, Box(insert(r.get(), x))) }
+    }
+}
+```
+
+`Box(v)` constructs one, `b.get()` reads it and `b.set(v)` replaces the
+value. A Box has VALUE semantics: `var b = a` gives `b` its own Box,
+and a `set` — or a field or element assigned — through `b` is not seen
+through `a`. The copy is lazy: a Box is copied when it is written
+through while another owner still holds it, and written in place when
+it is not. A Box passed by name to a `mut` parameter is made unique
+by the caller and written in place by the callee, so the caller sees
+the write. Since the value written is evaluated first,
+`b.set(LNode{next: b})` keeps the old Box inside the new one, and so
+does `n.next = n`; through a `mut` parameter such a write goes to the
+callee's own copy. A Box cannot be made to contain itself, which is
+what lets the Acyclicity Rule exempt it. Otherwise a Box is transparent: fields and methods are
+reached through it, comparison, arithmetic and SAY see the value, and
+MATCH sees through it (`Node(v, Leaf, _)` matches a node whose left Box
+holds `Leaf`; a binding pattern binds the Box itself). A **direct**
+self-reference, `Node(v T, l Tree[T])`, is not boxed implicitly: the
+specification admits self-reference only through `weak` or a Box, so
+the translator reports the cycle and names both remedies. Destruction
+of a deep structure is iterative and uses no stack in proportion to
+its depth. A program that declares its own type named `Box` shadows
+this one.
 
 ```voila
 struct Node {
@@ -823,9 +1244,27 @@ match parse_port(s) {                // handle both arms
 ```
 
 `try e` propagates failure (an error value, or `nil` from an optional)
-out of the enclosing procedure. The `else` operator supplies a default;
-its right operand may instead be a diverging statement (`return`,
-`throw`, `break`, `continue`).
+out of the enclosing procedure; the postfix form `e?` is identical. In a
+procedure whose result is a plain `T`, or which declares no result at
+all, and which declares no THROWS clause, `try`/`?` instead raises the
+failure as an exception, as MUST does — a caller could not receive it
+otherwise. The `main` procedure is the exception: a failure propagated
+out of it ends the program with code 1 (Appendix C). The
+`else` operator supplies a default; its right operand may instead be a
+diverging statement (`return`, `throw`, `break`, `continue`), or a
+block that runs only on failure:
+
+```voila
+let opts = parse(args) else {
+    usage()
+    os.exit(2)
+}
+```
+
+The block's last statement is its value, or it diverges, under the
+rules of Section 4.6 — except when the whole expression is a statement
+whose value is unused (`save(d) else { say "not saved" }`); then the
+block is an ordinary block.
 
 ## 9.3 Exceptions
 
@@ -868,6 +1307,17 @@ try {
 DEFERs run in LIFO order and its owned values are destroyed. An
 exception can therefore neither leak storage nor leave a file open.
 
+**A FINALLY block runs to its end.** Control may not leave it: a RETURN
+anywhere in it, and a BREAK or CONTINUE whose loop encloses it, is a
+translation-time error (`control flow out of a finally block is not
+allowed`), as in C#. Java's alternative — the finally's RETURN wins —
+silently discards the exception in flight or the value already being
+returned. A loop written inside the finally may be left as usual, and a
+closure written there is a procedure of its own. For the same reason a
+`?` or TRY inside a finally does not return the failure, even in a
+procedure whose result is `T!` or `?T`: it RAISES it, exactly as MUST
+does, the way a THROW written there would.
+
 ## 9.4 Bridging the Mechanisms
 
 ```voila
@@ -891,6 +1341,44 @@ program is an **abort**: the process prints a stack trace and ends. An
 abort is not catchable, and DEFERs do not run: the correct response to
 a wrong program is to stop, not to limp on. `os.on_abort(f)` may
 register one last-gasp handler (flush logs, notify a supervisor).
+
+The trace is written to standard error after the message, one line per
+active procedure, innermost first: its name as the program spells it
+(a closure is shown as the procedure it is written in) and the file and
+line of the statement that failed.
+
+```
+abort: index out of bounds: 5 (len 2)
+  at pick (app.voi:3)
+  at outer (app.voi:7)
+  at main (app.voi:14)
+```
+
+An unhandled exception prints `unhandled exception: <message>` and the
+trace recorded where it was first thrown — the same lines `e.trace()`
+returns — followed by any `caused by:` chain. At most 64 frames are
+listed; the rest are counted. Each procedure records its current line
+with one store per source line that can fail, which is the whole run-
+time cost of the facility.
+
+**Recovery points.** One place in the library may CONTAIN an abort:
+std/http's server calls each handler under a recovery point (11.15), so a
+defect in one request costs that request a 500 — the abort's message goes
+to standard error — and the server keeps serving, as Go's net/http
+recovers a handler's panic. Under a recovery point the aborts a program's
+own code provokes at the language level are contained: an index or a key
+out of bounds, a field of nil or of the wrong kind, a call of something
+that is not a function, a missing method, an operand of the wrong kind, a
+failed `assert`, a native given an argument of the wrong kind. The abort
+then unwinds like an exception — DEFERs and FINALLY blocks **do** run, so
+a deferred unlock or a `try { … } finally { mu.unlock() }` still releases
+its lock — but no `catch` clause sees it; only the recovery point does. A
+defer or a finally that itself aborts or throws while the request is
+being unwound makes that the request's failure, and it is contained the
+same way. Everything else stays fatal even there: running out of memory,
+a failure inside the runtime itself, a stack overflow, and an abort on a
+task the recovery point did not start (recovery is per task). A program cannot open a recovery point of its
+own; outside one, every abort ends the process as described above.
 
 ---
 
@@ -988,9 +1476,29 @@ Visible without any USE declaration: `say`, `printf`, `sprintf`, `len`,
 `str`, the conversion families of Section 3.5, `append`, `make`,
 `close`, `min`, `max`, `abs`, `sum`, `avg`, `round`, `floor`, `ceil`,
 `trunc`, `round_to`, `err`, `errf`, `assert`, `range`, `zip`,
-`enumerate`, `keys`, `values`, `shared`, `cell`, `weak`, `set`, and the
+`enumerate`, `keys`, `values`, `shared`, `cell`, `weak`, `Box`, `set`, and the
 common string helpers (`trim`, `pad`, `pad_left`, `center`, `upper`,
 `lower`, `split`, `join`, ...).
+
+**Argument kinds.** A library procedure implemented in the runtime
+states the kind of each argument its body relies on — a string, an
+integer, a slice, a map, a procedure. A call whose argument's type the
+translator knows and which is of the wrong kind is diagnosed at
+translation time:
+
+```
+app.voi:3:32: argument 2 of `os.run_capture` must be a slice, but `str` is given
+```
+
+Where the type is not known — the procedure called as a value, or an
+argument of unknown type — the call is checked when it is made and a
+wrong kind is an abort naming the procedure and the argument, never a
+memory fault. A newtype or Box whose value is of the right kind is
+accepted, by a direct call and through a value alike. The procedures
+that walk a sequence — `join`, `sum`, `avg`, `zip`, `enumerate`,
+`from_bytes`, `sort.reversed` — accept a set as well as a slice, in the
+set's insertion order. The kinds cover std/os, std/io, std/str, std/fmt, std/sort
+and every prelude procedure that reads a slice, a map or a channel.
 
 ## 11.2 std/fmt
 
@@ -1008,39 +1516,66 @@ Every function is Unicode-correct and returns a new string. Indices are
 0-based byte offsets (see Deviation D.2). Functions are callable both
 ways: `str.upper(s)` and `s.upper()` are the same call.
 
-Case/space: `upper lower title trim trim_left trim_right strip pad
-pad_left center`. Search: `contains index last_index starts_with
-ends_with count equal_fold`. Split: `substr left right split split_n
-lines fields word words subword delword`. Build: `join replace
+Case/space: `upper lower title trim trim_left trim_right strip
+trim_prefix trim_suffix pad pad_left center`. Search: `contains index
+last_index starts_with ends_with count equal_fold`. Split: `substr left
+right split split_n cut lines fields word words subword delword`. Build: `join replace
 replace_n repeat reverse translate overlay insert delstr`. Convert:
 `bytes from_bytes runes from_runes rune_len is_digit is_alpha is_space
-is_upper hex unhex b64 unb64`. Efficient building: `str.Builder{}` with
-`.write(x)` and `.done()`.
+is_upper valid_utf8 hex unhex b64 unb64`. Efficient building:
+`str.Builder{}` with `.write(x)` and `.done()`.
+
+`trim_prefix(s, p)` and `trim_suffix(s, p)` remove ONE leading or trailing
+copy of `p` (where `strip` removes any run of a set of characters), and
+`cut(s, sep)` splits around the first `sep`:
+
+```voila
+let (key, value, found) = "Content-Type: text/plain".cut(": ")
+// ("Content-Type", "text/plain", true); not found → (s, "", false)
+```
+
+Case mapping and the `is_` tests are Unicode-aware: `upper("héllo")` is
+`HÉLLO` and `is_alpha('é')` is true. `is_digit` alone stays ASCII `0-9`,
+because it guards `int()`. A `str` is a byte string, so `from_bytes`
+accepts any byte (binary data travels in a `str`); use `valid_utf8(s)` to
+check whether a string is well-formed text.
 
 ## 11.4 Other Packages
 
 | Package | Contents |
 |---|---|
-| std/os | `read write open create exists remove args env exit stderr stdout on_abort`; File: `lines() records(n) read_all() write() close()` |
+| std/os | `read write open create exists remove args env exit stderr stdout on_abort`; File: `lines() records(n) read_all() write() close()`. Processes and signals: `start kill getpid signals` and the `SIGINT`… constants (11.15); `walk glob` read directory trees. **`os.args()` does not include the program's name** — `args()[0]` is the first argument the user typed, unlike C's `argv` and Go's `os.Args` |
 | std/math | `pi e sqrt sin cos tan ln log2 log10 exp pow hypot mod` |
 | std/time | two halves. Stopwatch: `now since sleep after millis seconds`; `Second`, `Millisecond`, ... durations with integer arithmetic. Calendar: `DateTime`, `now_utc now_local date utc from_unix from_instant parse_rfc3339 is_leap_year days_in_month`. See 11.8. |
-| std/json | `encode pretty decode decode[T]` — numbers with fractions decode as `dec` |
+| std/json | `encode pretty decode decode[T]` — numbers with fractions decode as `dec`; `decode[T]` is typed and recursive, and reports a mismatch with its JSON path (11.16) |
 | std/csv | RFC 4180 — `decode(text) encode(recs)`, and a streaming `Reader`/`Writer` over any `io` source. A quoted field may contain commas, quotes and NEWLINES, so a record is not a line. See 11.10. |
 | std/log | `info warn error debug` to the standard error stream |
 | std/net | TCP, UDP and Unix-domain sockets — `listen connect listen_udp dial_udp listen_unix dial_unix resolve`; `Listener`, `Conn`, `Udp` methods. See 11.5. |
-| std/path | lexical paths — `base dir split join ext stem with_ext clean is_abs abs rel has_prefix`, and the `SEP` constant. `join` cleans its result, so `join(dir(p), base(p))` is `clean(p)` for every p. Nothing here touches the disk except `abs`. |
+| std/path | lexical paths — `base dir split join ext stem with_ext clean is_abs abs rel has_prefix matches`, and the `SEP` constant. `matches(pattern, name)` is a shell pattern — `*`, `?`, `[a-z]`, `[!x]`, `\c` — where `*` never crosses a `/`. `join` cleans its result, so `join(dir(p), base(p))` is `clean(p)` for every p. Nothing here touches the disk except `abs`. |
 | std/sync | `mutex() rwlock() atomic(n) once() wait_group()` — mutual exclusion, read/write locks, atomic integers, run-once and work counting. See 11.7. |
-| std/regex | RE2 semantics (linear time): `compile matches find find_all replace split`; a compiled `Regex` carries the same methods plus `source`. No backreferences and no lookaround — neither is expressible in a finite automaton, and supporting them would forfeit the linear-time guarantee. Note `{n}` inside a Voilà string literal is interpolation: write `\{n\}`. |
-| std/http | HTTP/1.1 client and server — `get(url) post(url, body) request(method, url, headers, body)` returning a `Response{status, reason, proto, headers, body}`; `listen(addr)` and `serve_one(handler)` for a server; `parse_url`, `Headers` (case-insensitive), chunked decoding. **No TLS**: an `https://` URL is refused. See 11.12. |
+| std/regex | RE2 semantics (linear time): `compile matches find find_all find_named names replace split`; a compiled `Regex` carries the same methods plus `source`. `find` returns `[]str` — the whole match, then each group by position — or nil; a NAMED group `(?P<year>\d+)` (or `(?<year>…)`) is also reachable by name: `find_named` returns a `map[str]str` of every named group plus `"0"` for the whole match (nil for no match), `names()` the group names by position, and `${year}` in a replacement inserts it. No backreferences and no lookaround — neither is expressible in a finite automaton, and supporting them would forfeit the linear-time guarantee. Note `{n}` inside a Voilà string literal is interpolation: write `\{n\}`. |
+| std/http | HTTP/1.1 client and server — `get(url) post(url, body) request(method, url, headers, body)` returning a `Response{status, reason, proto, headers, body}`; `listen(addr)`, `serve_one(handler)` and `serve(handler, stop)` for a server; `parse_url`, `Headers` (case-insensitive), chunked decoding, `url_decode url_encode parse_query` and `Request.query_params()`. `https://` URLs are fetched over TLS with the certificate verified, and `listen_tls(addr, cert, key)` serves HTTPS. See 11.12. |
+| std/tls | TLS 1.2 for `net.Conn`: `connect client server listen check_server version system_ca_file` and `Config`, verified against the system's CA bundle (11.18) |
+| std/compress | `deflate inflate zlib unzlib gzip gunzip`, as streams `deflate_writer … gunzip_reader`, `crc32 adler32`; zip (`zip_open zip_create`) and tar (`tar_read tar_write`); every decoder bounded by `max` (11.19) |
+| std/sqlite | an embedded SQL database: `open open_readonly`, `DB.exec run query query_one prepare transaction`, `Stmt`, `Row`, `Value`, `decode[T]` (11.20) |
 | std/conv | the conversion functions, package-qualified |
-| std/sort | `sort sort_by reversed` |
+| std/sort | `sort sort_by reversed` — `sort` and `sorted` order a user type by its `cmp` (7.3.3) |
+| std/slices | generic, and none changes its argument: `contains index_of last_index_of index_where count reversed insert remove binary_search binary_search_by compact unique chunk flatten concat equal min max partition repeat` (11.14) |
+| std/maps | `keys keys_sorted values items merge filter map_values invert from_items get_or equal` — insertion-ordered, so deterministic (11.14) |
+| std/heap | the priority queue: `heap.new[T]()` (smallest first, by `<` or a type's `cmp`), `heap.new_by(less)`, `heap.from(xs)`; `push pop peek len is_empty items_sorted` (11.14) |
+| std/chan | channel plumbing: `from collect map filter merge fan_out tee throttle limiter` (11.14) |
+| std/flag | typed command-line flags: `str int bool float dur`, `parse usage about program`, and independent `set(prog, about)` Sets (11.17) |
+| std/ffi | C interop and raw memory — OUTSIDE the safety guarantees: `ffi "C"` blocks, `alloc free cstr from_bytes null at sizeof`, `Ptr` (11.13) |
+| std/iter | the `Iterator[T]` trait EACH drives; `collect(it) count(it)` (7.3.3) |
 | std/rand, std/uuid | `rand.int(n) rand.float rand.seed(n)` — a fast, SEEDABLE, reproducible sequence, predictable and **not for secrets**; `uuid.new()`, which draws from std/crypto instead |
 | std/crypto | `sha256 sha512` and the legacy `sha1 md5`, each also as `_raw`; `hmac_sha256 hmac_sha512 hmac_sha1 hmac_md5` (+`_raw`); `random(n) random_int(n) equal(a, b)`. `crypto.random` is the only random source fit for a key or a token. See 11.11. |
 | std/test | assertions and table tests — `suite(name)`, then `eq ne near ok not_ok raises raises_msg fail table run`, and `summary report done`. See 11.9. |
 
 Collections carry methods directly: slices have `append pop first last
 map filter reduce sort sort_by sorted contains index_of reverse join
-any all each`; maps have `keys values has get set delete`; sets have
+any all each insert remove` (`insert(i, v)` and `remove(i)` change the
+slice in place and throw RangeError for an index out of range; `remove`
+returns the element); maps have `keys values has get set delete`; sets have
 `add remove has items`.
 
 ---
@@ -1742,13 +2277,31 @@ connections to take is not a library's decision. `srv.accept()` hands back a
 `Content-Length` is written from the body actually sent, so a handler cannot
 declare one length and send another.
 
-### 11.12.1 There is no TLS
+### 11.12.1 HTTPS
 
-This release has no TLS stack, so `https://` is **refused by name** at
-`parse_url` — it is not fetched over port 443 in the clear and it is not
-downgraded to `http://`. Either would hand a program's credentials to anyone
-on the path while its source said `https`. Terminate TLS outside the program
-(a local proxy, a sidecar) and point this at the plaintext side.
+An `https://` URL is fetched over TLS 1.2 (std/tls, 11.18), on port 443
+unless the URL names another, and the server's certificate is **verified**
+— against the system's CA bundle, for the URL's host — before a byte of the
+request is written. A certificate that fails is an error; an `https` URL is
+never fetched in the clear and never downgraded to `http://`. The client's
+`tls` field is the std/tls `Config` it uses:
+
+```voila
+var c = http.client()
+c.tls.ca_file = "corp-ca.pem"        // trust a private authority instead
+let r = try c.get("https://intranet.example/status")
+```
+
+`c.tls.server_name` names the host to verify when the URL's is not the
+certificate's (an IP address, say), and `c.tls.insecure = true` turns
+verification off — for a test against a throwaway certificate, never for
+anything real.
+
+A server speaks HTTPS from `http.listen_tls(addr, cert_file, key_file)`:
+the certificate chain and the key are PEM files, loaded (and checked) when
+it starts, and every verb — `serve_one`, `accept`, `serve`, `serve_for` —
+works on it unchanged. Under `serve` each connection's handshake runs on
+that connection's own task, so a slow or hostile client delays nobody else.
 
 ### 11.12.2 Headers, URLs and chunked bodies
 
@@ -1759,7 +2312,7 @@ case-INSENSITIVE throughout — `get has all remove set` all match with
 `add` keeps what is there; `set` replaces it in place.
 
 `http.parse_url` yields `URL{scheme, host, port, path, query}` with the port
-filled in (80 when the URL omits it), the fragment dropped (it is never sent),
+filled in (80 when the URL omits it, 443 for https), the fragment dropped (it is never sent),
 and `userinfo` refused rather than silently discarded.
 
 `Transfer-Encoding: chunked` is decoded on read, on both sides — a real server
@@ -1785,6 +2338,585 @@ a header line is assembled by the package itself and refused at 65536 bytes,
 so a peer that never sends a newline cannot grow the process; and every socket
 carries a timeout, so a peer that says nothing at all is an error and not a
 wedged task.
+
+## 11.13 The std/ffi Package
+
+`std/ffi` calls C and reaches raw C memory. **Everything that goes through
+it is outside the safety guarantees**: a wrong prototype, a pointer used
+after its block was freed, a C function that writes past a buffer — none is
+caught. It is therefore marked: every `use "std/ffi"` draws the warning
+`ffi`, which is off by default, printed by `-Wall`, and fatal under
+`--strict` (12.6), so `voila check --strict` refuses a program that uses it.
+
+```
+   >>──FFI──"C"──{──┬───────────────────────────────────┬──}────────────><
+                    ├──LINK──"library"──────────────────┤
+                    └──FUNC──name──(──params──)──ctype──┘
+```
+
+```voila
+use "std/ffi"
+
+ffi "C" {
+    link "z"                                   // the build adds -lz
+    func strlen(s *char) usize
+    func zlibVersion() *char
+    func compress(dst *void, dstlen *void, src *char, n ulong) int
+    func snprintf(buf *void, n usize, fmt *char, args ...) int
+}
+
+func main() {
+    say strlen("hello"), zlibVersion()
+    let buf = ffi.alloc(64)
+    defer ffi.free(buf)
+    snprintf(buf, 64, "%s=%lld", "answer", 42)
+    say buf.read_cstr(0)                       // answer=42
+}
+```
+
+Each `func` of a block is a C prototype and, from then on, an ordinary
+procedure of the package: called, typed and checked like any other. Its C
+types fix the Voilà types a caller passes:
+
+| C type | Voilà type |
+|---|---|
+| `char short int long` and the `u`/`unsigned` forms, `i8`…`u64`, `size_t usize ssize_t intptr_t off_t` | an integer: a narrow parameter is range-checked on entry; every integer result is `int` (`long` is 64 bits) |
+| `float double f32 f64` | `float` |
+| `bool` | `bool` |
+| `*char` | `str` as a parameter — its bytes are lent, READ-ONLY, for the call: C must neither keep the pointer nor write through it (a buffer C fills — `strcpy`, `read`, `getcwd` — is a `*void` given an `ffi.alloc` block); a str holding a NUL byte is refused with ValueError, since C would read only up to it; `?str` as a result, copied at once, `nil` for NULL |
+| any other pointer — `*void *u8 **char` … | `ffi.Ptr`; `nil` or `ffi.null()` is NULL |
+| `...` | C varargs, at most six, by each value's run-time kind: a float travels as a double, an int as a 64-bit integer (so `%lld`, not `%d`, for an int wider than 32 bits), a str or a `Ptr` as an address |
+
+`link "name"` hands `-lname` to the C compiler; a program with no `link`
+still depends on libc alone. The prototype is bound to the C symbol under a
+name of the compiler's own, so it never clashes with a declaration the
+system headers make, and a C function whose name is a Voilà keyword cannot
+be declared. There are **no callbacks** from C into Voilà.
+
+**Raw memory.** `ffi.alloc(n)` is `n` zeroed bytes, freed with
+`ffi.free(p)`; `ffi.cstr(s)` and `ffi.from_bytes(b)` are allocated copies.
+A `Ptr` is `{addr, size}`: the size is known for a block this package
+allocated and `-1` for a pointer C returned. Its methods read and write at a
+byte offset — `read_i8 read_u8 read_i16 read_u16 read_i32 read_u32
+read_i64 read_u64 read_f32 read_f64 read_ptr read_cstr read_str(off, n)
+read_bytes(off, n)` and the `write_` forms — and every one is checked
+against the size when it is known (RangeError), and against NULL
+(RuntimeError). `offset(n)` moves the pointer; `ffi.sizeof("int")` gives a
+C type's size, which is how a struct's field offsets are written down —
+there is no struct layout syntax. `ffi.free` accepts only a live block
+`ffi.alloc` returned, and aborts on anything else (a double free, memory C
+allocated, an offset into a block), because a bad free corrupts the
+allocator for the whole process.
+
+## 11.14 Collections: std/slices, std/maps, std/heap, std/chan
+
+All four are Voilà source, generic in their element types, and none
+changes its argument: a function that "edits" a slice returns a new one.
+The in-place forms are slice methods (`xs.insert(i, v)`, `xs.remove(i)`,
+`xs.reverse()`, `xs.sort()`), which a `var` may call.
+
+```voila
+let xs = [5, 1, 4, 1, 5, 9]
+slices.binary_search(xs.sorted(), 4)    // (2, true): index, found
+slices.compact([1, 1, 2, 1])            // [1, 2, 1] — runs collapsed
+slices.unique(xs)                       // [5, 1, 4, 9] — first of each
+slices.chunk(xs, 4)                     // [[5, 1, 4, 1], [5, 9]]
+maps.keys_sorted(m)                     // keys in order, whatever built m
+var q = heap.new[int]()                 // smallest first; new_by(less)
+```
+
+Ordering is the language's own (`<`, or a type's `cmp`, 7.3.3), so
+`binary_search`, `min`, `max` and a default heap work on anything `sort`
+can order; equality is `==`. A map iterates in insertion order, so every
+`std/maps` result is deterministic.
+
+`chan.tee(src)` copies every value to two outputs, each with a queue of its
+own without bound, so the two may be drained at different speeds or one
+after the other — at the cost of holding what the slower one has not read.
+
+`std/chan` builds pipelines. Each function that returns a channel SPAWNS the
+task that feeds it and returns at once; that task belongs to the caller's
+group (10.1), so the group does not finish until it has — and it finishes
+when its input is closed. The other side of that rule: a pipeline nobody
+drains never finishes, and its group waits for it forever — `let c =
+chan.from(xs); say <-c` hangs at the end of `main`. Consume what you start:
+
+```voila
+group {
+    let sq = chan.map(chan.from([1, 2, 3]), fn(n int) int { return n * n })
+    say chan.collect(sq)                          // [1, 4, 9]
+    let all = chan.merge([a, b])                  // fan-in
+    let workers = chan.fan_out(jobs, 4)           // fan-out
+}
+```
+
+`chan` is a keyword, and the package's qualifier is spelled the same:
+directly before a `.` the word is the qualifier (the channel type and its
+constructor are always `chan[`). `chan.limiter(every, burst)` is a
+token-bucket `Limiter` (`wait()`, `allow()`), and `chan.throttle(src,
+every)` the same applied to a channel.
+
+## 11.15 Processes and Signals
+
+`os.start(prog, args)` runs a program WITHOUT waiting for it and returns a
+process handle: `pid()`, `wait()` (the exit status, or 128 + the signal
+that ended it — the convention of `os.run`; it may be called again),
+`running()`, `kill(sig)` (SIGTERM by default; safe while another task is
+in `wait()`), and `stdin()` and
+`stdout()`, the child's standard input and output as a std/io writer and
+reader. Its standard error is the parent's. `wait` closes the child's stdin
+first, so a filter that reads to the end of its input finishes; `kill` may
+be called while another task waits. From the first `os.start` on, SIGPIPE
+is ignored by this process (unless the program installed its own
+disposition), so writing to a child that has exited is an IOError rather
+than the end of the program — the child itself gets the default back.
+
+```voila
+var p = must os.start("sort", [])
+must p.stdin().write("pear\napple\n")
+p.stdin().close()
+each line in p.stdout() { say line }      // apple, pear
+say must p.wait()                          // 0
+```
+
+`os.signals(os.SIGINT, os.SIGTERM)` returns a channel that receives each
+listed signal's number as it arrives, which a task reads with `<-`, `each`
+or `select`. The signal handler itself is async-signal-safe — it only
+writes the number to a pipe, and a dispatcher thread delivers it — and a
+signal that arrives while the channel's buffer is full is dropped (a burst
+of SIGINTs is one request to stop). Once a signal is subscribed it no longer
+terminates the process. `os.signal_stop(ch)` ends a subscription and closes
+its channel; a signal nobody subscribes to any more goes back to its
+default action. `os.kill(pid, sig)` sends a signal to one process and
+refuses a pid of 0 or less — which kill(2) would read as a whole process
+group, or every process the program may signal; `os.kill_group(pgid,
+sig)` signals a group by name. `os.getpid()` is the process's id. The
+`os.SIG…` constants are the platform's numbers.
+
+`std/http`'s `Server.serve(handler, stop)` answers each connection on its
+own task until a value arrives on `stop`, then closes the listener and
+waits for the requests in flight before it returns — so
+`srv.serve(app, must os.signals(os.SIGINT, os.SIGTERM))` is a server that
+shuts down gracefully on Ctrl-C. `serve_for(handler, stop, grace)` bounds
+that wait: a connection still open `grace` after the stop is shut down
+(`Conn.shutdown`). Each handler is called under a RECOVERY POINT (9.5): an
+abort in it — an index out of bounds, a field of nil — answers that one
+request 500 and is reported on standard error, and a throw answers 500
+too; neither stops the server.
+
+`os.walk(root)` lists every file and directory below `root`, depth first and
+sorted, without following symbolic links, and fails on a directory it
+cannot read; `os.walk_all(root)` carries on past one and returns `(entries,
+skipped)`, a "path: reason" line per skipped directory (only an unreadable
+root is an error). `os.glob(pattern)` is the paths a shell pattern matches,
+sorted (no match is an empty list). Every file, socket and pipe the
+runtime opens is close-on-exec, so none of them leaks into a child.
+
+## 11.16 Typed JSON
+
+`json.decode[T](s)` builds a `T` from the document, all the way down:
+nested structures, slices and sets of them, maps (a non-`str` key is parsed
+from the key text), `?T` (null, or a field that is absent), enumerations (a
+unit variant is its name, `"Red"`; one with a payload is
+`{"Circle": {"r": 1.5}}`), newtypes (their underlying value) and `Box[T]`.
+A field the document lacks is an error unless its type is `?T` or it
+declares a default; keys the structure does not declare are ignored. A
+mismatch is an error VALUE whose message is the JSON path:
+
+```voila
+struct Limits { max_mb int }
+struct Config { name str, limits Limits, tags []str, nick ?str }
+match json.decode[Config](`{"name": "svc", "limits": {"max_mb": "big"}}`) {
+    Ok(c)  => say c.limits.max_mb
+    Err(e) => say e.message()     // limits.max_mb: expected int, got string
+}
+```
+
+The parser is strict (RFC 8259): trailing text, a trailing comma, a bare
+control character in a string, a leading zero, or an exponent beyond
+±999999999 is `bad JSON at line L, column C: …`, and a number too large
+for a `float` field is an error rather than an infinity. A map's keys may
+be of any type `decode` can read — they are written as their text (`80`,
+`true`, `Red`) and read back from it. `json.encode` is the exact inverse of `decode[T]`, so a value
+survives the round trip (a float that is NaN or infinite, which JSON cannot
+spell, encodes as `null`); a value nested deeper than 512 levels is a
+ValueError rather than a stack overflow. There is no field-renaming tag: the specification
+has no annotation syntax, so a JSON key is the field's name.
+
+## 11.17 The std/flag Package
+
+```voila
+use "std/flag"
+use "std/time"
+
+func main() {
+    flag.str("name|n", "world", "who to greet")
+    flag.int("count", 1, "how many times")
+    flag.bool("loud|l", false, "shout it")
+    flag.dur("pause", time.Second * 0, "wait between greetings")
+    let opts = flag.parse()
+    each i in 0..opts.int("count") { say "hello,", opts.str("name") }
+    say opts.args()                  // the positional arguments
+}
+```
+
+A flag has a NAME — with an optional one-letter alias after a bar,
+`"name|n"` — a DEFAULT, whose type is the flag's (`str int bool float
+dur`), and a line of HELP. Accepted: `--name=value`, `--name value`, `-n
+value`, `-n=value`; a bool alone is true, and `--name=false` or
+`--no-name` sets it false; `--` ends the flags; flags and positional
+arguments may be interleaved. A duration is written as it prints: `90s`,
+`1m30s`, `250ms`. `flag.parse()` parses `os.args()`: `--help` and `-h`
+print the usage (generated from the declarations) and exit 0, and an
+undeclared flag, a missing value or a value of the wrong type prints the
+error and the usage to standard error and exits 2. `flag.set(prog,
+about)` is an independent Set with the same methods whose `parse(args)`
+returns an error VALUE instead — for tests and subcommands.
+
+**`os.args()` does not include the program's name.** Its first element is
+the first argument after it, which is unlike C's `argv[0]` and Go's
+`os.Args[0]`; so the whole of `os.args()` is what is parsed. The usage line
+names the executable's base name (`flag.program(name)` sets it — under
+`voila run` the binary is the run cache's).
+
+## 11.18 The std/tls Package
+
+`std/tls` puts TLS 1.2 under a `std/net` connection. It is built on
+BearSSL, vendored in the toolchain (12.2), so it needs no OpenSSL and the
+program still links libc alone.
+
+```voila
+use "std/tls"
+
+func main() {
+    var conn = must tls.connect("example.com:443", tls.Config{})
+    must conn.write_all("HEAD / HTTP/1.1\r\nHost: example.com\r\n" ||
+                        "Connection: close\r\n\r\n")
+    say must conn.read_line()
+    conn.close()
+}
+```
+
+A TLS connection **is** a `net.Conn`. Once the handshake is done the session
+sits beneath the socket, and `read`, `read_line`, `write_all`, `io.reader`,
+`set_timeout` and `close` all work through it — which is why std/http
+speaks HTTPS without a line of TLS of its own. `tls.client(conn, cfg)`
+upgrades a connection that is already open; `tls.version(conn)` says
+`"TLS1.2"`, or `""` for a plain one.
+
+`tls.Config` has six fields, all defaulted, so `tls.Config{}` is a
+verifying client:
+
+| Field | |
+|---|---|
+| `server_name` | the name to verify and send as SNI (default: the host of the address) |
+| `ca_file` | a PEM bundle to trust INSTEAD of the system's |
+| `insecure` | skip verification — tests only |
+| `cert_file`, `key_file` | a server's PEM certificate chain (leaf first) and private key |
+| `timeout_ms` | bounds the handshake and, after it, each read and write (30000) |
+
+### 11.18.1 Verification
+
+A client checks three things: the server's chain leads to a trusted
+authority, every certificate is within its dates, and the leaf names the
+host. The authorities are the platform's bundle — `$SSL_CERT_FILE` when set,
+else the first of `/etc/ssl/cert.pem` (macOS, the BSDs, Alpine),
+`/etc/ssl/certs/ca-certificates.crt` (Debian, Ubuntu),
+`/etc/pki/tls/certs/ca-bundle.crt` (Fedora, RHEL) and the other usual
+places; `tls.system_ca_file()` says which — or `ca_file`. Each failure says
+which check failed:
+
+```
+tls: certificate is not trusted (unknown certificate authority)
+tls: certificate does not match host name "example.org"
+tls: certificate has expired or is not yet valid
+```
+
+On top of BearSSL's checks of the chain, std/tls applies the rules the
+rest of the Web PKI expects, as Go's crypto/x509 does: the certificate must
+carry a subjectAltName (a Common Name alone is refused); a name is matched
+against its DNS entries, where a wildcard is only a whole left-most label
+with at least two labels after it (`*.example.com` matches `a.example.com`,
+never `a.b.example.com`, and `*.com` matches nothing); a host that is an IP
+address is matched against its IP-address entries (and is not sent as
+SNI); an extendedKeyUsage, when present, must allow serverAuth; and no
+certificate the server sends may be signed with SHA-1. Neither side
+renegotiates. A server name is checked before it is used at all: a NUL,
+a `*`, an empty label, a non-ASCII byte (use the IDNA `xn--` form) or any
+character no host name has is refused. `insecure: true` turns all of it off; the connection is then
+encrypted but not authenticated, which is what TLS exists to prevent — use
+it against a throwaway test certificate and nowhere else.
+
+### 11.18.2 Servers
+
+```voila
+var lis = must tls.listen("127.0.0.1:8443",
+                          tls.Config{cert_file: "srv.pem", key_file: "srv.key"})
+var conn = must lis.accept()          // TCP accept, then the handshake
+```
+
+The key is a PEM RSA or EC private key — PKCS#1, SEC 1 or PKCS#8, not
+encrypted. `listen` (and `tls.check_server(cfg)`) load both files at once, so
+a bad one is reported at start-up rather than by the first client; they are
+cached, and read again when either changes, so a renewed certificate is
+picked up without a restart. `tls.server(conn, cfg)` handshakes a connection
+accepted some other way — do it on the connection's own task, as std/http's
+`serve` does, so one slow client cannot stall the accept loop.
+
+### 11.18.3 Limits
+
+A peer that ends the connection WITHOUT TLS's own close (close_notify) is
+an error, not an end of stream — anyone on the path can cut a TCP
+connection, and a body read to its end would otherwise be silently
+truncated. std/tls's own `close` always sends close_notify.
+
+TLS 1.2 only: BearSSL 0.6 has no TLS 1.3, and servers still offer 1.2. No
+client certificates, no session resumption, no revocation checking. A
+session is a single state machine, so tasks sharing one connection take
+turns — a read in progress makes another task's write wait. HTTP/1.1, which
+alternates, is unaffected; a protocol that reads and writes at once on two
+tasks wants two connections.
+
+## 11.19 The std/compress Package
+
+`std/compress` is DEFLATE in its three framings, zip and tar. The codecs are
+miniz, vendored (12.2); tar is plain Voilà. Data is a `str`, which is a
+byte string — `bytes` and `from_bytes` convert.
+
+```voila
+use "std/compress"
+
+func main() {
+    let text = str.repeat("all work and no play\n", 1000)
+    let packed = must compress.gzip(text)
+    say len(text), "->", len(packed)
+    say must compress.gunzip(packed) == text
+}
+```
+
+| Encode | Decode | Framing |
+|---|---|---|
+| `deflate(data, level)` | `inflate(data, max)` | raw DEFLATE (RFC 1951) — what zip uses inside |
+| `zlib(data, level)` | `unzlib(data, max)` | zlib (RFC 1950): header and Adler-32 |
+| `gzip(data, level)` | `gunzip(data, max)` | gzip (RFC 1952): header, CRC-32 and length |
+
+`level` is 0 (store) to 9 (smallest), default 6. A decoder is **strict**:
+the input must be exactly one stream — for gzip, one or more members, as
+`gunzip` accepts — with nothing after it, and every checksum must hold.
+Truncated, corrupt or trailing data is an `IOError` naming the problem; no
+input makes a decoder crash. gzip output has no file name and a zero
+timestamp, so equal input always gives equal output. `crc32(data, crc)` and
+`adler32(data, adler)` are the checksums, continuable a piece at a time.
+
+### 11.19.1 Decompression bombs
+
+A few kilobytes can inflate to gigabytes. Every decoder therefore takes
+`max`, the most bytes it will produce — `compress.DEFAULT_MAX` (256 MiB)
+unless given, `0` for no limit — and stops with an error the moment its
+output would pass it:
+
+```voila
+match compress.gunzip(upload, 1048576) {
+    Ok(data) => process(data)
+    Err(e)   => say e.message()   // compress: gzip output exceeds the limit of 1048576 bytes
+}
+```
+
+### 11.19.2 Streams
+
+Each framing is also a stream: an `io.Writer` that compresses what it is
+given into another writer, and an `io.Reader` that decodes what it reads
+from another reader — so `read_line`, `read_all`, `each` and `io.copy`
+work on them.
+
+```voila
+var w = must compress.gzip_writer(must io.writer(must os.create("log.gz")))
+each line in lines { must w.write_all(line || "\n") }
+must w.close()                     // the final block and the trailer
+
+var r = must compress.gunzip_reader(must io.reader(must os.open("log.gz")))
+each line in r { say line }
+```
+
+A writer **must be closed**: `close` writes the final block and, for gzip,
+the trailer, and a file without them is truncated. Closing it does not
+close the writer underneath. `flush()` makes everything written so far
+decodable by the far end, at a few bytes' cost. The readers take `max`.
+
+### 11.19.3 zip
+
+```voila
+let z = must compress.zip_open(must os.read("site.zip"))
+each e in z.entries { say e.name, e.size, e.is_dir }
+let page = must z.read("index.html")
+say must z.extract_to("out")      // files written
+
+var w = must compress.zip_create()
+must w.add("hello.txt", "hi\n")
+must w.add_dir("docs")
+must os.write("new.zip", must w.finish())
+```
+
+Archives are read from, and built in, memory. A `ZipEntry` has `name size
+compressed is_dir crc32 mtime mode is_link`. Reading verifies each member's CRC-32; an
+encrypted member, or one compressed other than by store or deflate, is
+refused by name. A member's DECLARED size is checked against `max` before
+anything is inflated, and extraction never writes past it. `extract_to`
+checks the WHOLE archive before writing anything: a name that would land
+outside the directory — an absolute path, a `..` component, a backslash,
+the "zip slip" — a symbolic link or a device, a name that is both a file and
+another's directory, declared sizes totalling more than `max`, and then
+every member's data and CRC, inflated to nowhere — a second pass inflates
+each member straight into its file, so memory stays at one buffer. File
+and directory clashes are found case-insensitively ("D" and "d/x.txt"
+are one path on macOS), and so is anything already in the destination
+that is in the way (a directory where a file goes). Files are written
+under temporary names and renamed into place only when all of them are
+written. So a hostile or broken ARCHIVE writes nothing; the filesystem
+failing part-way (a full disk) can still leave the directories made so
+far, and a symbolic link already inside the directory is followed — extract
+into one of your own. A zip member whose recorded Unix mode has no file
+type (as Python's zipfile writes) is a regular file.
+`compress.safe_join(dir, name)` is the same name check for a program that
+extracts by hand, and `compress.extract(members, dir)` the same writer. `add(name, data, level, mtime)`: `mtime` is Unix seconds,
+0 for now (zip stores local time, to two seconds).
+
+### 11.19.4 tar
+
+```voila
+let tarball = must compress.tar_write([
+    compress.TarEntry{name: "notes", kind: "dir", mode: 493},
+    compress.TarEntry{name: "notes/a.txt", data: "hello\n"},
+])
+must os.write("notes.tar.gz", must compress.gzip(tarball))
+each e in must compress.tar_read(must compress.gunzip(must os.read("notes.tar.gz"))) {
+    say e.kind, e.name, len(e.data)
+}
+```
+
+A `TarEntry` is `name data kind mode mtime link`, where `kind` is `"file"`,
+`"dir"`, `"symlink"`, `"link"` (hard) or, read from an archive, `"other"`.
+Writing is POSIX ustar: a name of up to 100 bytes, or up to 255 split at a
+`/`; a longer one is refused. Reading also understands GNU's long-name
+records and POSIX pax headers, so archives from GNU tar and bsdtar read
+correctly. Every header's checksum is verified, every size checked against
+what is there, and the total bounded by `max`.
+`compress.tar_extract(bytes, dir, max)` writes an archive out with every
+protection `extract_to` has: links, devices and unsafe names are refused,
+and nothing is written unless the whole archive passes. Permission bits
+are not applied.
+
+## 11.20 The std/sqlite Package
+
+`std/sqlite` is SQLite, vendored (12.2): an SQL database in a file, or in
+memory, with nothing to install and nothing beyond libc to link.
+
+```voila
+use "std/sqlite"
+
+struct User {
+    id   int
+    name str
+    age  int = 0
+}
+
+func main() {
+    let db = must sqlite.open(":memory:")
+    defer db.close()
+    must db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)")
+    must db.run("INSERT INTO users (name, age) VALUES (?, ?)", "ada", 36)
+    must db.run("INSERT INTO users (name, age) VALUES (?, ?)", "bob", nil)
+    each row in must db.query("SELECT id, name, age FROM users ORDER BY id") {
+        say row.int("id"), row.str("name"), row.is_null("age")
+        let u = must sqlite.decode[User](row)
+    }
+}
+```
+
+| | |
+|---|---|
+| `open(path)`, `open_readonly(path)` | a `DB`; `":memory:"` is private and in memory |
+| `db.exec(sql)` | a statement, or a whole script of them, with no parameters and no rows |
+| `db.run(sql, args...)` | ONE statement; returns the rows it changed |
+| `db.query(sql, args...)`, `db.query_one(...)` | its rows, as `[]Row`, or the first as `?Row` |
+| `db.prepare(sql)` | a `Stmt`: `bind next run query reset close`, and `cols` |
+| `db.transaction(body)` | `body` in BEGIN … COMMIT, rolled back on an error or a throw |
+| `begin commit rollback in_transaction` | the same by hand |
+| `last_insert_id changes set_busy_timeout close` | |
+
+### 11.20.1 Parameters and columns
+
+Parameters are `?`, `?NNN` or `:name`, bound by position. A value is an
+`int`, `float`, `bool` (1 or 0), `str` (TEXT), `[]byte` (BLOB), `dec` (its
+exact TEXT — a REAL would round it) or `nil` (NULL): anything that
+implements `sqlite.Arg`. Their number must match the statement's; a missing
+or an extra one is an error before the statement runs.
+
+A column is a `sqlite.Value`, SQLite's five storage classes:
+
+```voila
+match row.get("age") {
+    sqlite.Value.Null    => say "unknown"
+    sqlite.Value.Int(n)  => say n
+    _                    => say "something else"
+}
+```
+
+`sqlite.decode` takes one `Row`; given anything else — a `[]Row` from a
+query — it returns an error rather than aborting.
+
+`row.int(col)`, `float`, `str` and `bytes` read a column the way SQLite
+converts one — NULL is the zero value. `row.at(i)`, `row.map()`,
+`row.index(col)` and `row.json()` are there too; an unknown column name
+throws `KeyError`. `sqlite.decode[T](row)` builds a `T` from a row, column
+names as field names, by `json.decode[T]`'s rules (11.16): a field with a
+default may be missing, an unknown column or a value of the wrong kind is
+an error that names the field.
+
+### 11.20.2 Errors and transactions
+
+Every failure — a syntax error, a violated constraint, a locked database —
+is an `IOError` value whose message is SQLite's own, prefixed `sqlite:`
+(`sqlite: NOT NULL constraint failed: users.name`). `prepare` (and so `run`
+and `query`) accepts exactly ONE statement; `exec` is the verb for a
+script.
+
+`db.transaction(fn() unit! { … })` commits when the function returns `Ok`
+and rolls back when it returns an error — which `transaction` returns — or
+throws, when the exception is rethrown after the rollback. `begin` is
+`BEGIN IMMEDIATE`: it takes the write lock at once, so a transaction that
+will write fails, or waits, at its start rather than halfway through.
+
+### 11.20.3 Tasks
+
+Tasks are threads (10.1), and SQLite is built SERIALIZED: every call on a
+connection holds that connection's lock, so a `DB` and its statements may
+be used from any task without corrupting anything.
+
+A transaction TAKES its connection. SQLite has one transaction per
+connection, so from `begin` (or the start of `transaction`) until the
+commit or the rollback, every other task's call on that connection waits —
+it would otherwise run inside the transaction, and be rolled back with it.
+The waiting is real: a task holding a transaction must not wait for a task
+that is waiting for the connection. Transactions do not nest. `transaction`
+rolls back on every way out — an error, a throw, or a fault a recovery
+point contains (an http handler's) — and a task that ENDS holding a
+transaction it began by hand has it rolled back, and the connection given
+back, as its thread exits. `in_transaction()` never waits: it says whether
+THIS task holds the connection's transaction. The gate isolates calls,
+not iterations: a `Stmt` stepped with `next()` across another task's
+transaction on the same connection can see that transaction's uncommitted
+writes — use a separate connection for isolation. A transaction is one
+task's: a task it spawns cannot use the connection until the transaction
+ends, so one spawned in a `group` the transaction waits for fails at once
+with a `deadlock` error instead of hanging — pass the work back, or give
+the other task its own connection. Two tasks stepping one
+`Stmt` still interleave its rows. For concurrent writers the pattern is a
+connection per task: `sqlite.open` the same
+file in each — connections wait up to five seconds (`set_busy_timeout`) for
+each other's locks, and SQLite's file locking keeps them consistent. For a
+file shared by many writers, `PRAGMA journal_mode = WAL` lets readers
+proceed while one writes.
 
 ---
 
@@ -1832,6 +2964,13 @@ either way the system `cc` produces the final binaries (BOOTSTRAP.md):
 The produced executable links libvoila and the C library. It contains
 no compiler, no interpreter and no virtual machine; `otool -L` or `ldd`
 shows nothing but libc.
+
+The three packages built on vendored C libraries — std/tls (BearSSL),
+std/compress (miniz) and std/sqlite (SQLite) — are compiled into a program
+only when it uses them. The first such build compiles the library, which
+takes a moment (SQLite, the largest, about six seconds), and caches it in
+`~/.cache/voila` beside the runtime; every later build links the cached copy.
+None of them needs anything but libc, so `otool -L` still shows libc alone.
 
 ## 12.3 The Equivalence Guarantee
 
@@ -1964,13 +3103,11 @@ lists the codes it knows. The codes today are:
 |---|---|
 | `unused-import` | A `use` that nothing reaches. The scan is deliberately shy, because deleting an import that *is* reached breaks the program: it spans the whole package rather than the one file (a qualifier resolves against the package's merged imports); it counts a package's trait names and enum variants, which an importer may spell bare; it never reports a package that adds methods to somebody else's type, nor one whose package-level initializer runs its own code, since neither leaves anything in the importing file to find; and `std/str` is exempt, its functions being reachable bare (`s.upper()` *is* `str.upper(s)`). |
 | `unreachable` | A statement written after a `return`, `throw`, `break` or `continue` in the same block. |
-| `type-mismatch` | A value that does not fit the hole it is put in: an initialiser or an assignment against its annotation, an argument against the parameter, a returned value against the declared result, a field a struct does not declare, and the existence and arity of a method on a nominal receiver — which the runtime otherwise resolves by string and answers with an abort. A trait-typed hole takes any implementor and a trait-typed receiver answers the trait's own methods, so `[]Describe` is judged too. It is deliberately partial: it says nothing where it cannot be sure, and generics, `?T`/`T!` payloads, enum payloads, collection literals and most operators are among the things it declines to guess at. |
+| `ffi` | A `use "std/ffi"`: what goes through it is outside the safety guarantees (11.13). Off by DEFAULT, so a plain `voila check` of a program that calls C says `ok` and nothing else; `-Wall` prints it and `--strict` makes it fatal, which is how `voila check --strict` refuses a program that calls C or touches raw memory. |
+| `type-mismatch` | Retired. It named the first, partial version of the expression type check, which reported warnings; that check is now the static type check of Section 4.8 and its findings are **errors**. The code is still accepted on the command line, so that a build script naming it keeps working, and nothing is reported under it. |
 
-`unused-import` and `unreachable` are on by default. `type-mismatch` is **off**
-by default — ask for it with `-Wtype-mismatch`, `-Wall` or `--strict`. It is
-the youngest and largest check in the compiler and it reasons about a partial
-inference rather than about a declaration; it fired on nothing in the whole
-repository, but the cost of a mistake in it is a refused build, so it opts in. Warnings never change the code that is emitted — but
+`unused-import` and `unreachable` are on by default. Warnings never change
+the code that is emitted — but
 the option state *is* part of the `voila run` cache key, so a `--strict` run is
 never answered with the binary a lenient one left behind.
 
@@ -1982,7 +3119,9 @@ See Appendix C.
 
 `std/net` (11.5) is the first standard package written in Voilà rather than
 in C; `std/sync` (11.7), `std/path`, the calendar half of `std/time` (11.8),
-`std/test` (11.9), `std/csv` (11.10) and `std/http` (11.12) are the next six. A package that a program reaches with `use "std/X"` may
+`std/test` (11.9), `std/csv` (11.10) and `std/http` (11.12) are the next six,
+and `std/iter`, `std/slices`, `std/maps`, `std/heap`, `std/chan`, `std/flag`
+and `std/ffi` (11.13–11.17) followed. A package that a program reaches with `use "std/X"` may
 now be Voilà source carried inside the compiler and compiled into the program,
 exactly as the C runtime is (12.2). Only the operations that cross into the
 operating system — the true system calls, the machine-level primitives
@@ -2025,6 +3164,21 @@ change to the shim or the package, rebuild and reseed as for any compiler
 change — `./build.sh` then `./build.sh reseed` (or `./bootstrap.bash` on a
 machine without a Voilà binary).
 
+**A package over a vendored C library** — std/tls, std/compress and
+std/sqlite (11.18–11.20) — differs in steps 2, 3 and 7. Its natives must not
+be in libvoila, or every program would link the library; so the shim is a
+runtime EXTENSION, `runtime/src/ext/X.c`, beside the library's source in
+`runtime/src/vendor/`, and its natives sit in that file's own table,
+`const VlExtEntry vl_ext_X[]`, not in std.c's. `low.VendorOf` maps the
+package's natives to the extension; when a program calls one, the generated
+C carries a `/* voila-vendor: X */` line and registers the table in `main`,
+and the driver compiles the extension into `~/.cache/voila/ext-X-<key>/` on
+first use and links it before libvoila. The extension list is `EXTENSIONS`
+in `tools/build.voi`, which regenerates `voilac/rt/vendor.voi` (the sources
+the compiler carries) as it does the runtime's blob. An extension hands a
+resource to Voilà as a `VlHandle` (runtime/src/voila_int.h), whose ops a
+reader, a writer or a socket filter can drive.
+
 A Voilà-source package may export a `const` as well as functions —
 `path.SEP` is one — because the grafted declaration is an ordinary program
 global that the qualified name resolves to before any native is considered.
@@ -2049,9 +3203,10 @@ shared   spawn    struct   switch   throw    throws   trait    true
 try      type     use      var      weak     while    yield
 ```
 
-Reserved for future use: `async await macro unsafe where`.
+Reserved for future use: `async await macro unsafe`.
 Contextual (not reserved): `fallthrough by upper lower digits timeout
-fn cell`.
+fn cell where`. (`where` opens a bound clause, 7.4, only as `where NAME
+:` after a declaration's signature.)
 
 # Appendix B. Format Verb Summary
 
@@ -2109,18 +3264,24 @@ callee inherits the caller's context), following REXX. Section 5.10
 states the precise rule.
 
 **D.5 — Weak handles.** `weak.upgrade()` succeeds while the target is
-reachable. Destruction timing for shared values is not guaranteed, and
-that is the only way a program could observe the difference.
+reachable, and answers nil once it has been freed — a handle shares a small
+control block with its target, never the target itself, so it outlives the
+value safely. Destruction timing for shared values held only by a
+temporary is not guaranteed, and that is the only way a program could
+observe the difference.
 
-**D.6 — What the compiler refuses.** Three semantics are not expressible
+**D.6 — What the compiler refuses.** One semantic is not expressible
 in the generated C, and the compiler **refuses** the program rather than
 produce a binary that would behave differently from the specification:
+the implicit `ctx` of a task.
 
-1. a closure that captures a variable **declared inside a loop** (each
-   iteration is a separate binding; a C frame is per procedure). Write a
-   helper that takes the value as a parameter;
-2. `parse` into a variable captured from an enclosing procedure;
-3. the implicit `ctx` of a task.
+(Two more items used to stand in this list. A closure that captures a
+variable declared inside a loop now receives a per-iteration copy of
+the loop variables it names (Section 6.3), which is exactly a fresh
+binding per iteration; only a loop variable that is reassigned after
+the copy is refused, and that is diagnosed by `voila check` with its
+position and name. `parse` into a variable captured from an enclosing
+procedure is translated through a scratch register and written back.)
 
 Tasks are **operating-system threads**, not green threads: the semantics
 of Chapter 10 hold exactly — a group joins every task, a failure cancels
@@ -2133,26 +3294,45 @@ block indefinitely is given a deadline with `set_timeout`, which the
 operating system enforces.
 
 The packages named in the specification's §13.4 that this release does not
-provide — `std/chan`, `std/slices`, `std/maps`, `std/vm`, `std/ffi`,
-`std/xml`, `std/yaml` — are refused at the `use`, not silently mistranslated,
-so a program that names one fails to compile rather than at run time.
-(`std/regex` and `std/http` were in this list until they shipped; see
-Sections 11.12 and 13.)
+provide — `std/vm`, `std/xml`, `std/yaml` — are refused at the `use`, not
+silently mistranslated, so a program that names one fails to compile rather
+than at run time. (`std/regex`, `std/http`, `std/chan`, `std/slices`,
+`std/maps` and `std/ffi` were in this list until they shipped; see Sections
+11.12 to 11.14.)
 
 Values are boxed in the default translation. Under `-O3` (Section 12.5)
 the toolchain converts provably-typed INT, FLOAT, and BOOL registers to
 machine arithmetic and elides frame allocation; measured gains reach
 40 percent on arithmetic-bound programs. Procedure parameters and
 values that cross procedure boundaries remain boxed — C-class arithmetic
-throughout is future work, not a present property.
+throughout is future work, not a present property. The static type check
+(Section 4.8) does not feed the `-O3` inference: a type it infers is a
+fact about the program text, but its UNKNOWN is not a proof, and a
+parameter arrives boxed by the calling convention whatever its declared
+type, so the register-level inference keeps its own, flow-insensitive,
+proof.
 
 **D.7 — Reference cycles through closures.** The Acyclicity Rule (Section
 8.4) governs the type graph and makes owning cycles among *values*
 impossible. A **closure** that captures the procedure frame in which it
-is itself stored is outside that rule; the runtime detects and breaks
-exactly this cycle when the procedure completes. A cycle formed
-indirectly (a closure stored in a collection that the captured frame
-owns) is not detected and will retain storage until the process ends.
+is itself stored is outside that rule; the runtime breaks it when the
+procedure completes: every register of a captured frame that no closure
+reads through an upvalue is dropped then — a closure held directly, or
+inside a structure or a collection (`return H{less: fn(a, b) …}`). A
+closure that another, escaped closure still reads (`let h = fn…; return
+fn() { h() }`) is kept, and the cycle it forms with the frame is broken
+when the last outside holder lets the frame go — or, for a closure that
+refers to itself (`var fib = …; fib = fn(n) { … fib(n - 1) … }; return
+fib`), when the last holder of the closure lets it go. The closure may
+be held by the register directly or inside a structure, enum, tuple,
+`Box`, slice or map that nothing else holds (`var h = H{…}; h.f = fn(n)
+{ … h.f(n - 1) … }`, `let b = Box2{f: fn…}; return fn() { b.f() }`); the
+runtime looks at most 256 values deep into such containers. Two cases
+are not detected and retain storage until the process ends: a closure
+buried deeper than that, and a container that refers to itself through
+its own closure and is *returned* (`var h = H{…}; h.f = fn…h.f…; return
+h`) — the copy the caller holds shares the container, and its release
+gives the runtime no frame to examine.
 
 **D.8 — Identifiers outside ASCII.** The specification says an
 identifier begins with a letter. The lexer accepts any byte above 127 in
@@ -2161,12 +3341,58 @@ non-letter such as `€` is admitted where the specification would reject
 it. Identifiers in the standard library and in the compiler are ASCII.
 
 **D.9 — Not yet implemented.** `voila mod tidy`, `voila fmt/test/doc/bench/repl`,
-`std/vm`, `std/ffi`, `std/xml/yaml`, signatures in `std/crypto`, checked `throws`
+`std/vm`, `std/xml/yaml`, signatures in `std/crypto`, checked `throws`
 verification, and the full flow-sensitive borrow checker (a straight-line
 use-after-move analysis is provided). Cross-compilation is by C: `voila build
 --emit=c` produces a translation unit that any C compiler for any target can
 build (see `build_voila.bash`). The unimplemented constructs parse correctly
 and are diagnosed where semantics are missing.
+
+**D.10 — Copy semantics of structures.** Resolved. Structures,
+slices, maps, sets and Boxes have value semantics (Section 8.2) wherever
+they are held, copied lazily on the first write while another holder still
+shares the value. A register the program will not read again is dropped
+as soon as it is dead, and a block's bindings at the block's end, so that
+neither counts as a holder; a binding whose value may hold a `shared`
+handle is kept to the end of its scope, as §6.3 requires of a weak
+reference's target.
+
+**D.11 — Static methods through a type parameter.** `T.m()` for a static
+trait method is available in a top-level generic procedure only (7.4):
+a method's, an IMPL block's and a trait's own type parameters carry no
+type descriptor, because a method is reached by dynamic dispatch and its
+caller cannot know which body, and so which descriptors, it will reach.
+For the same reason a procedure that takes descriptors cannot be used as
+a value. A descriptor read from a value argument is the value's RUN-TIME
+type, looking through a Box: `like(Box(p))` reaches `P`'s method, not
+`Box`'s. (An argument whose static type is a sized integer passes that
+type instead.) A static call through a parameter takes positional
+arguments only; a named one is refused. In a trait default, `Self` is the
+type the call was dispatched for — for a receiver whose static type is a
+sized integer, that type — but inside a generic body a value of a type
+parameter is dispatched by its run-time type, so a `u8` there reaches
+`int`'s method.
+
+**D.12 — The foreign function interface.** The specification shows an
+`ffi` block and no more. This release adds `link "name"` inside the block
+for the libraries a program links, maps C types to Voilà types as in 11.13,
+passes at most six variadic arguments, and has no callbacks from C and no
+struct layout syntax (a struct is memory at offsets). The prototype is
+trusted: a wrong one is undefined behaviour, which is what the `ffi` mark
+says.
+
+**D.13 — How a decimal prints.** A `dec` keeps the scale it was written
+or computed with (`1.50d * 2` is held as 300 × 10⁻², that is `3.00`), but
+`say`, `str` and `%v` print it NORMALIZED, without trailing fractional
+zeros: `1.00d` prints as `1`, `1.50d` as `1.5`. REXX would print `1.00`. The frozen goldens of this
+release depend on the normalized form, so it stays; use `x.format(2)` or
+`%.2f` (both exact, half-even) for a fixed number of places.
+
+**D.14 — Aborts under a recovery point.** §8.6 makes every abort final.
+This release contains the language-level ones inside std/http's handler
+calls (9.5) — a server's one defective request should not end every
+other request — and nowhere else; a program cannot open a recovery point
+of its own.
 
 # Appendix E. Glossary
 

@@ -1,0 +1,14 @@
+narrow_index.voi:12:45: `?int` is used in arithmetic
+narrow_index.voi:17:52: `?int` is used in arithmetic
+narrow_index.voi:22:44: `?int` is used in arithmetic
+narrow_index.voi:28:39: `?int` is used in arithmetic
+narrow_index.voi:34:40: `?int` is used in arithmetic
+narrow_index.voi:40:43: `?int` is used in arithmetic
+narrow_index.voi:46:41: `?int` is used in arithmetic
+narrow_index.voi:54:30: `?int` is used in arithmetic
+narrow_index.voi:62:37: `?int` is used in arithmetic
+narrow_index.voi:72:14: `?int` is used in arithmetic
+narrow_index.voi:76:36: `?int` is used in arithmetic
+narrow_index.voi:84:14: `?int` is used in arithmetic
+narrow_index.voi:90:14: `?int` is used in arithmetic
+!narrow_index.voi:95:

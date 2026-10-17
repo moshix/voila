@@ -1,0 +1,11 @@
+200 ok /a
+500 500 internal server error
+500 500 internal server error
+the handler's defer ran
+500 500 internal server error
+500 500 internal server error
+200 ok /b
+server stopped cleanly
+the idle client was cut off: true
+serve_for returned
+within the grace, not the 30 s read timeout: true

@@ -20,6 +20,7 @@
  * state change broadcasts, and every waiter re-checks. */
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
+static void wake_all(void);
 
 static int64_t now_ns(void) {
   struct timespec ts;
@@ -40,11 +41,23 @@ static bool group_cancelled(VlGroup *g) {
 static void cancel_group(VlGroup *g) {
   if (!g) return;
   g->cancelled = true;
-  pthread_cond_broadcast(&g_cv);
+  wake_all();
 }
 
 /* wait_ms broadcasts nothing; it waits on the global monitor with a deadline
  * so cancellation and timeouts are always observed. */
+/* wake_all wakes the threads waiting on the monitor — and skips the system
+ * call when nobody is: every channel operation used to broadcast, so a
+ * pipeline whose tasks were all busy paid a futex/kernel round trip per
+ * value for no one (chan.tee spent most of its time there). g_waiters is
+ * read and written under g_mu, as every caller holds it; were one ever to
+ * call this without the lock, a missed wake-up would cost only latency,
+ * since monitor_wait never sleeps longer than its 20 ms deadline. */
+static int g_waiters;
+static void wake_all(void) {
+  if (g_waiters > 0) pthread_cond_broadcast(&g_cv);
+}
+
 static void monitor_wait(void) {
   struct timespec ts;
   struct timeval tv;
@@ -52,7 +65,9 @@ static void monitor_wait(void) {
   int64_t ns = (int64_t)tv.tv_usec * 1000 + 20 * 1000000LL; /* 20 ms */
   ts.tv_sec = tv.tv_sec + ns / 1000000000LL;
   ts.tv_nsec = ns % 1000000000LL;
+  g_waiters++;
   pthread_cond_timedwait(&g_cv, &g_mu, &ts);
+  g_waiters--;
 }
 
 void vl_check_cancelled(void) {
@@ -71,7 +86,7 @@ static void group_fail(VlGroup *g, Value exc, bool is_value) {
     if (g->suppressed.t != VL_OBJ) g->suppressed = vl_slice_new(0);
     vl_slice_append(g->suppressed, vl_retain(exc));
   }
-  pthread_cond_broadcast(&g_cv);
+  wake_all();
   pthread_mutex_unlock(&g_mu);
 }
 
@@ -95,6 +110,7 @@ Value vl_group_end(bool as_error_value) {
   VlGroup *g = c->group;
   if (!g) return vl_nil();
 
+  __atomic_store_n(&c->joining, g, __ATOMIC_RELEASE);
   pthread_mutex_lock(&g_mu);
   bool timed_out = false;
   while (g->live > 0) {
@@ -103,11 +119,15 @@ Value vl_group_end(bool as_error_value) {
     if (g->deadline_ns && now_ns() >= g->deadline_ns && !g->cancelled) {
       timed_out = true;
       g->cancelled = true;
-      pthread_cond_broadcast(&g_cv);
+      wake_all();
     }
     monitor_wait();
   }
   pthread_mutex_unlock(&g_mu);
+  __atomic_store_n(&c->joining, NULL, __ATOMIC_RELEASE);
+  /* The group's calls are over: cycle judgements that had to wait for
+   * them are made now (value.c). */
+  vl_judge_deferred();
 
   c->group = g->parent;
 
@@ -160,7 +180,7 @@ static void *task_main(void *arg) {
 
   VlHandler h;
   if (VL_TRY(h)) {
-    Value exc = vl_eh_current();
+    Value exc = vl_eh_pending();
     pthread_mutex_lock(&t->mu);
     t->exc = vl_retain(exc);
     pthread_mutex_unlock(&t->mu);
@@ -178,15 +198,32 @@ static void *task_main(void *arg) {
     if (r.t == VL_OBJ && r.u.o->kind == O_ERR) group_fail(t->group, r, true);
   }
 
+  /* The task is finished with the closure and the arguments it was started
+   * with, so they are dropped NOW rather than with the last Task value. A
+   * spawn BLOCK captures its enclosing frame, and that frame holds the Task
+   * in the register the spawn wrote: when the function returns while the
+   * task is still running — std/chan's stages all do — frame -> Task ->
+   * closure -> frame is a cycle nothing else would break, and it leaked the
+   * frame and everything in it. Only this thread reads either field, and
+   * the release is atomic (vl_release), so no lock is needed. */
+  Value clo = t->closure;
+  t->closure = vl_nil();
+  vl_release(clo);
+  for (int i = 0; i < t->argc; i++) vl_release(t->argv[i]);
+  t->argc = 0;
+
   pthread_mutex_lock(&g_mu);
   t->done = true;
   if (t->group) t->group->live--;
-  pthread_cond_broadcast(&g_cv);
+  wake_all();
   pthread_mutex_unlock(&g_mu);
 
   pthread_mutex_lock(&t->mu);
   pthread_cond_broadcast(&t->cv);
   pthread_mutex_unlock(&t->mu);
+
+  /* This task's calls are over: judgements deferred for them (value.c). */
+  vl_judge_deferred();
 
   /* Release the reference task_new took on the thread's behalf. */
   Value self;
@@ -308,7 +345,7 @@ void vl_chan_send(Value cv, Value owned) {
   int64_t h = ring_head(c);
   c->buf[(h + c->count) % c->cap] = owned;
   c->count++;
-  pthread_cond_broadcast(&g_cv);
+  wake_all();
 
   if (is_rendezvous(c)) {
     /* rendezvous: block until a receiver takes the value */
@@ -320,13 +357,29 @@ void vl_chan_send(Value cv, Value owned) {
   pthread_mutex_unlock(&g_mu);
 }
 
+bool vl_chan_try_send(Value cv, Value owned) {
+  VlChan *c = (VlChan *)cv.u.o;
+  pthread_mutex_lock(&g_mu);
+  if (c->closed || is_rendezvous(c) || c->count >= c->cap) {
+    pthread_mutex_unlock(&g_mu);
+    vl_release(owned);
+    return false;
+  }
+  int64_t h = ring_head(c);
+  c->buf[(h + c->count) % c->cap] = owned;
+  c->count++;
+  wake_all();
+  pthread_mutex_unlock(&g_mu);
+  return true;
+}
+
 static bool chan_take(VlChan *c, Value *out) {
   if (c->count == 0) return false;
   int64_t h = ring_head(c);
   *out = c->buf[h % c->cap];
   if (!is_rendezvous(c)) c->head = (c->head + 1) % c->cap;
   c->count--;
-  pthread_cond_broadcast(&g_cv);
+  wake_all();
   return true;
 }
 
@@ -370,7 +423,7 @@ void vl_chan_close(Value cv) {
     vl_throwf("RuntimeError", "close of already-closed channel");
   }
   c->closed = true;
-  pthread_cond_broadcast(&g_cv);
+  wake_all();
   pthread_mutex_unlock(&g_mu);
 }
 
@@ -405,7 +458,7 @@ int vl_select(VlSelCase *cases, int n, Value *recv_val, bool *recv_ok) {
           int64_t h = ring_head(c);
           c->buf[(h + c->count) % c->cap] = vl_retain(cases[i].send);
           c->count++;
-          pthread_cond_broadcast(&g_cv);
+          wake_all();
           pthread_mutex_unlock(&g_mu);
           return i;
         }
@@ -456,7 +509,7 @@ static void *after_main(void *p) {
     int64_t h = ring_head(c);
     c->buf[(h + c->count) % c->cap] = vl_instant(now_ns());
     c->count++;
-    pthread_cond_broadcast(&g_cv);
+    wake_all();
   }
   pthread_mutex_unlock(&g_mu);
   vl_release(a->ch);

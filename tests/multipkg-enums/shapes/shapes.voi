@@ -1,0 +1,24 @@
+package shapes
+
+// Two enums of ONE package share the variant name `Unit` (§3.5: each enum is
+// a namespace of its own). Inside the package the qualified spellings say
+// which is meant; `Circle` and `Point` are unique and stay usable bare.
+enum Shape { Circle(r float), Unit }
+enum Size { Unit, Big(n int) }
+
+func Unit1() Shape { return Shape.Unit }
+func Unit2() Size { return Size.Unit }
+
+func Name(s Shape) str {
+    return match s {
+        Shape.Unit => "unit shape"
+        Circle(r)  => "circle {r}"
+    }
+}
+
+func Weigh(z Size) str {
+    match z {
+        Size.Unit => return "unit size"
+        Big(n)    => return "big {n}"
+    }
+}

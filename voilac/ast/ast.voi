@@ -155,7 +155,8 @@ impl Tree {
 func IsRefKind(k int) bool {
     return k == COMPOSITE or k == CLOSURE or k == LET or k == VAR or
            k == IF or k == ARM or k == TFN or k == PARAM or
-           k == FIELDDECL or k == IMPLDEC or k == TYPEDEC
+           k == FIELDDECL or k == IMPLDEC or k == TYPEDEC or
+           k == SLICELIT or k == MAPLIT
 }
 
 const NIL_NODE = 0
@@ -181,7 +182,9 @@ const INDEX     = 15  // Kids = x, index
 const FIELD     = 16  // Kids[0] = x; Sval = name
 const COMPOSITE = 17  // Sval = type name (Pkg.Name); Ival = TNAMED;
                       // Kids = COMPFIELD…
-const SLICELIT  = 18  // Kids = elements
+const SLICELIT  = 18  // Kids = elements; Ival = the written type (0 for a
+                      // bare `[…]`): TSLICE for `[]int{…}`, TSET for
+                      // `set[int]{…}`
 const TUPLE     = 19  // Kids = elements (0 = unit)
 const CLOSURE   = 20  // Ival = result type; Ival2 = 1 for `fn own`;
                       // Kids = block, LIST of PARAM, LIST of captures
@@ -191,14 +194,25 @@ const ATTEMPT   = 23
 const ELSEEXPR  = 24  // Kids = x, alt; Ival2 = 1 when alt is a
                       // diverging statement (return/throw/break/continue)
 const SPAWNEXPR = 25  // Kids[0] = call or block; Ival2 = 1 when a block
+const MAPLIT    = 26  // `map[K]V{k: v, …}`: Ival = the TMAP type node;
+                      // Kids = key, value, key, value, … (alternating)
+
+// IF and MATCH double as EXPRESSIONS (§5.3): the same node kinds, reached
+// through an expression slot instead of a statement list. An `if` used as a
+// value always has an else; each branch BLOCK (or arm body) yields the value
+// of its final statement. ELSEEXPR's Ival2 = 2 marks a BLOCK alternative,
+// `f() else { … }`, which yields a value the same way or diverges.
 
 // ---------------------------------------------------------------- statements
 
 const BLOCK       = 40  // Kids = statements
 const LET         = 41  // Sval = names joined by ","; Ival = type node;
-                        // Ival2 = 1 for const; Kids[0] = value
+                        // Ival2 = 1 for const, 2 for a destructuring
+                        // `var (a, b) = …` (mutable names); Kids[0] = value
 const VAR         = 42  // Sval = name; Ival = type node; Kids[0] = value (0 = zero)
-const ASSIGN      = 43  // Ival = op token; Kids = target, value
+const ASSIGN      = 43  // Ival = op token; Kids = target, value. A
+                        // parallel `a, b = x, y` has a TUPLE target and a
+                        // TUPLE (or any tuple-valued) value
 const EXPRSTMT    = 44
 const IF          = 45  // Ival = pattern (0 unless `if let`);
                         // Kids = cond-or-value, then, else(0)
@@ -233,13 +247,27 @@ const FUNC      = 82  // Sval = name; Ival2 = flags (1 self, 2 mut, 4 own,
 const STRUCTDEC = 83  // Sval = name; Kids = LIST of FIELDDECL, LIST of generics
 const ENUMDEC   = 84  // Sval = name; Kids = LIST of VARIANTDEC, LIST of
                       // generics
-const TRAITDEC  = 85  // Sval = name; Kids[0] = LIST of FUNC
+const TRAITDEC  = 85  // Sval = name; Kids = LIST of FUNC, LIST of generics
+                      // (a generic trait's `[T]`; empty for a plain one)
 const IMPLDEC   = 86  // Sval = trait ("" = inherent); Ival = type node;
-                      // Kids = LIST of FUNC, LIST of generics
+                      // Kids = LIST of FUNC, LIST of generics, the trait
+                      // as written (a TNAMED whose Kids are a generic
+                      // trait's arguments; 0 when inherent)
 const EXCDEC    = 87  // Sval = name; Kids = LIST of FIELDDECL, LIST of FUNC
 const TYPEDEC   = 88  // Sval = name; Ival = target type; Ival2 = 1 for an
                       // alias; Kids[0] = STRUCTDEC (0 = none)
 const GLOBAL    = 89  // Kids[0] = LET or VAR
+const FFIDEC    = 90  // an `ffi "C" { … }` block (§12): Sval = the ABI;
+                      // Kids[0] = LIST of STR, the `link` libraries. The
+                      // block's functions follow it in the declaration list
+                      // as FUNC nodes flagged FUNC_FFI.
+
+// FUNC_FFI is the FUNC flag (Ival2) of a function declared in an `ffi`
+// block. Such a FUNC has no body; its Kids[6] is a STR whose Sval is the C
+// signature, "@name|result|param,param,…|variadic" in the C type codes of
+// par.ffi_ctype — the Voilà types of its PARAMs and result are derived from
+// those, so the checker judges every call like any other function's.
+const FUNC_FFI  = 32
 
 // ---------------------------------------------------------------- auxiliary
 
@@ -257,7 +285,10 @@ const CATCH      = 107 // Sval = name; Kids = block, LIST of type nodes
 const COMPFIELD  = 108 // Sval = name (""=positional); Kids[0] = value
 const PARSETERM  = 109 // Ival = kind (0 var, 1 discard, 2 lit, 3 col);
                        // Ival2 = column; Sval = name or literal text
-const GENERIC    = 110 // Sval = "name|bound"
+const GENERIC    = 110 // Sval = "name|bound" — several bounds joined by
+                       // `+` ("T|Show+Into"), inline and `where` alike;
+                       // Kids = the bounds as TNAMED nodes, in that order
+                       // (a generic trait's arguments are THEIR Kids)
 
 // ---------------------------------------------------------------- types
 
@@ -280,6 +311,12 @@ const PNIL     = 141
 const PLIT     = 142 // Kids[0] = literal expression
 const PBIND    = 143 // Sval = name
 const PVARIANT = 144 // Sval = name; Kids = sub-patterns
+const POR      = 145 // `p1 | p2 | …`: Kids = the alternatives
+const PRANGE   = 146 // `lo..hi` / `lo..=hi`: Kids = lo, hi (literal
+                     // expressions); Ival2 = 1 inclusive
+const PSTRUCT  = 147 // `P{x: 0, y}`: Sval = struct type; Kids = PFIELD…
+const PFIELD   = 148 // Sval = field name; Kids[0] = sub-pattern
+const PTUPLE   = 149 // `(p1, p2, …)`: Kids = sub-patterns
 
 // Parameter modes. A PARAM keeps its mode in Ival2, with bit 16 for variadic.
 const MODE_BORROW = 0
@@ -314,6 +351,7 @@ func KindName(k int) str {
     if k == ATTEMPT   { return "attempt" }
     if k == ELSEEXPR  { return "else" }
     if k == SPAWNEXPR { return "spawn" }
+    if k == MAPLIT    { return "maplit" }
     if k == BLOCK     { return "block" }
     if k == LET       { return "let" }
     if k == VAR       { return "var" }
@@ -348,6 +386,7 @@ func KindName(k int) str {
     if k == EXCDEC    { return "exception" }
     if k == TYPEDEC   { return "typedecl" }
     if k == GLOBAL    { return "global" }
+    if k == FFIDEC    { return "ffi" }
     if k == PARAM     { return "param" }
     if k == FIELDDECL { return "fielddecl" }
     if k == VARIANTDEC { return "variant" }
@@ -375,6 +414,11 @@ func KindName(k int) str {
     if k == PLIT      { return "plit" }
     if k == PBIND     { return "pbind" }
     if k == PVARIANT  { return "pvariant" }
+    if k == POR       { return "por" }
+    if k == PRANGE    { return "prange" }
+    if k == PSTRUCT   { return "pstruct" }
+    if k == PFIELD    { return "pfield" }
+    if k == PTUPLE    { return "ptuple" }
     if k == LIST      { return "list" }
     if k == NIL_NODE  { return "-" }
     return "?"

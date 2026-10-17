@@ -1,0 +1,113 @@
+// 47_typecheck.voi — the static type check (§3, §5) must ACCEPT all of
+// this. Each line is a shape a plausible over-tightening would wrongly
+// reject: the numeric lattice (an untyped literal, a u16 into an int or a
+// float, int with dec), generics unified at the call (a literal binding that
+// a wider argument widens, an inferred result used at its type), a `?T`
+// narrowed or unwrapped, newtypes and aliases, variant payloads typed by the
+// subject, a rune that is a number and the string it denotes, `||` that
+// converts, an `if`/`match` value whose numeric branches join, a sized store
+// checked at run time, tuples, closures, channels, variadics.
+use "std/str"
+type Cel int
+type Names []str
+type UserID = int
+struct P { x int, y int }
+struct Stack[T] { items []T }
+impl[T] Stack[T] {
+    func push(mut self, v T) { self.items.append(v) }
+    func pop(mut self) ?T { return self.items.pop() }
+    func size(self) int { return len(self.items) }
+}
+enum Shape { Circle(r float), Rect(w float, h float), Empty }
+enum Tree[T] { Leaf, Node(v T, l Box[Tree[T]], r Box[Tree[T]]) }
+trait Show2 { func show2(self) str }
+impl Show2 for P { func show2(self) str { return "P" } }
+func area(s Shape) float {
+    match s {
+        Circle(r) => return 3.14 * r * r
+        Rect(w, h) => return w * h
+        Empty => return 0.0
+    }
+}
+func mx[T: Ord](a T, b T) T { if a > b { return a }; return b }
+func first[T](xs []T) ?T { if len(xs) == 0 { return nil }; return xs[0] }
+func scale(f float) float { return f * 2.0 }
+func divmod(a int, b int) (int, int) { return a ~/ b, a % b }
+func show_all(xs []Show2) str { var o = ""; each x in xs { o = o || x.show2() }; return o }
+func maybe(n int) ?int { if n < 0 { return nil }; return n }
+func sum(xs ...int) int { var t = 0; each x in xs { t += x }; return t }
+func main() {
+    let count u16 = 300
+    var total int = 0
+    total += count
+    say scale(3), scale(count)
+    let price dec = 19.99d
+    let qty int = 3
+    say price * qty
+    var f = 1.5
+    f = f + 2
+    f += 1
+    say mx(1, 2.5), mx("a", "b"), mx(Cel(3), Cel(4))
+    say first([1, 2]), first([]str{})
+    var st = Stack[int]{items: []}
+    st.push(1)
+    let v = st.pop()
+    if v != nil { say v + 1 }
+    let w = st.pop() else 0
+    say w + 1
+    let q, r = divmod(7, 2)
+    say q + r
+    let (a, b) = (1, "x")
+    say a + 1, b || "y"
+    let c = Cel(5)
+    say c + Cel(1), int(c) + 1, c == Cel(5)
+    var lit Cel = 7
+    lit = 9
+    let u UserID = 5
+    let i int = u
+    say i, u + 1
+    var ns = Names(["a"])
+    ns.append("b")
+    say len(ns), ns[0]
+    say area(Circle(1.0)), area(Shape.Empty)
+    let t = Node(1, Box(Leaf), Box(Leaf))
+    match t { Node(x, _, _) => say x + 1; _ => say "leaf" }
+    say show_all([P{x: 1, y: 2}])
+    let s = "hello"
+    say s.upper(), str.upper(s), upper(s), s[0] == 'h', s[1..3]
+    say 'A' == "A", 'a' + 1
+    let m = map[str]int{"a": 1}
+    say m["a"] + 1, m.keys(), len(m)
+    let k = maybe(3)
+    match k { nil => say "none"; Some(n) => say n + 1 }
+    let n2 = to_int("42") else 0
+    say n2 + 1
+    let sz = if total > 3 { "big" } else { "small" }
+    say sz
+    let nm = match total { 1 => 1.5, _ => 2 }
+    say nm
+    let fs = [fn(x int) int { return x + 1 }]
+    say fs[0](2)
+    say sum(1, 2, 3)
+    var bytes = []u8{1, 2}
+    bytes[0] = 200
+    let big = 70
+    bytes.append(big)
+    let ch = chan[int](2)
+    ch <- 5
+    say <-ch
+    let ok = true and not false
+    say ok
+    var opt ?int = nil
+    opt = 5
+    say opt
+    let e = [1, 2.5]
+    say e
+    let tup = (1, "a")
+    say tup.0 + 1, tup.1 || "b"
+    var best = 0
+    each x in [3, 1, 2] { if x > best { best = x } }
+    say best
+    let half = 7 / 2
+    say half + 0.5
+}

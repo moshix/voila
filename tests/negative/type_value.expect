@@ -1,0 +1,7 @@
+type_value.voi:8:16: `int` is a type
+type_value.voi:9:13: `str` is a type
+type_value.voi:11:16: `str` is a type
+type_value.voi:12:13: `P` is a struct type
+type_value.voi:13:13: `Color` is an enum type
+!type_value.voi:14:
+!type_value.voi:15:

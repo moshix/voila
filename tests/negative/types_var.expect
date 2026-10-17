@@ -1,0 +1,9 @@
+cannot assign `str` to `n`, which is `int`
+cannot assign `int` to `s`, which is `str`
+cannot assign `bool` to `f`, which is `float`
+cannot assign `int` to `p`, which is `P`
+an element of `[]int` must be `int`, but `str` is given
+cannot assign `float` to `i`, which is `int`
+!to `u`
+!to `w`
+!to `o`

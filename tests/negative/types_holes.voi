@@ -1,0 +1,40 @@
+// The static type check (chk/expr.voi): a value that does not fit the hole
+// it is put into, at every kind of hole. The `!` lines of the .expect are
+// the neighbours that must stay legal.
+struct P { x int }
+struct Q { y int }
+type UserID = int
+
+func f(a int) int { return a }
+func g() int { return "abc" }
+func takep(p P) int { return p.x }
+func pair() (int, str) { return (1, 2) }
+func ok_pair() (int, str) { return (1, "a") }
+func uid(u UserID) int { return u }
+func scale(x float) float { return x }
+
+func main() {
+    say f("s")
+    say takep(Q{y: 1})
+    var xs []int = []
+    xs.append("str")
+    let a = []int{"a", 2.5}
+    let m = map[str]int{"a": "b"}
+    let m2 = map[str]int{1: 2}
+    let s = set[int]{"a"}
+    let ys []str = []int{1}
+    let zs []str = [1, 2]
+    let p = P{x: "one"}
+    var n = 3
+    n = "three"
+    let tf = true
+    let t int = tf
+    let ch = chan[int](1)
+    ch <- "x"
+    let big = 5
+    say scale(big)
+    // Legal: an alias is its target, a literal widens, a u16 widens.
+    say uid(5), f(UserID(3)), scale(3), takep(P{x: 1})
+    let count u16 = 300
+    say scale(count), ok_pair(), a, m, m2, s, ys, zs, p, t
+}

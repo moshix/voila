@@ -1,0 +1,13 @@
+// A struct pattern must name a declared struct, and only its fields.
+struct P { x int, y int }
+enum E { A, B }
+
+func f(p P) str {
+    match p {
+        P{x: 0, z: 1} => return "bad field"
+        Q{x: 0} => return "no such struct"
+        _ => return "rest"
+    }
+}
+
+func main() { say f(P{x: 1, y: 2}) }

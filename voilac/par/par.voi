@@ -34,6 +34,15 @@ struct Parser {
     noLit int   // >0 inside a statement header: a composite literal needs parens
     lev   int   // >0 inside brackets, where a composite literal is fine again
     selfFlags int // set by params() when the receiver is `self`
+    armComma  int // >0 while a one-statement match arm is parsed: a `,`
+                  // may end it (see match_stmt)
+    // `Self` inside an impl block is the implementing type (§3.6). While
+    // the block's methods are parsed, selfTy is its TARGET type node and
+    // selfName that type's name as written (`Point`, `geom.Point`); both are
+    // empty elsewhere — in a trait, `Self` stays `Self`, a placeholder the
+    // checker and lowerer understand.
+    selfTy    int
+    selfName  str
 }
 
 func New(file str, src str) Parser { return NewAt(file, src, 1, 1) }
@@ -45,7 +54,8 @@ func NewAt(file str, src str, line int, col int) Parser {
     let ts = lx.Tokens()
     var p = Parser{ts: ts, ip: lx.IParts, i: 0, file: file,
                    T: ast.NewTree(), Errs: lx.Errs,
-                   noLit: 0, lev: 0, selfFlags: 0}
+                   noLit: 0, lev: 0, selfFlags: 0, armComma: 0,
+                   selfTy: 0, selfName: ""}
     return p
 }
 
@@ -116,6 +126,11 @@ impl Parser {
             self.skip_semis()
             return
         }
+        if self.armComma > 0 and self.at(tok.COMMA) {
+            self.next()
+            self.skip_semis()
+            return
+        }
         if self.at(tok.RBRACE) or self.at(tok.EOF) { return }
         self.error("expected end of statement, found {self.show()}")
         while not self.at(tok.SEMI) and not self.at(tok.RBRACE) and
@@ -151,6 +166,11 @@ impl Parser {
             if self.at(tok.EOF) { break }
             if self.at(tok.USE) {
                 uses.append(self.use_decl())
+            } else if self.at(tok.IDENT) and self.cur().Lit == "ffi" and
+                      self.peek(1).Kind == tok.STR {
+                // `ffi "C" { … }` (§12): `ffi` is contextual, a block only
+                // when a string follows it at the top level of a file.
+                each d in self.ffi_block() { decls.append(d) }
             } else if self.decl_start() {
                 decls.append(self.decl())
             } else if self.at(tok.CONST) or self.at(tok.LET) or self.at(tok.VAR) {
@@ -161,6 +181,26 @@ impl Parser {
                 script.append(self.stmt())
             }
             self.skip_semis()
+        }
+        // An ffi block's pointer type is std/ffi's Ptr, so the block needs
+        // the package; saying so here names the cause instead of leaving an
+        // unknown type `ffi.Ptr` for the reader to decode.
+        var ffiAt = 0
+        each d in decls {
+            if ffiAt == 0 and self.T.Kind(d) == ast.FFIDEC { ffiAt = d }
+        }
+        if ffiAt != 0 {
+            var have = false
+            each u in uses {
+                if str.split(self.T.Get(u).Sval, "|")[0] == "std/ffi" {
+                    have = true
+                }
+            }
+            if not have {
+                let fd = self.T.Get(ffiAt)
+                self.Errs.append("{self.file}:{fd.Line}:{fd.Col}: an `ffi` " ||
+                                 "block needs `use \"std/ffi\"` (§12)")
+            }
         }
         let lu = self.T.List(uses)
         let ld = self.T.List(decls)
@@ -222,22 +262,94 @@ impl Parser {
         self.next()
         while not self.at(tok.RBRACKET) and not self.at(tok.EOF) {
             let n = self.expect(tok.IDENT)
-            var bound = ""
-            if self.accept(tok.COLON) {
-                // A bound names a TRAIT, and trait names are package-
-                // qualified (§11.2.1), so `[T: geom.Named]` must parse. The
-                // loader resolves either spelling to the same flat name.
-                bound = self.expect(tok.IDENT).Lit
-                while self.at(tok.DOT) {
-                    self.next()
-                    bound = bound || "." || self.expect(tok.IDENT).Lit
-                }
-            }
-            gs.append(self.add(ast.GENERIC, n, 0, 0, n.Lit || "|" || bound, []))
+            var bounds = []
+            if self.accept(tok.COLON) { bounds = self.bound_list() }
+            gs.append(self.add(ast.GENERIC, n, 0, 0,
+                               n.Lit || "|" || self.bound_names(bounds),
+                               bounds))
             if not self.accept(tok.COMMA) { break }
         }
         self.expect(tok.RBRACKET)
         return self.T.List(gs)
+    }
+
+    // bound_list parses the bounds after `T:` — one trait or several joined
+    // by `+` (`Show + Into[str]`). Each is read by the TYPE grammar, so a
+    // qualified `geom.Named` and a generic trait's arguments both parse, and
+    // each must come out as a plain TNAMED: a bound names a trait, never a
+    // slice or an option. The nodes become the GENERIC's Kids; the loader
+    // flattens their names exactly as it does any other type's.
+    func bound_list(mut self) []int {
+        var bs = []
+        while true {
+            let b = self.type_expr()
+            if self.T.Kind(b) != ast.TNAMED {
+                self.error("a bound names a trait, such as `Show` or " ||
+                           "`Into[str]` (§3.7)")
+            }
+            bs.append(b)
+            if not self.accept(tok.PLUS) { break }
+        }
+        return bs
+    }
+
+    // bound_names spells a bound list the way GENERIC.Sval carries it after
+    // the `|`: the trait NAMES joined by `+`, type arguments left in the
+    // Kids. Every consumer that only asks "which traits" reads this string.
+    func bound_names(self, bounds []int) str {
+        var ns = []
+        each b in bounds {
+            ns.append(self.T.Get(b).Sval)
+        }
+        return str.join(ns, "+")
+    }
+
+    // at_where reports whether a `where` clause starts here. `where` is
+    // reserved by §2.5 but has always lexed as an identifier, and the corpus
+    // (the compiler included) uses it as one, so it is CONTEXTUAL: it opens a
+    // clause only where a declaration's body or end is expected and only as
+    // `where NAME :`. A clause may begin on the next line, so virtual
+    // semicolons in front of it are looked through.
+    func at_where(self) bool {
+        var j = self.i
+        while j < len(self.ts) - 1 and self.ts[j].Kind == tok.SEMI { j += 1 }
+        if j + 2 >= len(self.ts) { return false }
+        return self.ts[j].Kind == tok.IDENT and self.ts[j].Lit == "where" and
+               self.ts[j + 1].Kind == tok.IDENT and
+               self.ts[j + 2].Kind == tok.COLON
+    }
+
+    // where_clause folds `where T: A + B, U: C` into the generic list `gens`
+    // that the declaration already parsed, so nothing downstream can tell a
+    // where-bound from an inline one: `[T: A] … where T: B` is `[T: A + B]`.
+    // A name that is not one of the list's own parameters is refused — there
+    // would be nothing for the bound to constrain.
+    func where_clause(mut self, gens int) {
+        if not self.at_where() { return }
+        self.skip_semis()
+        self.next()                               // `where`
+        while true {
+            let n = self.expect(tok.IDENT)
+            self.expect(tok.COLON)
+            let bounds = self.bound_list()
+            var found = 0
+            each g in self.T.Get(gens).Kids {
+                if str.split(self.T.Get(g).Sval, "|")[0] == n.Lit { found = g }
+            }
+            if found == 0 {
+                self.Errs.append("{self.file}:{n.Line}:{n.Col}: `where` " ||
+                                 "names `{n.Lit}`, which is not a type " ||
+                                 "parameter of this declaration (§3.7)")
+            } else {
+                each b in bounds {
+                    self.T.AddKid(found, b)
+                }
+                let nm = str.split(self.T.Get(found).Sval, "|")[0]
+                self.T.Nodes[found].Sval = nm || "|" ||
+                    self.bound_names(self.T.Get(found).Kids)
+            }
+            if not self.accept(tok.COMMA) { break }
+        }
     }
 
     // FLAG bits on a FUNC node's Ival2.
@@ -254,7 +366,8 @@ impl Parser {
         var results = []
         if not self.at(tok.LBRACE) and not self.at(tok.SEMI) and
            not self.at(tok.THROWS) and not self.at(tok.NOTHROW) and
-           not self.at(tok.ASSIGN) and not self.at(tok.EOF) {
+           not self.at(tok.ASSIGN) and not self.at(tok.EOF) and
+           not self.at_where() {
             if self.at(tok.LPAREN) {
                 self.next()
                 while not self.at(tok.RPAREN) and not self.at(tok.EOF) {
@@ -275,6 +388,7 @@ impl Parser {
         } else if self.accept(tok.NOTHROW) {
             flags = flags | 8
         }
+        self.where_clause(gens)
         var body = 0
         var dflt = 0
         if self.at(tok.LBRACE) {
@@ -286,6 +400,157 @@ impl Parser {
         let lt = self.T.List(thr)
         return self.add(ast.FUNC, t, 0, flags, name.Lit,
                         [body, params, lr, gens, lt, dflt])
+    }
+
+    // ------------------------------------------------------------ ffi
+
+    // ffi_block parses `ffi "C" { … }` (§12) into a FFIDEC node, which
+    // carries the `link` libraries, followed by one FUNC per declared C
+    // function. The FUNCs are ordinary top-level declarations from here on —
+    // called, typed and checked like any other — except that they have no
+    // body: the lowerer gives each a single FFI instruction instead.
+    //
+    //     ffi "C" {
+    //         link "z"                                  // -lz
+    //         func strlen(s *char) usize
+    //         func snprintf(buf *u8, n usize, fmt *char, args ...) int
+    //     }
+    func ffi_block(mut self) []int {
+        let t = self.next()                           // `ffi`
+        let abi = self.expect(tok.STR)
+        if abi.Lit != "C" {
+            self.error("the only foreign ABI is \"C\" (§12)")
+        }
+        self.expect(tok.LBRACE)
+        var links = []
+        var fns = []
+        self.skip_semis()
+        while not self.at(tok.RBRACE) and not self.at(tok.EOF) {
+            if self.at(tok.IDENT) and self.cur().Lit == "link" {
+                self.next()
+                let lib = self.expect(tok.STR)
+                if not link_name_ok(lib.Lit) {
+                    self.Errs.append("{self.file}:{lib.Line}:{lib.Col}: " ||
+                                     "`link \"{lib.Lit}\"` must name a " ||
+                                     "library — letters, digits, `_`, `.`, " ||
+                                     "`+` and `-` — as cc's -l takes it")
+                }
+                links.append(self.add(ast.STR, lib, 0, 0, lib.Lit, []))
+            } else if self.at(tok.FUNC) {
+                fns.append(self.ffi_func())
+            } else {
+                self.error("expected `func` or `link` in an ffi block, " ||
+                           "found {self.show()}")
+                self.next()
+            }
+            self.expect_semi()
+            self.skip_semis()
+        }
+        self.expect(tok.RBRACE)
+        let ll = self.T.List(links)
+        var out = [self.add(ast.FFIDEC, t, 0, 0, abi.Lit, [ll])]
+        each f in fns { out.append(f) }
+        return out
+    }
+
+    // ffi_func parses one C prototype. Its parameter and result types are C
+    // types (ffi_ctype); each PARAM also gets the VOILÀ type a caller must
+    // pass (ffi_vtype), and the C signature itself rides in Kids[6].
+    func ffi_func(mut self) int {
+        let t = self.expect(tok.FUNC)
+        let name = self.expect(tok.IDENT)
+        self.expect(tok.LPAREN)
+        var ps = []
+        var ctys = []
+        var variadic = "0"
+        while not self.at(tok.RPAREN) and not self.at(tok.EOF) {
+            if self.at(tok.ELLIPSIS) {                // a bare `...`
+                let e = self.next()
+                ps.append(self.add(ast.PARAM, e, 0, 16, "args", [0]))
+                variadic = "1"
+                break
+            }
+            let pn = self.expect(tok.IDENT)
+            if self.accept(tok.ELLIPSIS) {            // `args ...`
+                ps.append(self.add(ast.PARAM, pn, 0, 16, pn.Lit, [0]))
+                variadic = "1"
+                break
+            }
+            let ct = self.ffi_ctype()
+            if ct == "void" {
+                self.error("`void` is not a parameter type; a C function " ||
+                           "with no parameters is written `()`")
+            }
+            ctys.append(ct)
+            ps.append(self.add(ast.PARAM, pn, self.ffi_vtype(pn, ct, false),
+                               0, pn.Lit, [0]))
+            if not self.accept(tok.COMMA) { break }
+        }
+        self.expect(tok.RPAREN)
+        var ret = "void"
+        var results = []
+        if not self.at(tok.SEMI) and not self.at(tok.RBRACE) and
+           not self.at(tok.EOF) {
+            ret = self.ffi_ctype()
+            if ret != "void" { results.append(self.ffi_vtype(t, ret, true)) }
+        }
+        let sig = self.add(ast.STR, name, 0, 0,
+                           "@" || name.Lit || "|" || ret || "|" ||
+                           str.join(ctys, ",") || "|" || variadic, [])
+        return self.add(ast.FUNC, t, 0, ast.FUNC_FFI, name.Lit,
+                        [0, self.T.List(ps), self.T.List(results),
+                         self.T.List([]), self.T.List([]), 0, sig])
+    }
+
+    // ffi_ctype reads a C type — `int`, `usize`, `*char`, `**void` — and
+    // returns its CODE, the spelling the backend's FFI lowering and the
+    // runtime's converters agree on:
+    //
+    //   i8 u8 i16 u16 i32 u32 i64 u64   the integer widths
+    //   f32 f64 bool void               as named
+    //   cstr                            `*char`: a NUL-terminated string
+    //   ptr                             any other pointer: a raw address
+    func ffi_ctype(mut self) str {
+        var stars = 0
+        while self.at(tok.STAR) or self.at(tok.POWER) {
+            if self.at(tok.POWER) { stars += 2 } else { stars += 1 }
+            self.next()
+        }
+        let n = self.expect(tok.IDENT)
+        let base = ffi_base(n.Lit)
+        if base == "" {
+            self.Errs.append("{self.file}:{n.Line}:{n.Col}: `{n.Lit}` is not " ||
+                             "a C type an ffi block knows (§12): use int, " ||
+                             "long, usize, i32, u8, double, bool, *char, " ||
+                             "*void and the like")
+            return "i64"
+        }
+        if stars == 0 { return base }
+        if stars == 1 and n.Lit == "char" { return "cstr" }
+        return "ptr"
+    }
+
+    // ffi_vtype is the Voilà type of a C type code: a sized integer type for
+    // a narrow integer PARAMETER (so the value is range-checked on the way
+    // in, §3.2) and `int` for every integer RESULT; `str` for a `*char`
+    // parameter and `?str` for a `*char` result (NULL is nil); std/ffi's
+    // `Ptr` for any other pointer.
+    func ffi_vtype(mut self, at tok.Token, ct str, result bool) int {
+        var name = "int"
+        if not result and (ct == "i8" or ct == "u8" or ct == "i16" or
+                           ct == "u16" or ct == "i32" or ct == "u32" or
+                           ct == "u64") {
+            name = ct
+        }
+        if ct == "f32" or ct == "f64" { name = "float" }
+        if ct == "bool" { name = "bool" }
+        if ct == "ptr" { name = "ffi.Ptr" }
+        if ct == "cstr" {
+            let s = self.add(ast.TNAMED, at, 0, 0, "str", [])
+            if result { return self.add(ast.TOPTION, at, 0, 0, "", [s]) }
+            return s
+        }
+        return self.add(ast.TNAMED, at, 0, 0, name, [])
     }
 
     // params returns a LIST of PARAM; self's flags land in self.selfFlags.
@@ -432,19 +697,39 @@ impl Parser {
         return self.add(ast.ENUMDEC, t, 0, 0, n.Lit, [self.T.List(vs), gens])
     }
 
+    // trait_decl parses `trait Name[T, …] { … }`. A trait may be GENERIC
+    // (§3.6): its parameters are in scope in every method signature and
+    // default body, and an `impl` names the arguments (`impl Into[str] for
+    // Cel`). Inside the braces `Self` is the implementing type, left as the
+    // name `Self` — only an impl block knows which type that is.
     func trait_decl(mut self) int {
         let t = self.expect(tok.TRAIT)
         let n = self.expect(tok.IDENT)
+        let gens = self.generics()
+        self.where_clause(gens)
         self.expect(tok.LBRACE)
         var ms = []
         while true {
             self.skip_semis()
             if self.at(tok.RBRACE) or self.at(tok.EOF) { break }
+            if self.at(tok.TYPE) {
+                // An associated type (`type Item`). Not in the language: a
+                // generic trait says the same thing — see §3.6.
+                self.error("a trait has no associated types; make the " ||
+                           "trait generic instead, as in `trait " ||
+                           "Iterator[T] \{ func next(mut self) ?T \}` (§3.6)")
+                while not self.at(tok.SEMI) and not self.at(tok.RBRACE) and
+                      not self.at(tok.EOF) {
+                    self.next()
+                }
+                continue
+            }
             ms.append(self.func_decl())
             self.skip_semis()
         }
         self.expect(tok.RBRACE)
-        return self.add(ast.TRAITDEC, t, 0, 0, n.Lit, [self.T.List(ms)])
+        return self.add(ast.TRAITDEC, t, 0, 0, n.Lit,
+                        [self.T.List(ms), gens])
     }
 
     func impl_decl(mut self) int {
@@ -452,6 +737,7 @@ impl Parser {
         let gens = self.generics()
         let first = self.type_expr()
         var trait_name = ""
+        var trait_ty = 0
         var ty = first
         if self.accept(tok.FOR) {
             let fn2 = self.T.Get(first)
@@ -462,11 +748,24 @@ impl Parser {
             // all: trait names are package-qualified like every other
             // declaration (§11.2.1), so `impl pkg.Show for T` names a
             // different trait than a local `Show`, and the loader is the
-            // stage that resolves either one to its flat name.
+            // stage that resolves either one to its flat name. The whole
+            // TNAMED is kept as well (Kids[2]), because a GENERIC trait's
+            // arguments — the `str` of `impl Into[str] for Cel` — live in
+            // its Kids.
             trait_name = fn2.Sval
+            trait_ty = first
             ty = self.type_expr()
         }
+        self.where_clause(gens)
         self.expect(tok.LBRACE)
+        // `Self` is the target from here to the closing brace. Only a NAMED
+        // target has a name to stand in for it.
+        let savedTy = self.selfTy
+        let savedName = self.selfName
+        if self.T.Kind(ty) == ast.TNAMED {
+            self.selfTy = ty
+            self.selfName = self.T.Get(ty).Sval
+        }
         var ms = []
         while true {
             self.skip_semis()
@@ -474,9 +773,40 @@ impl Parser {
             ms.append(self.func_decl())
             self.skip_semis()
         }
+        self.selfTy = savedTy
+        self.selfName = savedName
         self.expect(tok.RBRACE)
         return self.add(ast.IMPLDEC, t, ty, 0, trait_name,
-                        [self.T.List(ms), gens])
+                        [self.T.List(ms), gens, trait_ty])
+    }
+
+    // copy_tree deep-copies a subtree. `Self` in an impl block's TYPE
+    // positions becomes the target type, and the arena invariant (ast.voi:
+    // every node owns its Kids slice) forbids two parents sharing one node,
+    // so each `Self` gets a copy of its own. A ref-kind node's Ival is a node
+    // id too, and is copied the same way.
+    func copy_tree(mut self, id int) int {
+        if id == 0 { return 0 }
+        let n = self.T.Get(id)
+        var kids = []
+        each k in n.Kids {
+            kids.append(self.copy_tree(k))
+        }
+        var iv = n.Ival
+        if ast.IsRefKind(n.Kind) and iv != 0 { iv = self.copy_tree(iv) }
+        return self.T.Add(n.Kind, n.Line, n.Col, iv, n.Ival2, n.Sval, kids)
+    }
+
+    // self_expr is `Self` in EXPRESSION position inside an impl block — the
+    // `Self` of `Self.default()`, `Self{x: 0}` and `Self(5)` — spelled as
+    // the target's name would have been written: a bare IDENT, or `pkg.Name`
+    // as a FIELD for a target that another package declares.
+    func self_expr(mut self, t tok.Token) int {
+        let nm = self.selfName
+        let dot = str.index(nm, ".")
+        if dot < 0 { return self.add(ast.IDENT, t, 0, 0, nm, []) }
+        let q = self.add(ast.IDENT, t, 0, 0, nm[0..dot], [])
+        return self.add(ast.FIELD, t, 0, 0, nm[dot + 1..len(nm)], [q])
     }
 
     func exception_decl(mut self) int {
@@ -617,6 +947,14 @@ impl Parser {
             if name == "fn" {
                 return self.fn_type(t)
             }
+            if name == "Self" and self.selfTy != 0 and not self.at(tok.DOT) {
+                return self.copy_tree(self.selfTy)
+            }
+            if name == "Self" and self.selfName != "" and
+               not self.at(tok.DOT) {
+                // An interpolated string's sub-parser knows the name only.
+                return self.add(ast.TNAMED, t, 0, 0, self.selfName, [])
+            }
             var full = name
             if self.accept(tok.DOT) {
                 full = full || "." || self.expect(tok.IDENT).Lit
@@ -654,6 +992,47 @@ impl Parser {
         }
         return self.add(ast.TFN, t, res, 0, "", [self.T.List(ps)])
     }
+}
+
+// ffi_base maps a C type NAME (the part after any `*`) to its code. The
+// integer names cover C's own (`int`, `long`, `size_t`, …), <stdint.h>'s
+// and Voilà's sized spellings; `long` is 64 bits, as on every LP64 system
+// this runtime supports.
+func ffi_base(n str) str {
+    if n == "char" or n == "i8" or n == "schar" or n == "int8_t" { return "i8" }
+    if n == "uchar" or n == "u8" or n == "byte" or n == "uint8_t" { return "u8" }
+    if n == "short" or n == "i16" or n == "int16_t" { return "i16" }
+    if n == "ushort" or n == "u16" or n == "uint16_t" { return "u16" }
+    if n == "int" or n == "i32" or n == "int32_t" { return "i32" }
+    if n == "uint" or n == "u32" or n == "unsigned" or n == "uint32_t" {
+        return "u32"
+    }
+    if n == "long" or n == "i64" or n == "int64_t" or n == "isize" or
+       n == "ssize_t" or n == "longlong" or n == "off_t" or
+       n == "intptr_t" or n == "ptrdiff_t" {
+        return "i64"
+    }
+    if n == "ulong" or n == "u64" or n == "uint64_t" or n == "usize" or
+       n == "size_t" or n == "ulonglong" or n == "uintptr_t" {
+        return "u64"
+    }
+    if n == "float" or n == "f32" { return "f32" }
+    if n == "double" or n == "f64" { return "f64" }
+    if n == "bool" or n == "_Bool" { return "bool" }
+    if n == "void" { return "void" }
+    return ""
+}
+
+// link_name_ok accepts what cc's `-l` takes as a library name.
+func link_name_ok(s str) bool {
+    if len(s) == 0 { return false }
+    each c in s {
+        let ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+                 (c >= '0' and c <= '9') or c == '_' or c == '.' or
+                 c == '+' or c == '-'
+        if not ok { return false }
+    }
+    return s[0] != '-'
 }
 
 func type_start(k int) bool {

@@ -1,0 +1,12 @@
+// The implicit `ctx` of a task (§9.5) has no C translation yet, so the
+// backend refuses the program rather than build one that behaves differently
+// (manual App. D.6). This used to be the second of two fixtures here; the
+// first, a closure capturing a loop variable, is a legal program now and
+// lives in tests/conformance/39_loopclosure.voi.
+func main() {
+    group {
+        spawn {
+            if ctx.cancelled() { say "cancelled" }
+        }
+    }
+}

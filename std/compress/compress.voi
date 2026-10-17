@@ -1,0 +1,358 @@
+// std/compress — DEFLATE, zlib, gzip, zip and tar (§13.4).
+//
+//     use "std/compress"
+//
+//     let packed = try compress.gzip(text)
+//     let back   = try compress.gunzip(packed)
+//
+// The codecs are the vendored miniz (runtime/src/vendor/miniz), compiled
+// into the program only when it uses this package; tar (tar.voi) is plain
+// Voilà. Everything works on a `str`, which is a BYTE string (§13.2): any
+// bytes, text or not. `bytes(s)` and `from_bytes(b)` convert to and from
+// `[]byte`.
+//
+// ---------------------------------------------------------------- one-shot
+//
+//     deflate(data, level) / inflate(data, max)     raw DEFLATE (RFC 1951)
+//     zlib(data, level)    / unzlib(data, max)      zlib (RFC 1950)
+//     gzip(data, level)    / gunzip(data, max)      gzip (RFC 1952)
+//
+// `level` is 0 (store) to 9 (smallest), default 6. A decoder is STRICT: the
+// input must be exactly one stream (gzip: one or more members, as gunzip
+// accepts) with nothing after it, and every checksum must hold; anything
+// else is an IOError naming what was wrong. Nothing here aborts on bad
+// input.
+//
+// ------------------------------------------------- decompression bombs
+//
+// Every decoder takes `max`, the most bytes it will produce, DEFAULT_MAX
+// (256 MiB) unless given. It stops with an error the moment the output
+// would pass it — a few kilobytes that inflate to gigabytes cost an error,
+// not the machine's memory. Pass a smaller `max` for untrusted input, or a
+// larger one for data known to be big; `0` means no limit.
+//
+// ---------------------------------------------------------------- streams
+//
+//     let f = try os.create("log.gz")
+//     var w = try compress.gzip_writer(try io.writer(f))
+//     try w.write_all(text)
+//     try w.close()                  // the trailer: close() is NOT optional
+//
+//     var r = try compress.gunzip_reader(try io.reader(try os.open("log.gz")))
+//     each line in r { … }
+//
+// A stream is an ordinary io.Writer or io.Reader, so read_line, read_all,
+// `each`, and io.copy work on it. A writer must be CLOSED — that writes the
+// final block and the trailer, and a gzip file without them is truncated —
+// and closing it does not close the writer underneath (close that too). A
+// writer's flush() makes everything written so far decodable by the far
+// end, at a few bytes' cost.
+//
+// ---------------------------------------------------------------- archives
+//
+// zip (zip.voi) reads and writes archives in memory: zip_open(bytes) lists
+// and extracts, zip_create() builds one. tar (tar.voi) does the same for
+// ustar archives; a .tar.gz is gzip(tar_write(…)).
+//
+// Concurrency: a stream is serialized by its io.Reader/io.Writer's lock,
+// so tasks may share one; a zip reader or writer belongs to one task at a
+// time (pass it, do not share it).
+package compress
+
+use "std/io"
+use "std/os"
+use "std/path"
+use "std/str"
+
+// DEFAULT_LEVEL is zlib's own default, a good balance of speed and size.
+const DEFAULT_LEVEL = 6
+
+// DEFAULT_MAX bounds every decoder unless told otherwise: 256 MiB.
+const DEFAULT_MAX = 268435456
+
+// The framings, as the C side numbers them (runtime/src/ext/compress.c).
+const FMT_RAW  = 0
+const FMT_ZLIB = 1
+const FMT_GZIP = 2
+
+// check_level refuses a level miniz would misread: 0..9 only.
+func check_level(level int) unit! {
+    if level < 0 or level > 9 {
+        return errf("compress: level {level} is not in 0..9")
+    }
+    return ()
+}
+
+// check_max refuses a negative bound: 0 is "no limit", not "nothing".
+func check_max(max int) unit! {
+    if max < 0 {
+        return errf("compress: max {max} is negative (0 means no limit)")
+    }
+    return ()
+}
+
+// ------------------------------------------------------------- one-shot
+
+// deflate compresses `data` as a raw DEFLATE stream (no header, no
+// checksum — the framing zip uses inside its entries).
+func deflate(data str, level int = DEFAULT_LEVEL) str throws IOError {
+    try check_level(level)
+    return compress._encode(data, level, FMT_RAW)
+}
+
+// inflate decodes a raw DEFLATE stream, producing at most `max` bytes.
+func inflate(data str, max int = DEFAULT_MAX) str throws IOError {
+    try check_max(max)
+    return try compress._decode(data, max, FMT_RAW)
+}
+
+// zlib compresses `data` in the zlib framing: a two-byte header, the
+// DEFLATE stream, and an Adler-32 of the data.
+func zlib(data str, level int = DEFAULT_LEVEL) str throws IOError {
+    try check_level(level)
+    return compress._encode(data, level, FMT_ZLIB)
+}
+
+// unzlib decodes zlib-framed data, checking its Adler-32.
+func unzlib(data str, max int = DEFAULT_MAX) str throws IOError {
+    try check_max(max)
+    return try compress._decode(data, max, FMT_ZLIB)
+}
+
+// gzip compresses `data` as one gzip member. The header carries no file
+// name and a zero timestamp, so equal input always gives equal output.
+func gzip(data str, level int = DEFAULT_LEVEL) str throws IOError {
+    try check_level(level)
+    return compress._encode(data, level, FMT_GZIP)
+}
+
+// gunzip decodes gzip data — every member of it, concatenated, as gunzip
+// does — checking each member's CRC-32 and length.
+func gunzip(data str, max int = DEFAULT_MAX) str throws IOError {
+    try check_max(max)
+    return try compress._decode(data, max, FMT_GZIP)
+}
+
+// crc32 is the CRC-32 of `data` (the one zip, gzip and PNG use), continuing
+// from `crc` so a large input can be checked a piece at a time.
+func crc32(data str, crc int = 0) int {
+    return compress._crc32(data, crc)
+}
+
+// adler32 is the Adler-32 of `data` (zlib's), continuing from `adler`.
+func adler32(data str, adler int = 1) int {
+    return compress._adler32(data, adler)
+}
+
+// ---------------------------------------------------------------- streams
+
+// deflate_writer is an io.Writer that compresses what it is given as raw
+// DEFLATE and writes the result to `w`.
+func deflate_writer(w io.Writer, level int = DEFAULT_LEVEL) io.Writer throws IOError {
+    try check_level(level)
+    return try io.writer(try compress._writer(w, level, FMT_RAW))
+}
+
+// zlib_writer is deflate_writer in the zlib framing.
+func zlib_writer(w io.Writer, level int = DEFAULT_LEVEL) io.Writer throws IOError {
+    try check_level(level)
+    return try io.writer(try compress._writer(w, level, FMT_ZLIB))
+}
+
+// gzip_writer is deflate_writer as one gzip member.
+func gzip_writer(w io.Writer, level int = DEFAULT_LEVEL) io.Writer throws IOError {
+    try check_level(level)
+    return try io.writer(try compress._writer(w, level, FMT_GZIP))
+}
+
+// inflate_reader is an io.Reader of the decoded bytes of the raw DEFLATE
+// stream `r` carries, at most `max` of them.
+func inflate_reader(r io.Reader, max int = DEFAULT_MAX) io.Reader throws IOError {
+    try check_max(max)
+    return try io.reader(try compress._reader(r, max, FMT_RAW))
+}
+
+// unzlib_reader is inflate_reader for zlib-framed data.
+func unzlib_reader(r io.Reader, max int = DEFAULT_MAX) io.Reader throws IOError {
+    try check_max(max)
+    return try io.reader(try compress._reader(r, max, FMT_ZLIB))
+}
+
+// gunzip_reader is inflate_reader for gzip data, every member of it.
+func gunzip_reader(r io.Reader, max int = DEFAULT_MAX) io.Reader throws IOError {
+    try check_max(max)
+    return try io.reader(try compress._reader(r, max, FMT_GZIP))
+}
+
+// ------------------------------------------------------------ paths
+
+// safe_path refuses an archive member name that would land OUTSIDE the
+// directory it is extracted into — the "zip slip": an absolute path, a
+// `..` component, a backslash (a separator on Windows, so an archive made
+// there can smuggle one), or a NUL. Returns the name with any leading
+// "./" removed.
+//
+// It is public, with safe_join, for a program that extracts by hand.
+func safe_path(name str) str throws IOError {
+    if name == "" { return errf("compress: an archive member has no name") }
+    if str.starts_with(name, "/") or str.contains(name, "\\") or
+       str.contains(name, "\u{0}") {
+        return errf("compress: refusing unsafe member name {name}")
+    }
+    var parts = []
+    each p in str.split(name, "/") {
+        if p == ".." {
+            return errf("compress: refusing unsafe member name {name}")
+        }
+        if p != "" and p != "." { parts.append(p) }
+    }
+    if len(parts) == 0 {
+        return errf("compress: refusing unsafe member name {name}")
+    }
+    return str.join(parts, "/")
+}
+
+// safe_join is `dir` joined with an archive member's name, refused (as
+// safe_path refuses it) when the name would land outside `dir`.
+func safe_join(dir str, name str) str throws IOError {
+    return path.join(dir, try safe_path(name))
+}
+
+// Member is one entry of an archive about to be extracted: its name, its
+// kind ("file" or "dir"; anything else is refused) and its bytes.
+struct Member {
+    name str
+    kind str
+    data str
+}
+
+// plan checks members about to be extracted — ALL of them, so that an
+// archive that is bad anywhere writes nothing at all — and returns each
+// one's safe relative path: every name is safe (safe_path), every kind is
+// a file or a directory (a symbolic or a hard link could point anywhere,
+// and a device is no business of an archive), no name appears twice as a
+// file, and no member is both a file and the directory of another. The
+// last two compare names CASE-INSENSITIVELY: on a case-insensitive file
+// system (macOS's, Windows') "D" and "d/x.txt" are one path, and the clash
+// would otherwise surface half-way through the writing.
+func plan(members []Member) []str throws IOError {
+    var rels = []
+    var files = set([])
+    var dirs = set([])
+    each m in members {
+        let rel = try safe_path(m.name)
+        if m.kind != "file" and m.kind != "dir" {
+            var what = m.kind
+            if what == "other" { what = "special file (a device or a FIFO)" }
+            return errf("compress: refusing to extract {m.name}: a " ||
+                        "{what}, not a file or a directory")
+        }
+        let key = str.lower(rel)
+        if m.kind == "file" {
+            if key in files {
+                return errf("compress: {m.name} appears twice")
+            }
+            files.add(key)
+        } else {
+            dirs.add(key)
+        }
+        // every directory above it is a directory, not a file
+        let parts = str.split(key, "/")
+        var above = ""
+        var i = 0
+        while i < len(parts) - 1 {
+            if above == "" { above = parts[i] } else { above = above || "/" || parts[i] }
+            dirs.add(above)
+            i += 1
+        }
+        rels.append(rel)
+    }
+    each f in files {
+        if f in dirs {
+            return errf("compress: {f} is both a file and a directory")
+        }
+    }
+    return rels
+}
+
+// extract writes members under `dir` (made if missing) once plan has
+// passed them, and returns the number of files written.
+func extract(members []Member, dir str) int throws IOError {
+    let rels = try plan(members)
+    return try place(members, rels, dir, fn(i int, to str) unit! {
+        try os.write(to, members[i].data)
+        return ()
+    })
+}
+
+// place is the writing half of every extraction, after plan. First it
+// checks that the DESTINATION has room — no directory already where a
+// file goes, no file already where a directory (or a file's parent) goes —
+// so a clash on disk also stops it before anything is written. Then it
+// writes each file through `write` to a temporary name beside its place,
+// and only when every one has been written renames them all into place;
+// if a write fails, the temporaries are removed.
+//
+// So a hostile or broken ARCHIVE writes nothing. The filesystem can still
+// fail in the middle — the directories made so far stay, and a rename
+// that fails part-way leaves the files before it — and a symbolic link
+// that is already inside `dir` is followed: extract into a directory of
+// your own.
+func place(members []Member, rels []str, dir str,
+           write fn(int, str) unit!) int throws IOError {
+    if os.exists(dir) and not os.isdir(dir) {
+        return errf("compress: {dir} is not a directory")
+    }
+    each i, m in members {
+        let parts = str.split(rels[i], "/")
+        var at = dir
+        each k, p in parts {
+            at = path.join(at, p)
+            let last = k == len(parts) - 1
+            if not last or m.kind == "dir" {
+                if os.exists(at) and not os.isdir(at) {
+                    return errf("compress: a file is in the way at {at}")
+                }
+            } else if os.isdir(at) {
+                return errf("compress: a directory is in the way at {at}")
+            }
+        }
+    }
+    try os.mkdir_all(dir)
+    let suffix = ".voila-part-" || str(os.pid())
+    var temps = []
+    var finals = []
+    var failure = ""
+    each i, m in members {
+        let dest = path.join(dir, rels[i])
+        if m.kind == "dir" {
+            match os.mkdir_all(dest) {
+                Ok(u) => u
+                Err(e) => failure = e.message()
+            }
+        } else {
+            match os.mkdir_all(path.dir(dest)) {
+                Ok(u) => u
+                Err(e) => failure = e.message()
+            }
+            if failure == "" {
+                let tmp = dest || suffix
+                temps.append(tmp)
+                finals.append(dest)
+                match write(i, tmp) {
+                    Ok(u) => u
+                    Err(e) => failure = e.message()
+                }
+            }
+        }
+        if failure != "" { break }
+    }
+    if failure != "" {
+        each t in temps { os.remove(t) }
+        return err(failure)
+    }
+    each k, t in temps {
+        try os.rename(t, finals[k])
+    }
+    return len(temps)
+}

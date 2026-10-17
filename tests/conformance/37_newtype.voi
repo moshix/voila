@@ -1,0 +1,87 @@
+// Type declarations (§3.8). `type X = T` is an ALIAS — another name for T,
+// interchangeable with it. `type X T` is a NEWTYPE — a distinct named type
+// with T's representation: it takes methods and trait impls of its own, is
+// built and taken apart by explicit conversion (`Cel(5)`, `int(c)`), prints
+// as its underlying value unless it has a `show`, and keeps T's operators
+// between two values of the same newtype.
+
+type Cel int
+type Fah float
+type Age u8
+type Names []str
+type Handler fn(int) int
+type UserID = int
+type Pt2 = Pt
+
+struct Pt { x int, y int }
+
+trait Describe { func describe(self) str }
+
+impl Cel {
+    func label(self) str { return "celsius" }
+    func to_fah(self) Fah { return Fah(float(int(self)) * 9.0 / 5.0 + 32.0) }
+}
+impl Describe for Cel { func describe(self) str { return "{int(self)}°C" } }
+impl Describe for Fah { func describe(self) str { return "{float(self)}°F" } }
+
+impl Names {
+    func shout(self) str { return str.upper(self.join(",")) }
+}
+
+func warmest(xs []Cel) Cel {
+    var best = xs[0]
+    each x in xs {
+        if x > best { best = x }
+    }
+    return best
+}
+
+func main() {
+    let c = Cel(21)
+    say c, c.label(), c.describe(), c.to_fah().describe()
+    say int(c) + 1, float(Fah(1.5)) * 2.0
+    let d = c + Cel(4)
+    say d, d > c, d - c, c == Cel(21), c != Cel(22)
+    say Cel(5) / Cel(2)                 // `/` is exact division: a float
+    say warmest([Cel(3), Cel(30), Cel(-4)])
+
+    // Trait impls dispatch on the newtype, not on its underlying type.
+    let ds = []Describe{Cel(10), Fah(50.0)}
+    each x in ds { say x.describe() }
+
+    // A newtype over a sized int keeps the range of its underlying type.
+    let a = Age(200)
+    say a
+    try { say Age(300) } catch e { say "Age(300):", e.message() }
+    try { say a + Age(100) } catch e { say "overflow:", e.message() }
+
+    // A newtype over a slice keeps the slice's builtins.
+    var ns = Names(["ann", "bob"])
+    ns.append("cy")
+    say ns, len(ns), ns[1], ns.shout()
+    each n in ns { say n }
+
+    // A newtype over a function type is callable.
+    let h = Handler(fn(x int) int { return x * 2 })
+    say h(21)
+
+    // An untyped literal stored into a newtype location converts to it, as
+    // an untyped constant does in Go; any other value needs `Cel(x)`.
+    var lit Cel = 7
+    say lit.label(), lit + Cel(1)
+    let back Age = 9
+    say back
+
+    // Zero values.
+    var z Cel
+    var zn Names
+    say z, len(zn)
+
+    // Aliases are their target.
+    let u UserID = 7
+    say u + 1, UserID(8) == 8
+    var u2 UserID
+    say u2
+    let p Pt2 = Pt{x: 1, y: 2}
+    say p
+}

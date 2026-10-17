@@ -1,0 +1,88 @@
+// 75_https — std/http over std/tls, on loopback: an HTTPS server (serve,
+// and serve_one) and clients that verify it against the test CA. The
+// certificate names "localhost"; the server listens on 127.0.0.1, so the
+// verifying clients say which name to check (Client.tls.server_name).
+use "std/http"
+
+func handler(r http.Request) http.Response {
+    if r.method == "POST" {
+        return http.text(200, "posted " || str(len(r.body)) || " bytes\n")
+    }
+    return http.text(200, "secure " || r.path || "\n")
+}
+
+func show(what str, res http.Response!) {
+    match res {
+        Ok(r) => say what, r.status, r.body.trim()
+        Err(e) => say what, "ERR", e.message()
+    }
+}
+
+func verified() http.Client {
+    var c = http.client()
+    c.tls.ca_file = "tests/tls/ca.pem"
+    c.tls.server_name = "localhost"
+    return c
+}
+
+func main() {
+    var srv = must http.listen_tls("127.0.0.1:0", "tests/tls/server.pem",
+                                   "tests/tls/server.key")
+    let base = "https://" || srv.addr()
+    let stop = chan[int](1)
+    group {
+        spawn srv.serve(handler, stop)
+        let c = verified()
+        show("GET", c.get(base || "/index"))
+        show("POST", c.post(base || "/upload", str.repeat("z", 100000)))
+        var hs = http.headers()
+        hs.set("X-Test", "1")
+        show("PUT", c.request("PUT", base || "/thing?x=1", hs, "body"))
+        // the system's authorities do not know the test CA. (Which error
+        // says so depends on the machine — "not trusted", or no bundle at
+        // all — so only the refusal is printed.)
+        var sys = http.client()
+        sys.tls.server_name = "localhost"
+        match sys.get(base || "/") {
+            Ok(r) => say "system CA: accepted?!"
+            Err(e) => say "system CA: refused"
+        }
+        // with no server_name the URL's host is checked — an IP — and fails
+        var byip = verified()
+        byip.tls.server_name = ""
+        show("by IP", byip.get(base || "/"))
+        var wrong = verified()
+        wrong.tls.server_name = "example.org"
+        show("wrong name", wrong.get(base || "/"))
+        var loose = http.client()
+        loose.tls.insecure = true
+        show("insecure", loose.get(base || "/anyway"))
+        // plaintext HTTP to a TLS port is no request at all
+        match http.get("http://" || srv.addr() || "/") {
+            Ok(r) => say "plain: answered?!", r.status
+            Err(e) => say "plain: refused"
+        }
+        stop <- 1
+    }
+    say "served"
+
+    // serve_one: one connection, one TLS handshake, one request
+    var one = must http.listen_tls("127.0.0.1:0", "tests/tls/rsa.pem",
+                                   "tests/tls/rsa.key")
+    group {
+        spawn fn() {
+            match one.serve_one(handler) {
+                Ok(u) => u
+                Err(e) => say "serve_one:", e.message()
+            }
+        }()
+        show("serve_one", verified().get("https://" || one.addr() || "/one"))
+    }
+    one.close()
+
+    match http.listen_tls("127.0.0.1:0", "tests/tls/missing.pem",
+                          "tests/tls/server.key") {
+        Ok(s) => say "??"
+        Err(e) => say e.message().contains("cannot read certificate file")
+    }
+}

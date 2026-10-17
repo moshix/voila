@@ -343,8 +343,9 @@ func main() {
     show_url("http://example.com/search?q=voila")
     show_url("http://[::1]:9000/v6")
     show_url("http://example.com/page#anchor")
-    say "-- urls this package refuses --"
     show_url("https://example.com/secret")
+    show_url("https://example.com:8443/x")
+    say "-- urls this package refuses --"
     show_url("ftp://example.com/f")
     show_url("example.com/no-scheme")
     show_url("http:///no-host")

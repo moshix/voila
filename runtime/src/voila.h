@@ -93,7 +93,10 @@ typedef enum {
   O_MUTEX,      /* std/sync: a pthread mutex (sync.Mutex) */
   O_RWLOCK,     /* std/sync: a pthread rwlock (sync.RWLock) */
   O_ATOMIC,     /* std/sync: one atomically-updated int64 (sync.Atomic) */
-  O_REGEX       /* std/regex: a compiled pattern (its NFA program) */
+  O_REGEX,      /* std/regex: a compiled pattern (its NFA program) */
+  O_BOX,        /* Box[T]: an owned, unique heap indirection (§6.3) */
+  O_PROC,       /* std/os: a started child process (os.start, proc.c) */
+  O_HANDLE      /* a resource a C extension owns (VlHandle, voila_int.h) */
 } VlKind;
 
 struct VlObj {
@@ -104,6 +107,25 @@ struct VlObj {
 /* ---------------------------------------------------------------- frames */
 
 typedef struct VlFrame VlFrame;
+
+/* A re-entrant lock owned by a task context (value.c, vl_lock_acquire). */
+typedef struct {
+  void *owner;
+  int depth;
+} VlLock;
+
+/* VlFnInfo names a compiled function for stack traces (§8.6, manual §9.5):
+ * its Voilà name as a user reads it and the source file it came from. One
+ * static instance per function, emitted by the code generator. */
+typedef struct {
+  const char *name;
+  const char *file;
+  /* upmask[i] = 1: register i is read by a closure of this function
+   * through an upvalue (vl_frame_clear must not drop it at exit). NULL:
+   * none is. */
+  const unsigned char *upmask;
+  int nupmask;
+} VlFnInfo;
 
 /* A compiled function's registers live in a heap frame so closures can
  * capture them by reference (the interpreter's environments, made explicit).
@@ -130,8 +152,38 @@ struct VlFrame {
    * any cross-task global), and this flag adds one more reason that
    * pattern is undefined — pass closures through channels, not globals. */
   uint8_t shared;
-  Value *defers; /* closures, run LIFO on exit and on unwind */
+  /* 1 once the function has returned (vl_frame_clear): only closures read
+   * the frame from then on. Also former padding. */
+  uint8_t done;
+  /* 1 once a closure over this frame — or over a frame below it — MAY
+   * ESCAPE its task: one the lowerer could not prove is only called in
+   * place or handed straight to a builtin collection method that runs it
+   * at once (low/expr.voi, closure_escapes). Set when such a closure is
+   * made (vl_closure_escapes), on the frame's own task, before the closure
+   * value is anywhere else; set on every frame of the chain, so a frame
+   * that escapes has ancestors that do. Only then can another task reach
+   * the frame's variables: reads of them take the frame's lock
+   * (vl_varread) and `mut` arguments in them are copied in (SHAREDTHR).
+   * Former padding. */
+  uint8_t escapes;
+  Value *defers;
+  void *reaper; /* the task clearing a garbage frame (self_cycle_only) */ /* closures, run LIFO on exit and on unwind */
+  /* The frame's reference count (hdr.rc is unused for frames): real
+   * references, calls in progress and judgement holds, packed (value.c,
+   * FRAME_REFS). Then the judgement's bookkeeping: a request to judge
+   * again, and whether this frame counts as a call in progress of its
+   * `up` (frame_enter). */
+  uint64_t frc;
+  uint8_t pending;
+  uint8_t inact;
+  VlLock vlock; /* its captured variables' writes (vl_varlock) */
   int ndefers, capdefers;
+  /* Where this activation is, for an abort's or an uncaught exception's
+   * stack trace: the function (set once, after the frame is made) and the
+   * source line of the last statement that can fail (one store per source
+   * line, emitted by the code generator only where a trap is possible). */
+  const VlFnInfo *info;
+  int line;
   Value r[1]; /* flexible */
 };
 
@@ -195,6 +247,20 @@ typedef struct {
   int nfields;
   const char *const *fields;
   const char *const *ftypes; /* declared type of each field, for zero values */
+  /* 1: a NEWTYPE (`type Cel int`, §3.8) — a distinct named type over one
+   * underlying value, held in the single field f[0]. The runtime treats it
+   * as transparent wherever the underlying value is what is wanted
+   * (printing, calls, indexing, iteration, comparison) and as nominal
+   * wherever the type is (method dispatch, equality across types). Trailing
+   * member: initializers that omit it leave it 0. */
+  int newtype;
+  /* Each field's DECLARED DEFAULT (`limit int = 10`), as a pointer into the
+   * program's constant pool, or NULL where the field has none; the member
+   * itself is NULL for a type that declares no default. The generator
+   * applies defaults at a literal itself — this is for code that builds a
+   * struct from data, json.decode[T] (json.c), so that a field with a
+   * default may be absent. Trailing, like `newtype`. */
+  const Value *const *defaults;
 } VlType;
 
 typedef struct {
@@ -202,6 +268,9 @@ typedef struct {
   const char *variant; /* variant name */
   int nfields;
   const char *const *fields;
+  /* The declared type of each payload field (json.decode[T] reads them);
+   * trailing, so an initializer that omits it leaves it NULL. */
+  const char *const *ftypes;
 } VlVariant;
 
 /* The generated program registers its metadata before main runs. */
@@ -228,10 +297,44 @@ Value vl_zero(const char *type_text); /* zero value of a declared type */
 
 Value vl_closure(VlFn fn, VlFrame *up);
 Value vl_native(const char *name, VlFn fn);
+/* The argument-kind check of a native call (std.c, low.NativeKinds). */
+void vl_argk(const char *name, const char *kinds, Value *argv, int argc,
+             bool fix);
+const char *vl_native_kinds(const char *name);
 Value vl_call(Value callee, Value *argv, int argc); /* borrowed argv */
 Value vl_call_named(Value callee, Value *argv, int argc, const char **names,
                     int nnamed);
 Value vl_callm(Value recv, const char *method, Value *argv, int argc);
+/* Static trait methods through a type parameter (voilac/low/traitdesc.voi):
+ * a type descriptor is the type's flat name as a str. */
+Value vl_typedesc(Value v);
+/* A Box's copy-on-write (types.c). */
+Value vl_box_unique(Value v, int64_t n);
+Value vl_cow_unique(Value v, int64_t n);
+Value *vl_up_slot(VlFrame *f, int depth, int slot);
+/* A write through a variable that closures capture (low/boxcow.voi,
+ * var_root): its frame's lock is held from the start of the write's path
+ * to its store (or, for a `mut` argument or a `mut self` receiver, to the
+ * call's return), so writes from several tasks into one captured variable
+ * go one at a time and none is lost to a copy-on-write judged by another
+ * writer's temporaries (§10). Released on unwind too. */
+void vl_varlock(VlFrame *f);
+void vl_varunlock(VlFrame *f);
+VlFrame *vl_frame_up(VlFrame *f, int depth);
+/* A read of a variable that closures capture: an OWNED reference, taken
+ * under the frame's lock once a closure over the frame may escape its task
+ * (value.c). */
+Value vl_varread(VlFrame *f, int slot);
+/* The closure just made may escape its task: mark its frame chain. */
+void vl_closure_escapes(Value c);
+Value vl_callm_as(Value recv, const char *type, const char *method,
+                  Value *argv, int argc);
+Value vl_self_desc(Value self);
+/* The object kinds with value semantics that UNIQ copies on write: a Box, a
+ * struct, a slice, a map and a set (bit i = VlKind i). */
+#define VL_COW_KINDS ((1u << O_BOX) | (1u << O_STRUCT) | (1u << O_SLICE) | \
+                      (1u << O_MAP) | (1u << O_SET))
+Value vl_callt(Value desc, const char *method, Value *argv, int argc);
 Value vl_spawn_fn(VlFn fn, Value *argv, int argc);
 Value vl_spawn_closure(Value closure);
 Value vl_await(Value task);
@@ -293,11 +396,16 @@ typedef struct VlHandler {
   jmp_buf buf;
   struct VlHandler *prev;
   int frame_depth;
+  int cleanup_depth; /* the unwind-cleanup stack's height (err.c) */
 } VlHandler;
 
 void vl_eh_prepare(VlHandler *h);
 void vl_eh_pop(void);
 Value vl_eh_current(void); /* owned copy of the in-flight exception */
+/* The in-flight exception INCLUDING a fault (an abort under a recovery
+ * point): what a try with a `finally` needs, to run the finally on a
+ * fault's way past (err.c). */
+Value vl_eh_pending(void);
 bool vl_istype(Value exc, const char *types); /* comma-separated names */
 
 #define VL_TRY(h) (vl_eh_prepare(&(h)), setjmp((h).buf))
@@ -384,6 +492,88 @@ static inline int64_t vl_ineg_ck(int64_t a) {
   return -a;
 }
 
+/* ------------------------------------------------- sized integers (§3.2)
+ * Every integer is an int64 at run time; a SIZED type (i8 … u64) is a range
+ * the compiler knows statically. Arithmetic whose static type is sized, a
+ * compound assignment to a sized location, and a store of a value of
+ * another type into one are checked against that range — the type's code
+ * travels as a small integer, and the message names the type. As with the
+ * int64 traps above, every message lives once, in the cold vl_trap_sz*
+ * functions (ops.c), behind both the boxed and the -O3 native path. u64 is
+ * 0..INT64_MAX: the representation is an int64. */
+enum { VL_SZ_I8 = 1, VL_SZ_I16, VL_SZ_I32, VL_SZ_U8, VL_SZ_U16, VL_SZ_U32,
+       VL_SZ_U64 };
+static inline int64_t vl_sz_lo(int t) {
+  switch (t) {
+  case VL_SZ_I8: return -128;
+  case VL_SZ_I16: return -32768;
+  case VL_SZ_I32: return -2147483648LL;
+  default: return 0;
+  }
+}
+static inline int64_t vl_sz_hi(int t) {
+  switch (t) {
+  case VL_SZ_I8: return 127;
+  case VL_SZ_I16: return 32767;
+  case VL_SZ_I32: return 2147483647LL;
+  case VL_SZ_U8: return 255;
+  case VL_SZ_U16: return 65535;
+  case VL_SZ_U32: return 4294967295LL;
+  default: return INT64_MAX;
+  }
+}
+void vl_trap_szovf(const char *op, int64_t a, int64_t b, int t)
+    __attribute__((noreturn));
+void vl_trap_szneg(int64_t a, int t) __attribute__((noreturn));
+void vl_trap_szval(int64_t v, int t) __attribute__((noreturn));
+/* Boxed forms: the arithmetic op (0 +, 1 -, 2 *, 3 **, 4 ~/) on two
+ * values, range-checked when the result is an integer; the negation; and a
+ * check of a value about to be stored into a sized location. */
+Value vl_arith_sz(int op, Value a, Value b, int t);
+Value vl_neg_sz(Value a, int t);
+void vl_cksz(Value v, int t);
+
+static inline int64_t vl_iadd_sz(int64_t a, int64_t b, int t) {
+  int64_t c;
+  if (__builtin_add_overflow(a, b, &c) || c < vl_sz_lo(t) || c > vl_sz_hi(t))
+    vl_trap_szovf("+", a, b, t);
+  return c;
+}
+static inline int64_t vl_isub_sz(int64_t a, int64_t b, int t) {
+  int64_t c;
+  if (__builtin_sub_overflow(a, b, &c) || c < vl_sz_lo(t) || c > vl_sz_hi(t))
+    vl_trap_szovf("-", a, b, t);
+  return c;
+}
+static inline int64_t vl_imul_sz(int64_t a, int64_t b, int t) {
+  int64_t c;
+  if (__builtin_mul_overflow(a, b, &c) || c < vl_sz_lo(t) || c > vl_sz_hi(t))
+    vl_trap_szovf("*", a, b, t);
+  return c;
+}
+static inline int64_t vl_ineg_sz(int64_t a, int t) {
+  if (a == INT64_MIN || -a < vl_sz_lo(t) || -a > vl_sz_hi(t))
+    vl_trap_szneg(a, t);
+  return -a;
+}
+/* ** and ~/ use their out-of-line int64 cores (whose own traps — a
+ * negative exponent, division by zero — come first); the range check
+ * follows. */
+static inline int64_t vl_ipow_sz(int64_t a, int64_t b, int t) {
+  int64_t c = vl_ipow_i(a, b);
+  if (c < vl_sz_lo(t) || c > vl_sz_hi(t)) vl_trap_szovf("**", a, b, t);
+  return c;
+}
+static inline int64_t vl_idiv_sz(int64_t a, int64_t b, int t) {
+  int64_t c = vl_ifloordiv(a, b);
+  if (c < vl_sz_lo(t) || c > vl_sz_hi(t)) vl_trap_szovf("~/", a, b, t);
+  return c;
+}
+static inline int64_t vl_cksz_i(int64_t v, int t) {
+  if (v < vl_sz_lo(t) || v > vl_sz_hi(t)) vl_trap_szval(v, t);
+  return v;
+}
+
 /* `try expr` inside a function that returns T!: the generated code checks
  * vl_isfail and jumps to the function's exit with the failure as its result.
  * vl_tryp exists for the interpreter-shaped path and simply returns v. */
@@ -450,11 +640,16 @@ typedef enum {
   VL_P_NIL,
   VL_P_LIT,
   VL_P_BIND,
-  VL_P_VARIANT
+  VL_P_VARIANT,
+  VL_P_OR,     /* elems = the alternatives; the first that matches wins */
+  VL_P_RANGE,  /* elems = lo, hi (VL_P_LIT); name "=" when inclusive */
+  VL_P_STRUCT, /* name = struct type; elems = VL_P_FIELD */
+  VL_P_FIELD,  /* name = field; elems[0] = the field's sub-pattern */
+  VL_P_TUPLE   /* elems = one sub-pattern per position */
 } VlPatKind;
 typedef struct VlPat {
   VlPatKind kind;
-  const char *name; /* variant name */
+  const char *name; /* variant, struct type or field name; range "=" */
   int slot;         /* VL_P_BIND: frame register */
   int lit;          /* VL_P_LIT: index into the program's constant pool */
   int nelems;
@@ -467,6 +662,31 @@ bool vl_match(VlFrame *f, Value subject, const VlPat *p, const Value *consts);
 void vl_init(int argc, char **argv);
 int vl_finish(void); /* joins the root group; returns the exit code */
 void vl_say(Value *argv, int argc);
+
+/* ---------------------------------------------------------------- ffi */
+
+/* The conversions around a call into C from an `ffi "C" { … }` block (§12,
+ * ffi.c): the generator unboxes each argument with one of these, calls the
+ * C function through a prototype bound to its symbol, and boxes the result.
+ * `argi` and `fn` name the argument in an abort. */
+int64_t vl_ffi_int(Value v, int argi, const char *fn);
+double vl_ffi_float(Value v, int argi, const char *fn);
+bool vl_ffi_bool(Value v, int argi, const char *fn);
+const char *vl_ffi_cstr(Value v, int argi, const char *fn);
+void *vl_ffi_ptr(Value v, int argi, const char *fn);
+Value vl_ffi_ret_u64(unsigned long long r);
+Value vl_ffi_ret_ptr(void *p);
+Value vl_ffi_ret_cstr(const char *s);
+int vl_ffi_vclass(Value v);      /* 1: a variadic argument travels as double */
+double vl_ffi_vdouble(Value v);
+long long vl_ffi_vword(Value v);
+/* VL_FFI_SYM spells a C symbol for an asm label: the platform's user-label
+ * prefix (`_` on Darwin, nothing on Linux) glued to the name. Binding the
+ * prototype to the symbol this way gives it a C name of the generator's own,
+ * so it can never clash with a declaration the headers already made. */
+#define VL_FFI_STR2(x) #x
+#define VL_FFI_STR(x) VL_FFI_STR2(x)
+#define VL_FFI_SYM(name) VL_FFI_STR(__USER_LABEL_PREFIX__) name
 
 /* Builtin (prelude) and package functions used by generated code are
  * declared in voila_std.h, which the generator includes. */

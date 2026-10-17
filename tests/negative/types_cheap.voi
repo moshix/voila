@@ -1,0 +1,30 @@
+// The cheap type errors the fourth batch's review found still accepted:
+// a `?T` never narrowed used in arithmetic, a map's key type, a function
+// value's arity, `len` and `each` of a number, a field of a primitive, a
+// destructuring of the wrong width, an index that is not a position, and a
+// std native's result used as the wrong type. The `!` lines stay legal.
+use "std/os"
+use "std/str"
+func main() {
+    let x ?int = to_int("q")
+    say x + 1
+    var m = map[str]int{"a": 1}
+    m[1] = 2
+    let f = fn(a int) int { return a }
+    say f(1, 2)
+    say len(5)
+    each c in 5 { say c }
+    say [1, 2][0].x
+    let t = (1, "a")
+    let a, b, c = t
+    let xs = [1]
+    say xs["k"]
+    say str.trim(os.run_capture("echo", ["hi"]) else "")
+    let ok bool = os.pid()
+    // Legal: a narrowed optional, the right key, the right arity, `len`
+    // of a string, two names for a pair, an int position.
+    let y ?int = to_int("4")
+    if y != nil { say y + 1 }
+    let a2, b2 = t
+    say m["a"], f(1), len("ab"), xs[0], a2, b2, a, b, c, ok
+}

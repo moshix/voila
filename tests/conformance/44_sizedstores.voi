@@ -1,0 +1,50 @@
+// The sized-integer range traps at the stores the second batch missed
+// (§3.2): a compound assignment to an element's field, a typed closure's
+// result, an append to and an assignment into a sized collection, a send on
+// a sized channel, and arithmetic on a sized tuple member and on the
+// variable of an `each` over a sized slice. Each trap is the same
+// OverflowError at every -O level; the in-range stores beside them stay
+// silent.
+
+struct P { a u8 }
+
+func main() {
+    let big = 300
+
+    var arr = [P{a: 250}]
+    try { arr[0].a += 10; say "field", arr[0].a } catch e { say "field:", e.message() }
+    arr[0].a += 5
+    say arr[0].a
+
+    let g = fn(x int) u8 { return x }
+    try { say "closure", g(big) } catch e { say "closure:", e.message() }
+    say g(200)
+
+    var bs = []u8{250}
+    try { bs.append(big); say "append", bs } catch e { say "append:", e.message() }
+    bs.append(1, 2)
+    say bs
+
+    var m = make(map[str]u8)
+    try { m["k"] = big; say "map", m } catch e { say "map:", e.message() }
+    m["k"] = 9
+    say m
+
+    let ch = chan[u8](2)
+    try { ch <- big; say "send", <-ch } catch e { say "send:", e.message() }
+    ch <- 7
+    say <-ch
+
+    let t (u8, int) = (250, 1)
+    try { say "tuple", t.0 + 10 } catch e { say "tuple:", e.message() }
+    say t.0 + 5, t.1 + 1000
+
+    each b in bs {
+        try { say "each", b + 10 } catch e { say "each:", e.message() }
+    }
+
+    // Not sized: an untyped literal list, and a plain int slice.
+    each x in [1000, 2000] { say x * x }
+    let ys = [big, big]
+    say ys[0] * 1000
+}

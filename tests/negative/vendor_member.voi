@@ -1,0 +1,10 @@
+// The vendored-library packages are judged by the same std-surface check
+// as every grafted package: a misspelt member is refused with a near miss,
+// not lowered to a native that does not exist.
+use "std/sqlite"
+use "std/tls"
+
+func main() {
+    say sqlite.decod("x")
+    say tls.conect("example.com:443")
+}

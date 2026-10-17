@@ -129,7 +129,6 @@ func type_func(m mut ir.Module, fi int) {
         i += 1
     }
     if not any { return }                      // nothing unboxed: stay silent
-    m.Funcs[fi].RegT = t
 
     // The decision is visible in `-S -O3` listings: one note per typed slot.
     var notes = []
@@ -146,6 +145,9 @@ func type_func(m mut ir.Module, fi int) {
         notes.append(ins)
     }
     m.Funcs[fi].Instrs = notes
+    // Stored LAST: `t` is a slice, and a slice MOVES on assignment (§6.4) —
+    // the notes above still read it.
+    m.Funcs[fi].RegT = t
 }
 
 func t_name(t int) str {
@@ -235,6 +237,20 @@ func operand_type(m ir.Module, a str, t []int) int {
 // the multi-write ops handled by pin_boxed.
 func def_type(m ir.Module, fi int, ins ir.Instr, t []int) int {
     let op = ins.Op
+    // A KILL drops a temporary's reference (low/kill.voi): no value is
+    // written, and a native slot is left alone by the backend.
+    if op == "KILL" { return 0 - 1 }
+    // VARLOCK/VARUNLOCK take and drop a captured variable's lock
+    // (low/boxcow.voi, var_root): no register is written.
+    if op == "VARLOCK" or op == "VARUNLOCK" { return 0 - 1 }
+    // VARREAD: an owned reference to a captured variable's value
+    // (low/expr.voi) — always a boxed value, so its consumers retain and
+    // release it, whatever the variable's own register is typed.
+    if op == "VARREAD" { return T_BOX }
+    // SHAREDTHR: a count UNIQ reads as `.u.i` — kept boxed.
+    if op == "SHAREDTHR" { return T_BOX }
+    // ESCAPE marks a closure's frames (low/expr.voi): no register written.
+    if op == "ESCAPE" { return 0 - 1 }
     if op == "LOADK" {
         return const_type(m, ins.Args[1])
     }
@@ -318,7 +334,8 @@ func def_type(m ir.Module, fi int, ins ir.Instr, t []int) int {
        op == "NUMDIG" or
        op == "ARGDEF" or op == "SELBEG" or op == "SELEND" or
        op == "SELSEND" or op == "SELDEF" or op == "*" or
-       op == "NDSAVE" or op == "NDREST" or op == "EHPUSH" {
+       op == "NDSAVE" or op == "NDREST" or op == "EHPUSH" or
+       op == "CKSZ" {
         return 0 - 1
     }
     if reg_slot(ins.Args[0]) < 0 { return 0 - 1 }

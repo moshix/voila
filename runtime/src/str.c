@@ -55,6 +55,148 @@ static int rune_len_n(const unsigned char *p, int64_t remaining) {
   return n;
 }
 
+/* ---------------------------------------------------------------- unicode */
+
+/* utf8_next decodes ONE well-formed UTF-8 sequence at p and stores its length
+ * in *len. It returns -1 (with *len = 1) for anything ill-formed: a stray
+ * continuation byte, a truncated sequence, an overlong encoding, a UTF-16
+ * surrogate, or a value past U+10FFFF. Callers that transform text copy that
+ * one byte through unchanged, so a malformed string is never made worse. */
+static int32_t utf8_next(const unsigned char *p, int64_t rem, int *len) {
+  *len = 1;
+  uint32_t c = p[0];
+  if (c < 0x80) return (int32_t)c;
+  int n;
+  uint32_t min; /* smallest code point that NEEDS n bytes: below it = overlong */
+  if ((c & 0xE0) == 0xC0) { n = 2; c &= 0x1F; min = 0x80; }
+  else if ((c & 0xF0) == 0xE0) { n = 3; c &= 0x0F; min = 0x800; }
+  else if ((c & 0xF8) == 0xF0) { n = 4; c &= 0x07; min = 0x10000; }
+  else return -1;
+  if ((int64_t)n > rem) return -1;
+  for (int k = 1; k < n; k++) {
+    if ((p[k] & 0xC0) != 0x80) return -1;
+    c = (c << 6) | (p[k] & 0x3F);
+  }
+  if (c < min || c > 0x10FFFF || (c >= 0xD800 && c <= 0xDFFF)) return -1;
+  *len = n;
+  return (int32_t)c;
+}
+
+/* utf8_put encodes r at out and returns the number of bytes written (1-4). */
+static int utf8_put(uint32_t r, char *out) {
+  if (r < 0x80) { out[0] = (char)r; return 1; }
+  if (r < 0x800) {
+    out[0] = (char)(0xC0 | (r >> 6)); out[1] = (char)(0x80 | (r & 0x3F));
+    return 2;
+  }
+  if (r < 0x10000) {
+    out[0] = (char)(0xE0 | (r >> 12)); out[1] = (char)(0x80 | ((r >> 6) & 0x3F));
+    out[2] = (char)(0x80 | (r & 0x3F));
+    return 3;
+  }
+  out[0] = (char)(0xF0 | (r >> 18)); out[1] = (char)(0x80 | ((r >> 12) & 0x3F));
+  out[2] = (char)(0x80 | ((r >> 6) & 0x3F)); out[3] = (char)(0x80 | (r & 0x3F));
+  return 4;
+}
+
+#include "unicode_tab.h"
+
+/* The tables in unicode_tab.h are sorted, non-overlapping rows. Binary search
+ * finds the LAST row whose lo <= c; c belongs to it only if it is also within
+ * hi and lands on the row's stride (alternating Upper/lower pairs use 2). */
+static int uc_row(const void *rows, size_t size, int n, uint32_t c) {
+  int lo = 0, hi = n - 1, hit = -1;
+  while (lo <= hi) {
+    int mid = (lo + hi) / 2;
+    const VlRangeRow *r = (const VlRangeRow *)((const char *)rows + (size_t)mid * size);
+    if (r->lo <= c) { hit = mid; lo = mid + 1; } else hi = mid - 1;
+  }
+  if (hit < 0) return -1;
+  const VlRangeRow *r = (const VlRangeRow *)((const char *)rows + (size_t)hit * size);
+  if (c > r->hi || (c - r->lo) % r->stride != 0) return -1;
+  return hit;
+}
+
+/* A VlCaseRow's first member is its VlRangeRow, so the row pointer converts
+ * to a valid VlRangeRow pointer and one search serves both table shapes. */
+static uint32_t uc_case(const VlCaseRow *t, int n, uint32_t c) {
+  int i = uc_row(t, sizeof *t, n, c);
+  return i < 0 ? c : (uint32_t)((int32_t)c + t[i].delta);
+}
+static uint32_t uc_upper(uint32_t c) { return uc_case(vl_uc_upper, VL_UC_UPPER_N, c); }
+static uint32_t uc_lower(uint32_t c) { return uc_case(vl_uc_lower, VL_UC_LOWER_N, c); }
+static bool uc_is_letter(uint32_t c) {
+  return uc_row(vl_uc_letter, sizeof vl_uc_letter[0], VL_UC_LETTER_N, c) >= 0;
+}
+/* Titlecase differs from uppercase only for the DŽ/LJ/NJ/DZ digraphs, so the
+ * title table holds just those and everything else falls back to upper. */
+static uint32_t uc_title(uint32_t c) {
+  int i = uc_row(vl_uc_title, sizeof vl_uc_title[0], VL_UC_TITLE_N, c);
+  return i < 0 ? uc_upper(c) : (uint32_t)((int32_t)c + vl_uc_title[i].delta);
+}
+/* is_upper's two classes (see tools/gen_unicode.py): a rune that rules a
+ * string out (Lowercase property, or titlecase Lt), and a rune that counts
+ * as upper case (Uppercase property). Uncased runes (digits, 日) are neither. */
+static bool uc_not_upper(uint32_t c) {
+  return uc_row(vl_uc_notupper, sizeof vl_uc_notupper[0], VL_UC_NOTUPPER_N, c) >= 0;
+}
+static bool uc_is_upper(uint32_t c) {
+  return uc_row(vl_uc_uppercase, sizeof vl_uc_uppercase[0], VL_UC_UPPERCASE_N, c) >= 0;
+}
+
+/* Unicode White_Space (PropList.txt): a short, stable list. */
+static bool uc_is_space(uint32_t c) {
+  return (c >= 0x09 && c <= 0x0D) || c == 0x20 || c == 0x85 || c == 0xA0 ||
+         c == 0x1680 || (c >= 0x2000 && c <= 0x200A) || c == 0x2028 ||
+         c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
+}
+
+/* case_map rewrites s rune by rune: the first rune goes through `first`, the
+ * rest through `rest` (title() passes titlecase, then lowercase). A case change may change
+ * the encoded length (U+0250 ɐ → U+2C6F Ɐ grows 2 → 3 bytes; K U+212A → k
+ * shrinks 3 → 1), and no mapping grows by more than half, so 2n+4 is a safe
+ * bound for the output buffer. */
+static Value case_map(const char *s, int64_t n, uint32_t (*first)(uint32_t),
+                      uint32_t (*rest)(uint32_t)) {
+  char *b = (char *)vl_alloc((size_t)n * 2 + 4);
+  int64_t o = 0;
+  bool at_first = true;
+  for (int64_t i = 0; i < n;) {
+    int len;
+    int32_t r = utf8_next((const unsigned char *)s + i, n - i, &len);
+    if (r < 0) b[o++] = s[i];  /* ill-formed byte: copy through */
+    else o += utf8_put((at_first ? first : rest)((uint32_t)r), b + o);
+    at_first = false;
+    i += len;
+  }
+  return vl_str_take(b, o);
+}
+
+/* from_bytes_checked builds a str from a []byte. A str is a BYTE string
+ * (§13.3: os.read, net.recv and crypto's _raw digests carry binary in one),
+ * so any byte sequence is accepted; what is refused, as an ERROR value
+ * (§8.1), is an element that is not a byte at all (outside 0..255), which
+ * used to be silently truncated. valid_utf8() tells text from binary. */
+static Value from_bytes_checked(Value slice) {
+  /* A slice, or a set in insertion order (VlSeq). */
+  int64_t len = vl_seq_len(slice);
+  VlSeq q = vl_seq(slice);
+  char *b = (char *)vl_alloc((size_t)len + 1);
+  Value ev;
+  for (int64_t i = 0; vl_seq_next(&q, &ev); i++) {
+    int64_t v = I(ev);
+    if (v < 0 || v > 255) {
+      free(b);
+      char msg[96];
+      snprintf(msg, sizeof msg, "from_bytes: element %lld is %lld, not a byte",
+               (long long)i, (long long)v);
+      return vl_err_cstr(msg);
+    }
+    b[i] = (char)v;
+  }
+  return vl_str_take(b, len);
+}
+
 /* ---------------------------------------------------------------- helpers */
 
 static Value split_str(const char *s, int64_t n, const char *sep, int64_t sn,
@@ -141,6 +283,7 @@ static const StrArity str_arity[] = {
     {"words", 1, 1},       {"bytes", 1, 1},      {"runes", 1, 1},
     {"rune_len", 1, 1},    {"is_digit", 1, 1},   {"is_alpha", 1, 1},
     {"is_space", 1, 1},    {"is_upper", 1, 1},   {"hex", 1, 1},
+    {"valid_utf8", 1, 1},
     {"unhex", 1, 1},       {"b64", 1, 1},        {"unb64", 1, 1},
     {"from_bytes", 1, 1},  {"from_runes", 1, 1},
     {"strip", 2, 2},       {"pad", 2, 2},        {"pad_left", 2, 2},
@@ -149,6 +292,7 @@ static const StrArity str_arity[] = {
     {"count", 2, 2},       {"equal_fold", 2, 2}, {"left", 2, 2},
     {"right", 2, 2},       {"split", 2, 2},      {"word", 2, 2},
     {"repeat", 2, 2},      {"join", 2, 2},
+    {"trim_prefix", 2, 2}, {"trim_suffix", 2, 2},{"cut", 2, 2},
     {"substr", 2, 3},      {"split_n", 3, 3},    {"delword", 2, 3},
     {"subword", 2, 3},     {"replace", 3, 3},    {"translate", 3, 3},
     {"overlay", 3, 3},     {"insert", 3, 3},     {"delstr", 3, 3},
@@ -179,25 +323,26 @@ Value vl_str_call(const char *name, Value *argv, int argc, bool *ok) {
 
   /* These three take a slice as their subject, not a string. */
   if (eq(name, "join")) {
-    Value parts = argv[0];
     Value sep = vl_tostr(argv[1]);
-    VlSlice *p = (VlSlice *)parts.u.o;
+    /* A slice in order, or a set in insertion order (VlSeq). */
+    VlSeq q = vl_seq(argv[0]);
     Value b = vl_builder_new();
-    for (int64_t i = 0; i < p->len; i++) {
+    /* an element's `show` may throw (err.c, unwind cleanups) */
+    int mark = vl_cleanup_mark();
+    vl_cleanup_slot(&b);
+    vl_cleanup_slot(&sep);
+    Value e;
+    for (int64_t i = 0; vl_seq_next(&q, &e); i++) {
       if (i) vl_builder_write(b, sep);
-      vl_builder_write(b, p->e[i]);
+      vl_builder_write(b, e);
     }
+    vl_cleanup_to(mark);
     Value out = vl_builder_done(b);
     vl_release(b);
     vl_release(sep);
     return out;
   }
-  if (eq(name, "from_bytes")) {
-    VlSlice *sl = (VlSlice *)argv[0].u.o;
-    char *b = (char *)vl_alloc((size_t)sl->len + 1);
-    for (int64_t i = 0; i < sl->len; i++) b[i] = (char)I(sl->e[i]);
-    return vl_str_take(b, sl->len);
-  }
+  if (eq(name, "from_bytes")) return from_bytes_checked(argv[0]);
   if (eq(name, "from_runes")) {
     VlSlice *sl = (VlSlice *)argv[0].u.o;
     Value b = vl_builder_new();
@@ -219,11 +364,8 @@ Value vl_str_call(const char *name, Value *argv, int argc, bool *ok) {
   const char *s = argc > 0 ? S(argv[0], &n) : "";
 
   if (eq(name, "upper") || eq(name, "lower")) {
-    bool up = eq(name, "upper");
-    char *b = vl_strdup_n(s, n);
-    for (int64_t i = 0; i < n; i++)
-      b[i] = up ? (char)toupper((unsigned char)b[i]) : (char)tolower((unsigned char)b[i]);
-    return vl_str_take(b, n);
+    uint32_t (*f)(uint32_t) = eq(name, "upper") ? uc_upper : uc_lower;
+    return case_map(s, n, f, f);
   }
   if (eq(name, "title")) {
     Value words = fields_of(s, n);
@@ -237,11 +379,7 @@ Value vl_str_call(const char *name, Value *argv, int argc, bool *ok) {
       }
       int64_t wn;
       const char *ws = S(w->e[i], &wn);
-      char *t = vl_strdup_n(ws, wn);
-      for (int64_t k = 0; k < wn; k++) t[k] = (char)tolower((unsigned char)t[k]);
-      if (wn) t[0] = (char)toupper((unsigned char)t[0]);
-      Value tv = vl_str_n(t, wn);
-      free(t);
+      Value tv = case_map(ws, wn, uc_title, uc_lower);
       vl_builder_write(b, tv);
       vl_release(tv);
     }
@@ -338,6 +476,48 @@ Value vl_str_call(const char *name, Value *argv, int argc, bool *ok) {
       }
     }
     return vl_int(found);
+  }
+  /* trim_prefix(s, p) / trim_suffix(s, p): s without a leading / trailing p,
+   * or s itself when it does not start / end with p. Exactly one copy of p
+   * is removed — unlike strip, which takes a SET of characters. */
+  if (eq(name, "trim_prefix") || eq(name, "trim_suffix")) {
+    int64_t pn;
+    const char *p = S(argv[1], &pn);
+    if (pn > n) return vl_str_n(s, n);
+    if (eq(name, "trim_prefix")) {
+      if (memcmp(s, p, (size_t)pn) == 0) return vl_str_n(s + pn, n - pn);
+      return vl_str_n(s, n);
+    }
+    if (memcmp(s + n - pn, p, (size_t)pn) == 0) return vl_str_n(s, n - pn);
+    return vl_str_n(s, n);
+  }
+  /* cut(s, sep) -> (before, after, found): s split around the FIRST sep. When
+   * sep does not occur the answer is (s, "", false), so `before` is always
+   * usable on its own. An empty sep is found at offset 0. */
+  if (eq(name, "cut")) {
+    int64_t pn;
+    const char *p = S(argv[1], &pn);
+    int64_t at = -1;
+    for (int64_t i = 0; i + pn <= n; i++) {
+      if (memcmp(s + i, p, (size_t)pn) == 0) {
+        at = i;
+        break;
+      }
+    }
+    Value parts[3];
+    if (at < 0) {
+      parts[0] = vl_str_n(s, n);
+      parts[1] = vl_str("");
+      parts[2] = vl_bool(false);
+    } else {
+      parts[0] = vl_str_n(s, at);
+      parts[1] = vl_str_n(s + at + pn, n - at - pn);
+      parts[2] = vl_bool(true);
+    }
+    Value t = vl_tuple_new(parts, 3); /* retains */
+    vl_release(parts[0]);
+    vl_release(parts[1]);
+    return t;
   }
   if (eq(name, "starts_with") || eq(name, "ends_with")) {
     int64_t pn;
@@ -443,13 +623,14 @@ Value vl_str_call(const char *name, Value *argv, int argc, bool *ok) {
   }
   if (eq(name, "join")) {
     /* join(parts, sep) — the subject is a slice, not a string */
-    Value parts = argv[0];
     Value sep = vl_tostr(argv[1]);
-    VlSlice *p = (VlSlice *)parts.u.o;
+    /* A slice in order, or a set in insertion order (VlSeq). */
+    VlSeq q = vl_seq(argv[0]);
     Value b = vl_builder_new();
-    for (int64_t i = 0; i < p->len; i++) {
+    Value e;
+    for (int64_t i = 0; vl_seq_next(&q, &e); i++) {
       if (i) vl_builder_write(b, sep);
-      vl_builder_write(b, p->e[i]);
+      vl_builder_write(b, e);
     }
     Value out = vl_builder_done(b);
     vl_release(b);
@@ -562,12 +743,7 @@ Value vl_str_call(const char *name, Value *argv, int argc, bool *ok) {
       vl_slice_append(out, vl_int((unsigned char)s[i]));
     return out;
   }
-  if (eq(name, "from_bytes")) {
-    VlSlice *sl = (VlSlice *)argv[0].u.o;
-    char *b = (char *)vl_alloc((size_t)sl->len + 1);
-    for (int64_t i = 0; i < sl->len; i++) b[i] = (char)I(sl->e[i]);
-    return vl_str_take(b, sl->len);
-  }
+  if (eq(name, "from_bytes")) return from_bytes_checked(argv[0]);
   if (eq(name, "runes")) {
     Value out = vl_slice_new(0);
     for (int64_t i = 0; i < n;) {
@@ -598,6 +774,18 @@ Value vl_str_call(const char *name, Value *argv, int argc, bool *ok) {
     vl_release(b);
     return out;
   }
+  if (eq(name, "valid_utf8")) {
+    /* True when s is well-formed UTF-8 (no stray, truncated or overlong
+     * sequence, no surrogate, nothing past U+10FFFF). A str may hold any
+     * bytes (§13.3); this is how a program tells text from binary. */
+    for (int64_t i = 0; i < n;) {
+      int len;
+      if (utf8_next((const unsigned char *)s + i, n - i, &len) < 0)
+        return vl_bool(false);
+      i += len;
+    }
+    return vl_bool(true);
+  }
   if (eq(name, "rune_len")) {
     int64_t c = 0;
     for (int64_t i = 0; i < n;) {
@@ -608,20 +796,27 @@ Value vl_str_call(const char *name, Value *argv, int argc, bool *ok) {
   }
   if (eq(name, "is_digit") || eq(name, "is_alpha") || eq(name, "is_space") ||
       eq(name, "is_upper")) {
+    /* Each test holds for EVERY rune of s (and s is non-empty). is_digit
+     * stays ASCII 0-9 on purpose: it guards int(), which parses only ASCII
+     * digits. The others are Unicode: letters are category L*, space is
+     * White_Space, and is_upper matches Python's str.isupper: no lowercase
+     * or titlecase rune, and at least one uppercase rune (so uncased text
+     * like "日本" or "123" is not upper). Ill-formed UTF-8 fails every test. */
     if (n == 0) return vl_bool(false);
-    for (int64_t i = 0; i < n; i++) {
-      unsigned char c = (unsigned char)s[i];
-      if (eq(name, "is_digit") && !isdigit(c)) return vl_bool(false);
-      if (eq(name, "is_alpha") && !isalpha(c)) return vl_bool(false);
-      if (eq(name, "is_space") && !is_space_c((char)c)) return vl_bool(false);
-      if (eq(name, "is_upper") && islower(c)) return vl_bool(false);
+    bool has_upper = false;
+    for (int64_t i = 0; i < n;) {
+      int len;
+      int32_t r = utf8_next((const unsigned char *)s + i, n - i, &len);
+      if (r < 0) return vl_bool(false);
+      uint32_t c = (uint32_t)r;
+      if (uc_is_upper(c)) has_upper = true;
+      if (eq(name, "is_digit") && !(c >= '0' && c <= '9')) return vl_bool(false);
+      if (eq(name, "is_alpha") && !uc_is_letter(c)) return vl_bool(false);
+      if (eq(name, "is_space") && !uc_is_space(c)) return vl_bool(false);
+      if (eq(name, "is_upper") && uc_not_upper(c)) return vl_bool(false);
+      i += len;
     }
-    if (eq(name, "is_upper")) {
-      bool has_alpha = false;
-      for (int64_t i = 0; i < n; i++)
-        if (isalpha((unsigned char)s[i])) has_alpha = true;
-      return vl_bool(has_alpha);
-    }
+    if (eq(name, "is_upper")) return vl_bool(has_upper);
     return vl_bool(true);
   }
   if (eq(name, "hex")) {
@@ -639,7 +834,7 @@ Value vl_str_call(const char *name, Value *argv, int argc, bool *ok) {
     return vl_str_take(b, n * 2);
   }
   if (eq(name, "unhex")) {
-    if (n % 2) return vl_err(vl_str("bad hex"));
+    if (n % 2) return vl_err_cstr("bad hex");
     char *b = (char *)vl_alloc((size_t)(n / 2) + 1);
     for (int64_t i = 0; i < n / 2; i++) {
       int hi = s[i * 2], lo = s[i * 2 + 1];

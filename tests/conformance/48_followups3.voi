@@ -1,0 +1,39 @@
+// The follow-ups to the third batch's review.
+//
+//  C. A type descriptor FORWARDED through a generic function keeps the
+//     static type the outer caller knew: `wrap(b)` with `b u8` reaches the
+//     `u8` impl, not the `int` one a run-time kind would name (§3.7).
+//  E. A static method of an INSTANTIATED generic type, `Wrap[int].make()`.
+//  F. A method a program implements for a BUILTIN type — written, or
+//     inherited from a trait default — answers in method-call form.
+
+trait Default { func default() Self }
+impl Default for int { func default() int { return 42 } }
+impl Default for u8 { func default() u8 { return 8 } }
+impl Default for str { func default() str { return "s" } }
+
+func like[T: Default](x T) T { return T.default() }
+func wrap[T: Default](x T) T { return like(x) }
+func wrap2[T: Default](x T) T { return wrap(x) }
+
+trait Sh {
+    func sh(self) str
+    func loud(self) str = self.sh() || "!"
+}
+impl Sh for int { func sh(self) str { return "int {self}" } }
+impl Sh for str { func sh(self) str { return "str {self}" } }
+impl Sh for float { func sh(self) str { return "float" } }
+
+struct Wrap[T] { v T }
+trait Make { func make() Self }
+impl[T] Make for Wrap[T] { func make() Self { return Self{v: nil} } }
+
+func main() {
+    let b u8 = 3
+    say "C:", wrap(b), like(b), wrap2(b), wrap(7), wrap("x")
+    say "E:", Wrap[int].make(), Wrap[str].make().v == nil
+    let n = 5
+    let s = "hi"
+    let fl = 2.5
+    say "F:", n.sh(), n.loud(), s.sh(), s.loud(), 7.loud(), fl.sh()
+}

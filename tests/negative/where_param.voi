@@ -1,0 +1,5 @@
+// A `where` clause constrains the declaration's OWN type parameters; one
+// naming anything else has nothing to bound.
+trait Named { func name(self) str }
+func f[T](x T) str where U: Named { return "" }
+func main() { }

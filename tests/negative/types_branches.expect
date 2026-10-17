@@ -1,0 +1,8 @@
+`pick` returns `int`, but `str` is given
+`x1` is `int`, but its initialiser is `str`
+`x2` is `int`, but its initialiser is `str`
+the branches of this `if` value yield `int` and `str`
+the branches of this `match` value yield `bool` and `str`
+!`y1`
+!`y2`
+!`y3`

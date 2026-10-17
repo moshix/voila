@@ -1,0 +1,6 @@
+// `Some(Red)` covers Red; Blue is the one missing.
+enum Color { Red, Green, Blue }
+func f(o ?Color) int {
+    return match o { Some(Red) => 1; Green => 2; nil => 3 }
+}
+func main() { say f(nil) }

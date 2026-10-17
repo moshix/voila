@@ -1,0 +1,31 @@
+// Control may not leave a `finally` block: the specification gives it no
+// exit of its own, and a `return` there would silently discard the value
+// already being returned — or the exception in flight — as Java's does. So,
+// as in C#, it is a compile-time error. (Lowering one used to recurse until
+// the compiler crashed.) Legal, and lowered first so the check is seen to
+// pass them: a loop INSIDE the finally left by break and continue, and a
+// closure written there, which is a function of its own.
+func legal() int {
+    try {
+        return 1
+    } finally {
+        each i in 0..3 {
+            if i == 1 { continue }
+            if i == 2 { break }
+        }
+        let g = fn() int { return 5 }
+        say g()
+    }
+    return 0
+}
+
+func c(n int) int {
+    try { return 1 } finally {
+        if n == 5 { return 2 }
+    }
+    return 3
+}
+
+func main() {
+    say legal(), c(5)
+}

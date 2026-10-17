@@ -4,6 +4,7 @@
 package chk
 
 use "voilac/ast"
+use "voilac/tok"
 use "std/str"
 
 // ---------------------------------------------------------------- lattice
@@ -184,23 +185,23 @@ impl Checker {
         if v.Kind == ast.INT or v.Kind == ast.FLOAT or v.Kind == ast.DEC or
            v.Kind == ast.STR {
             self.lattice_literal(target, value)
-        } else if v.Kind == ast.UNARY {
-            // The sign is handled by the range's symmetry: only the magnitude
-            // of a negated integer literal is judged.
+        } else if v.Kind == ast.UNARY and v.Ival == tok.MINUS {
+            // A NEGATED integer literal is judged with its sign: the ranges
+            // are not symmetric, so `-128` fits in i8 while `128` does not,
+            // and `-1` fits in no unsigned type.
             let x = self.T.Kid(value, 0)
-            if x != 0 and self.T.Kind(x) == ast.INT {
-                self.lattice_literal(target, x)
-            }
-        } else if v.Kind == ast.IDENT {
-            if v.Sval in scope {
-                let from = scope[v.Sval]
-                if is_numeric(from) and is_numeric(target) {
-                    if not widens_to(from, target) {
-                        self.lattice_error(from, target, value)
-                    }
+            if x != 0 and self.T.Kind(x) == ast.INT and is_int_type(target) {
+                let m = to_int(self.T.Get(x).Sval, 0)
+                if m != nil and (0 - m < int_lo(target) or
+                                 0 - m > int_hi(target)) {
+                    self.report_at(x, "literal -" || self.T.Get(x).Sval ||
+                                      " does not fit in {target}")
                 }
             }
         }
+        // A NAME of a known numeric type is judged by chk/expr.voi, which
+        // knows every binding's type — the same §3.2 rule and wording, at
+        // every hole and not only an initialiser.
     }
 
     func lattice_literal(mut self, target str, lit int) {
@@ -220,7 +221,11 @@ impl Checker {
             if is_int_type(target) {
                 self.report_at(lit, "float → {target} truncates")
             } else if target == "dec" {
-                self.report_at(lit, "binary float → dec is lossy")
+                // The LITERAL is the binary float: `1.25` is not 1.25
+                // exactly, so storing it into a dec would round (§3.2).
+                self.report_at(lit, "binary float → dec is lossy: the " ||
+                                    "literal {n.Sval} is a float; write " ||
+                                    "{n.Sval}d for the exact decimal")
             }
         } else if n.Kind == ast.DEC {
             // Note: `byte` is absent from Go's list here, so a dec literal
@@ -248,70 +253,327 @@ impl Checker {
     // ------------------------------------------------------------ match
 
     // check_exhaustiveness verifies that a match covers its subject (§3.5).
+    //
+    // EVERY match the program contains is judged — statement or value,
+    // inside a closure, a `defer`/`spawn` body or a trait default alike — by
+    // walking the whole tree from the file node rather than all_stmts(),
+    // which deliberately stops at closure bodies. A match is a match
+    // wherever it is written, and a missed one aborts at run time.
     func check_exhaustiveness(mut self) {
-        each s in self.all_stmts() {
-            if self.T.Kind(s) == ast.MATCH { self.check_match(s) }
+        var ms = []
+        self.collect_matches(self.file, ms)
+        each m in ms { self.check_match(m) }
+    }
+
+    // collect_matches gathers the MATCH nodes reachable from `node`, through
+    // every child and every node-id Ival, in tree order.
+    func collect_matches(self, node int, out mut []int) {
+        if node == 0 { return }
+        let n = self.T.Get(node)
+        if n.Kind == ast.MATCH { out.append(node) }
+        each k in n.Kids {
+            self.collect_matches(k, out)
+        }
+        if ast.IsRefKind(n.Kind) and n.Ival != 0 {
+            self.collect_matches(n.Ival, out)
         }
     }
 
+    // check_match decides whether a match covers its subject, with the
+    // classic USEFULNESS algorithm (Maranget, "Warnings for pattern
+    // matching"): the match is exhaustive exactly when a row of wildcards
+    // would match nothing the arms have not already matched. It is what
+    // makes the nested forms — or-patterns, tuples, struct patterns, a
+    // variant whose payload is itself refutable — judged exactly rather
+    // than by the name of the outermost constructor alone.
+    //
+    // A guarded arm may fall through, so it proves nothing and is left out.
+    // When the arms leave TOP-LEVEL variants of an enum unmentioned, those
+    // variants are the diagnostic: "not exhaustive" on its own tells a user
+    // nothing they did not already know.
     func check_match(mut self, m int) {
-        let mn = self.T.Get(m)
-        var variants = []
-        var catchAll = false
-        var sawNil = false
-        var sawSome = false
-        var sawOk = false
-        var sawErr = false
+        var rows = []
         each a in self.T.Get(self.T.Kid(m, 1)).Kids {
-            // A guarded arm may fall through, so it proves nothing about
-            // coverage.
             if self.T.Kid(a, 0) != 0 { continue }
             let p = self.T.Get(a).Ival
             if p == 0 { continue }
-            let pk = self.T.Kind(p)
-            if pk == ast.PWILD or pk == ast.PBIND {
-                catchAll = true
-            } else if pk == ast.PNIL {
-                sawNil = true
-            } else if pk == ast.PVARIANT {
-                let nm = self.T.Get(p).Sval
-                if nm == "Some" {
-                    sawSome = true
-                } else if nm == "Ok" {
-                    sawOk = true
-                } else if nm == "Err" {
-                    sawErr = true
-                } else {
-                    variants.append(nm)
-                }
+            rows.append([p])
+        }
+        if not self.uncovered(rows, 1) { return }
+
+        // Which enum is at the top, and which of its variants no arm names?
+        var named = set([])
+        var first = ""
+        each r in self.expand_rows(rows) {
+            var key = self.ctor_key(r[0])
+            // `Some(Red)` names `Red` as surely as a bare `Red` does.
+            if key == "some" { key = self.ctor_key(self.T.Kid(r[0], 0)) }
+            if str.starts_with(key, "v:") {
+                let vn = key[2..len(key)]
+                named.add(vn)
+                if first == "" { first = vn }
             }
         }
-        // A catch-all, or both halves of an option or a result, covers it.
-        if catchAll or (sawNil and sawSome) or (sawOk and sawErr) { return }
-
-        if len(variants) > 0 {
-            let en = self.enum_of(variants[0])
+        if first != "" {
+            let en = self.enum_of(first)
             if en != 0 {
-                var covered = set([])
-                each v in variants { covered.add(v) }
                 var missing = []
                 each v in self.T.Get(self.T.Kid(en, 0)).Kids {
                     let vn = self.T.Get(v).Sval
-                    if not (vn in covered) { missing.append(vn) }
+                    if not (vn in named) { missing.append(vn) }
                 }
-                // Matching a ?Enum: the Some/nil combination was judged above.
-                if sawNil or sawSome { return }
-                if len(missing) == 0 { return }
-                let ename = self.T.Get(en).Sval
-                // The missing variants ARE the diagnostic: "not exhaustive" on
-                // its own tells a user nothing they did not already know.
-                self.report_at(m,
-                               "match on `{ename}` is not exhaustive; " ||
-                               "missing cases: " || str.join(missing, ", "))
-                return
+                if len(missing) > 0 {
+                    let ename = self.T.Get(en).Sval
+                    self.report_at(m,
+                                   "match on `{ename}` is not exhaustive; " ||
+                                   "missing cases: " || str.join(missing, ", "))
+                    return
+                }
             }
         }
         self.report_at(m, "match is not exhaustive")
+    }
+
+    // uncovered reports whether some value vector of width n is matched by
+    // NO row. A row is a list of pattern node ids, 0 standing for a
+    // wildcard the algorithm introduced itself.
+    func uncovered(self, rows0 [][]int, n int) bool {
+        let rows = self.expand_rows(rows0)
+        if n == 0 { return len(rows) == 0 }
+        // The constructors the first column mentions, in row order (never a
+        // set walk: the order must not depend on hashing).
+        var keys = []
+        var seen = set([])
+        each r in rows {
+            let key = self.ctor_key(r[0])
+            if key != "" and not (key in seen) {
+                seen.add(key)
+                keys.append(key)
+            }
+        }
+        // A `?Enum` subject may be matched by `Some(Red)` and by `Red`
+        // alike. When both spellings meet in one column, `Some(p)` is
+        // rewritten to `p` (a bare `Some` to a wildcard over the payload's
+        // constructors… which is simply a wildcard), and the column judged
+        // again against the enum's variants plus nil.
+        var hasVariant = false
+        each key in keys {
+            if str.starts_with(key, "v:") { hasVariant = true }
+        }
+        if hasVariant and "some" in seen {
+            var unwrapped = []
+            each r in rows {
+                var nr = [r[0]]
+                if self.ctor_key(r[0]) == "some" {
+                    nr = [self.T.Kid(r[0], 0)]
+                }
+                each x in r[1..len(r)] { nr.append(x) }
+                unwrapped.append(nr)
+            }
+            return self.uncovered(unwrapped, n)
+        }
+        let sig = self.signature(keys)
+        var complete = len(sig) > 0
+        each k in sig {
+            if not (k in seen) { complete = false }
+        }
+        if complete {
+            // Every constructor of the type appears: the vector is
+            // uncovered iff it is uncovered under SOME constructor.
+            each k in sig {
+                let ar = self.ctor_arity(k)
+                if self.uncovered(self.specialize(rows, k, ar), ar + n - 1) {
+                    return true
+                }
+            }
+            return false
+        }
+        // Some constructor appears in no row (or the domain is infinite):
+        // only the wildcard rows can match it.
+        var dflt = []
+        each r in rows {
+            if self.ctor_key(r[0]) == "" { dflt.append(r[1..len(r)]) }
+        }
+        return self.uncovered(dflt, n - 1)
+    }
+
+    // expand_rows replaces a row whose first pattern is an or-pattern by one
+    // row per alternative, recursively.
+    func expand_rows(self, rows [][]int) [][]int {
+        var out = []
+        each r in rows {
+            if len(r) > 0 and r[0] != 0 and self.T.Kind(r[0]) == ast.POR {
+                var alts = []
+                each a in self.T.Get(r[0]).Kids {
+                    var nr = [a]
+                    each x in r[1..len(r)] { nr.append(x) }
+                    alts.append(nr)
+                }
+                each x in self.expand_rows(alts) { out.append(x) }
+            } else {
+                out.append(r)
+            }
+        }
+        return out
+    }
+
+    // ctor_key names the constructor a pattern tests for, or "" for one
+    // that matches anything. Literals other than `true`/`false` and ranges
+    // are "lit": their domain is infinite, so they never complete a
+    // signature. A name that is no enum's variant (an exception type, say)
+    // is "x:" for the same reason.
+    func ctor_key(self, p int) str {
+        if p == 0 { return "" }
+        let n = self.T.Get(p)
+        let k = n.Kind
+        if k == ast.PWILD or k == ast.PBIND { return "" }
+        if k == ast.PNIL { return "nil" }
+        if k == ast.PTUPLE { return "t:" || str(len(n.Kids)) }
+        if k == ast.PSTRUCT { return "s:" || n.Sval }
+        if k == ast.PLIT {
+            let v = self.T.Get(n.Kids[0])
+            if v.Kind == ast.BOOL { return "b:" || v.Sval }
+            return "lit"
+        }
+        if k == ast.PVARIANT {
+            if n.Sval == "Some" { return "some" }
+            if n.Sval == "Ok" { return "ok" }
+            if n.Sval == "Err" { return "err" }
+            let vn = self.variant_name(n.Sval)
+            if self.enum_of(vn) != 0 { return "v:" || vn }
+            return "x:" || n.Sval
+        }
+        return "lit"
+    }
+
+    // signature is the complete constructor set of the type the keys come
+    // from, or empty when it is infinite or unknown.
+    func signature(self, keys []str) []str {
+        var out = []
+        var hasNil = false
+        each k in keys {
+            if k == "nil" { hasNil = true }
+        }
+        each k in keys {
+            if str.starts_with(k, "v:") {
+                // A `?Enum` subject may be matched by its variants directly
+                // beside `nil`, so nil joins the enum's own variants.
+                let en = self.enum_of(k[2..len(k)])
+                each v in self.T.Get(self.T.Kid(en, 0)).Kids {
+                    out.append("v:" || self.T.Get(v).Sval)
+                }
+                if hasNil { out.append("nil") }
+                return out
+            }
+        }
+        each k in keys {
+            if k == "some" or k == "nil" { return ["some", "nil"] }
+            if k == "ok" or k == "err" { return ["ok", "err"] }
+            if str.starts_with(k, "b:") { return ["b:true", "b:false"] }
+            if str.starts_with(k, "t:") { return [k] }
+            if str.starts_with(k, "s:") and k[2..len(k)] in self.structs {
+                return [k]
+            }
+        }
+        return out
+    }
+
+    // ctor_arity is the number of sub-patterns a constructor carries.
+    func ctor_arity(self, k str) int {
+        if k == "some" or k == "ok" or k == "err" { return 1 }
+        if str.starts_with(k, "t:") {
+            let n = to_int(k[2..len(k)])
+            if n == nil { return 0 }
+            return n
+        }
+        if str.starts_with(k, "v:") {
+            let vd = self.variant_decl(k[2..len(k)])
+            if vd == 0 { return 0 }
+            return self.T.NKids(self.T.Kid(vd, 0))
+        }
+        if str.starts_with(k, "s:") {
+            return len(self.struct_fields(k[2..len(k)]))
+        }
+        return 0
+    }
+
+    // specialize keeps the rows that can match constructor k, replacing
+    // their first pattern by its ar sub-patterns (wildcards for a wildcard,
+    // and for a struct field or a payload the pattern leaves unwritten).
+    func specialize(self, rows [][]int, k str, ar int) [][]int {
+        var out = []
+        each r in rows {
+            let h = r[0]
+            let hk = self.ctor_key(h)
+            if hk != "" and hk != k { continue }
+            var nr = []
+            if hk == "" {
+                var i = 0
+                while i < ar {
+                    nr.append(0)
+                    i += 1
+                }
+            } else if str.starts_with(k, "s:") {
+                each f in self.struct_fields(k[2..len(k)]) {
+                    var sub = 0
+                    each pf in self.T.Get(h).Kids {
+                        if self.T.Get(pf).Sval == f { sub = self.T.Kid(pf, 0) }
+                    }
+                    nr.append(sub)
+                }
+            } else {
+                let ks = self.T.Get(h).Kids
+                var i = 0
+                while i < ar {
+                    if i < len(ks) { nr.append(ks[i]) } else { nr.append(0) }
+                    i += 1
+                }
+            }
+            each x in r[1..len(r)] { nr.append(x) }
+            out.append(nr)
+        }
+        return out
+    }
+
+    // variant_name resolves an ENUM-qualified pattern name, `Shape.Circle`
+    // (or `geom.Shape.Circle`), to the flat variant name the declaration
+    // carries; vl_match accepts that spelling, so the checker must too. Any
+    // other name is returned unchanged.
+    func variant_name(self, name str) str {
+        if self.enum_of(name) != 0 { return name }
+        let dot = str.last_index(name, ".")
+        if dot <= 0 { return name }
+        let q = name[0..dot]
+        let v = name[dot + 1..len(name)]
+        if not (q in self.enums) { return name }
+        each vd in self.T.Get(self.T.Kid(self.enums[q], 0)).Kids {
+            let full = self.T.Get(vd).Sval
+            let d2 = str.last_index(full, ".")
+            var short = full
+            if d2 >= 0 { short = full[d2 + 1..len(full)] }
+            if short == v { return full }
+        }
+        return name
+    }
+
+    // variant_decl finds a variant's VARIANTDEC, or 0.
+    func variant_decl(self, variant str) int {
+        let e = self.enum_of(variant)
+        if e == 0 { return 0 }
+        each v in self.T.Get(self.T.Kid(e, 0)).Kids {
+            if self.T.Get(v).Sval == variant { return v }
+        }
+        return 0
+    }
+
+    // struct_fields lists a declared struct's field names, in order.
+    func struct_fields(self, name str) []str {
+        var out = []
+        if not (name in self.structs) { return out }
+        each f in self.T.Get(self.T.Kid(self.structs[name], 0)).Kids {
+            if self.T.Kind(f) == ast.FIELDDECL { out.append(self.T.Get(f).Sval) }
+        }
+        return out
     }
 
     // enum_of finds the enum a variant name belongs to, or 0.
@@ -327,61 +589,177 @@ impl Checker {
 
     // ------------------------------------------------------------ moves
 
-    // check_moves is the straight-line use-after-move analysis (§6.1): within
-    // one block, sequentially, a binding passed to an `own` parameter — or
-    // dropped — must not be used again. Branch and loop bodies are skipped:
-    // the analysis is conservative, not a dataflow.
+    // check_moves is the straight-line use-after-move analysis (§6.1, §6.4):
+    // within one block, sequentially, a binding that MOVED must not be used
+    // again. A value moves when it is handed to an `own` parameter, dropped,
+    // or — for a type that owns storage (infer.voi's is_noncopy, recorded by
+    // the expression walk in moveIdents) — bound to another name, assigned,
+    // or sent on a channel, BY NAME. Only names this function owns move that
+    // way: its `let`/`var` bindings and its `own` parameters; a borrowed
+    // parameter bound to a second name is a second borrow.
+    //
+    // It is straight-line, not a dataflow: a move inside a branch or a loop
+    // body is tracked to the end of that body only, while a move before one
+    // is seen by every use inside it. A re-assignment or a re-binding
+    // revives the name. Conservative in the right direction — it misses a
+    // move in one branch followed by a use after the `if`, and accuses
+    // nothing that runs.
     func check_moves(mut self) {
         each d in self.T.Get(self.T.Kid(self.file, 1)).Kids {
-            if self.T.Kind(d) == ast.FUNC and self.T.Kid(d, 0) != 0 {
-                var moved = make(map[str]int)
-                self.moves_block(self.T.Kid(d, 0), moved)
+            let k = self.T.Kind(d)
+            if k == ast.FUNC {
+                self.moves_fn(d)
+            } else if k == ast.IMPLDEC or k == ast.TRAITDEC {
+                each m in self.T.Get(self.T.Kid(d, 0)).Kids { self.moves_fn(m) }
+            } else if k == ast.EXCDEC {
+                each m in self.T.Get(self.T.Kid(d, 1)).Kids { self.moves_fn(m) }
             }
         }
         let script = self.T.Get(self.T.Kid(self.file, 2)).Kids
         if len(script) > 0 {
             var moved = make(map[str]int)
-            each s in script { self.moves_stmt(s, moved) }
+            var owned = set([])
+            each s in script { self.moves_stmt(s, moved, owned) }
         }
     }
 
-    func moves_block(mut self, b int, moved mut map[str]int) {
-        if b == 0 { return }
-        each s in self.T.Get(b).Kids { self.moves_stmt(s, moved) }
+    func moves_fn(mut self, fn int) {
+        if self.T.Kind(fn) != ast.FUNC or self.T.Kid(fn, 0) == 0 { return }
+        var moved = make(map[str]int)
+        var owned = set([])
+        each p in self.T.Get(self.T.Kid(fn, 1)).Kids {
+            if (self.T.Get(p).Ival2 & 3) == ast.MODE_OWN {
+                owned.add(self.T.Get(p).Sval)
+            }
+        }
+        self.moves_block(self.T.Kid(fn, 0), moved, owned)
     }
 
-    func moves_stmt(mut self, s int, moved mut map[str]int) {
+    func moves_block(mut self, b int, moved mut map[str]int,
+                     owned mut set[str]) {
+        if b == 0 { return }
+        each s in self.T.Get(b).Kids { self.moves_stmt(s, moved, owned) }
+    }
+
+    // moves_nested walks a nested body in COPIES of the state: what moves
+    // inside stays inside, what moved before is seen.
+    //
+    // `binds` are the names the nested body binds on entry — a loop's
+    // variables, an arm's or an `if let`'s pattern — which are NEW bindings:
+    // alive, and not this function's to move.
+    func moves_nested(mut self, b int, moved map[str]int, owned set[str],
+                      binds []str) {
+        if b == 0 { return }
+        var m2 = make(map[str]int)
+        each k in keys(moved) { m2[k] = moved[k] }
+        var o2 = set([])
+        each k in owned { o2.add(k) }
+        each nm in binds {
+            if nm in m2 { m2[nm] = 0 }
+            if nm in o2 { o2.remove(nm) }
+        }
+        if self.T.Kind(b) == ast.BLOCK or self.T.Kind(b) == ast.LIST {
+            each s in self.T.Get(b).Kids { self.moves_stmt(s, m2, o2) }
+        } else {
+            self.moves_stmt(b, m2, o2)
+        }
+    }
+
+    func moves_stmt(mut self, s int, moved mut map[str]int,
+                    owned mut set[str]) {
         if s == 0 { return }
         let n = self.T.Get(s)
         let k = n.Kind
-        if k == ast.EXPRSTMT or k == ast.LET {
-            let v = self.T.Kid(s, 0)
-            self.moved_use(v, moved)
-            self.record_moves(v, moved)
-        } else if k == ast.VAR {
+        if k == ast.LET or k == ast.VAR {
             let v = self.T.Kid(s, 0)
             if v != 0 {
                 self.moved_use(v, moved)
                 self.record_moves(v, moved)
+                self.move_value(v, moved, owned)
+            }
+            // The bound names are new bindings: alive, and owned here.
+            each nm in str.split(n.Sval, ",") {
+                if nm in moved { moved[nm] = 0 }
+                owned.add(nm)
+            }
+        } else if k == ast.EXPRSTMT {
+            let v = self.T.Kid(s, 0)
+            self.moved_use(v, moved)
+            self.record_moves(v, moved)
+            if v != 0 and self.T.Kind(v) == ast.BINARY and
+               self.T.Get(v).Ival == tok.ARROW {
+                self.move_value(self.T.Kid(v, 1), moved, owned)
             }
         } else if k == ast.ASSIGN {
             let v = self.T.Kid(s, 1)
             self.moved_use(v, moved)
             self.record_moves(v, moved)
-            // Re-assignment revives the binding. A move records the line it
-            // happened on, so line 0 is the "alive again" marker: the map
-            // has no delete the C backend is known to carry.
             let lhs = self.T.Kid(s, 0)
+            // Writing INTO a moved value (`xs[0] = 1`, `p.x = 1`) uses it.
+            if lhs != 0 and self.T.Kind(lhs) != ast.IDENT and
+               self.T.Kind(lhs) != ast.TUPLE {
+                self.moved_use(lhs, moved)
+            }
+            if n.Ival == tok.ASSIGN { self.move_value(v, moved, owned) }
+            // Re-assignment revives the binding. A move records the line it
+            // happened on, so line 0 is the "alive again" marker.
             if lhs != 0 and self.T.Kind(lhs) == ast.IDENT {
                 moved[self.T.Get(lhs).Sval] = 0
+            } else if lhs != 0 and self.T.Kind(lhs) == ast.TUPLE {
+                each t in self.T.Get(lhs).Kids {
+                    if self.T.Kind(t) == ast.IDENT {
+                        moved[self.T.Get(t).Sval] = 0
+                    }
+                }
             }
         } else if k == ast.SAY or k == ast.RETURN {
             each a in n.Kids { self.moved_use(a, moved) }
         } else if k == ast.DROP {
             moved[n.Sval] = n.Line
         } else if k == ast.BLOCK {
-            self.moves_block(s, moved)
+            self.moves_block(s, moved, owned)
+        } else if k == ast.IF {
+            self.moved_use(self.T.Kid(s, 0), moved)
+            var pb = []
+            self.pattern_names(n.Ival, pb)
+            self.moves_nested(self.T.Kid(s, 1), moved, owned, pb)
+            self.moves_nested(self.T.Kid(s, 2), moved, owned, [])
+        } else if k == ast.WHILE or k == ast.FOR or k == ast.EACH {
+            self.moved_use(self.T.Kid(s, 0), moved)
+            var lv = []
+            if k != ast.WHILE {
+                each part in str.split(str.split(n.Sval, "|")[0], ",") {
+                    if part != "" { lv.append(part) }
+                }
+            }
+            self.moves_nested(self.T.Kid(s, 1), moved, owned, lv)
+        } else if k == ast.MATCH {
+            self.moved_use(self.T.Kid(s, 0), moved)
+            each a in self.T.Get(self.T.Kid(s, 1)).Kids {
+                var ab = []
+                self.pattern_names(self.T.Get(a).Ival, ab)
+                self.moves_nested(self.T.Kid(a, 1), moved, owned, ab)
+            }
         }
+    }
+
+    // pattern_names lists the names a pattern binds.
+    func pattern_names(self, p int, out mut []str) {
+        if p == 0 { return }
+        let n = self.T.Get(p)
+        if n.Kind == ast.PBIND {
+            out.append(n.Sval)
+            return
+        }
+        each sub in n.Kids { self.pattern_names(sub, out) }
+    }
+
+    // move_value records a bare owned NAME whose value moves (moveIdents).
+    func move_value(mut self, v int, moved mut map[str]int, owned set[str]) {
+        if v == 0 or self.T.Kind(v) != ast.IDENT { return }
+        if not (v in self.moveIdents) { return }
+        let an = self.T.Get(v)
+        if an.Sval in owned { moved[an.Sval] = an.Line }
     }
 
     // moved_use reports every identifier used after a straight-line move.
@@ -390,7 +768,10 @@ impl Checker {
             if self.T.Kind(x) != ast.IDENT { continue }
             let nm = self.T.Get(x).Sval
             if nm in moved and moved[nm] != 0 {
-                self.report_at(x, "use of moved value `{nm}`")
+                self.report_at(x, "use of moved value `{nm}` (moved on " ||
+                                  "line {moved[nm]}; a value that owns " ||
+                                  "storage moves on assignment — §6.4, " ||
+                                  "write `.clone()` for a copy)")
             }
         }
     }
@@ -412,6 +793,8 @@ impl Checker {
                 if (self.T.Get(p).Ival2 & 3) != ast.MODE_OWN { continue }
                 if i >= len(args) { continue }
                 let av = self.T.Kid(args[i], 0)
+                // A Copy value is copied into an `own` parameter, not moved.
+                if av in self.copyArgs { continue }
                 if av != 0 and self.T.Kind(av) == ast.IDENT {
                     let an = self.T.Get(av)
                     moved[an.Sval] = an.Line

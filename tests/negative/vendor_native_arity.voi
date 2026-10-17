@@ -1,0 +1,8 @@
+// A native of a vendored-library package (std/compress over miniz) is
+// bounded like every other: the arity check refuses the call at compile
+// time, before the extension it lives in is ever compiled or linked.
+use "std/compress"
+
+func main() {
+    say compress._encode("x")
+}

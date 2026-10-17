@@ -1,0 +1,255 @@
+// std/slices — generic algorithms over slices (§13.4).
+//
+// Every function here is pure Voilà and generic in the element type. None of
+// them changes its argument: a function that "edits" a slice — insert,
+// remove, reverse, compact — returns a NEW slice and leaves the one it was
+// handed alone, because a parameter is a borrow (§6.1) and a borrow is
+// read-only. The in-place forms are slice METHODS instead (`xs.insert(i, v)`,
+// `xs.remove(i)`, `xs.reverse()`, `xs.sort()`), which a `var` may call.
+//
+// Ordering is the language's own: `<` on numbers and strings, and a user
+// type's `cmp` (§3.6, the Ord protocol), so `binary_search`, `min` and `max`
+// work on anything `sort` can order. Equality is structural `==`.
+package slices
+
+// contains reports whether v is an element of xs.
+func contains[T](xs []T, v T) bool {
+    each x in xs {
+        if x == v { return true }
+    }
+    return false
+}
+
+// index_of is the position of the first element equal to v, or -1.
+func index_of[T](xs []T, v T) int {
+    each i, x in xs {
+        if x == v { return i }
+    }
+    return -1
+}
+
+// last_index_of is the position of the last element equal to v, or -1.
+func last_index_of[T](xs []T, v T) int {
+    var i = len(xs) - 1
+    while i >= 0 {
+        if xs[i] == v { return i }
+        i -= 1
+    }
+    return -1
+}
+
+// index_where is the position of the first element `f` accepts, or -1.
+func index_where[T](xs []T, f fn(T) bool) int {
+    each i, x in xs {
+        if f(x) { return i }
+    }
+    return -1
+}
+
+// count is how many elements equal v.
+func count[T](xs []T, v T) int {
+    var n = 0
+    each x in xs {
+        if x == v { n += 1 }
+    }
+    return n
+}
+
+// reversed is a copy of xs in the opposite order. (`xs.reverse()` reverses a
+// `var` in place.)
+func reversed[T](xs []T) []T {
+    var out = []
+    var i = len(xs) - 1
+    while i >= 0 {
+        out.append(xs[i])
+        i -= 1
+    }
+    return out
+}
+
+// insert is a copy of xs with v placed at position i, 0 <= i <= len(xs);
+// anything else throws RangeError. (`xs.insert(i, v)` is the in-place form.)
+func insert[T](xs []T, i int, v T) []T {
+    if i < 0 or i > len(xs) {
+        throw RangeError{msg: "slices.insert: index {i} out of range " ||
+                              "0..{len(xs)}"}
+    }
+    var out = []
+    each j, x in xs {
+        if j == i { out.append(v) }
+        out.append(x)
+    }
+    if i == len(xs) { out.append(v) }
+    return out
+}
+
+// remove is a copy of xs without the element at position i; an index
+// outside 0..len(xs)-1 throws RangeError. (`xs.remove(i)` is the in-place
+// form, and returns the element it took out.)
+func remove[T](xs []T, i int) []T {
+    if i < 0 or i >= len(xs) {
+        throw RangeError{msg: "slices.remove: index {i} out of range " ||
+                              "for length {len(xs)}"}
+    }
+    var out = []
+    each j, x in xs {
+        if j != i { out.append(x) }
+    }
+    return out
+}
+
+// binary_search looks for v in xs, which must already be sorted ascending.
+// It returns the position of an element equal to v and true, or — when there
+// is none — the position v would have to be inserted at to keep xs sorted,
+// and false. O(log n) comparisons.
+func binary_search[T](xs []T, v T) (int, bool) {
+    // Invariant: everything before lo is < v, everything from hi on is >= v.
+    var lo = 0
+    var hi = len(xs)
+    while lo < hi {
+        let mid = lo + (hi - lo) ~/ 2
+        if xs[mid] < v {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    return lo, lo < len(xs) and xs[lo] == v
+}
+
+// binary_search_by is binary_search with the ordering supplied: `cmp(x)`
+// answers negative when x sorts before the target, zero when x is the target
+// and positive when it sorts after — the slice must be sorted by that order.
+func binary_search_by[T](xs []T, cmp fn(T) int) (int, bool) {
+    var lo = 0
+    var hi = len(xs)
+    while lo < hi {
+        let mid = lo + (hi - lo) ~/ 2
+        if cmp(xs[mid]) < 0 {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    return lo, lo < len(xs) and cmp(xs[lo]) == 0
+}
+
+// compact collapses each run of consecutive equal elements into one, the
+// way `uniq(1)` does: [1, 1, 2, 1] becomes [1, 2, 1]. Sorted input therefore
+// comes out with every duplicate gone.
+func compact[T](xs []T) []T {
+    var out = []
+    each i, x in xs {
+        if i == 0 or x != xs[i - 1] { out.append(x) }
+    }
+    return out
+}
+
+// unique keeps the FIRST occurrence of every distinct element, in order:
+// [3, 1, 3, 2, 1] becomes [3, 1, 2]. Membership is by `==`, so it is
+// O(n²) — use compact on sorted input when the slice is large.
+func unique[T](xs []T) []T {
+    var out = []
+    each x in xs {
+        var seen = false
+        each y in out {
+            if y == x {
+                seen = true
+                break
+            }
+        }
+        if not seen { out.append(x) }
+    }
+    return out
+}
+
+// chunk splits xs into consecutive pieces of n elements; the last piece holds
+// whatever is left over. n must be at least 1 (RangeError otherwise).
+func chunk[T](xs []T, n int) [][]T {
+    if n < 1 {
+        throw RangeError{msg: "slices.chunk: size {n} must be at least 1"}
+    }
+    var out = []
+    var cur = []
+    each x in xs {
+        cur.append(x)
+        if len(cur) == n {
+            out.append(cur)
+            cur = []
+        }
+    }
+    if len(cur) > 0 { out.append(cur) }
+    return out
+}
+
+// flatten concatenates a slice of slices.
+func flatten[T](xss [][]T) []T {
+    var out = []
+    each xs in xss {
+        each x in xs { out.append(x) }
+    }
+    return out
+}
+
+// concat is a followed by b, as a new slice.
+func concat[T](a []T, b []T) []T {
+    var out = []
+    each x in a { out.append(x) }
+    each x in b { out.append(x) }
+    return out
+}
+
+// equal reports whether a and b hold equal elements in the same order.
+func equal[T](a []T, b []T) bool {
+    if len(a) != len(b) { return false }
+    each i, x in a {
+        if x != b[i] { return false }
+    }
+    return true
+}
+
+// min is the smallest element, or nil for an empty slice.
+func min[T](xs []T) ?T {
+    if len(xs) == 0 { return nil }
+    var best = xs[0]
+    each x in xs {
+        if x < best { best = x }
+    }
+    return best
+}
+
+// max is the largest element, or nil for an empty slice.
+func max[T](xs []T) ?T {
+    if len(xs) == 0 { return nil }
+    var best = xs[0]
+    each x in xs {
+        if x > best { best = x }
+    }
+    return best
+}
+
+// partition splits xs into the elements `f` accepts and the ones it does
+// not, each in its original order.
+func partition[T](xs []T, f fn(T) bool) ([]T, []T) {
+    var yes = []
+    var no = []
+    each x in xs {
+        if f(x) {
+            yes.append(x)
+        } else {
+            no.append(x)
+        }
+    }
+    return yes, no
+}
+
+// repeat is a slice of n copies of v.
+func repeat[T](v T, n int) []T {
+    var out = []
+    var i = 0
+    while i < n {
+        out.append(v)
+        i += 1
+    }
+    return out
+}

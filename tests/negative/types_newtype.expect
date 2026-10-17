@@ -1,0 +1,13 @@
+argument 1 of `f` is `Cel`, but `Fah` is given — a newtype converts only explicitly
+`c` is `Cel`, but its initialiser is `Fah`
+`c2` is `Cel`, but its initialiser is `int`
+`x` is `int`, but its initialiser is `Cel`
+`+` between `Cel` and `Fah`
+`+` between `Cel` and `int`
+`==` between `Cel` and `int`
+argument 1 of `toint` is `int`, but `Cel` is given
+`acc` is `Cel`, and `int` does not mix with it
+!`lit`
+!argument 1 of `f` is `Cel`, but `int`
+!`+` between `Cel` and `Cel`
+!`>` between

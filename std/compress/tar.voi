@@ -1,0 +1,326 @@
+// std/compress — tar archives (POSIX ustar), in plain Voilà.
+//
+//     let tarball = try compress.tar_write([
+//         compress.TarEntry{name: "notes/", kind: "dir", mode: 493},
+//         compress.TarEntry{name: "notes/a.txt", data: "hello\n"},
+//     ])
+//     try os.write("notes.tar.gz", try compress.gzip(tarball))
+//
+//     each e in try compress.tar_read(try compress.gunzip(try os.read(p))) {
+//         say e.kind, e.name, len(e.data)
+//     }
+//
+// A tar archive is a sequence of 512-byte headers, each followed by its
+// member's bytes padded to 512, and ended by two zero blocks. Writing uses
+// the ustar layout: a name of up to 100 bytes, or up to 255 split at a "/"
+// into a prefix and a name. Reading also understands the two common ways
+// longer names are stored — GNU's `L`/`K` records and POSIX pax `x`
+// headers (path, linkpath, size) — so an archive from GNU tar or bsdtar
+// reads correctly. Every header's checksum is verified, every size is
+// checked against what is actually there, and the total member size is
+// bounded by `max` (DEFAULT_MAX unless given), so a corrupt or hostile
+// archive is an error, never a crash.
+package compress
+
+use "std/fmt"
+use "std/str"
+
+// TarEntry is one member. `kind` is "file", "dir", "symlink", "link" (a
+// hard link) or, reading, "other" (a device or a FIFO, kept by name only).
+// `mode` is the permission bits (493 is 0o755, 420 0o644); `mtime` is Unix
+// seconds; `link` is a link's target.
+struct TarEntry {
+    name  str
+    data  str = ""
+    kind  str = "file"
+    mode  int = 420
+    mtime int = 0
+    link  str = ""
+}
+
+const TAR_BLOCK = 512
+
+// ---------------------------------------------------------------- reading
+
+// tar_read parses an archive's bytes into its members.
+func tar_read(data str, max int = DEFAULT_MAX) []TarEntry throws IOError {
+    try check_max(max)
+    var out = []
+    var at = 0
+    var total = 0
+    // Extended names and sizes apply to the NEXT header only.
+    var long_name = ""
+    var long_link = ""
+    var pax = make(map[str]str)
+    while at < len(data) {
+        if at + TAR_BLOCK > len(data) {
+            return errf("compress: tar: truncated header at byte {at}")
+        }
+        let blk = data[at..at + TAR_BLOCK]
+        if is_zero_block(blk) { break }        // the end marker
+        let b = bytes(blk)
+        try check_tar_sum(b, at)
+        let typ = b[156]
+        var size = try tar_octal(b, 124, 12, "size")
+        if "size" in pax { size = try pax_int(pax["size"], "size") }
+        at += TAR_BLOCK
+        if size > len(data) - at {
+            return errf("compress: tar: member at byte {at - TAR_BLOCK} " ||
+                        "claims {size} bytes but the archive ends first")
+        }
+        let body = data[at..at + size]
+        at += round_up(size)
+        if at > len(data) { at = len(data) }   // the last member's padding
+
+        // The records that describe the next header rather than a member.
+        if typ == 76 {                          // 'L': GNU long name
+            long_name = cstr(body)
+            continue
+        }
+        if typ == 75 {                          // 'K': GNU long link
+            long_link = cstr(body)
+            continue
+        }
+        if typ == 120 {                         // 'x': pax extended header
+            pax = try parse_pax(body)
+            continue
+        }
+        if typ == 103 { continue }              // 'g': pax global header
+
+        total += size
+        if max > 0 and total > max {
+            return errf("compress: tar: members exceed the limit of " ||
+                        "{max} bytes")
+        }
+        var name = cstr(blk[0..100])
+        let prefix = cstr(blk[345..500])
+        if prefix != "" and blk[257..262] == "ustar" {
+            name = prefix || "/" || name
+        }
+        if long_name != "" { name = long_name }
+        if "path" in pax { name = pax["path"] }
+        var link = cstr(blk[157..257])
+        if long_link != "" { link = long_link }
+        if "linkpath" in pax { link = pax["linkpath"] }
+
+        var e = TarEntry{name: name, kind: tar_kind(typ), link: link}
+        e.mode = try tar_octal(b, 100, 8, "mode")
+        e.mtime = try tar_octal(b, 136, 12, "mtime")
+        if e.kind == "file" { e.data = body }
+        out.append(e)
+        long_name = ""
+        long_link = ""
+        pax = make(map[str]str)
+    }
+    return out
+}
+
+// tar_kind names a header's type flag.
+func tar_kind(typ int) str {
+    if typ == 48 or typ == 0 or typ == 55 { return "file" }   // '0' NUL '7'
+    if typ == 53 { return "dir" }                             // '5'
+    if typ == 50 { return "symlink" }                         // '2'
+    if typ == 49 { return "link" }                            // '1'
+    return "other"
+}
+
+func is_zero_block(blk str) bool {
+    return str.skip_any(blk, "\u{0}", 0) == len(blk)
+}
+
+// check_tar_sum verifies a header's checksum: the sum of its 512 bytes
+// with the checksum field itself counted as eight spaces.
+func check_tar_sum(b []byte, at int) unit! {
+    let want = try tar_octal(b, 148, 8, "checksum")
+    var sum = 0
+    each i, c in b {
+        if i >= 148 and i < 156 {
+            sum += 32
+        } else {
+            sum += int(c)
+        }
+    }
+    if sum != want {
+        return errf("compress: tar: header checksum mismatch at byte {at} " ||
+                    "(corrupt archive, or not a tar archive)")
+    }
+    return ()
+}
+
+// tar_octal reads a NUL- or space-terminated octal field. A base-256
+// field (top bit set: GNU's encoding for huge sizes) is refused by name.
+func tar_octal(b []byte, off int, n int, what str) int throws IOError {
+    if int(b[off]) >= 128 {
+        return errf("compress: tar: base-256 {what} fields are not supported")
+    }
+    var v = 0
+    var i = off
+    let end = off + n
+    while i < end and (int(b[i]) == 32 or int(b[i]) == 0) { i += 1 }
+    var digits = 0
+    while i < end {
+        let c = int(b[i])
+        if c == 32 or c == 0 { break }
+        if c < 48 or c > 55 {
+            return errf("compress: tar: bad octal {what} field")
+        }
+        v = v * 8 + (c - 48)
+        digits += 1
+        i += 1
+    }
+    return v
+}
+
+// parse_pax reads a pax extended header: records "LEN key=value\n", where
+// LEN counts the whole record, its own digits included.
+func parse_pax(body str) map[str]str throws IOError {
+    var out = make(map[str]str)
+    var at = 0
+    while at < len(body) {
+        let sp = str.find_any(body, " ", at)
+        if sp < 0 { return errf("compress: tar: malformed pax header") }
+        let n = try pax_int(body[at..sp], "record length")
+        if n <= sp - at or at + n > len(body) {
+            return errf("compress: tar: malformed pax header")
+        }
+        let rec = body[sp + 1..at + n]
+        let eq = str.find_any(rec, "=", 0)
+        if eq < 0 or not str.ends_with(rec, "\n") {
+            return errf("compress: tar: malformed pax header")
+        }
+        out[rec[0..eq]] = rec[eq + 1..len(rec) - 1]
+        at += n
+    }
+    return out
+}
+
+func pax_int(s str, what str) int throws IOError {
+    if s == "" { return errf("compress: tar: bad pax {what}") }
+    var v = 0
+    each c in s {
+        if c < '0' or c > '9' { return errf("compress: tar: bad pax {what}") }
+        v = v * 10 + (int(c) - 48)
+        if v > 1099511627776 {                  // 1 TiB: not a real member
+            return errf("compress: tar: pax {what} out of range")
+        }
+    }
+    return v
+}
+
+// cstr is a fixed-width field up to its first NUL.
+func cstr(f str) str {
+    let z = str.find_any(f, "\u{0}", 0)
+    if z < 0 { return f }
+    return f[0..z]
+}
+
+func round_up(n int) int {
+    return (n + TAR_BLOCK - 1) ~/ TAR_BLOCK * TAR_BLOCK
+}
+
+// tar_extract reads an archive and writes its members under `dir` (made if
+// missing), with every protection compress.extract gives: the whole
+// archive is read and checked first — names that would escape `dir`,
+// links, devices, a total over `max` — and only then is anything written.
+// Returns the number of files written. Permission bits are not applied.
+func tar_extract(data str, dir str, max int = DEFAULT_MAX) int throws IOError {
+    var ms = []
+    each e in try tar_read(data, max) {
+        ms.append(Member{name: e.name, kind: e.kind, data: e.data})
+    }
+    return try extract(ms, dir)
+}
+
+// ---------------------------------------------------------------- writing
+
+// tar_write renders the members as a ustar archive. A directory's name
+// gets a trailing "/"; only a "file" carries data.
+func tar_write(entries []TarEntry) str throws IOError {
+    var b = str.Builder{}
+    each e in entries {
+        var name = e.name
+        var size = 0
+        var typ = "0"
+        if e.kind == "file" {
+            size = len(e.data)
+        } else if e.kind == "dir" {
+            typ = "5"
+            if not str.ends_with(name, "/") { name = name || "/" }
+        } else if e.kind == "symlink" {
+            typ = "2"
+        } else if e.kind == "link" {
+            typ = "1"
+        } else {
+            return errf("compress: tar: cannot write a member of kind " ||
+                        "{e.kind} ({e.name})")
+        }
+        if e.kind != "file" and len(e.data) > 0 {
+            return errf("compress: tar: {e.name}: only a file has data")
+        }
+        let prefix, short = try split_name(name)
+        var h = str.Builder{}
+        h.write(try field(short, 100, "name"))
+        h.write(try octal_field(e.mode, 8, "mode"))
+        h.write(try octal_field(0, 8, "uid"))
+        h.write(try octal_field(0, 8, "gid"))
+        h.write(try octal_field(size, 12, "size"))
+        h.write(try octal_field(e.mtime, 12, "mtime"))
+        h.write("        ")                       // checksum, as spaces
+        h.write(typ)
+        h.write(try field(e.link, 100, "link target"))
+        h.write("ustar\u{0}00")
+        h.write(zeros(32 + 32))                   // uname, gname
+        h.write(try octal_field(0, 8, "devmajor"))
+        h.write(try octal_field(0, 8, "devminor"))
+        h.write(try field(prefix, 155, "name prefix"))
+        h.write(zeros(12))
+        let hdr = h.done()
+        var sum = 0
+        each c in bytes(hdr) { sum += int(c) }
+        let chk = fmt.sprintf("%06o", sum) || "\u{0} "
+        b.write(hdr[0..148] || chk || hdr[156..TAR_BLOCK])
+        b.write(e.data)
+        b.write(zeros(round_up(size) - size))
+    }
+    b.write(zeros(2 * TAR_BLOCK))
+    return b.done()
+}
+
+// split_name fits a name into ustar's two fields: the whole name when it
+// has 100 bytes or fewer, else a prefix of at most 155 and a name of at
+// most 100, split at a "/".
+func split_name(name str) (str, str) throws IOError {
+    if name == "" { return errf("compress: tar: a member has no name") }
+    if len(name) <= 100 { return ("", name) }
+    var i = len(name) - 1
+    while i > 0 {
+        if name[i] == '/' and i <= 155 and len(name) - i - 1 <= 100 and
+           len(name) - i - 1 > 0 {
+            return (name[0..i], name[i + 1..len(name)])
+        }
+        i -= 1
+    }
+    return errf("compress: tar: name too long for ustar: {name}")
+}
+
+func field(s str, n int, what str) str throws IOError {
+    if len(s) > n {
+        return errf("compress: tar: {what} longer than {n} bytes: {s}")
+    }
+    return s || zeros(n - len(s))
+}
+
+// octal_field is n-1 zero-padded octal digits and a NUL.
+func octal_field(v int, n int, what str) str throws IOError {
+    if v < 0 { return errf("compress: tar: negative {what}") }
+    let o = fmt.sprintf("%o", v)
+    if len(o) > n - 1 {
+        return errf("compress: tar: {what} {v} does not fit the ustar field")
+    }
+    return str.repeat("0", n - 1 - len(o)) || o || "\u{0}"
+}
+
+func zeros(n int) str {
+    if n <= 0 { return "" }
+    return str.repeat("\u{0}", n)
+}

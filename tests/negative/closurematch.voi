@@ -1,0 +1,8 @@
+// A match inside a closure is judged for exhaustiveness like any other.
+enum C { R, G, B }
+func main() {
+    let c = R
+    let f = fn() int { return match c { R => 1 } }
+    defer { match c { R => say 1 } }
+    say f()
+}

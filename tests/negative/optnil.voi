@@ -1,0 +1,6 @@
+// Bare variants never match nil: a ?Enum subject needs a nil arm.
+enum Color { Red, Green, Blue }
+func f(o ?Color) int {
+    return match o { Red => 1; Green => 2; Blue => 3 }
+}
+func main() { say f(nil) }

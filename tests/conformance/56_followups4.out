@@ -1,0 +1,9 @@
+1: 18 0 17
+2: a b true true
+2b: case converts
+2c: 21C 30C
+3: true true
+4: x x 1
+5: 2 3
+6: [1, 2, 3] [9, 1, 2, 3] [9, 2, 3] [1, 2] [[1, 7, 2]] [1, 5, 2, 3]
+6b: {"x": 1, "z": 3} {"x": 1, "y": 2} 3 2 0 1 Cfg{name: "a", tags: ["t"]} Cfg{name: "a", tags: ["t", "u"]}

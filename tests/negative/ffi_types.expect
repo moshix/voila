@@ -1,0 +1,6 @@
+argument 1 of `strlen` is `str`, but `int` is given
+argument 1 of `abs` is `i32`, but `str` is given
+argument 1 of `memset` is `ffi.Ptr`, but `str` is given
+`home` is `str`, but its initialiser is `?str`
+!argument 2 of `memset`
+!argument 3 of `memset`

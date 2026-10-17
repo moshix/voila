@@ -4,9 +4,13 @@
 #include "voila_int.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* The largest exponent a decimal may be written with (REXX's limit). */
+#define DEC_MAX_EXP 999999999LL
 
 static Value decv(VlDec *d) {
   Value v;
@@ -78,11 +82,17 @@ static bool parse_into(const char *s, int *neg, char **digits, int *nd, int *exp
     if (*p == 'e' || *p == 'E') { e = p; break; }
   const char *mend = e ? e : s + strlen(s);
 
+  /* The exponent is bounded like REXX's (±999999999): anything larger is
+   * refused rather than wrapped. strtol saturates at LONG_MAX and a cast to
+   * int then kept the low 32 bits — "1e4294967297" read as 10 — and the
+   * exponents the arithmetic adds together must stay inside an int. */
   int expPart = 0;
   if (e) {
     char *end;
-    long v = strtol(e + 1, &end, 10);
-    if (end == e + 1) return false;
+    errno = 0;
+    long long v = strtoll(e + 1, &end, 10);
+    if (end == e + 1 || *end) return false;
+    if (errno == ERANGE || v > DEC_MAX_EXP || v < -DEC_MAX_EXP) return false;
     expPart = (int)v;
   }
 
@@ -102,6 +112,7 @@ static bool parse_into(const char *s, int *neg, char **digits, int *nd, int *exp
     if (seen_dot) frac++;
   }
   if (!seen_digit) { free(buf); return false; }
+  if ((long long)expPart - frac < -DEC_MAX_EXP) { free(buf); return false; }
   buf[n] = 0;
   *digits = buf;
   *nd = n;
@@ -112,13 +123,22 @@ static bool parse_into(const char *s, int *neg, char **digits, int *nd, int *exp
 Value vl_dec_parse(const char *s) {
   int neg, nd, exp;
   char *digits;
-  if (!parse_into(s, &neg, &digits, &nd, &exp)) {
-    Value sv = vl_str(s);
-    vl_throw_conv("str", "dec", sv);
-  }
+  if (!parse_into(s, &neg, &digits, &nd, &exp))
+    vl_throw_conv_cstr("str", "dec", s);
   Value v = make(neg, digits, nd, exp);
   free(digits);
   return v;
+}
+
+/* vl_dec_try_parse is vl_dec_parse that answers false instead of throwing
+ * (std/json reports a bad number as an error value). */
+bool vl_dec_try_parse(const char *s, Value *out) {
+  int neg, nd, exp;
+  char *digits;
+  if (!parse_into(s, &neg, &digits, &nd, &exp)) return false;
+  *out = make(neg, digits, nd, exp);
+  free(digits);
+  return true;
 }
 
 Value vl_dec_from_float(double f) {

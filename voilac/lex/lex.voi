@@ -220,7 +220,21 @@ impl Lexer {
             let start = self.pos
             self.skip_to(self.src.skip_any(self.idChars, self.pos))
             let word = self.src[start..self.pos]
-            if word in self.kw {
+            // `chan` is a keyword, and it is ALSO std/chan's qualifier:
+            // `chan.merge(…)`. Directly before a `.` it can only be the
+            // qualifier — the channel type and its constructor are always
+            // spelled `chan[` — so there it lexes as an identifier; and so
+            // it does after `package`, in std/chan's own package clause.
+            if word == "chan" and (self.peek() == 46 or
+                                   self.last == tok.PACKAGE) {
+                return self.emit(tok.IDENT, word, line, col)
+            }
+            // A keyword directly after `.` or `func` can only be a NAME —
+            // a member (`flag.parse()`, `opts.select`) or the function a
+            // declaration is naming (`func parse(…)`, reachable as a member
+            // or a method) — since no keyword-led construct starts there.
+            if word in self.kw and self.last != tok.DOT and
+               self.last != tok.FUNC {
                 return self.emit(self.kw[word], word, line, col)
             }
             return self.emit(tok.IDENT, word, line, col)
@@ -336,6 +350,20 @@ impl Lexer {
     }
 
     func number(mut self, line int, col int) tok.Token {
+        // Right after a `.` a number is a TUPLE POSITION (`t.0`, `t.0.1`):
+        // plain decimal digits and nothing else — no `_` separators, no
+        // radix, no fraction (`t.0.1` is two positions, not FLOAT 0.1).
+        if self.last == tok.DOT {
+            let start = self.pos
+            self.skip_to(self.src.skip_any("0123456789", self.pos))
+            let p = self.peek()
+            if p == 95 or is_letter(p) {
+                self.error(line, col, "a tuple position is plain decimal " ||
+                                      "digits")
+                self.skip_to(self.src.skip_any(self.digChars, self.pos))
+            }
+            return self.emit(tok.INT, self.src[start..self.pos], line, col)
+        }
         let c0 = self.peek()
         let c1 = self.peek_at(1)
         // Radix prefixes: 0x, 0o, 0b (§2.6).
@@ -648,6 +676,9 @@ func can_end_expr(k int) bool {
     if k == tok.RPAREN or k == tok.RBRACKET or k == tok.RBRACE or k == tok.DOT {
         return true
     }
+    // A postfix `?` (§5.1, `f(x)?`) ends an expression. The `?T` type form
+    // never ends a line: its type always follows on the same one.
+    if k == tok.QUESTION { return true }
     return false
 }
 

@@ -1,0 +1,10 @@
+// An `ffi` block's pointers are std/ffi's Ptr, so the block needs the
+// package (§12) — and the refusal names that, at the block, instead of
+// leaving an unknown type `ffi.Ptr` behind for the reader to decode.
+ffi "C" {
+    func strlen(s *char) usize
+}
+
+func main() {
+    say strlen("x")
+}

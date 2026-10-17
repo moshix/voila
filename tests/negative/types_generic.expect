@@ -1,0 +1,10 @@
+argument 2 of `mx` is `int`, but `str` is given
+`n` is `int`, but its initialiser is `str`
+argument 1 of `Stack.push` is `int`, but `str` is given
+`Other` does not implement `Default`, required by the bound `T: Default` on `like`
+`float` does not implement `Tr`, required by the bound `T: Tr` on `show`
+no bound of `T` declares a method `nonexistent`
+!`int` does not implement
+!`Other` does not implement `Tr`
+!argument 2 of `mx` is `int`, but `float`
+!declares a method `go`

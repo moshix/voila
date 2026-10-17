@@ -1,0 +1,9 @@
+// The same refusal inside a closure, for `continue` (finally_return.voi).
+func main() {
+    let f = fn() {
+        each i in 0..3 {
+            try { say i } finally { if i == 1 { continue } }
+        }
+    }
+    f()
+}

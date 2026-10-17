@@ -1,0 +1,20 @@
+// Generic traits and static trait methods ACROSS packages (§3.6, §11.2.1):
+// the importer implements kit's traits — one qualified, one by its bare
+// name — passes its own type to kit's generic functions, and calls kit's
+// static method directly and through a parameter of its own.
+package main
+
+use "app/kit"
+
+struct Mine { s str }
+impl kit.Make for Mine { func make_one() Self { return Self{s: "mine"} } }
+impl Conv[str] for Mine { func conv(self) str { return self.s } }
+
+func local[T: kit.Make]() T { return T.make_one() }
+
+func main() {
+    say kit.Build[kit.Gadget](), kit.Build[Mine](), local[Mine]()
+    say local[kit.Gadget]()
+    say kit.Show(kit.Gadget{n: 3}), kit.Show(Mine{s: "x"})
+    say kit.Gadget.make_one()
+}

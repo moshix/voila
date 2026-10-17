@@ -1,0 +1,12 @@
+// §12: whatever goes through std/ffi is outside the safety guarantees and
+// "must be marked, and `voila check --strict` rejects it". The mark is the
+// `ffi` warning at the `use`; --strict (-Wall -Werror) makes it fatal.
+use "std/ffi"
+
+ffi "C" {
+    func getpid() int
+}
+
+func main() {
+    say getpid() > 0
+}

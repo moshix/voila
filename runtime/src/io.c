@@ -34,6 +34,7 @@
 #include "voila_int.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -182,12 +183,28 @@ void vl_writer_free(VlObj *o) {
 
 /* ---------------------------------------------------------------- source */
 
+/* sock_src is a socket's byte source: its filter (std/tls's session, see
+ * VlSocket.flt) when one is installed, else its descriptor. */
+static bool sock_src(VlSocket *s, int *fd, VlHandle **h, const char **why) {
+  if (s->closed || s->fd < 0) {
+    *why = "the underlying socket is closed";
+    return false;
+  }
+  if (s->flt.t == VL_OBJ) *h = (VlHandle *)s->flt.u.o;
+  else *fd = s->fd;
+  return true;
+}
+
 /* rd_src resolves where the bytes come from RIGHT NOW — see the VlReader
  * comment in voila_int.h for why this is a lookup rather than a cached
- * handle. Returns false with *why set when the source is gone. */
-static bool rd_src(VlReader *r, FILE **f, int *fd, const char **why) {
+ * handle. Exactly one of *f, *fd and *h is set: a FILE*, a descriptor, or
+ * an extension's handle (an O_HANDLE owner, or a socket's filter). Returns
+ * false with *why set when the source is gone. */
+static bool rd_src(VlReader *r, FILE **f, int *fd, VlHandle **h,
+                   const char **why) {
   *f = NULL;
   *fd = -1;
+  *h = NULL;
   *why = NULL;
   if (r->closed) {
     *why = "reader is closed";
@@ -202,13 +219,10 @@ static bool rd_src(VlReader *r, FILE **f, int *fd, const char **why) {
     *f = o->f;
     return true;
   }
-  if (r->owner.t == VL_OBJ && r->owner.u.o->kind == O_SOCKET) {
-    VlSocket *s = (VlSocket *)r->owner.u.o;
-    if (s->closed || s->fd < 0) {
-      *why = "the underlying socket is closed";
-      return false;
-    }
-    *fd = s->fd;
+  if (r->owner.t == VL_OBJ && r->owner.u.o->kind == O_SOCKET)
+    return sock_src((VlSocket *)r->owner.u.o, fd, h, why);
+  if (r->owner.t == VL_OBJ && r->owner.u.o->kind == O_HANDLE) {
+    *h = (VlHandle *)r->owner.u.o;
     return true;
   }
   if (r->f) {
@@ -223,9 +237,11 @@ static bool rd_src(VlReader *r, FILE **f, int *fd, const char **why) {
   return false;
 }
 
-static bool wr_src(VlWriter *w, FILE **f, int *fd, const char **why) {
+static bool wr_src(VlWriter *w, FILE **f, int *fd, VlHandle **h,
+                   const char **why) {
   *f = NULL;
   *fd = -1;
+  *h = NULL;
   *why = NULL;
   if (w->closed) {
     *why = "writer is closed";
@@ -240,13 +256,10 @@ static bool wr_src(VlWriter *w, FILE **f, int *fd, const char **why) {
     *f = o->f;
     return true;
   }
-  if (w->owner.t == VL_OBJ && w->owner.u.o->kind == O_SOCKET) {
-    VlSocket *s = (VlSocket *)w->owner.u.o;
-    if (s->closed || s->fd < 0) {
-      *why = "the underlying socket is closed";
-      return false;
-    }
-    *fd = s->fd;
+  if (w->owner.t == VL_OBJ && w->owner.u.o->kind == O_SOCKET)
+    return sock_src((VlSocket *)w->owner.u.o, fd, h, why);
+  if (w->owner.t == VL_OBJ && w->owner.u.o->kind == O_HANDLE) {
+    *h = (VlHandle *)w->owner.u.o;
     return true;
   }
   if (w->f) {
@@ -283,8 +296,9 @@ static bool rd_grow(VlReader *r, int64_t want, Value *err) {
 static int64_t rd_fill(VlReader *r, Value *err) {
   FILE *f;
   int fd;
+  VlHandle *h;
   const char *why;
-  if (!rd_src(r, &f, &fd, &why)) {
+  if (!rd_src(r, &f, &fd, &h, &why)) {
     *err = io_err(why);
     return -1;
   }
@@ -295,6 +309,20 @@ static int64_t rd_fill(VlReader *r, Value *err) {
   }
   if (r->w == r->cap && !rd_grow(r, r->cap * 2, err)) return -1;
   size_t room = (size_t)(r->cap - r->w);
+  if (h) {
+    if (!h->ops->read) {
+      *err = io_errf("%s cannot be read", h->ops->name);
+      return -1;
+    }
+    int64_t n = h->ops->read(h->ctx, r->b + r->w, (int64_t)room, err);
+    if (n < 0) return -1;
+    if (n == 0) {
+      r->eof = true;
+      return 0;
+    }
+    r->w += n;
+    return n;
+  }
   if (f) {
     size_t n = fread(r->b + r->w, 1, room, f);
     if (n == 0) {
@@ -432,6 +460,20 @@ static Value rd_at_eof(VlReader *r) {
   return vl_bool(got == 0);
 }
 
+/* handle_close ends an extension stream the reader or writer OWNS (own_src:
+ * io.reader/io.writer over an O_HANDLE). It is the handle's close op that
+ * writes a compressor's trailer, so its error is the close's result.
+ * Returns unit, or the owned error value. */
+static Value handle_close(bool own_src, Value owner) {
+  if (!own_src || owner.t != VL_OBJ || owner.u.o->kind != O_HANDLE)
+    return vl_unit();
+  VlHandle *h = (VlHandle *)owner.u.o;
+  if (!h->ops->close) return vl_unit();
+  Value err = vl_nil();
+  if (!h->ops->close(h->ctx, &err)) return err;
+  return vl_unit();
+}
+
 /* rd_close is idempotent, and its real work is releasing `owner`: that is the
  * moment a file the reader was keeping alive is finally fclose()d, in
  * obj_free. A standard handle is exempt — os.stdin is process-wide and shared
@@ -443,6 +485,7 @@ static Value rd_close(VlReader *r) {
     if (r->f) fclose(r->f);
     else if (r->fd >= 0) io_close_fd(r->fd);
   }
+  Value herr = handle_close(r->own_src, r->owner);
   r->f = NULL;
   r->fd = -1;
   r->closed = true;
@@ -452,7 +495,7 @@ static Value rd_close(VlReader *r) {
   Value o = r->owner;
   r->owner = vl_nil();
   vl_release(o);
-  return vl_unit();
+  return herr;
 }
 
 /* ---------------------------------------------------------------- writing */
@@ -466,8 +509,21 @@ static Value wr_bytes(VlWriter *w, const char *p, int64_t n) {
   if (w->discard) return vl_unit();
   FILE *f;
   int fd;
+  VlHandle *h;
   const char *why;
-  if (!wr_src(w, &f, &fd, &why)) return io_err(why);
+  if (!wr_src(w, &f, &fd, &h, &why)) return io_err(why);
+  if (h) {
+    if (!h->ops->write) return io_errf("%s cannot be written", h->ops->name);
+    while (n > 0) {
+      Value err = vl_nil();
+      int64_t k = h->ops->write(h->ctx, p, n, &err);
+      if (k < 0) return err;
+      if (k == 0) return io_err("short write: the sink accepted no bytes");
+      p += k;
+      n -= k;
+    }
+    return vl_unit();
+  }
   if (f) {
     if (n > 0 && fwrite(p, 1, (size_t)n, f) != (size_t)n)
       return io_errno("write");
@@ -514,8 +570,13 @@ static Value wr_flush(VlWriter *w) {
   if (w->discard) return vl_unit();
   FILE *f;
   int fd;
+  VlHandle *h;
   const char *why;
-  if (!wr_src(w, &f, &fd, &why)) return io_err(why);
+  if (!wr_src(w, &f, &fd, &h, &why)) return io_err(why);
+  if (h && h->ops->flush) {
+    Value err = vl_nil();
+    if (!h->ops->flush(h->ctx, &err)) return err;
+  }
   if (f && fflush(f) != 0) return io_errno("flush");
   return vl_unit();
 }
@@ -529,10 +590,24 @@ static Value wr_close(VlWriter *w) {
     return vl_unit();
   }
   Value out = wr_flush(w);
-  if (is_err(out)) vl_release(out);
   if (w->own_src) {
     if (w->f) fclose(w->f);
     else if (w->fd >= 0) io_close_fd(w->fd);
+  }
+  /* An extension stream's close can FAIL (a compressor's trailer is its
+   * last write), and that failure is the caller's to see: losing it would
+   * report a truncated archive as a clean close. */
+  Value herr = handle_close(w->own_src, w->owner);
+  /* For an extension stream a failed final flush is the close's failure
+   * too (unless the handle's own close already reported one): the data it
+   * held is lost, and a compressor's output would be truncated. (A file's
+   * or a socket's close keeps its old contract of not reporting it.) */
+  bool hstream = w->owner.t == VL_OBJ && w->owner.u.o->kind == O_HANDLE;
+  if (hstream && is_err(out) && !is_err(herr)) {
+    vl_release(herr);
+    herr = out;
+  } else {
+    vl_release(out);
   }
   w->f = NULL;
   w->fd = -1;
@@ -540,7 +615,7 @@ static Value wr_close(VlWriter *w) {
   Value o = w->owner;
   w->owner = vl_nil();
   vl_release(o);
-  return vl_unit();
+  return herr;
 }
 
 /* ---------------------------------------------------------------- methods */
@@ -678,6 +753,13 @@ static Value reader_over(Value src, int64_t cap) {
                       false, false);
   case O_SOCKET:
     return reader_new(NULL, -1, src, "<socket>", cap, false, false);
+  case O_HANDLE: {
+    /* An extension's stream (a decompressor): the reader OWNS it, so the
+     * reader's close is the stream's close (handle_close). */
+    VlHandle *h = (VlHandle *)src.u.o;
+    if (!h->ops->read) return vl_nil();
+    return reader_new(NULL, -1, src, h->ops->name, cap, true, false);
+  }
   default:
     return vl_nil();
   }
@@ -693,6 +775,11 @@ static Value writer_over(Value dst) {
                       false, false);
   case O_SOCKET:
     return writer_new(NULL, -1, dst, "<socket>", false, false, false);
+  case O_HANDLE: {
+    VlHandle *h = (VlHandle *)dst.u.o;
+    if (!h->ops->write) return vl_nil();
+    return writer_new(NULL, -1, dst, h->ops->name, true, false, false);
+  }
   default:
     return vl_nil();
   }
@@ -729,16 +816,18 @@ bool vl_io_isatty(Value h) {
     VlReader *r = (VlReader *)h.u.o;
     FILE *f;
     int fd;
+    VlHandle *hh;
     const char *why;
-    if (!rd_src(r, &f, &fd, &why)) return false;
+    if (!rd_src(r, &f, &fd, &hh, &why) || hh) return false;
     return f ? io_isatty_fd(fileno(f)) : io_isatty_fd(fd);
   }
   case O_WRITER: {
     VlWriter *w = (VlWriter *)h.u.o;
     FILE *f;
     int fd;
+    VlHandle *hh;
     const char *why;
-    if (!wr_src(w, &f, &fd, &why)) return false;
+    if (!wr_src(w, &f, &fd, &hh, &why) || hh) return false;
     return f ? io_isatty_fd(fileno(f)) : io_isatty_fd(fd);
   }
   case O_FILE: {
@@ -878,6 +967,9 @@ Value vl_io_pipe(Value *argv, int argc, VlFrame *up) {
 #else
   int fds[2];
   if (pipe(fds) != 0) return io_errno("io.pipe");
+  /* Close-on-exec, like every descriptor the runtime opens (std.c). */
+  fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+  fcntl(fds[1], F_SETFD, FD_CLOEXEC);
   Value none = vl_nil();
   Value r = reader_new(NULL, fds[0], none, "<pipe>", IO_BUFSZ, true, false);
   Value w = writer_new(NULL, fds[1], none, "<pipe>", true, false, false);
@@ -889,6 +981,18 @@ Value vl_io_pipe(Value *argv, int argc, VlFrame *up) {
   vl_release(w);
   return t;
 #endif
+}
+
+/* A reader / writer that owns a raw descriptor: os.start's pipes to a child
+ * (proc.c). Dropping it closes the descriptor, as for io.pipe. */
+Value vl_io_fd_reader(int fd, const char *name) {
+  Value none = vl_nil();
+  return reader_new(NULL, fd, none, name, IO_BUFSZ, true, false);
+}
+
+Value vl_io_fd_writer(int fd, const char *name) {
+  Value none = vl_nil();
+  return writer_new(NULL, fd, none, name, true, false, false);
 }
 
 Value vl_io_read_all(Value *argv, int argc, VlFrame *up) {

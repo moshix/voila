@@ -1,0 +1,54 @@
+// 32_unicode.voi — Unicode-correct case mapping and classification, and
+// from_bytes / valid_utf8 (§13.2: "every function is Unicode-correct").
+//
+// Before this, upper("héllo") gave "HéLLO", is_alpha('é') was false, and
+// from_bytes silently truncated an element like 300 to a byte.
+package main
+
+func main() {
+    // Case mapping: Latin-1, Latin Extended-A, Greek, Cyrillic, Armenian.
+    say upper("héllo wörld")
+    say lower("ÀÉÎÕÜ ĀĂĄ")
+    say upper("straße")              // ß has no 1:1 uppercase: kept as is
+    say upper("αβγ δέλτα")
+    say lower("ПРИВЕТ МИР")
+    say upper("բարեւ")
+    say title("élan vital ñandú")
+    say upper("😀 ok")               // no case: unchanged
+    // Length can change: ɐ (2 bytes) uppercases to Ɐ (3 bytes); the Kelvin
+    // sign (3 bytes) lowercases to an ASCII k (1 byte).
+    say len("ɐ"), len(upper("ɐ"))
+    say len("\u{212A}"), lower("\u{212A}")
+    // Simple mappings that SpecialCasing would expand, and titlecase digraphs.
+    say lower("İ"), upper("ᾳ"), title("ǆemal")
+    // Method spelling goes through the same code.
+    say "ça va".upper()
+
+    // Classification.
+    say is_alpha('é'), is_alpha("ñandú"), is_alpha("日本語"), is_alpha("a1")
+    say is_upper("ÉCOLE"), is_upper("École"), is_upper("123"), is_upper("ΑΒΓ")
+    // Uncased text is not upper; Lowercase-property and titlecase runes
+    // (ⅰ, ⓐ, ǅ) rule a string out just as Ll letters do.
+    say is_upper("日本語"), is_upper("ʰ"), is_upper("Aⅰ"), is_upper("Aⓐ"), is_upper("ǅ")
+    say is_space("\u{00A0}\u{3000}"), is_space(" \t"), is_space("x")
+    say is_digit("123"), is_digit("١٢٣")   // is_digit stays ASCII (int() does)
+
+    // A str is a byte string: from_bytes keeps any byte, valid_utf8 tells
+    // text from binary.
+    say from_bytes(bytes("naïve ✓")) else "BAD"
+    say valid_utf8("naïve ✓"), valid_utf8(""), valid_utf8("plain")
+    let bin = from_bytes([255, 254]) else "BAD"
+    say len(bin), valid_utf8(bin)
+    say valid_utf8(from_bytes([0xC3]) else "")             // truncated
+    say valid_utf8(from_bytes([0xC0, 0xAF]) else "")       // overlong "/"
+    say valid_utf8(from_bytes([0xED, 0xA0, 0x80]) else "") // surrogate
+    say valid_utf8(from_bytes([0xF4, 0x90, 0x80, 0x80]) else "") // > U+10FFFF
+    // Elements that are not bytes are an error, not silently truncated.
+    say from_bytes([300]) else "NOT A BYTE"
+    match from_bytes([0x61, -1]) {
+        Ok(s) => say "ok {s}"
+        Err(e) => say "err: {e}"
+    }
+    // Case mapping leaves ill-formed bytes exactly as they were.
+    say bytes(upper(from_bytes([0x61, 0xFF, 0x62]) else ""))
+}

@@ -1,0 +1,34 @@
+// A closure that would break the spawned-body rules (§10) — it assigns a
+// variable it captures, grows a collection in one, or hands one to a `mut`
+// parameter — may not run in a task either: captured by a spawned body,
+// handed to a parameter its callee runs in a task, or sent over a
+// channel. A closure that only stores elements, or writes inside the
+// user's own critical section, may.
+use "std/sync"
+func go(f fn()) { group { for i in 0..2 { spawn { f() } } } }
+func relay(g fn()) { go(g) }
+func main() {
+    var out = [0, 0]
+    var n = 0
+    let grow = fn() { out.append(1) }
+    let count = fn() { n += 1 }
+    let store = fn() { out[0] = 5 }
+    let mu = sync.mutex()
+    let guarded = fn() { mu.lock(); n = n + 1; mu.unlock() }
+    group {
+        spawn { grow() }
+        spawn { count() }
+        spawn { store() }
+        spawn { guarded() }
+    }
+    go(fn() { out.append(2) })
+    relay(count)
+    go(store)
+    let ch = chan[fn()](2)
+    ch <- grow
+    ch <- store
+    // A lock made per call is shared with nobody: no critical section.
+    let fresh = fn() { let mine = sync.mutex(); mine.lock(); out.append(3); mine.unlock() }
+    group { spawn { fresh() } }
+    say out, n
+}

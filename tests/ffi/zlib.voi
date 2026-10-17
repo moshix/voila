@@ -1,0 +1,53 @@
+// std/ffi against the system zlib (§12): `link "z"` adds -lz to the build,
+// out-parameters are ffi.alloc'd cells, and a buffer C fills is read back
+// as a str. selftest runs this only where libz is installed.
+use "std/ffi"
+
+ffi "C" {
+    link "z"
+    func zlibVersion() *char
+    func crc32(crc ulong, buf *char, len uint) ulong
+    func adler32(adler ulong, buf *char, len uint) ulong
+    func compressBound(n ulong) ulong
+    func compress(dst *void, dstlen *void, src *char, n ulong) int
+    func uncompress(dst *void, dstlen *void, src *void, n ulong) int
+}
+
+const Z_OK = 0
+const Z_BUF_ERROR = -5
+
+func main() {
+    say zlibVersion() != nil
+    let text = "the quick brown fox jumps over the lazy dog, " ||
+               "the quick brown fox jumps over the lazy dog"
+    say crc32(0, text, len(text)), adler32(1, text, len(text))
+    say crc32(0, "", 0)
+
+    // compress into a buffer sized by compressBound; destLen is in/out.
+    let bound = compressBound(len(text))
+    let packed = ffi.alloc(bound)
+    defer ffi.free(packed)
+    let plen = ffi.alloc(8)
+    defer ffi.free(plen)
+    plen.write_u64(0, bound)
+    say compress(packed, plen, text, len(text)) == Z_OK
+    let clen = plen.read_u64(0)
+    say clen < len(text), clen <= bound
+
+    // ...and back.
+    let out = ffi.alloc(len(text))
+    defer ffi.free(out)
+    let olen = ffi.alloc(8)
+    defer ffi.free(olen)
+    olen.write_u64(0, len(text))
+    say uncompress(out, olen, packed, clen) == Z_OK
+    say olen.read_u64(0) == len(text), out.read_str(0, olen.read_u64(0)) == text
+
+    // A destination that is too small is zlib's error code, not a crash.
+    let tiny = ffi.alloc(4)
+    defer ffi.free(tiny)
+    let tlen = ffi.alloc(8)
+    defer ffi.free(tlen)
+    tlen.write_u64(0, 4)
+    say uncompress(tiny, tlen, packed, clen) == Z_BUF_ERROR
+}

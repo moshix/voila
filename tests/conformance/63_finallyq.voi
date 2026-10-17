@@ -1,0 +1,69 @@
+// `?` and `try` inside a finally RAISE a failure (as `must` does) even in
+// a fallible function: returning it would be a hidden `return` out of the
+// finally, discarding the exception or the value in flight (§8.2).
+exception Boom { why str }
+
+func risky(ok bool) int! {
+    if ok { return 7 }
+    return err("from finally")
+}
+
+// An exception in flight: the finally's failure is raised in its place,
+// not returned as an Err value.
+func in_flight() int! {
+    try {
+        throw Boom{why: "in flight"}
+    } finally {
+        let v = risky(false)?
+        say "unreached", v
+    }
+    return 1
+}
+
+// A return in flight: the failure is raised; 5 is not returned and the
+// failure does not become the function's Err value either.
+func returning() int! {
+    try { return 5 } finally { let v = try risky(false) }
+    return 1
+}
+
+// The success path: `?` yields the value and the return goes through.
+func fine() int! {
+    var got = 0
+    try { got = 1 } finally { got += risky(true)? }
+    return got
+}
+
+// A closure written in a finally is a function of its own: its `?`
+// returns the failure as usual.
+func closure_inside() int! {
+    var r = 0
+    try { r = 1 } finally {
+        let f = fn() int! { let v = risky(false)?; return v }
+        match f() { Ok(v) => r = v; Err(e) => r = 0 - 1 }
+    }
+    return r
+}
+
+// probe tells a RETURNED failure (an Err value) from a RAISED one.
+func probe(f fn() int!) str {
+    match f() {
+        Ok(v) => return "ok " || str(v)
+        Err(e) => return "returned Err: " || e.message()
+    }
+    return "?"
+}
+
+func report(name str, f fn() int!) {
+    match attempt probe(f) {
+        Ok(s) => say name, s
+        Err(e) => say name, "raised:", e.message()
+    }
+}
+
+func main() {
+    report("in_flight", in_flight)
+    report("returning", returning)
+    report("fine", fine)
+    report("closure_inside", closure_inside)
+}

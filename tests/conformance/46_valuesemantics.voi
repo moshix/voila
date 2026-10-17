@@ -1,0 +1,158 @@
+// Structs have VALUE semantics (§3.4, §6.4): a Copy struct is copied on
+// assignment, and a struct that owns storage moves — so no program can see
+// one struct through two names. The runtime shares a struct between names
+// and copies it LAZILY, when one of them writes (vl_cow_unique): every level
+// of a write path, the receiver of a `mut self` method and an argument to a
+// `mut` parameter are made unique first. Run it under `leaks`.
+
+struct P { x int, y int }
+struct Line { a P, b P }
+struct H { b ?Box[H], name str }
+struct Counter { n int }
+struct N { v int, b ?Box[N] }
+type NP P
+
+impl P {
+    func inc(mut self) { self.x += 1 }
+    func get(self) int { return self.x }
+}
+
+impl Counter {
+    func bump(mut self) { self.n += 1 }
+}
+
+impl N {
+    // A write whose value took `self` goes to the method's own copy, as a
+    // `mut` parameter's does (§6.3): the caller keeps its value, and no
+    // Box ever holds its holder.
+    func link(mut self) { self.b = Box(self) }
+}
+
+// A copy taken from a `mut` parameter or a `mut self` receiver is made at
+// once — they are written in place, so a lazy copy would see the writes.
+func taken(p mut P) int {
+    let old = p
+    p.x = 5
+    return old.x
+}
+
+func bump(p mut P) { p.x += 100 }
+func boxbump(b mut Box[int]) { b.set(b.get() + 100) }
+func peek(p P) int { return p.x }
+func moved_in(own p P) P {
+    var q = p
+    q.y = 77
+    return q
+}
+
+func main() {
+    // 1. assignment copies; a write through the copy is not seen.
+    var a = P{x: 1, y: 2}
+    var b = a
+    b.x = 9
+    say "1:", a.x, b.x
+
+    // 2. a nested path: every level is made unique.
+    var l1 = Line{a: P{x: 1, y: 1}, b: P{x: 2, y: 2}}
+    var l2 = l1
+    l2.a.x = 50
+    say "2:", l1.a.x, l2.a.x
+    var pa = l1.b
+    pa.y = 60
+    say "2b:", l1.b.y, pa.y
+
+    // 3. elements: a struct read out of a slice is a copy, and a write
+    //    through the slice is not seen by the copy.
+    var xs = [P{x: 1, y: 1}, P{x: 2, y: 2}]
+    let keep = xs[0]
+    xs[0].x = 10
+    say "3:", keep.x, xs[0].x
+    each e in xs { e.x = 99 }
+    say "3b:", xs[0].x, xs[1].x
+
+    // 4. a `mut self` method writes its receiver, and only it.
+    var c = a
+    c.inc()
+    say "4:", a.x, c.x
+    xs[1].inc()
+    say "4b:", xs[1].x
+
+    // 5. a `mut` parameter writes the caller's location in place — a name,
+    //    a field, an element — and nobody else's.
+    var d = a
+    bump(d)
+    say "5:", a.x, d.x
+    var ys = [P{x: 1, y: 0}]
+    let ycopy = ys[0]
+    bump(ys[0])
+    say "5b:", ys[0].x, ycopy.x
+    bump(l2.b)
+    say "5c:", l1.b.x, l2.b.x
+
+    // 6. a map value is a location too.
+    var m = map[str]P{"k": P{x: 3, y: 3}}
+    let mk = m["k"]
+    m["k"].x = 30
+    say "6:", mk.x, m["k"].x
+
+    // 7. a Box inside a struct field: no Box can be made to contain its
+    //    own holder (the batch-3 review's cycle — it leaked three objects).
+    var n = H{b: nil, name: "a"}
+    n.b = Box(n)
+    say "7:", n.b.name, n.b.b == nil
+    var arr = [H{b: nil, name: "z"}]
+    arr[0].b = Box(arr[0])
+    say "7b:", arr[0].b.name, arr[0].b.b == nil
+
+    // 8. a `mut` Box parameter given an element or a map value writes that
+    //    location only (the review's MEDIUM B).
+    var boxes = [Box(5)]
+    let kb = boxes[0]
+    boxbump(boxes[0])
+    say "8:", boxes[0], kb
+    var bm = map[str]Box[int]{"k": Box(7)}
+    let k2 = bm["k"]
+    boxbump(bm["k"])
+    say "8b:", bm["k"], k2
+
+    // 9. a closure's captured struct is a variable like any other.
+    var cnt = Counter{n: 0}
+    let snap = cnt
+    let tick = fn() { cnt.bump() }
+    tick()
+    tick()
+    say "9:", snap.n, cnt.n
+
+    // 10. a borrowed argument is read, an owned one is the callee's.
+    say "10:", peek(a), moved_in(a).y, a.y
+
+    // 11. a million writes through a uniquely held struct copy nothing.
+    var big = Counter{n: 0}
+    var i = 0
+    while i < 1000000 {
+        big.n = big.n + 1
+        i += 1
+    }
+    say "11:", big.n
+
+    // 12. what a Box or a newtype holds is not written through another
+    //     name that shares it.
+    let p12 = P{x: 1, y: 0}
+    var b12 = Box(p12)
+    b12.x = 5
+    b12.inc()
+    say "12:", p12.x, b12.x
+    let base = P{x: 3, y: 3}
+    var np = NP(base)
+    np.x = 4
+    say "12b:", base.x, np.x
+
+    // 13. snapshots of in-place locations.
+    var s13 = P{x: 1, y: 0}
+    say "13:", taken(s13), s13.x
+
+    // 14. a `mut self` method cannot make a Box hold its own receiver.
+    var n14 = N{v: 1, b: nil}
+    n14.link()
+    say "14:", n14.v, n14.b == nil
+}

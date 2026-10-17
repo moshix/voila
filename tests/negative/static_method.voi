@@ -1,0 +1,9 @@
+// Only a top-level generic function receives its type parameters at run
+// time; a method is reached by dynamic dispatch, whose caller could not
+// pass them.
+trait Default { func default() Self }
+struct Stack[T] { items []T }
+impl[T: Default] Stack[T] {
+    func fill(mut self) { self.items.append(T.default()) }
+}
+func main() { }

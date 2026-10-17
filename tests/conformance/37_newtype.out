@@ -1,0 +1,21 @@
+21 celsius 21°C 69.8°F
+22 3
+25 true 4 true true
+2.5
+30
+10°C
+50°F
+200
+Age(300): ConvError{from: "int", to: "u8", value: "300"}
+overflow: integer overflow: 200 + 100 is out of range for u8
+["ann", "bob", "cy"] 3 bob ANN,BOB,CY
+ann
+bob
+cy
+42
+celsius 8
+9
+0 0
+8 true
+0
+Pt{x: 1, y: 2}

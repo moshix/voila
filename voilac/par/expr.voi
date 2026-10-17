@@ -3,6 +3,7 @@ package par
 
 use "voilac/tok"
 use "voilac/ast"
+use "std/str"
 
 // bin_prec returns the binding power of a binary operator, or 0 when the token
 // is not one. Only `**` is right-associative.
@@ -36,7 +37,16 @@ impl Parser {
                 self.next()
                 var inc = 0
                 if k == tok.RANGEEQ { inc = 1 }
-                let hi = self.binary(P_RANGE + 1)
+                // `s[10..]`: inside brackets a range may stop short of its
+                // upper bound (0 = open). The lowerer accepts an open bound
+                // only where it is a slice index and refuses it elsewhere.
+                var hi = 0
+                if not (self.lev > 0 and self.at(tok.RBRACKET)) {
+                    hi = self.binary(P_RANGE + 1)
+                } else if inc == 1 {
+                    self.error("`..=` needs an upper bound; write `..` " ||
+                               "to run to the end")
+                }
                 var by = 0
                 if self.at(tok.IDENT) and self.cur().Lit == "by" {
                     self.next()
@@ -55,6 +65,14 @@ impl Parser {
                    c == tok.CONTINUE {
                     alt = self.diverging_stmt()
                     isStmt = 1
+                } else if c == tok.LBRACE and
+                          not (self.noLit > 0 and self.lev == 0) {
+                    // `f() else { usage(); os.exit(2) }` — a BLOCK
+                    // alternative (Ival2 = 2). It yields the value of its
+                    // final expression, or diverges. In a statement header
+                    // the brace opens the body instead, as for a composite.
+                    alt = self.block()
+                    isStmt = 2
                 } else {
                     alt = self.binary(P_ELSE)     // right-associative
                 }
@@ -152,6 +170,10 @@ impl Parser {
                 x = self.index_tail(x)
             } else if k == tok.DOT {
                 let t = self.next()
+                if self.at(tok.INT) or self.at(tok.FLOAT) {
+                    x = self.tuple_field(x, t)
+                    continue
+                }
                 let n = self.expect(tok.IDENT)
                 x = self.add(ast.FIELD, t, 0, 0, n.Lit, [x])
             } else if k == tok.LBRACE {
@@ -161,11 +183,19 @@ impl Parser {
                 let nt = self.expr_to_named(x)
                 if nt == 0 { return x }
                 x = self.composite_tail(nt)
-            } else if k == tok.BANG or k == tok.QUESTION {
-                // §5.1 lists postfix `!`/`?`, but the spec gives them no
-                // expression semantics: they are type forms only.
-                self.error("postfix `{tok.Spelling(k)}` is a type form " ||
-                           "(`int{tok.Spelling(k)}`); it has no expression meaning")
+            } else if k == tok.QUESTION {
+                // Postfix `?` propagates a failure (§5.1, §8.1): `f(x)?` is
+                // exactly `try f(x)`, so it becomes the very same TRYEXPR
+                // node and nothing downstream can tell the spellings apart.
+                // There is no ambiguity with the `?T` type form: that one is
+                // PREFIX and only ever parsed by type_expr, in a type slot.
+                let q = self.next()
+                x = self.add(ast.TRYEXPR, q, 0, 0, "", [x])
+            } else if k == tok.BANG {
+                // §5.1 lists postfix `!`, but the spec gives it no expression
+                // semantics: `T!` is a type form only.
+                self.error("postfix `!` is a type form (`int!`); it has no " ||
+                           "expression meaning")
                 self.next()
             } else {
                 return x
@@ -211,11 +241,27 @@ impl Parser {
         if n.Kind == ast.INDEX {
             // The BASE is checked before the argument is converted, so a
             // failure here leaves no orphan TNAMED behind in the arena.
+            // An INDEX holds one kid per written type argument after the
+            // base — `Lru[str, int]` has three (see index_tail).
             let b = self.T.Get(n.Kids[0])
-            if b.Kind != ast.IDENT { return 0 }
-            let arg = self.expr_to_type(n.Kids[1])
-            if arg == 0 { return 0 }
-            return self.T.Add(ast.TNAMED, n.Line, n.Col, 0, 0, b.Sval, [arg])
+            if b.Kind != ast.IDENT and b.Kind != ast.FIELD { return 0 }
+            var bname = b.Sval
+            if b.Kind == ast.FIELD {
+                let bb = self.T.Get(b.Kids[0])
+                if bb.Kind != ast.IDENT { return 0 }
+                bname = bb.Sval || "." || b.Sval
+            }
+            var args = []
+            var i = 1
+            while i < len(n.Kids) {
+                // Ival2 = 2: the arguments were read as TYPES already.
+                var arg = n.Kids[i]
+                if n.Ival2 != 2 { arg = self.expr_to_type(n.Kids[i]) }
+                if arg == 0 { return 0 }
+                args.append(arg)
+                i += 1
+            }
+            return self.T.Add(ast.TNAMED, n.Line, n.Col, 0, 0, bname, args)
         }
         return 0
     }
@@ -279,13 +325,126 @@ impl Parser {
                         [fun, self.T.List(args), self.T.List(targs)])
     }
 
+    // index_tail parses `x[i]`, `x[lo..hi]` with either bound optional
+    // (`s[10..]`, `s[..3]`, `s[..]`), and an instantiation with SEVERAL type
+    // arguments, `mk[str, int]`, whose extra arguments become extra kids:
+    // INDEX is [x, idx] for a subscript and [x, T1, T2, …] for the rest.
     func index_tail(mut self, x int) int {
         let t = self.expect(tok.LBRACKET)
         self.lev += 1
-        let idx = self.expr()
+        let bk = self.T.Kind(x)
+        if bk == ast.IDENT or bk == ast.FIELD {
+            let ta = self.try_type_args(x, t)
+            if ta != 0 { return ta }
+        }
+        var idx = 0
+        if self.at(tok.RANGE) or self.at(tok.RANGEEQ) {
+            // An open LOWER bound: the range starts at 0.
+            let rt = self.next()
+            var inc = 0
+            if rt.Kind == tok.RANGEEQ { inc = 1 }
+            var hi = 0
+            if not self.at(tok.RBRACKET) {
+                hi = self.binary(P_RANGE + 1)
+            } else if inc == 1 {
+                self.error("`..=` needs an upper bound; write `..` to run " ||
+                           "to the end")
+            }
+            idx = self.add(ast.RANGE, rt, 0, inc, "", [0, hi, 0])
+        } else {
+            idx = self.expr()
+        }
+        var kids = [x, idx]
+        while self.accept(tok.COMMA) {
+            if self.at(tok.RBRACKET) { break }
+            kids.append(self.expr())
+        }
         self.lev -= 1
         self.expect(tok.RBRACKET)
-        return self.add(ast.INDEX, t, 0, 0, "", [x, idx])
+        return self.add(ast.INDEX, t, 0, 0, "", kids)
+    }
+
+    // try_type_args reads `f[[]int, ?str](…)` / `Box[map[str]int]{…}`: type
+    // arguments that only the TYPE grammar can spell. It is speculative,
+    // like try_collection_lit — the bracket is read as a type list, and kept
+    // only when that succeeds, a `(` or `{` follows, and at least one
+    // argument is a form no expression could be (`f[T](x)` with plain names
+    // stays the ordinary INDEX, which the later stages already resolve).
+    // A kept instantiation is an INDEX with Ival2 = 2 whose kids after the
+    // base are TYPE nodes. On failure the position and the diagnostics are
+    // rolled back and 0 is returned.
+    func try_type_args(mut self, x int, t tok.Token) int {
+        let savedI = self.i
+        let savedErrs = len(self.Errs)
+        var tys = []
+        var decisive = false
+        while not self.at(tok.RBRACKET) and not self.at(tok.EOF) {
+            let ty = self.type_expr()
+            tys.append(ty)
+            if not self.simple_type(ty) { decisive = true }
+            if not self.accept(tok.COMMA) { break }
+        }
+        let k1 = self.peek(1).Kind
+        let ok = len(self.Errs) == savedErrs and self.at(tok.RBRACKET) and
+                 decisive and len(tys) > 0 and
+                 (k1 == tok.LPAREN or k1 == tok.LBRACE)
+        if not ok {
+            self.i = savedI
+            self.Errs = self.Errs[0..savedErrs]
+            return 0
+        }
+        self.next()
+        self.lev -= 1
+        var kids = [x]
+        each ty in tys { kids.append(ty) }
+        return self.add(ast.INDEX, t, 0, 2, "", kids)
+    }
+
+    // simple_type reports whether a type node could also have been read as
+    // an expression: a (dotted) name, possibly instantiated with such names,
+    // or a parenthesised list of those — `(r, c)` is a tuple TYPE of two
+    // names and equally a tuple VALUE, so `seen[(r, c)] = true` must stay a
+    // subscript. A bracket holding nothing but such forms is never taken
+    // as type arguments; one decisive type form (`[]int`, `?str`, `map[…]…`)
+    // is what commits.
+    func simple_type(self, ty int) bool {
+        let n = self.T.Get(ty)
+        if n.Kind == ast.TNAMED {
+            each a in n.Kids {
+                if not self.simple_type(a) { return false }
+            }
+            return true
+        }
+        if n.Kind == ast.TTUPLE {
+            each a in n.Kids {
+                if not self.simple_type(a) { return false }
+            }
+            return true
+        }
+        return false
+    }
+
+    // tuple_field parses the positional selector of `t.0`. It is an INDEX
+    // by a constant — a tuple is indexable at run time — so every later
+    // stage already understands it. The lexer reads a number right after a
+    // `.` as plain digits, so `t.0.1` arrives as two selectors; the FLOAT
+    // split below is kept for robustness only.
+    func tuple_field(mut self, x int, dot tok.Token) int {
+        let n = self.next()
+        var parts = [n.Lit]
+        if n.Kind == tok.FLOAT { parts = str.split(n.Lit, ".") }
+        var out = x
+        each p in parts {
+            if len(p) == 0 or not all_digits(p) {
+                self.error("expected a tuple position after `.`, found {n.Lit}")
+                return out
+            }
+            let k = self.add(ast.INT, n, 0, 0, p, [])
+            // Ival2 = 1 marks the `.N` spelling, so the checker can tell a
+            // tuple selector from an ordinary subscript.
+            out = self.add(ast.INDEX, dot, 0, 1, "", [out, k])
+        }
+        return out
     }
 
     func primary(mut self) int {
@@ -302,6 +461,9 @@ impl Parser {
         if k == tok.NIL   { self.next() ; return self.add(ast.NILLIT, t, 0, 0, "nil", []) }
         if k == tok.ISTR  { self.next() ; return self.interp_str(t) }
         if k == tok.SELF  { self.next() ; return self.add(ast.SELF, t, 0, 0, "self", []) }
+
+        if k == tok.IF    { return self.if_expr() }
+        if k == tok.MATCH { return self.match_stmt() }
 
         if k == tok.SPAWN {
             self.next()
@@ -346,7 +508,19 @@ impl Parser {
                                   self.peek(1).Kind == tok.OWN) {
                 return self.closure()
             }
+            // `map[K]V{…}` and `set[T]{…}`: a collection type in expression
+            // position can only open a literal. `set(xs)`, the prelude
+            // constructor, is followed by `(`, never `[`.
+            if (t.Lit == "map" or t.Lit == "set") and
+               self.peek(1).Kind == tok.LBRACKET {
+                let lit = self.try_collection_lit()
+                if lit != 0 { return lit }
+            }
             self.next()
+            // `Self` in an impl block is the implementing type (§3.6).
+            if t.Lit == "Self" and self.selfName != "" {
+                return self.self_expr(t)
+            }
             return self.add(ast.IDENT, t, 0, 0, t.Lit, [])
         }
         if k == tok.LPAREN {
@@ -372,6 +546,13 @@ impl Parser {
             self.expect(tok.RPAREN)
             return x
         }
+        if k == tok.LBRACKET and self.peek(1).Kind == tok.RBRACKET and
+           typed_slice_start(self.peek(2).Kind) {
+            // `[]int{1, 2}`: `[]` followed by an element type. A bare `[]`
+            // is followed by a terminator, a comma or a bracket, never by a
+            // type, so the two spellings cannot be confused.
+            return self.collection_lit()
+        }
         if k == tok.LBRACKET {
             self.next()
             self.lev += 1
@@ -388,6 +569,101 @@ impl Parser {
         self.error("expected expression, found {self.show()}")
         self.next()
         return self.add(ast.NILLIT, t, 0, 0, "nil", [])
+    }
+
+    // collection_lit parses a TYPED collection literal: `[]T{a, b}`,
+    // `set[T]{a, b}` (both SLICELIT, the type in Ival) and
+    // `map[K]V{k: v, …}` (MAPLIT, keys and values alternating in Kids).
+    // The type is read by type_expr, so any element type an annotation may
+    // spell is accepted here too. Separators are commas, and a newline is as
+    // good as one, exactly as in a struct literal.
+    func collection_lit(mut self) int {
+        let t = self.cur()
+        let ty = self.type_expr()
+        let tk = self.T.Kind(ty)
+        if tk != ast.TSLICE and tk != ast.TMAP and tk != ast.TSET {
+            self.error("expected a collection type before `\{`")
+        }
+        self.expect(tok.LBRACE)
+        self.lev += 1
+        var es = []
+        while true {
+            self.skip_semis()
+            if self.at(tok.RBRACE) or self.at(tok.EOF) { break }
+            let e = self.expr()
+            es.append(e)
+            if tk == ast.TMAP {
+                self.expect(tok.COLON)
+                es.append(self.expr())
+            }
+            if not self.accept(tok.COMMA) {
+                // A newline (a virtual `;`) separates members as well as a
+                // comma does; anything else ends the list.
+                if not self.at(tok.SEMI) { break }
+                self.skip_semis()
+            }
+        }
+        self.lev -= 1
+        self.expect(tok.RBRACE)
+        if tk == ast.TMAP {
+            return self.add(ast.MAPLIT, t, ty, 0, "", es)
+        }
+        return self.add(ast.SLICELIT, t, ty, 0, "", es)
+    }
+
+    // try_collection_lit parses `map[K]V{…}` / `set[T]{…}` SPECULATIVELY:
+    // `map` and `set` are ordinary identifiers, and a local of either name
+    // may be indexed (`set[1]`, `map["a"]`). The type is read first; only
+    // when it parses cleanly and a `{` follows is this a literal. Otherwise
+    // the position and the diagnostics are rolled back and 0 is returned,
+    // so the caller parses a plain identifier. The nodes the attempt added
+    // stay in the arena, unreferenced, which no pass minds.
+    //
+    // In a statement header `set[x] {` is ambiguous (the brace may open the
+    // body), so there the literal needs parentheses, as a struct literal
+    // does.
+    func try_collection_lit(mut self) int {
+        if self.noLit > 0 and self.lev == 0 and self.cur().Lit == "set" {
+            return 0
+        }
+        let savedI = self.i
+        let savedErrs = len(self.Errs)
+        self.type_expr()
+        let ok = len(self.Errs) == savedErrs and self.at(tok.LBRACE)
+        self.i = savedI
+        self.Errs = self.Errs[0..savedErrs]
+        if not ok { return 0 }
+        return self.collection_lit()
+    }
+
+    // if_expr parses an `if` in VALUE position (§5.3): the same IF node a
+    // statement makes, but the `else` is mandatory — without one there is no
+    // value on the false path. `else if` chains are if_exprs in turn.
+    func if_expr(mut self) int {
+        let t = self.expect(tok.IF)
+        var cond = 0
+        var pat = 0
+        if self.at(tok.LET) {
+            self.next()
+            pat = self.pattern()
+            self.expect(tok.ASSIGN)
+            cond = self.header_expr()
+        } else {
+            cond = self.header_expr()
+        }
+        let then = self.block()
+        var els = 0
+        if self.skip_semis_before(tok.ELSE) {
+            self.next()
+            if self.at(tok.IF) {
+                els = self.if_expr()
+            } else {
+                els = self.block()
+            }
+        } else {
+            self.error("an `if` used as a value needs an `else` branch")
+        }
+        return self.add(ast.IF, t, pat, 0, "", [cond, then, els])
     }
 
     func closure(mut self) int {
@@ -428,6 +704,9 @@ impl Parser {
             if ip.IsExpr[i] {
                 var sub = NewAt(self.file, ip.Parts[i], ip.PartLine[i],
                                 ip.PartCol[i])
+                // `"{Self.zero()}"` inside an impl: the sub-parser has its
+                // own arena, so it is told the target's NAME, not its node.
+                sub.selfName = self.selfName
                 let e = sub.expr()
                 if not sub.at(tok.EOF) and not sub.at(tok.SEMI) {
                     sub.error("unexpected {sub.show()} after interpolated " ||
@@ -443,4 +722,22 @@ impl Parser {
         }
         return self.add(ast.INTERP, t, 0, 0, "", parts)
     }
+}
+
+// typed_slice_start reports whether the token after `[]` begins an element
+// type, which is what turns `[]` into the head of a typed slice literal.
+func typed_slice_start(k int) bool {
+    return k == tok.IDENT or k == tok.LBRACKET or k == tok.QUESTION or
+           k == tok.CHAN or k == tok.SHARED or k == tok.WEAK
+}
+
+// all_digits reports whether s is a non-empty run of ASCII digits.
+func all_digits(s str) bool {
+    if len(s) == 0 { return false }
+    var i = 0
+    while i < len(s) {
+        if s[i] < 48 or s[i] > 57 { return false }
+        i += 1
+    }
+    return true
 }

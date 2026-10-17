@@ -1,0 +1,54 @@
+// Nil narrowing is flow-sensitive (§5.5): a name of an optional type is a
+// `T` only where every path to it proved it non-nil. Each refusal below is
+// a program that aborts at run time with "invalid operands: nil and int";
+// the `!` lines are the shapes that stay legal.
+func a() int {
+    var x ?int = nil
+    if x == nil { say "no" }            // neither leaves nor assigns
+    return x + 1
+}
+func b() int {
+    var x ?int = 3
+    if x != nil {
+        x = nil                         // the narrowing is undone
+        return x + 1
+    }
+    return 0
+}
+func c(xs []int) int {
+    var best ?int = nil
+    each v in xs {
+        if best == nil or v < best { best = v }
+    }
+    return best + 0                     // the loop may not have run
+}
+func d() int {
+    var x ?int = 1
+    if x == nil { return 0 }
+    let clear = fn() { x = nil }        // a closure assigns it
+    clear()
+    return x + 1
+}
+var g ?int = 5
+func reset() { g = nil }
+func e() int {
+    if g == nil { return 0 }
+    reset()                             // a module `var`: never narrowed
+    return g + 1
+}
+func f() int {
+    var x ?int = nil
+    if let x = to_int("5") {            // the pattern's own x
+        x = 5
+    } else {
+        return 0
+    }
+    return x + 1
+}
+func ok(p ?int) int {
+    if p == nil { return 0 }
+    var o ?int = nil
+    o = 5
+    return p + o
+}
+func main() { say a(), b(), c([1]), d(), e(), f(), ok(1) }

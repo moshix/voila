@@ -1,0 +1,19 @@
+spawn_races.voi:20:17: a spawned task assigns `n`
+spawn_races.voi:21:17: a spawned task assigns `n`
+spawn_races.voi:22:17: a spawned task assigns `out`
+spawn_races.voi:23:18: a spawned task stores into a map in `m`
+spawn_races.voi:24:23: a spawned task stores into a map in `b`
+spawn_races.voi:25:20: a spawned task calls `.append(…)` on `out`
+spawn_races.voi:26:20: a spawned task calls `.insert(…)` on `out`
+spawn_races.voi:27:20: a spawned task calls `.sort(…)` on `out`
+spawn_races.voi:28:18: a spawned task calls `.delete(…)` on `m`
+spawn_races.voi:29:18: a spawned task calls `.add(…)` on `s`
+spawn_races.voi:30:18: a spawned task calls `.bump(…)` on `c`
+spawn_races.voi:31:22: a spawned task hands `out`
+spawn_races.voi:32:21: a spawned task calls `.pop(…)` on `b`
+spawn_races.voi:33:20: a spawned task hands `out`
+!spawn_races.voi:34:
+!spawn_races.voi:35:
+!spawn_races.voi:36:
+!spawn_races.voi:37:
+send the result over a channel, or keep it in a `cell` or a `shared` value

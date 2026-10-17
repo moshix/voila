@@ -1,0 +1,18 @@
+// A struct field is called like a method only when it holds a function:
+// `r.path()` on a `path str` field would abort at run time, so the check
+// refuses it — and says it is a field. The `!` lines are the legal
+// neighbours: a field that holds a function, and a real method.
+struct Req {
+    path  str
+    tags  []str
+    on    fn(int) int
+}
+impl Req {
+    func size(self) int { return len(self.path) }
+}
+func main() {
+    let r = Req{path: "/x", tags: [], on: fn(n int) int { return n + 1 }}
+    say r.path()
+    say r.tags()
+    say r.on(1), r.size(), r.path
+}

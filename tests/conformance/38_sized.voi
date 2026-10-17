@@ -1,0 +1,75 @@
+// Sized integers trap instead of wrapping (§3.2, §17). Every integer is an
+// int64 at run time; a sized type's range is enforced on arithmetic whose
+// static type is sized, on compound assignment to a sized location, and on
+// a store of a value not known to fit — an initialiser, an assignment, a
+// parameter, a returned value, a struct field, a slice element. Every trap
+// is an OverflowError, with the same message at every -O level.
+
+struct P { a u8, b i16 }
+impl P { func bump(mut self) { self.a += 100 } }
+
+func id8(x i8) i8 { return x }
+func narrow(n int) u8 { return n }
+func inc(x u8) u8 { return x + 1 }
+func pair() (int, int) { return 1000, 2 }
+
+func main() {
+    var x i8 = 127
+    try { x += 1 } catch e { say "1:", e.message() }
+    say x
+    x -= 1
+    say x
+
+    let y i8 = 100
+    try { say y + y } catch e { say "2:", e.message() }
+    try { say id8(200) } catch e { say "3:", e.message() }
+    try { say narrow(256) } catch e { say "4:", e.message() }
+    say narrow(255)
+    try { say inc(255) } catch e { say "5:", e.message() }
+
+    var p = P{a: 150, b: 5}
+    p.bump()
+    say p.a
+    try { p.bump() } catch e { say "6:", e.message() }
+    let big = 70000
+    try { let q = P{a: 1, b: big}; say q } catch e { say "7:", e.message() }
+
+    var bs = []u8{1, 2}
+    let wide = 300
+    try { bs[0] = wide } catch e { say "8:", e.message() }
+    say bs
+
+    let u u8 = 5
+    try { say -u } catch e { say "9:", e.message() }
+    var w u16 = 65535
+    try { w = w * 2 } catch e { say "10:", e.message() }
+    let lo i8 = -128
+    try { say lo ~/ -1 } catch e { say "11:", e.message() }
+    try { say lo - 1 } catch e { say "12:", e.message() }
+    let two i8 = 2
+    say two ** 6
+    try { say two ** 7 } catch e { say "13:", e.message() }
+    var big32 i32 = 2147483647
+    try { big32 += 1 } catch e { say "14:", e.message() }
+    var zero u32 = 0
+    try { zero -= 1 } catch e { say "15:", e.message() }
+
+    // Widening is free; a literal that does not fit makes the sum an int.
+    let c8 u8 = 200
+    let c16 i16 = c8 + 1000
+    say c16
+    let s i16 = c8
+    say s + s
+    try { let bad u8 = c8 + c8; say bad } catch e { say "16:", e.message() }
+
+    // A name rebound by a destructuring `let` loses its old sized type.
+    let rb u8 = 1
+    let rb, other = pair()
+    say rb + 1, other
+
+    // Explicit conversions still throw ConvError; wrap_/sat_ still wrap and
+    // saturate on request.
+    try { say u8(300) } catch e { say "17:", e.message() }
+    say wrap_u8(300), sat_u8(300)
+    say "done"
+}

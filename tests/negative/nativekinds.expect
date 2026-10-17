@@ -1,0 +1,10 @@
+14:36: argument 2 of `os.run_capture` must be a slice, but `str` is given
+15:21: argument 1 of `os.read` must be a str
+16:19: argument 1 of `str.upper` must be a str or a rune, but `int` is given
+17:13: argument 1 of `sum` must be a slice
+18:18: argument 1 of `str.join` must be a slice
+19:19: argument 1 of `os.exists` must be a str
+!:22:
+!:23:
+!:25:
+!:27:

@@ -1,0 +1,4 @@
+argument 1 of `Box.push` is `int`, but `str` is given
+argument 1 of `Box.push` is `str`, but `int` is given
+an element of `[]str` must be `str`, but `float` is given
+!`Box.size`

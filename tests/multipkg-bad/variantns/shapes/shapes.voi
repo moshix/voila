@@ -1,0 +1,4 @@
+package shapes
+
+enum Shape { Circle(r float), Unit }
+enum Size { Unit, Big(n int) }

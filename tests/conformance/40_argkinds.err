@@ -1,0 +1,2 @@
+abort: str.join: argument 1 must be a slice or a set, got str
+  at main (tests/conformance/40_argkinds.voi:31)

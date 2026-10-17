@@ -1,0 +1,39 @@
+// Trap identity for the SIZED integer types (§3.2): the range traps of
+// low/sized.voi must print byte-equal messages at -O0 and every -O level.
+// At -O3 the arithmetic is native (vl_iadd_sz and friends) and the messages
+// must come from the same cold vl_trap_sz* functions the boxed path uses.
+// Loops keep the operands in typed registers, which is what -O3 unboxes.
+
+func thousand() int { return 1000 }
+
+func main() {
+    var a i8 = 120
+    var i = 0
+    while i < 3 {
+        try { a += 4 } catch e { say "t1:", e.message() }
+        i += 1
+    }
+    var b u8 = 3
+    var j = 0
+    while j < 2 {
+        try { b -= 2 } catch e { say "t2:", e.message() }
+        j += 1
+    }
+    var c i16 = 200
+    try { c = c * c } catch e { say "t3:", e.message() }
+    var d u16 = 65535
+    try { d += 1 } catch e { say "t4:", e.message() }
+    var e32 i32 = -2147483648
+    try { e32 -= 1 } catch e { say "t5:", e.message() }
+    var f u32 = 4294967295
+    try { f = f + 1 } catch e { say "t6:", e.message() }
+    var g u64 = 9223372036854775807
+    try { g += 1 } catch e { say "t7:", e.message() }
+    let h i8 = -128
+    try { say -h } catch e { say "t8:", e.message() }
+    try { say h ~/ -1 } catch e { say "t9:", e.message() }
+    let k i8 = 3
+    try { say k ** 5 } catch e { say "t10:", e.message() }
+    try { let m u8 = thousand(); say m } catch e { say "t11:", e.message() }
+    say "sized traps done", a, b
+}

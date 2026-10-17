@@ -1,0 +1,5 @@
+tuplewidth.voi:6:10: a tuple of 2 members has no member 2
+tuplewidth.voi:6:20: a tuple of 2 members has no member 2
+`.1` selects a tuple member, but this value is `[]int`
+`.0` selects a tuple member, but this value is `str`
+this tuple pattern has 2 members, but the subject has 3

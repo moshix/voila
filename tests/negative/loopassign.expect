@@ -1,0 +1,1 @@
+loopassign.voi:24:17: this closure captures `c`, which is declared inside a loop and assigned to there

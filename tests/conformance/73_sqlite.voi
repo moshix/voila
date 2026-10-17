@@ -1,0 +1,233 @@
+// 73_sqlite — std/sqlite over the vendored SQLite: exec and prepared
+// statements, every parameter kind, every column kind, typed rows
+// (sqlite.decode[T]), transactions committed, rolled back on an error and
+// on a throw, the error messages SQLite gives, and tasks — several
+// connections to one file, and one connection shared.
+use "std/os"
+use "std/path"
+use "std/sqlite"
+
+struct User {
+    id   int
+    name str
+    age  int = 0
+}
+
+func show(what str, r int!) {
+    match r {
+        Ok(n) => say what, "ok", n
+        Err(e) => say what, "ERR", e.message()
+    }
+}
+
+func count(db sqlite.DB, table str) int {
+    match db.query_one("SELECT count(*) AS n FROM " || table) {
+        Ok(r) => {
+            match r {
+                nil => return 0 - 1
+                row => return row.int("n")
+            }
+        }
+        Err(e) => say "count:", e.message()
+    }
+    return 0 - 1
+}
+
+func worker(file str, id int) unit! {
+    let db = try sqlite.open(file)
+    defer db.close()
+    var i = 0
+    while i < 25 {
+        try db.run("INSERT INTO log (who, n) VALUES (?, ?)", id, i)
+        i += 1
+    }
+    return ()
+}
+
+func shared_worker(db sqlite.DB, id int) unit! {
+    var i = 0
+    while i < 25 {
+        try db.run("INSERT INTO log (who, n) VALUES (?, ?)", id, i)
+        i += 1
+    }
+    return ()
+}
+
+func main() {
+    let db = must sqlite.open(":memory:")
+    say len(sqlite.version()) > 0
+    must db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, " ||
+                 "age INTEGER, pic BLOB, score REAL, price TEXT); " ||
+                 "CREATE INDEX users_name ON users(name)")
+
+    say "-- parameters --"
+    // a []byte binds as a BLOB, a str as TEXT, a dec as its exact TEXT
+    let pic []byte = [1, 0, 255]
+    show("ada", db.run("INSERT INTO users (name, age, pic, score, price) " ||
+                       "VALUES (?, ?, ?, ?, ?)", "ada", 36, pic, 9.5, 19.99d))
+    show("bob", db.run("INSERT INTO users (name, age) VALUES (?, ?)", "bob", nil))
+    show("cy", db.run("INSERT INTO users (name, age, score) VALUES (?1, ?2, ?2)",
+                      "cy", true))
+    say db.last_insert_id(), db.changes()
+    let st = must db.prepare("INSERT INTO users (name, age) VALUES (?, ?)")
+    var i = 0
+    while i < 5 {
+        show("stmt", st.run("user" || str(i), 20 + i))
+        i += 1
+    }
+    st.close()
+    st.close()
+    show("closed stmt", st.run("x", 1))
+
+    say "-- columns --"
+    each row in must db.query("SELECT id, name, age, pic, score, price FROM users " ||
+                              "WHERE id <= ? ORDER BY id", 3) {
+        say row.int("id"), row.str("name"), row.int("age"), row.bytes("pic"),
+            row.float("score"), row.str("price"), row.is_null("age")
+        say "  ", row.json()
+    }
+    let r1 = must db.query_one("SELECT * FROM users WHERE name = ?", "ada")
+    match r1 {
+        nil => say "no ada"
+        row => {
+            match row.get("pic") {
+                sqlite.Value.Blob(b) => say "blob", b
+                _ => say "not a blob"
+            }
+            match row.at(1) {
+                sqlite.Value.Text(s) => say "text", s
+                _ => say "not text"
+            }
+            say len(row.map()), row.len(), row.index("score"), row.index("nope")
+            try {
+                say row.int("nope")
+            } catch e: KeyError {
+                say "KeyError:", e.key
+            }
+        }
+    }
+    match db.query_one("SELECT * FROM users WHERE name = ?", "nobody") {
+        Ok(none) => say none == nil
+        Err(e) => say e.message()
+    }
+    say len(must db.query("SELECT 1 WHERE 0"))
+
+    say "-- typed rows --"
+    each row in must db.query("SELECT id, name, age FROM users WHERE age > ? " ||
+                              "ORDER BY age LIMIT 3", 21) {
+        let u = must sqlite.decode[User](row)
+        say u, u.name
+    }
+    let nameonly = must db.query_one("SELECT 7 AS id, 'zed' AS name")
+    match nameonly {
+        nil => say "?"
+        row => say must sqlite.decode[User](row)
+    }
+    let wrong = must db.query_one("SELECT 'x' AS id, 'zed' AS name")
+    match wrong {
+        nil => say "?"
+        row => {
+            match sqlite.decode[User](row) {
+                Ok(u) => say "decoded?!", u
+                Err(e) => say "decode:", e.message()
+            }
+        }
+    }
+
+    say "-- SQL functions --"
+    match db.query_one("SELECT sqrt(16.0) AS r, date('2020-02-28', '+1 day') AS d, " ||
+                       "upper('ada') AS u, typeof(1.5) AS t") {
+        Ok(r) => {
+            match r {
+                nil => say "no row"
+                row => say row.float("r"), row.str("d"), row.str("u"), row.str("t")
+            }
+        }
+        Err(e) => say e.message()
+    }
+
+    // decode takes ONE row: a slice of them is an error value, not an abort
+    match sqlite.decode[[]User](must db.query("SELECT id, name FROM users")) {
+        Ok(us) => say "decoded?!", us
+        Err(e) => say "decode:", e.message()
+    }
+
+    say "-- errors --"
+    show("syntax", db.run("SELEKT 1"))
+    show("no table", db.run("SELECT * FROM nope"))
+    show("not null", db.run("INSERT INTO users (name) VALUES (?)", nil))
+    show("too few", db.run("INSERT INTO users (name, age) VALUES (?, ?)", "x"))
+    show("too many", db.run("INSERT INTO users (name) VALUES (?)", "x", 1))
+    show("two stmts", db.run("SELECT 1; SELECT 2"))
+    show("empty", db.run("  -- just a comment"))
+    show("trailing ok", db.run("SELECT 1;  -- fine"))
+    match db.exec("CREATE TABLE users (x)") {
+        Ok(u) => say "??"
+        Err(e) => say "exec:", e.message()
+    }
+    match sqlite.open_readonly(path.join(os.tempdir(), "voila-73-missing.db")) {
+        Ok(d) => say "opened?!"
+        Err(e) => say "readonly:", e.message().contains("unable to open")
+    }
+
+    say "-- transactions --"
+    let before = count(db, "users")
+    let res = db.transaction(fn() unit! {
+        try db.run("INSERT INTO users (name) VALUES (?)", "tx1")
+        return errf("changed my mind")
+    })
+    say res, count(db, "users") == before, db.in_transaction()
+    try {
+        must db.transaction(fn() unit! {
+            try db.run("INSERT INTO users (name) VALUES (?)", "tx2")
+            throw ValueError{msg: "boom"}
+        })
+    } catch e: ValueError {
+        say "threw:", e.msg
+    }
+    say count(db, "users") == before, db.in_transaction()
+    must db.transaction(fn() unit! {
+        try db.run("INSERT INTO users (name) VALUES (?)", "tx3")
+        return ()
+    })
+    say count(db, "users") == before + 1
+    must db.begin()
+    say db.in_transaction()
+    must db.run("DELETE FROM users WHERE name LIKE 'user%'")
+    say db.changes()
+    must db.rollback()
+    say count(db, "users") == before + 1
+    match db.commit() {
+        Ok(u) => say "??"
+        Err(e) => say "commit:", e.message()
+    }
+
+    say "-- tasks --"
+    let dir = path.join(os.tempdir(), "voila_73_" || str(os.pid()))
+    must os.mkdir_all(dir)
+    let file = path.join(dir, "log.db")
+    let fdb = must sqlite.open(file)
+    must fdb.exec("PRAGMA journal_mode = WAL; " ||
+                  "CREATE TABLE log (who INTEGER, n INTEGER)")
+    group {
+        spawn worker(file, 1)
+        spawn worker(file, 2)
+        spawn worker(file, 3)
+        spawn worker(file, 4)
+    }
+    say count(fdb, "log")
+    group {
+        spawn shared_worker(fdb, 5)
+        spawn shared_worker(fdb, 6)
+    }
+    say count(fdb, "log")
+    each row in must fdb.query("SELECT who, count(*) AS c FROM log GROUP BY who " ||
+                               "ORDER BY who") {
+        printf("%d:%d ", row.int("who"), row.int("c"))
+    }
+    say ""
+    fdb.close()
+    show("closed db", fdb.run("SELECT 1"))
+    db.close()
+    os.run("rm", ["-rf", dir])
+}

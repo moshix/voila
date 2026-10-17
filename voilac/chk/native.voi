@@ -124,6 +124,12 @@ impl Checker {
                 self.natMax["str." || parts[0]] = mx
             }
         }
+        each e in low.NativeKinds() {
+            let parts = str.split(e, "|")
+            if len(parts) != 2 { continue }
+            self.natKinds[parts[0]] = parts[1]
+            if parts[0] in strm { self.natKinds["str." || parts[0]] = parts[1] }
+        }
         // The bare names the LOWERER will read as a prelude call. It is a
         // narrower set than the natives: fifteen std/str functions (trim_left,
         // last_index, split_n and the rest) are reachable as `str.NAME` and as
@@ -210,6 +216,26 @@ impl Checker {
         self.report_at(callee, "`" || name || "` takes " || wants ||
             plural(mx, " argument", " arguments") || ", but " ||
             str(given) || plural(given, " is", " are") || " given")
+    }
+
+    // native_callee_env is native_callee with the expression typer's
+    // environment as the set of shadowing bindings: every name in `env` (a
+    // parameter, a local, a module global) may hide a native or a package.
+    func native_callee_env(self, callee int, env map[str]int) str {
+        if callee == 0 { return "" }
+        let k = self.T.Kind(callee)
+        var probe = ""
+        if k == ast.IDENT {
+            probe = self.T.Get(callee).Sval
+        } else if k == ast.FIELD {
+            let base = self.T.Kid(callee, 0)
+            if base != 0 and self.T.Kind(base) == ast.IDENT {
+                probe = self.T.Get(base).Sval
+            }
+        }
+        var bound = set([])
+        if probe != "" and probe in env { bound.add(probe) }
+        return self.native_callee(callee, bound)
     }
 
     // native_callee names the native a callee resolves to, or "" when the

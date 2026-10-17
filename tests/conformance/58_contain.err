@@ -1,0 +1,3 @@
+http: handler for GET `/oob`: abort: index out of bounds: 4 (len 1)
+http: handler for GET `/assert`: abort: assertion failed: the handler's own invariant
+http: handler for GET `/caught`: abort: index out of bounds: 3 (len 0)

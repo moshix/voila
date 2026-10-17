@@ -1,0 +1,704 @@
+// low/boxcow.voi — the value semantics of a Box AND OF A STRUCT, by
+// copy-on-write.
+//
+// A struct is a value too (§3.4, §6.4): after `var b = a`, a write through
+// `b` must not be seen through `a`. The machinery below was written for a
+// Box and serves both — UNIQ copies either kind (vl_cow_unique) — with two
+// additions for the struct's sake: every level of a write PATH is made
+// unique (uniq_path: `a.b.c = v`, `xs[i].x = v`), and so is the receiver of
+// a method some declaration writes as `mut self` (recv_path), which writes
+// its receiver in place. Slices, maps and sets are values the same way
+// (§6.4): UNIQ copies them too, and the builtin methods that write one
+// (append, pop, sort, set, delete, add, …) are in mutMethods. Every dead
+// register is dropped as soon as it is dead (low/kill.voi), so a stale one
+// is not counted as an owner — which is what keeps a loop of writes through
+// a field from copying the whole container every time.
+//
+// `Box[T]` is a UNIQUE owner (§6.3): `var b = a` gives `b` a Box of its own,
+// as Rust's Box would, and `b.set(v)` must not be seen through `a`. Values are
+// shared references in this runtime, so the copy is made LAZILY: every
+// in-place write through a Box is preceded by
+//
+//     UNIQ  dst, src, threshold [, write-back]
+//
+// which copies the Box (a fresh Box over a shallow copy of its contents,
+// vl_box_unique in runtime/src/types.c) when its reference count exceeds the
+// THRESHOLD — the references this lowerer knows the location itself holds —
+// and, only when it did copy, writes the copy back where the Box was read
+// from (a field, an element, a global, an upvalue). Anything that is not a
+// Box passes through with one inline tag test and no write at all, so a
+// `set` on a cell or a user type, or a field of a plain struct, is unchanged.
+//
+// The writes covered are the ones that reach a Box's contents in place:
+// `L.set(v)` for an lvalue L (a name, `x.f`, `xs[i]`), and a field or element
+// assigned through a NAME, `b.v = 3`, `b[0] = 1`.
+//
+// NO BOX MAY CONTAIN ITSELF. The value being written is complete before the
+// test — the argument of `set`, the right-hand side of an assignment — so a
+// value that holds the Box has already added to its count, and the write goes
+// to a copy: `b.set(LNode{next: b})` stores the node in a NEW Box, and the
+// node holds the OLD one. A bare NAME as that value is the one case that
+// adds nothing (a name's register is used as is, unretained), so it is first
+// moved into a temporary of its own: `n.next = n` copies too.
+//
+// A `mut` PARAMETER is written in place, which is what `mut` promises the
+// caller (§6.1). Two things keep that honest:
+//
+//   · the CALLER makes a Box it passes by name to a `mut` parameter unique
+//     first (desc_call_args, traitdesc.voi), so the write is seen by the
+//     caller's variable and by nobody else;
+//   · inside the callee, the count is read BEFORE the value is evaluated
+//     (RCOUNT) and is the threshold: a write whose value captured the Box
+//     still goes to a copy, which then stays the callee's — the one way to
+//     keep that write from building a cycle in the caller's Box.
+package low
+
+use "voilac/ast"
+use "std/str"
+
+impl Lowerer {
+    // is_mut_param reports whether a name is a `mut` parameter of the
+    // function being lowered.
+    func is_mut_param(self, name str) bool {
+        return name in self.mutParams
+    }
+
+    // is_var reports whether a name is a variable this file can write back
+    // to: a local, an upvalue or a global.
+    func is_var(mut self, name str) bool {
+        return self.lookup(name) != "" or name in self.globals
+    }
+
+    // pre_count emits the RCOUNT a `mut` parameter's write needs, BEFORE its
+    // value is evaluated, and returns the threshold operand: the register
+    // for a `mut` parameter, else "1" (a name's own register holds it once).
+    func pre_count(mut self, nd int) str {
+        let n = self.T.Get(nd)
+        let name = root_name(n)
+        if name == "" or not self.is_mut_param(name) { return "1" }
+        let cur = self.lookup(name)
+        if cur == "" { return "1" }
+        let rk = self.new_reg()
+        self.emit(n.Line, "RCOUNT", [rk, cur])
+        return rk
+    }
+
+    // own_value gives a value about to be written through a Box a reference
+    // of its own: a bare name's register is used unretained, so without this
+    // `n.next = n` would not count `n` twice and the Box would take itself.
+    func own_value(mut self, vnode int, rv str, line int) str {
+        if vnode == 0 or self.T.Kind(vnode) != ast.IDENT { return rv }
+        let rt = self.new_reg()
+        self.emit(line, "MOVE", [rt, rv])
+        return rt
+    }
+
+    // cow_ident makes the Box a NAME holds unique and returns the operand
+    // that now holds it, or "" when the name is not a variable (a function,
+    // a package qualifier) and is left to the caller. `thr` is the threshold
+    // (pre_count).
+    func cow_ident(mut self, nd int, thr str) str throws LowerError {
+        let n = self.T.Get(nd)
+        let name = root_name(n)
+        let cur = self.lookup(name)
+        if cur != "" {
+            if self.is_local(name) {
+                self.emit(n.Line, "UNIQ", [cur, cur, thr])
+                return cur
+            }
+            // An upvalue: read through ^name, written back with the copy.
+            let rt = self.new_reg()
+            self.emit(n.Line, "UNIQ", [rt, cur, thr, "up", name])
+            return rt
+        }
+        if name in self.globals {
+            // Held by the global slot AND the temporary it is loaded into.
+            let rg = self.new_reg()
+            self.emit(n.Line, "GETGLB", [rg, name])
+            self.emit(n.Line, "UNIQ", [rg, rg, "2", "glb", name])
+            return rg
+        }
+        return ""
+    }
+
+    // lower_set_args lowers a `set` call's arguments with every bare name
+    // given a reference of its own (own_value). A named or spread argument
+    // (meaningless for `set`, but legal syntax) takes the ordinary path.
+    func lower_set_args(mut self, x int) str throws LowerError {
+        let args = self.T.Get(self.T.Kid(x, 1)).Kids
+        each a in args {
+            let an = self.T.Get(a)
+            if an.Ival == 1 or an.Sval != "" { return self.lower_args(x) }
+        }
+        let line = self.T.Get(x).Line
+        var regs = []
+        each a in args {
+            let v = self.T.Kid(a, 0)
+            let r = self.own_value(v, self.lower_expr(v), line)
+            // An owner while the Box is made unique: it stays live, and so
+            // counted, until the `set` that consumes it.
+            self.mark_named(r)
+            regs.append(r)
+        }
+        return "(" || str.join(regs, ",") || ")"
+    }
+
+    // lower_box_set lowers `L.set(args)` with L's Box made unique first.
+    // Returns "" when L is not an lvalue this covers, and the caller lowers
+    // an ordinary method call.
+    func lower_box_set(mut self, x int, base int) str throws LowerError {
+        let line = self.T.Get(x).Line
+        let bk = self.T.Kind(base)
+        if bk == ast.IDENT {
+            if not self.is_var(self.T.Get(base).Sval) { return "" }
+            let thr = self.pre_count(base)
+            let margs = self.lower_set_args(x)
+            // In a variable closures capture, under its frame's lock, as a
+            // store is (var_root): `set` replaces the Box's value in place.
+            let vr = self.var_root(base)
+            if vr != "" { self.emit(line, "VARLOCK", [vr]) }
+            let rb = self.cow_ident(base, thr)
+            let rd = self.new_reg()
+            self.emit(line, "CALLM", [rd, rb, "set", margs])
+            if vr != "" { self.emit(line, "VARUNLOCK", [vr]) }
+            return rd
+        }
+        if bk == ast.FIELD {
+            let ob = self.T.Kid(base, 0)
+            if self.T.Kind(ob) == ast.IDENT and
+               not self.is_var(self.T.Get(ob).Sval) {
+                return ""                    // a package member, a type
+            }
+            let fname = self.T.Get(base).Sval
+            // In a variable closures capture the whole write holds its
+            // frame's lock (var_root) — the arguments, which may run Voilà
+            // code, are lowered first.
+            let vr = self.var_root(base)
+            var margs = ""
+            if vr != "" {
+                margs = self.lower_set_args(x)
+                self.emit(line, "VARLOCK", [vr])
+            }
+            // The OUTER value is made unique too: `bx2.b.set(5)` with `bx2`
+            // a second name for a Box must not write through the first.
+            let ro = self.assign_base(ob)
+            if vr == "" { margs = self.lower_set_args(x) }
+            // The field is read AFTER the arguments, into a temporary — so
+            // the Box is held by the field and by the temporary: 2. Written
+            // back only when copied, so a tuple member (which cannot be
+            // assigned) holding a cell is never written to at all.
+            let rb = self.new_reg()
+            self.emit(line, "FIELD", [rb, ro, fname])
+            self.emit(line, "UNIQ", [rb, rb, "2", "fld", ro, fname])
+            let rd = self.new_reg()
+            self.emit(line, "CALLM", [rd, rb, "set", margs])
+            if vr != "" { self.emit(line, "VARUNLOCK", [vr]) }
+            return rd
+        }
+        if bk == ast.INDEX {
+            let ix = self.T.Kid(base, 1)
+            if self.T.NKids(base) != 2 or self.T.Get(base).Ival2 != 0 or
+               self.T.Kind(ix) == ast.RANGE {
+                return ""
+            }
+            // In a variable closures capture: the arguments and an index
+            // that runs Voilà code first, then the write under the lock.
+            let vr = self.var_root(base)
+            var margs = ""
+            var ri = ""
+            if vr != "" {
+                margs = self.lower_set_args(x)
+                ri = self.lower_expr(ix)
+                self.emit(line, "VARLOCK", [vr])
+            }
+            let rc = self.assign_base(self.T.Kid(base, 0))
+            if vr == "" {
+                ri = self.lower_expr(ix)
+                margs = self.lower_set_args(x)
+            }
+            let rb = self.new_reg()
+            self.emit(line, "INDEX", [rb, rc, ri])
+            self.emit(line, "UNIQ", [rb, rb, "2", "idx", rc, ri])
+            let rd = self.new_reg()
+            self.emit(line, "CALLM", [rd, rb, "set", margs])
+            if vr != "" { self.emit(line, "VARUNLOCK", [vr]) }
+            return rd
+        }
+        return ""
+    }
+
+    // assign_base lowers the BASE of a field or element assignment. A base
+    // that is a variable is made unique first (a Box written through must
+    // not be seen through another owner); anything else is lowered as is.
+    // The threshold is the one lower_assign counted before the value, when
+    // it did (pendThr), else a name's usual 1.
+    func assign_base(mut self, b int) str throws LowerError {
+        var thr = "1"
+        if self.pendThr != "" {
+            thr = self.pendThr
+            self.pendThr = ""
+        }
+        if self.T.Kind(b) == ast.IDENT {
+            // A `mut` parameter is written in place; it is counted (and so
+            // possibly copied) only when lower_assign took its count.
+            if self.is_mut_param(self.T.Get(b).Sval) and thr == "1" {
+                return self.lower_expr(b)
+            }
+            let r = self.cow_ident(b, thr)
+            if r != "" { return r }
+        }
+        // `self.x = v` in a `mut self` method: written in place, unless the
+        // value took a reference to `self` (the count lower_assign took
+        // first says so) — then the write goes to the method's own copy, as
+        // for a `mut` parameter, and no Box can come to hold its holder.
+        if self.T.Kind(b) == ast.SELF and thr != "1" {
+            let r = self.cow_ident(b, thr)
+            if r != "" { return r }
+        }
+        // A deeper base — `a.b.c = v`, `xs[i].x = v` — is made unique at
+        // EVERY level (uniq_path): a struct reached through a field or an
+        // element may be held by another name too. The root takes the
+        // count lower_assign took, when it took one.
+        let bk = self.T.Kind(b)
+        if bk == ast.FIELD or bk == ast.INDEX {
+            self.rootThr = thr
+            let r = self.uniq_path(b, "2")
+            self.rootThr = ""
+            return r
+        }
+        return self.lower_expr(b)
+    }
+
+    // uniq_path lowers an lvalue PATH that is about to be written through —
+    // the base of a field or element assignment, the receiver of a `mut self`
+    // method, an argument to a `mut` parameter — and makes each level of it
+    // unique, outermost first:
+    //
+    //     a.b.c = v       UNIQ a (the name);  t1 = a.b, UNIQ t1 fld a b;
+    //                     SETFLD t1 c v
+    //
+    // A level is read into a temporary, so the location and the temporary
+    // hold it: the threshold is 2 (`last` for the innermost level, which a
+    // caller that already holds one more reference raises to 3). A level that
+    // is copied is written back where it was read from, so the outer value
+    // sees the new one and every other holder keeps the old. Over-counting —
+    // a stale temporary that still holds a level — only costs a copy: the
+    // copy is written back, so the write still lands in the location.
+    //
+    // Roots that are written IN PLACE are left alone: `self` (a `mut self`
+    // receiver is the caller's, made unique by the caller) and a `mut`
+    // parameter (likewise). A package member or a type name is no lvalue.
+    func uniq_path(mut self, b int, last str) str throws LowerError {
+        let n = self.T.Get(b)
+        if n.Kind == ast.FIELD {
+            let ob = self.T.Kid(b, 0)
+            if self.T.Kind(ob) == ast.IDENT and
+               not self.is_var(self.T.Get(ob).Sval) {
+                return self.lower_expr(b)        // a package member, a type
+            }
+            let ro = self.path_base(ob)
+            let rb = self.new_reg()
+            self.emit(n.Line, "FIELD", [rb, ro, n.Sval])
+            self.emit(n.Line, "UNIQ", [rb, rb, last, "fld", ro, n.Sval])
+            self.pathTemps.append(rb)
+            return rb
+        }
+        if n.Kind == ast.INDEX {
+            let ix = self.T.Kid(b, 1)
+            // A tuple member (`t.0`, Ival2 1) cannot be written back, and a
+            // slice by a range is a new value, not a location.
+            if self.T.NKids(b) != 2 or n.Ival2 != 0 or
+               self.T.Kind(ix) == ast.RANGE {
+                return self.lower_expr(b)
+            }
+            let rc = self.path_base(self.T.Kid(b, 0))
+            let ri = self.lower_expr(ix)
+            let rb = self.new_reg()
+            self.emit(n.Line, "INDEX", [rb, rc, ri])
+            self.emit(n.Line, "UNIQ", [rb, rb, last, "idx", rc, ri])
+            self.pathTemps.append(rb)
+            return rb
+        }
+        let vn = root_name(n)
+        if vn != "" {
+            let rt = self.rootThr
+            self.rootThr = ""
+            if self.is_var(vn) and not self.is_mut_param(vn) {
+                let r = self.cow_ident(b, "1")
+                if r != "" { return r }
+            } else if rt != "" and rt != "1" and self.is_mut_param(vn) {
+                // A `mut` parameter or `mut self` root, counted before the
+                // value (pre_count): copied only if the value captured it.
+                let r = self.cow_ident(b, rt)
+                if r != "" { return r }
+            }
+        }
+        return self.lower_expr(b)
+    }
+
+    // var_root is the variable a write path `b` is rooted at when closures
+    // capture that variable — its register, or its `^name` upvalue — and ""
+    // otherwise. A write through it is done holding the variable's lock
+    // (VARLOCK … VARUNLOCK, vl_varlock): the variable is shared with every
+    // task that runs one of those closures (§10), and its copy-on-write
+    // judges uniqueness by reference counts. Without the lock another
+    // writer's path temporaries would inflate the count, and the copy this
+    // write made would be stored back over that writer's store (39's
+    // `spawn { out[j] = j * 10 }` lost elements). Under it, writers take
+    // turns, and every count they see is a real holder's — a snapshot
+    // (`let row = out[0]`) is copied away from exactly as without tasks.
+    func var_root(mut self, b int) str {
+        var r = b
+        while true {
+            let k = self.T.Kind(r)
+            if k == ast.FIELD or (k == ast.INDEX and self.T.NKids(r) == 2) {
+                r = self.T.Kid(r, 0)
+                continue
+            }
+            break
+        }
+        let n = self.T.Get(r)
+        if n.Kind != ast.IDENT { return "" }
+        let name = n.Sval
+        if not self.found(name) { return "" }        // a global, a package
+        if self.is_local(name) and not (name in self.capNames) { return "" }
+        return self.lookup(name)
+    }
+
+    // flush_mut_args stores back, once a call has returned, the private
+    // copies unique_mut_args handed its `mut` parameters for captured
+    // variables (copy-out; assign_to takes each variable's lock).
+    func flush_mut_args(mut self, line int) throws LowerError {
+        each i, v in self.pendWB {
+            self.assign_to(v, self.pendWBR[i], tok.ASSIGN, line, 0)
+        }
+        self.pendWB = []
+        self.pendWBR = []
+        self.drop_pre(self.pendPre)
+        self.pendPre = []
+    }
+
+    // drop_mut_args forgets the copy-outs a `spawn f(…)` would have needed:
+    // its call runs in the task, later, so nothing may be stored back here
+    // — and the checker refuses a captured variable handed to a `mut`
+    // parameter there (spawn_call), so there are none to forget.
+    func drop_mut_args(mut self) {
+        self.pendWB = []
+        self.pendWBR = []
+        self.drop_pre(self.pendPre)
+        self.pendPre = []
+    }
+
+    // uses_in_place reports whether every use of `name` under `node` runs
+    // the closure it names in place, on this task: a call `name(…)`, or a
+    // straight argument of a builtin collection method that runs it at once
+    // (sync_builtin, judged by the receiver's static type). Any other use —
+    // stored, sent, returned, assigned, handed to another function or method
+    // — may let it escape. By name: a use of an inner binding of the same
+    // name counts against it too, which only errs toward escaping.
+    func uses_in_place(mut self, node int, name str) bool {
+        if node == 0 { return true }
+        let n = self.T.Get(node)
+        if n.Kind == ast.IDENT { return n.Sval != name }
+        // Anything named inside a `spawn` runs on another task — even a
+        // plain call (`spawn f()`).
+        if n.Kind == ast.SPAWNEXPR { return not mentions(self.T, node, name) }
+        if n.Kind == ast.CALL {
+            let callee = self.T.Kid(node, 0)
+            var syncArgs = false
+            // `name(…)` is a call, in place; any other callee is judged as
+            // an expression of its own.
+            let selfCall = self.T.Kind(callee) == ast.IDENT and
+                           self.T.Get(callee).Sval == name
+            if not selfCall {
+                if self.T.Kind(callee) == ast.FIELD {
+                    syncArgs = sync_builtin(self.T.Get(callee).Sval) and
+                               coll_type(self.st(self.T.Kid(callee, 0)))
+                }
+                if not self.uses_in_place(callee, name) { return false }
+            }
+            each a in self.T.Get(self.T.Kid(node, 1)).Kids {
+                let av = self.T.Kid(a, 0)
+                if syncArgs and self.T.Kind(av) == ast.IDENT and
+                   self.T.Get(av).Sval == name {
+                    continue
+                }
+                if not self.uses_in_place(av, name) { return false }
+            }
+            return true
+        }
+        if (n.Kind == ast.ARM or n.Kind == ast.IF) and n.Ival != 0 {
+            if not self.uses_in_place(n.Ival, name) { return false }
+        }
+        each c in n.Kids {
+            if not self.uses_in_place(c, name) { return false }
+        }
+        return true
+    }
+
+    // written_in adds the names a subtree may WRITE after binding them —
+    // nested closures included, since they may run at any later time:
+    //   - the root of every assignment target, compound ones too (`x = …`,
+    //     `x += …`, `x.f = …`, `x[i] = …`, each member of `a, b = …`);
+    //   - the root of the receiver of every method some declaration (or a
+    //     builtin) writes as `mut self` (`x.append(…)`, `x.bump()`, Box
+    //     `set`);
+    //   - the root of every argument to a `mut` parameter of a known
+    //     function, to a native's writing position (native_mut_positions),
+    //     and to ANY call whose callee's modes are unknown — a closure
+    //     value, a method — since it may take the argument `mut`;
+    //   - every name a PARSE term binds.
+    // A captured binding not among them keeps the value it was made with,
+    // so reading it needs no lock (VARREAD "fixed").
+    func written_in(mut self, node int, out mut set[str]) {
+        if node == 0 { return }
+        let n = self.T.Get(node)
+        if n.Kind == ast.ASSIGN {
+            let t = self.T.Kid(node, 0)
+            if self.T.Kind(t) == ast.TUPLE {
+                each m in self.T.Get(t).Kids { self.written_root(m, out) }
+            } else {
+                self.written_root(t, out)
+            }
+        }
+        if n.Kind == ast.PARSETERM and n.Ival == 0 { out.add(n.Sval) }
+        if n.Kind == ast.CALL {
+            let callee = self.T.Kid(node, 0)
+            let args = self.T.Get(self.T.Kid(node, 1)).Kids
+            var params = []
+            var npos = []
+            var known = false
+            if self.T.Kind(callee) == ast.FIELD {
+                let recv = self.T.Kid(callee, 0)
+                let mn = self.T.Get(callee).Sval
+                if mn in self.mutMethods { self.written_root(recv, out) }
+                if self.T.Kind(recv) == ast.IDENT and
+                   self.is_pkg_qualifier(self.T.Get(recv).Sval) {
+                    let qn = self.T.Get(recv).Sval || "." || mn
+                    if qn in self.funcDecl {
+                        params = self.T.Get(self.T.Kid(self.funcDecl[qn],
+                                                       1)).Kids
+                        known = true
+                    } else {
+                        npos = native_mut_positions(qn)
+                        known = true          // a package's native
+                    }
+                }
+            } else if self.T.Kind(callee) == ast.IDENT {
+                let fnm = self.T.Get(callee).Sval
+                if fnm in self.funcDecl {
+                    params = self.T.Get(self.T.Kid(self.funcDecl[fnm], 1)).Kids
+                    known = true
+                } else if fnm in self.prelude {
+                    npos = native_mut_positions(fnm)
+                    known = true
+                }
+            }
+            each j, a in args {
+                let av = self.T.Kid(a, 0)
+                var w = not known or j in npos
+                if j < len(params) {
+                    w = (self.T.Get(params[j]).Ival2 & 3) == ast.MODE_MUT
+                }
+                if w { self.written_root(av, out) }
+            }
+        }
+        if (n.Kind == ast.ARM or n.Kind == ast.IF) and n.Ival != 0 {
+            self.written_in(n.Ival, out)
+        }
+        each c in n.Kids { self.written_in(c, out) }
+    }
+
+    // written_root adds the variable a path is rooted at, if any.
+    func written_root(self, t int, out mut set[str]) {
+        var r = t
+        while self.T.Kind(r) == ast.FIELD or self.T.Kind(r) == ast.INDEX {
+            r = self.T.Kid(r, 0)
+        }
+        if self.T.Kind(r) == ast.IDENT { out.add(self.T.Get(r).Sval) }
+    }
+
+    // captured_name: a variable that closures capture — an upvalue here
+    // (`op` is `^name`), or a local some closure in this function names.
+    func captured_name(self, name str, op str) bool {
+        if str.starts_with(op, "^") { return true }
+        return self.is_local(name) and name in self.capNames
+    }
+
+    // kill_path KILLs the path temporaries recorded since `mark` (the
+    // length of pathTemps when the caller began), once the write they served
+    // is done. A nested write inside the path's own index expression kills
+    // its own and leaves the outer ones — hence the mark.
+    func kill_path(mut self, mark int, line int) {
+        var i = mark
+        while i < len(self.pathTemps) {
+            self.emit(line, "KILL", [self.pathTemps[i]])
+            i += 1
+        }
+        self.pathTemps = self.pathTemps[0..mark]
+    }
+
+    // pure_path reports whether an lvalue path can be evaluated a second
+    // time with no observable effect: names, `self`, fields, and indices
+    // that are names or literals. unique_mut_args re-reads such a path; one
+    // with a call in an index (`bump(xs[next()])`) is passed as lowered.
+    func pure_path(self, b int) bool {
+        let n = self.T.Get(b)
+        if n.Kind == ast.IDENT or n.Kind == ast.SELF { return true }
+        if n.Kind == ast.FIELD { return self.pure_path(self.T.Kid(b, 0)) }
+        if n.Kind == ast.INDEX and self.T.NKids(b) == 2 {
+            let ik = self.T.Kind(self.T.Kid(b, 1))
+            if ik != ast.IDENT and ik != ast.INT and ik != ast.STR {
+                return false
+            }
+            return self.pure_path(self.T.Kid(b, 0))
+        }
+        return false
+    }
+
+    // path_base is one OUTER level of uniq_path: a field or element base is
+    // a path in its turn, anything else is uniq_path's root rule.
+    func path_base(mut self, b int) str throws LowerError {
+        return self.uniq_path(b, "2")
+    }
+
+    // recv_path lowers the receiver of a call to a method some declaration
+    // writes as `mut self` (Lowerer.mutMethods): an lvalue receiver is made
+    // unique, so the method's in-place writes reach that location and no
+    // other holder of the value.
+    func recv_path(mut self, base int) str throws LowerError {
+        let k = self.T.Kind(base)
+        if k == ast.IDENT or k == ast.FIELD or k == ast.INDEX {
+            return self.uniq_path(base, "2")
+        }
+        return self.lower_expr(base)
+    }
+
+    // unique_mut_args makes each Box a caller passes BY NAME to a `mut`
+    // parameter unique before the call (see the header), rewriting the
+    // argument register when the name is not a local. `params` is the
+    // callee's PARAM list and `args` the call's ARG nodes; only plain
+    // positional arguments up to the first named or spread one are paired.
+    func unique_mut_args(mut self, params []int, args []int,
+                         regs mut []str) throws LowerError {
+        each j, a in args {
+            let an = self.T.Get(a)
+            if an.Ival == 1 or an.Sval != "" { return }
+            if j >= len(params) or j >= len(regs) { return }
+            let pn = self.T.Get(params[j])
+            if (pn.Ival2 & 16) != 0 { return }
+            if (pn.Ival2 & 3) != ast.MODE_MUT { continue }
+            regs[j] = self.unique_mut_arg(self.T.Kid(a, 0), regs[j])
+        }
+    }
+
+    // unique_native_args is unique_mut_args for a NATIVE that writes an
+    // argument in place (native_mut_positions: `sort.sort(xs)`,
+    // `append(xs, v)`): the native has no declaration whose modes could be
+    // read, so its writing positions are listed.
+    func unique_native_args(mut self, callee str, args []int,
+                            regs mut []str) throws LowerError {
+        let pos = native_mut_positions(callee)
+        each j, a in args {
+            let an = self.T.Get(a)
+            if an.Ival == 1 or an.Sval != "" { return }
+            if j >= len(regs) { return }
+            if not (j in pos) { continue }
+            regs[j] = self.unique_mut_arg(self.T.Kid(a, 0), regs[j])
+        }
+    }
+
+    // unique_mut_arg makes the value a `mut` argument names unique where it
+    // lives before the call — so a second holder never sees the callee's
+    // writes — and returns the register to pass. `reg` is the register the
+    // argument was lowered into.
+    //
+    // In a variable closures capture, the copy-on-write and its write-back
+    // are made under the variable's frame lock, as a store's are (var_root),
+    // and — once a closure has captured the frame, so that other tasks may
+    // reach the variable (SHAREDTHR) — the callee is handed a PRIVATE COPY,
+    // stored back under the lock when the call returns (copy-in, copy-out,
+    // flush_mut_args): the callee is Voilà code, which runs unlocked and
+    // writes its `mut` parameter in place, and a task reading the variable
+    // holds a snapshot nothing may write in place (vl_varread). In a frame
+    // no closure has captured, the call writes in place as ever.
+    func unique_mut_arg(mut self, v int, reg str) str throws LowerError {
+        let vk = self.T.Kind(v)
+        let vr = self.var_root(v)
+        let ln = self.T.Get(v).Line
+        // (A path in a captured variable is walked again even when an
+        // index on it calls code: pre_mut_indices computed those first.)
+        if (vk == ast.FIELD or vk == ast.INDEX) and
+           (self.pure_path(v) or vr != "") {
+            // A field or an element: made unique where it lives, with the
+            // copy written back (uniq_path), and the call is given the
+            // re-read value — the one that IS in the location. The argument
+            // register lowered before is dropped first, so the location and
+            // the re-read temporary are the only holders the threshold 2
+            // counts.
+            self.emit(ln, "KILL", [reg])
+            if vr != "" { self.emit(ln, "VARLOCK", [vr]) }
+            var r = self.uniq_path(v, "2")
+            if vr != "" {
+                r = self.private_copy(r, vr, ln)
+                self.emit(ln, "VARUNLOCK", [vr])
+                self.pendWB.append(v)
+                self.pendWBR.append(r)
+            }
+            return r
+        }
+        if vk != ast.IDENT { return reg }
+        let vn = self.T.Get(v).Sval
+        // A `mut` parameter forwarded is the caller's caller's Box.
+        if self.is_mut_param(vn) or not self.is_var(vn) { return reg }
+        // An argument register that is a temporary holding the value — an
+        // upvalue's, or a captured variable's snapshot (VARREAD) — is dropped
+        // first, so the count judged is the variable's own.
+        if str.starts_with(reg, "r") and reg != self.lookup(vn) {
+            self.emit(ln, "KILL", [reg])
+        }
+        if vr != "" { self.emit(ln, "VARLOCK", [vr]) }
+        var r = self.cow_ident(v, "1")
+        if vr != "" {
+            if r == "" { r = self.lower_expr(v) }
+            r = self.private_copy(r, vr, ln)
+            self.emit(ln, "VARUNLOCK", [vr])
+            self.pendWB.append(v)
+            self.pendWBR.append(r)
+        }
+        if r == "" { return reg }
+        return r
+    }
+
+    // private_copy returns a register holding what `r` holds — a copy of
+    // its own once a closure has captured the frame of the variable `vroot`
+    // (SHAREDTHR: threshold 0, so any object is copied), the same value
+    // otherwise (threshold beyond any count). Made under the variable's
+    // lock by the caller.
+    func private_copy(mut self, r str, vroot str, ln int) str {
+        let rt = self.new_reg()
+        self.emit(ln, "SHAREDTHR", [rt, vroot])
+        let rp = self.new_reg()
+        self.emit(ln, "UNIQ", [rp, r, rt])
+        return rp
+    }
+}
+
+// root_name is the variable a path ROOT names: an identifier's own name, and
+// `self` for the receiver; "" for anything else.
+func root_name(n ast.Node) str {
+    if n.Kind == ast.IDENT { return n.Sval }
+    if n.Kind == ast.SELF { return "self" }
+    return ""
+}
+
+// native_mut_positions lists the argument positions a native writes in
+// place, which the lowerer treats as `mut` parameters (unique_native_args):
+// the slice `sort.sort` and `sort.sort_by` reorder, the slice the prelude
+// `append` grows.
+func native_mut_positions(callee str) []int {
+    if callee == "sort.sort" or callee == "sort.sort_by" or callee == "append" {
+        return [0]
+    }
+    return []
+}

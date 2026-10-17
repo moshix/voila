@@ -1,0 +1,3 @@
+abort: ffi.free: not a block ffi.alloc returned (freed twice, or allocated by C — free it with C's own function)
+  at ffi.free (std/ffi/ffi.voi:79)
+  at main (tests/conformance/59_fficheck.voi:37)

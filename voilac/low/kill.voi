@@ -1,0 +1,427 @@
+// low/kill.voi — dropping single-use temporaries early (KILL).
+//
+// A register keeps its value until it is next written. For a TEMPORARY —
+// the result of a sub-expression, read once by the instruction that
+// consumes it — that is too long: `while i < len(self.items)` leaves
+// `self.items` in the register that fed `len` for the whole loop body, and
+// copy-on-write (boxcow.voi, vl_cow_unique) then counts it as a second
+// owner and copies the slice on every write through `self.items`. That is
+// correct and quadratic.
+//
+// So, after lowering, every register is KILLed right after the last
+// instruction that can read it on any path (kill_live, a backward liveness
+// analysis); cg emits `vl_set(&F->r[n], vl_nil())`, which is the release the
+// next write would have done anyway, earlier. A dead register then never
+// counts as a holder of the value, which is what lets copy-on-write count
+// holders exactly. The analysis can only OVER-estimate liveness — an
+// instruction it does not know is taken to read every register it names —
+// so a KILL never drops a value something will still read.
+//
+// A function with an exception HANDLER uses a straight-line rule instead
+// (kill_local): the IR leaves the edges from every protected instruction to
+// the handler implicit, and liveness without them would be wrong.
+package low
+
+use "voilac/ir"
+use "std/str"
+
+// insert_kills adds the KILLs to function fi: by LIVENESS where the
+// control flow is fully visible (kill_live), else by the straight-line rule
+// below (a function with an exception handler, whose edges from every
+// protected instruction to its handler the IR does not spell out).
+func insert_kills(m mut ir.Module, fi int) {
+    var eh = false
+    each ins in m.Funcs[fi].Instrs {
+        if ins.Op == "EHPUSH" { eh = true }
+    }
+    if not eh {
+        kill_live(m, fi)
+        return
+    }
+    kill_local(m, fi)
+}
+
+// pinned marks the registers no KILL may touch: those a descendant closure
+// addresses as an upvalue (it reads the frame slot, not a token), and those
+// a pattern or a parse writes through the frame.
+func pinned(m ir.Module, fi int) []bool {
+    let f = m.Funcs[fi]
+    var keep = []
+    var i = 0
+    while i < f.NRegs {
+        keep.append(false)
+        i += 1
+    }
+    let prefix = f.Name || "$fn"
+    each g in m.Funcs {
+        if str.starts_with(g.Name, prefix) {
+            each u in g.Ups {
+                if u.Slot >= 0 and u.Slot < f.NRegs { keep[u.Slot] = true }
+            }
+        }
+    }
+    each ins in f.Instrs {
+        if ins.Pat != 0 or len(ins.Terms) > 0 {
+            each a in ins.Args {
+                each r in regs_of(a) {
+                    if r >= 0 and r < f.NRegs { keep[r] = true }
+                }
+            }
+            each t in ins.Terms {
+                each r in regs_of(t.Reg) {
+                    if r >= 0 and r < f.NRegs { keep[r] = true }
+                }
+            }
+        }
+    }
+    return keep
+}
+
+// kill_live is a backward LIVENESS analysis per register. A register is
+// live after instruction i when some path from i reaches an instruction that
+// READS it before one that writes it. Every occurrence of a register is a
+// read, except argument 0 of an instruction that certainly only WRITES its
+// argument 0 (pure_def) — so the analysis can only over-estimate liveness,
+// never under-estimate it: a KILL lands only where no later instruction on
+// any path can see the register's value. Named registers are killed too
+// once dead (nothing reads a name's slot except through its token, an
+// upvalue — pinned — or a pattern/parse — pinned), and that is the point:
+// `let g = gs[0]` inside a loop no longer holds the element across the next
+// write to `gs[0]`.
+func kill_live(m mut ir.Module, fi int) {
+    // The lowerer's own plain KILLs (kill_path, a stored value, a replaced
+    // argument) say nothing liveness will not say again, and earlier or at
+    // the same place: they are dropped first, so no register is killed
+    // twice. A KILL carrying a label stays (it is a jump target), and so
+    // does a scope-end one ("v": the dead named values liveness keeps).
+    var kept = []
+    each ins in m.Funcs[fi].Instrs {
+        if ins.Op == "KILL" and len(ins.Args) == 1 and len(ins.Labels) == 0 {
+            continue
+        }
+        kept.append(ins)
+    }
+    m.Funcs[fi].Instrs = kept
+    let f = m.Funcs[fi]
+    let n = len(f.Instrs)
+    let nr = f.NRegs
+    if n == 0 or nr == 0 { return }
+    var keep = pinned(m, fi)
+    // A NAMED register is dropped early only when its type is plain
+    // (ir.Func.Plain): a binding that may hold a `shared` value keeps it —
+    // and every `weak` handle to it — alive to the end of its scope (§6.3).
+    var plain = []
+    var pi = 0
+    while pi < nr {
+        plain.append(false)
+        pi += 1
+    }
+    each pr in f.Plain {
+        if pr >= 0 and pr < nr { plain[pr] = true }
+    }
+    each nr2 in f.Named {
+        if nr2 >= 0 and nr2 < nr and not plain[nr2] { keep[nr2] = true }
+    }
+
+    // Control flow: label → instruction, then successors and predecessors.
+    var at = make(map[str]int)
+    each ii, ins in f.Instrs {
+        each l in ins.Labels { at[l] = ii }
+    }
+    var preds = []
+    each ins in f.Instrs { preds.append([]) }
+    var succs = []
+    each ii, ins in f.Instrs {
+        var ss = []
+        if not ends_flow(ins.Op) and ii + 1 < n { ss.append(ii + 1) }
+        each a in ins.Args {
+            if len(a) >= 2 and a[0] == 'L' and a[1] >= '0' and a[1] <= '9' and
+               a in at {
+                ss.append(at[a])
+            }
+        }
+        succs.append(ss)
+        each t in ss { preds[t].append(ii) }
+    }
+
+    // Occurrences per register, in instruction order.
+    var occ = []
+    var i = 0
+    while i < nr {
+        occ.append([])
+        i += 1
+    }
+    var defs = []
+    // stamp[r] = the last instruction r was recorded at (one occurrence per
+    // instruction), instead of a fresh set per instruction.
+    var stamp = []
+    i = 0
+    while i < nr {
+        stamp.append(0 - 1)
+        i += 1
+    }
+    each ii, ins in f.Instrs {
+        var d = 0 - 1
+        if len(ins.Args) > 0 and pure_def(ins.Op) {
+            let r0 = reg_exact(ins.Args[0])
+            if r0 >= 0 and r0 < nr { d = r0 }
+        }
+        defs.append(d)
+        // A KILL the lowerer placed reads nothing: it is no occurrence.
+        if ins.Op == "KILL" { continue }
+        each a in ins.Args {
+            each r in regs_of(a) {
+                if r >= 0 and r < nr and stamp[r] != ii {
+                    stamp[r] = ii
+                    occ[r].append(ii)
+                }
+            }
+        }
+    }
+
+    var kills = []
+    each ins in f.Instrs { kills.append([]) }
+    var any = false
+    var live = []        // live-in, per instruction, for the register at hand
+    i = 0
+    while i < n {
+        live.append(false)
+        i += 1
+    }
+    var r = 0
+    while r < nr {
+        if keep[r] or len(occ[r]) == 0 {
+            r += 1
+            continue
+        }
+        // Seed: every occurrence that READS r is live-in; then walk the
+        // predecessors back, stopping at a pure write of r.
+        var touched = []
+        var work = []
+        each ii in occ[r] {
+            if defs[ii] != r or reads_also(f.Instrs[ii], r) {
+                if not live[ii] {
+                    live[ii] = true
+                    touched.append(ii)
+                    work.append(ii)
+                }
+            }
+        }
+        while len(work) > 0 {
+            let x = must work.pop()
+            each p in preds[x] {
+                if live[p] { continue }
+                if defs[p] == r { continue }    // written there: dead above
+                live[p] = true
+                touched.append(p)
+                work.append(p)
+            }
+        }
+        // A KILL after each occurrence that no path continues to read from.
+        each ii in occ[r] {
+            var liveOut = false
+            each sx in succs[ii] {
+                if live[sx] { liveOut = true }
+            }
+            // (Never after a KILL the lowerer already placed: it is one.)
+            let op = f.Instrs[ii].Op
+            if not liveOut and not ends_flow(op) and not branches(op) and
+               op != "KILL" {
+                kills[ii].append(r)
+                any = true
+            }
+        }
+        each t in touched { live[t] = false }
+        r += 1
+    }
+    if not any { return }
+    var out = []
+    each ii, ins in f.Instrs {
+        out.append(ins)
+        each kr in kills[ii] {
+            out.append(ir.Instr{Labels: [], Op: "KILL", Args: ["r" || str(kr)],
+                                Pat: 0, Terms: [], Src: 0})
+        }
+    }
+    m.Funcs[fi].Instrs = out
+}
+
+// reads_also: an instruction that writes r as argument 0 and reads it too
+// (`ADD r1,r1,r2`).
+func reads_also(ins ir.Instr, r int) bool {
+    each ai, a in ins.Args {
+        if ai == 0 { continue }
+        each x in regs_of(a) {
+            if x == r { return true }
+        }
+    }
+    return false
+}
+
+// reg_exact is the register an argument IS ("r7"), or -1.
+func reg_exact(a str) int {
+    if len(a) < 2 or a[0] != 'r' { return 0 - 1 }
+    let v = to_int(a[1..len(a)])
+    if v == nil { return 0 - 1 }
+    return v
+}
+
+// ends_flow: control never falls through to the next instruction.
+func ends_flow(op str) bool {
+    return op == "JUMP" or op == "RET" or op == "THROW" or
+           op == "RETHROW" or op == "ABORT"
+}
+
+// branches: an instruction that may jump — a KILL after it would run on
+// one path only; none is placed there.
+func branches(op str) bool {
+    return op == "JMPF" or op == "JMPT" or op == "ITNEXT" or
+           str.starts_with(op, "SEL") or op == "EHPUSH" or op == "ARGDEF"
+}
+
+// pure_def: the instructions whose argument 0 is a register they only
+// WRITE (a destination), and read nowhere else but through their other
+// arguments. Anything not listed counts its argument 0 as a read too —
+// the safe direction for the analysis.
+func pure_def(op str) bool {
+    if op == "LOADK" or op == "MOVE" or op == "FIELD" or op == "INDEX" or
+       op == "SLICE" or op == "CALL" or op == "CALLR" or op == "CALLM" or
+       op == "CALLT" or op == "NEWSTRUCT" or op == "NEWSLICE" or
+       op == "NEWMAP" or op == "NEWSET" or op == "NEWENUM" or
+       op == "NEWRANGE" or op == "NEWCHAN" or op == "TUPLE" or
+       op == "TOSTR" or op == "INTERP" or op == "CONV" or op == "TYPEOF" or
+       op == "RCOUNT" or op == "GETGLB" or op == "LOADFN" or
+       op == "MKCLOS" or op == "ZERO" or op == "SELFTY" or
+       op == "VARREAD" or op == "SHAREDTHR" {
+        return true
+    }
+    if op == "ADD" or op == "SUB" or op == "MUL" or op == "DIV" or
+       op == "IDIV" or op == "MOD" or op == "POW" or op == "NEG" or
+       op == "NOT" or op == "BAND" or op == "BOR" or op == "BXOR" or
+       op == "BNOT" or op == "SHL" or op == "SHR" or op == "CAT" {
+        return true
+    }
+    return str.starts_with(op, "CMP")
+}
+
+// kill_local is the straight-line rule, for a function with a handler.
+func kill_local(m mut ir.Module, fi int) {
+    let f = m.Funcs[fi]
+    let n = f.NRegs
+    if n == 0 { return }
+    var keep = pinned(m, fi)
+    var defAt = []
+    var useAt = []
+    var count = []
+    var i = 0
+    while i < n {
+        if i < f.NParams { keep[i] = true }
+        defAt.append(0 - 1)
+        useAt.append(0 - 1)
+        count.append(0)
+        i += 1
+    }
+    each r in f.Named {
+        if r >= 0 and r < n { keep[r] = true }
+    }
+    each ii, ins in f.Instrs {
+        each ai, a in ins.Args {
+            each r in regs_of(a) {
+                if r < 0 or r >= n { continue }
+                count[r] += 1
+                if ai == 0 and a == "r" || str(r) {
+                    defAt[r] = ii
+                } else {
+                    useAt[r] = ii
+                }
+            }
+        }
+    }
+    var kills = []
+    each ins in f.Instrs { kills.append([]) }
+    var any = false
+    i = 0
+    while i < n {
+        let d = defAt[i]
+        let u = useAt[i]
+        if not keep[i] and count[i] == 2 and d >= 0 and u > d and
+           reader_op(f.Instrs[u].Op) and no_labels(f, d + 1, u) {
+            kills[u].append(i)
+            any = true
+        }
+        i += 1
+    }
+    if not any { return }
+    var out = []
+    each ii, ins in f.Instrs {
+        out.append(ins)
+        each r in kills[ii] {
+            out.append(ir.Instr{Labels: [], Op: "KILL", Args: ["r" || str(r)],
+                                Pat: 0, Terms: [], Src: 0})
+        }
+    }
+    m.Funcs[fi].Instrs = out
+}
+
+// no_labels reports whether no instruction from..to (inclusive) carries a
+// label — a jump target inside the range would reach U without passing D.
+func no_labels(f ir.Func, from int, to int) bool {
+    var k = from
+    while k <= to {
+        if len(f.Instrs[k].Labels) > 0 { return false }
+        k += 1
+    }
+    return true
+}
+
+// reader_op: the instructions that only READ the operand in question and
+// fall through to the next — the ones a KILL may follow. A constructor, a
+// store and a MOVE take their own reference to the value they read, so the
+// temporary that fed them is dead the moment they are done. (A store WRITES
+// through its argument 0, but argument 0 is never the use counted here.)
+func reader_op(op str) bool {
+    if op == "NEWSTRUCT" or op == "NEWSLICE" or op == "NEWMAP" or
+       op == "NEWSET" or op == "NEWENUM" or op == "TUPLE" or
+       op == "SETFLD" or op == "SETIDX" or op == "SETGLB" or op == "UPSET" or
+       op == "SEND" or op == "MOVE" {
+        return true
+    }
+    if op == "CALL" or op == "CALLR" or op == "CALLM" or op == "CALLT" {
+        return true
+    }
+    if op == "FIELD" or op == "INDEX" or op == "SLICE" or op == "TOSTR" or
+       op == "INTERP" or op == "CONV" or op == "TYPEOF" or op == "SAY" {
+        return true
+    }
+    return str.starts_with(op, "CMP")
+}
+
+// regs_of lists the register numbers named in one argument string — a
+// plain `r5`, or the registers inside `(r1,r2)`, `(name:r3)`, `r4...`.
+func regs_of(a str) []int {
+    var out = []
+    let n = len(a)
+    var i = 0
+    while i < n {
+        if a[i] == 'r' and (i == 0 or not word_byte(a[i - 1])) {
+            var j = i + 1
+            var v = 0
+            var got = false
+            while j < n and a[j] >= '0' and a[j] <= '9' {
+                v = v * 10 + (a[j] - 48)
+                got = true
+                j += 1
+            }
+            if got and (j >= n or not word_byte(a[j])) { out.append(v) }
+            i = j
+        } else {
+            i += 1
+        }
+    }
+    return out
+}
+
+func word_byte(c int) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+           (c >= '0' and c <= '9') or c == '_' or c == '$'
+}

@@ -1,0 +1,13 @@
+`?int` is used in arithmetic
+a key of `map[str]int` must be `str`, but `int` is given
+`f` takes 1 argument, but 2 are given
+`len` takes a string or a collection, but `int` is given
+cannot iterate `int`
+`int` has no field `x`
+3 names but the value is a tuple of 2 members
+an index of `[]int` is an integer position, but `str` is given
+argument 1 of `str.trim` must be a str or a rune, but `(int, str, str)` is given
+`ok` is `bool`, but its initialiser is `int`
+!:27:
+!:28:
+!:29:

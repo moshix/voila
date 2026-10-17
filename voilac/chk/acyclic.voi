@@ -4,6 +4,14 @@
 // direct field of a named type, and shared[T]/cell[T] — the type graph must
 // be a DAG. Collection and optional edges are tree-shaped by construction and
 // are excluded; weak[T] never owns.
+//
+// Box[T] is excluded too, and for the same reason the spec gives (§6.3): a
+// Box is a UNIQUE owner, so the value it holds has exactly one parent and the
+// recursion it carries is a tree — `Node(v T, l Box[Tree[T]], …)` is the
+// spelling of a recursive sum type. A DIRECT self-reference
+// (`Node(l Tree[T])`) is NOT boxed for the program: the spec admits
+// self-reference "only through weak[T] or ?Box[T]", so the indirection is
+// written where it happens and the diagnostic says which spelling to use.
 package chk
 
 use "voilac/ast"
@@ -56,6 +64,11 @@ impl Checker {
         let tn = self.T.Get(te)
         var to = ""
         if tn.Kind == ast.TNAMED {
+            // The predeclared Box (not a program's own type of that name).
+            if tn.Sval == "Box" and not ("Box" in self.structs) and
+               not ("Box" in self.enums) {
+                return
+            }
             to = tn.Sval
         } else if tn.Kind == ast.TBOX {
             // The box kind is in Ival2: 0 shared, 1 cell, 2 weak. A weak box
@@ -98,7 +111,9 @@ impl Checker {
                     self.report_at(e.node,
                                    "type `{start}` forms an ownership cycle " ||
                                    "through field `{e.field}`; use " ||
-                                   "`weak[{start}]` for a back-edge")
+                                   "`weak[{start}]` for a back-edge, or " ||
+                                   "`Box[…]`/`?Box[…]` for a tree-shaped " ||
+                                   "recursive field")
                     continue
                 }
                 if not (e.to in seen) {

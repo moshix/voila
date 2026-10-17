@@ -1,0 +1,9 @@
+narrow_paths.voi:11:40: `?int` is used in arithmetic
+narrow_paths.voi:16:40: `?int` is used in arithmetic
+narrow_paths.voi:21:39: `?int` is used in arithmetic
+narrow_paths.voi:26:44: `?int` is used in arithmetic
+narrow_paths.voi:31:47: `?int` is used in arithmetic
+narrow_paths.voi:36:52: `?int` is used in arithmetic
+narrow_paths.voi:44:13: `?int` is used in arithmetic
+narrow_paths.voi:49:17: `?int` is used in arithmetic
+!narrow_paths.voi:56:

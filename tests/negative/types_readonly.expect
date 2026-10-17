@@ -1,0 +1,8 @@
+`bump` writes its receiver (`mut self`), but `self` is read-only in a method that does not take `mut self`
+`bumpp` takes `p` as `mut`, but `self` is read-only
+`bumpp` takes `p` as `mut`, but `p` is a borrowed parameter
+`bump` writes its receiver (`mut self`), but a tuple member cannot be written
+!:12:
+!:16:
+!:21:
+!:22:

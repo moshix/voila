@@ -1,0 +1,97 @@
+// Closures over loop variables (§10): each iteration is a fresh binding, as
+// in Go 1.22, so a closure created in an iteration keeps THAT iteration's
+// values — whether it is called at once, stored and called later, deferred,
+// spawned, or nested inside another closure. (This program was a backend
+// refusal until the per-iteration environments; it was the fixture
+// tests/negative-native/loopcapture.voi.)
+
+func counter() fn() int {
+    var n = 0
+    return fn() int {
+        n += 1
+        return n
+    }
+}
+
+func main() {
+    // Called at once: the original report.
+    let ts = [1, 2, 3]
+    let xs = [1, 2, 3, 4, 5]
+    for t in ts { say len(xs.filter(fn(x) { x > t })) }
+
+    // Stored and called after the loop.
+    var fs = []
+    for i in 1..4 { fs.append(fn() int { return i }) }
+    each f in fs { say f() }
+
+    // Both loop variables of `each`, and a `let` in the body.
+    var gs = []
+    each k, v in ["a", "b"] {
+        let w = v || "!"
+        gs.append(fn() str { return "{k}{w}" })
+    }
+    each g in gs { say g() }
+
+    // A `while` loop's body variable, captured beside an outer one that is
+    // declared BEFORE the loop and therefore shared by every closure.
+    var hits = 0
+    var hs = []
+    var i = 0
+    while i < 3 {
+        let sq = i * i
+        hs.append(fn() int {
+            hits += 1
+            return sq
+        })
+        i += 1
+    }
+    each h in hs { say h() }
+    say "hits", hits
+
+    // Nested loops and a closure inside a closure.
+    var ns = []
+    for a in 0..2 {
+        for b in 0..2 {
+            ns.append(fn() str {
+                let inner = fn() str { return "{a}{b}" }
+                return inner()
+            })
+        }
+    }
+    each n in ns { say n() }
+
+    // Tasks: each spawned block sees its own iteration.
+    var out = make([]int, 4)
+    group {
+        for j in 0..4 { spawn { out[j] = j * 10 } }
+    }
+    say out
+
+    // A closure that owns state of its own is unaffected.
+    let c = counter()
+    for r in 0..3 { say "count", c(), r }
+
+    // A name the closure declares itself is not a capture, and an assignment
+    // made before the closure copies the variable is simply what it copies.
+    var gs2 = []
+    for k in 0..2 {
+        var acc = k
+        acc += 10
+        gs2.append(fn(k int) int {
+            k += 1
+            return k + acc
+        })
+    }
+    each g in gs2 { say g(100) }
+
+    // `parse` inside a closure writes a variable of the enclosing frame.
+    var first = ""
+    var rest = ""
+    let split = fn() { parse "loop closures" first rest }
+    split()
+    say first, "/", rest
+
+    // Deferred blocks run at exit, each with its own iteration's value.
+    for d in 1..4 { defer say "deferred", d }
+    say "end"
+}

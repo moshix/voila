@@ -141,8 +141,9 @@ Value vl_map_values(Value mv) {
 /* ---------------------------------------------------------------- length */
 
 int64_t vl_len(Value v) {
+  v = vl_deref(v);
   if (v.t == VL_NIL) return 0;
-  if (v.t != VL_OBJ) vl_abort("len() of %s", vl_kind_name(v));
+  if (v.t != VL_OBJ) vl_fault("len() of %s", vl_kind_name(v));
   switch ((VlKind)v.u.o->kind) {
   case O_STR: return ((VlStr *)v.u.o)->len;
   case O_SLICE: return ((VlSlice *)v.u.o)->len;
@@ -151,7 +152,7 @@ int64_t vl_len(Value v) {
   case O_TUPLE: return ((VlTuple *)v.u.o)->n;
   case O_CHAN: return ((VlChan *)v.u.o)->count;
   case O_BUILDER: return vl_builder_len(v);
-  default: vl_abort("len() of %s", vl_kind_name(v));
+  default: vl_fault("len() of %s", vl_kind_name(v));
   }
   return 0;
 }
@@ -161,27 +162,28 @@ int64_t vl_len(Value v) {
 static int64_t want_int(Value v, const char *what) {
   if (v.t == VL_INT) return v.u.i;
   if (v.t == VL_RUNE) return (int64_t)v.u.r;
-  vl_abort("%s must be an integer, got %s", what, vl_kind_name(v));
+  vl_fault("%s must be an integer, got %s", what, vl_kind_name(v));
   return 0;
 }
 
 Value vl_index(Value coll, Value idx) {
+  coll = vl_deref(coll);
   if (coll.t == VL_OBJ && coll.u.o->kind == O_SHARED)
     return vl_index(((VlShared *)coll.u.o)->v, idx);
-  if (coll.t != VL_OBJ) vl_abort("cannot index %s", vl_kind_name(coll));
+  if (coll.t != VL_OBJ) vl_fault("cannot index %s", vl_kind_name(coll));
   switch ((VlKind)coll.u.o->kind) {
   case O_SLICE: {
     VlSlice *s = (VlSlice *)coll.u.o;
     int64_t i = want_int(idx, "index");
     if (i < 0 || i >= s->len)
-      vl_abort("index out of bounds: %lld (len %lld)", (long long)i, (long long)s->len);
+      vl_fault("index out of bounds: %lld (len %lld)", (long long)i, (long long)s->len);
     return vl_retain(s->e[i]);
   }
   case O_STR: {
     VlStr *s = (VlStr *)coll.u.o;
     int64_t i = want_int(idx, "index");
     if (i < 0 || i >= s->len)
-      vl_abort("string index out of bounds: %lld (len %lld)", (long long)i, (long long)s->len);
+      vl_fault("string index out of bounds: %lld (len %lld)", (long long)i, (long long)s->len);
     return vl_int((unsigned char)s->b[i]);
   }
   case O_MAP: {
@@ -192,38 +194,49 @@ Value vl_index(Value coll, Value idx) {
   case O_TUPLE: {
     VlTuple *t = (VlTuple *)coll.u.o;
     int64_t i = want_int(idx, "index");
-    if (i < 0 || i >= t->n) vl_abort("tuple index out of bounds: %lld", (long long)i);
+    if (i < 0 || i >= t->n) vl_fault("tuple index out of bounds: %lld", (long long)i);
     return vl_retain(t->e[i]);
   }
   default:
-    vl_abort("cannot index %s", vl_kind_name(coll));
+    vl_fault("cannot index %s", vl_kind_name(coll));
   }
   return vl_nil();
 }
 
 void vl_setidx(Value coll, Value idx, Value v) {
-  if (coll.t != VL_OBJ) vl_abort("cannot index-assign %s", vl_kind_name(coll));
+  coll = vl_deref(coll);
+  if (coll.t != VL_OBJ) vl_fault("cannot index-assign %s", vl_kind_name(coll));
   switch ((VlKind)coll.u.o->kind) {
   case O_SLICE: {
     VlSlice *s = (VlSlice *)coll.u.o;
     int64_t i = want_int(idx, "index");
     if (i < 0 || i >= s->len)
-      vl_abort("index out of bounds: %lld (len %lld)", (long long)i, (long long)s->len);
+      vl_fault("index out of bounds: %lld (len %lld)", (long long)i, (long long)s->len);
     vl_set(&s->e[i], v);
     return;
   }
   case O_MAP:
-    vl_map_set(coll, idx, v);
+    /* A store may insert: serialised like a growing method (call.c). */
+    {
+      int mark = vl_cleanup_mark();
+      VlLock *lk = vl_addr_lock(coll.u.o);
+      vl_lock_acquire(lk);
+      vl_cleanup_lock(lk);
+      vl_map_set(coll, idx, v);
+      vl_cleanup_to(mark);
+      vl_lock_release(lk);
+    }
     return;
   default:
-    vl_abort("cannot index-assign %s", vl_kind_name(coll));
+    vl_fault("cannot index-assign %s", vl_kind_name(coll));
   }
 }
 
 /* Slicing a range THROWS RangeError (§13.2), unlike scalar indexing. */
 Value vl_slice_range(Value coll, Value rv) {
+  coll = vl_deref(coll);
   if (rv.t != VL_OBJ || rv.u.o->kind != O_RANGE)
-    vl_abort("slice index must be a range");
+    vl_fault("slice index must be a range");
   VlRange *r = (VlRange *)rv.u.o;
   int64_t lo = r->lo, hi = r->hi;
   if (r->inclusive) hi++;
@@ -241,14 +254,15 @@ Value vl_slice_range(Value coll, Value rv) {
     for (int64_t i = lo; i < hi; i++) vl_slice_append(out, vl_retain(s->e[i]));
     return out;
   }
-  vl_abort("cannot slice %s", vl_kind_name(coll));
+  vl_fault("cannot slice %s", vl_kind_name(coll));
   return vl_nil();
 }
 
 /* ---------------------------------------------------------------- in */
 
 Value vl_cmpin(Value x, Value coll) {
-  if (coll.t != VL_OBJ) vl_abort("`in` not supported on %s", vl_kind_name(coll));
+  coll = vl_deref(coll);
+  if (coll.t != VL_OBJ) vl_fault("`in` not supported on %s", vl_kind_name(coll));
   switch ((VlKind)coll.u.o->kind) {
   case O_SLICE: {
     VlSlice *s = (VlSlice *)coll.u.o;
@@ -274,7 +288,7 @@ Value vl_cmpin(Value x, Value coll) {
                                 : (v >= r->lo && v < r->hi));
   }
   default:
-    vl_abort("`in` not supported on %s", vl_kind_name(coll));
+    vl_fault("`in` not supported on %s", vl_kind_name(coll));
   }
   return vl_bool(false);
 }
@@ -282,13 +296,13 @@ Value vl_cmpin(Value x, Value coll) {
 /* ---------------------------------------------------------------- codegen */
 
 /* Helpers the C backend emits calls to. */
-int64_t vl_int_of(Value v) { return want_int(v, "value"); }
+int64_t vl_int_of(Value v) { return want_int(vl_deref(v), "value"); }
 
 Value *vl_slice_data(Value s) { return ((VlSlice *)s.u.o)->e; }
 
 void vl_spread(Value dst, Value src) {
   if (src.t != VL_OBJ || src.u.o->kind != O_SLICE)
-    vl_abort("cannot spread %s (want slice)", vl_kind_name(src));
+    vl_fault("cannot spread %s (want slice)", vl_kind_name(src));
   VlSlice *s = (VlSlice *)src.u.o;
   for (int64_t i = 0; i < s->len; i++) vl_slice_append(dst, vl_retain(s->e[i]));
 }
@@ -296,6 +310,7 @@ void vl_spread(Value dst, Value src) {
 /* ---------------------------------------------------------------- iterate */
 
 Value vl_iter(Value src) {
+  src = vl_deref(src);
   VlIter *it = (VlIter *)vl_obj_new(O_ITER, sizeof(VlIter));
   it->src = vl_retain(src);
   it->i = 0;
@@ -310,11 +325,11 @@ bool vl_iter_next(Value itv, Value *key, Value *val) {
   VlIter *it = (VlIter *)itv.u.o;
   Value src = it->src;
   if (src.t == VL_NIL) return false;
-  if (src.t != VL_OBJ) vl_abort("cannot iterate over %s", vl_kind_name(src));
+  if (src.t != VL_OBJ) vl_fault("cannot iterate over %s", vl_kind_name(src));
   switch ((VlKind)src.u.o->kind) {
   case O_RANGE: {
     VlRange *r = (VlRange *)src.u.o;
-    if (r->by == 0) vl_abort("range step cannot be 0");
+    if (r->by == 0) vl_fault("range step cannot be 0");
     int64_t n = r->lo + it->i * r->by;
     bool more = r->by > 0 ? (n < r->hi || (r->inclusive && n == r->hi))
                           : (n > r->hi || (r->inclusive && n == r->hi));
@@ -418,6 +433,7 @@ bool vl_iter_next(Value itv, Value *key, Value *val) {
     const VlMethod *m = (tn && tn[0]) ? vl_find_method(tn, "next") : NULL;
     if (!m || !m->has_self) break; /* no protocol: the abort below explains */
     Value self = src;
+    vl_set_disp(m->type);
     Value v = m->fn(&self, 1, NULL);
     if (v.t == VL_NIL) {
       vl_release(v);
@@ -436,9 +452,9 @@ bool vl_iter_next(Value itv, Value *key, Value *val) {
    * reader off to write a method the runtime would never consult. */
   if (src.t == VL_OBJ &&
       (src.u.o->kind == O_STRUCT || src.u.o->kind == O_ENUM)) {
-    vl_abort("cannot iterate over %s: define `next(mut self) ?T` on it",
+    vl_fault("cannot iterate over %s: define `next(mut self) ?T` on it",
              vl_kind_name(src));
   }
-  vl_abort("cannot iterate over %s", vl_kind_name(src));
+  vl_fault("cannot iterate over %s", vl_kind_name(src));
   return false;
 }

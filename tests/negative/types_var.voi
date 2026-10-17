@@ -1,0 +1,26 @@
+// An unannotated `var` keeps the type its initialiser gave it (§4): every
+// later assignment is judged against it.
+struct P { x int }
+func main() {
+    var n = 3
+    n = "three"
+    var s = "a"
+    s = 1
+    var f = 1.5
+    f = true
+    var p = P{x: 1}
+    p = 5
+    var xs = [1, 2]
+    xs = ["a"]
+    var i = 0
+    i = 2.5
+    // Legal: the same type, an unknown start, a widening, a nil into ?T.
+    var u = []
+    u = [1]
+    var w = 1.5
+    w = 2
+    var o = to_int("1")
+    o = nil
+    n = 4
+    say n, s, f, p, xs, i, u, w, o
+}

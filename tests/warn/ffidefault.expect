@@ -1,0 +1,4 @@
+!warning[ffi]
+!error[ffi]
+!unused-import
+ok

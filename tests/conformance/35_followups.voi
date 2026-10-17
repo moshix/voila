@@ -1,0 +1,50 @@
+// Follow-ups to the expression-syntax batch.
+//
+// 1. A subscript holding a parenthesised tuple is an INDEX, not a list of
+//    type arguments: `(r, c)` reads as a tuple type of two names, but it is
+//    a value here — in an assignment target, an `if`/`while` header and a
+//    call through the indexed value. Tuples (and structs) hash structurally,
+//    so an equal tuple built later finds the key.
+// 2. `?`/`try` in a function that declares NO result raises the failure, as
+//    under a plain `T` result: the caller would otherwise discard it.
+
+struct P { x int, y int }
+
+func half(n int) int! {
+    if n % 2 != 0 { return err("odd: {n}") }
+    return n ~/ 2
+}
+
+func show(n int) {
+    let h = half(n)?
+    say "half", h
+}
+
+func show2(n int) {
+    say "half", try half(n)
+}
+
+func main() {
+    var seen = make(map[(int, int)]bool)
+    let r = 1
+    let c = 2
+    seen[(r, c)] = true
+    if seen[(r, c)] { say "hit" }
+    say (r, c) in seen, (c, r) in seen
+    var k = 0
+    while seen[(r, c)] {
+        k += 1
+        seen[(r, c)] = false
+    }
+    say k
+    let fm = make(map[(int, int)]fn(int) int)
+    fm[(r, c)] = fn(x int) int { return x * 10 }
+    say fm[(r, c)](3)
+    var pts = make(map[P]str)
+    pts[P{x: 1, y: 2}] = "p12"
+    say pts[P{x: 1, y: 2}]
+
+    show(4)
+    try { show(3) } catch e { say "caught:", e.message() }
+    try { show2(5) } catch e { say "caught:", e.message() }
+}

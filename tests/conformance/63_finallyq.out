@@ -1,0 +1,4 @@
+in_flight raised: from finally
+returning raised: from finally
+fine ok 8
+closure_inside ok -1

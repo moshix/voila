@@ -1,0 +1,61 @@
+// Value semantics through the natives that write an argument in place, and
+// the copy-in of a `mut` argument in a captured variable (§10, §6.4).
+use "std/sort"
+
+func push2(xs mut []int, f fn() int) int {
+    xs.append(9)
+    return f()
+}
+
+func main() {
+    // `sort.sort` and the prelude `append` write their slice in place —
+    // as a `mut` parameter: a second name keeps its value.
+    var xs = [3, 1, 2]
+    let snap = xs
+    sort.sort(xs)
+    say xs, snap
+    var ys = [5, 4]
+    let keep = ys
+    sort.sort_by(ys, fn(a int, b int) bool { return a < b })
+    append(ys, 6)
+    say ys, keep
+
+    // A captured variable handed to a `mut` parameter: once a closure has
+    // captured the frame, the callee works on a copy stored back when it
+    // returns — a closure reading the variable meanwhile sees the value
+    // from before the call.
+    var zs = [1]
+    let peek = fn() int { return len(zs) }
+    let seen = push2(zs, peek)
+    say zs, seen
+
+    // A `mut self` method's closure may be passed straight to `map`.
+    var c = Counter{n: 2, log: [1, 2]}
+    c.double()
+    say c.log
+
+    // In a function whose only closure is handed straight to a builtin
+    // collection method, the frame never escapes its task: a `mut self`
+    // call on a variable that closure reads runs in place, with no copy-in
+    // and no read lock — as in a frame with no closure at all. (The output
+    // is the same either way; this guards the cost: a copy per call would
+    // make the loop quadratic.)
+    say in_place()
+}
+
+func in_place() str {
+    var bag = Bag{xs: []}
+    let ks = [1, 2, 3].map(fn(v int) int { return v + len(bag.xs) })
+    for i in 0..20000 { bag.add(i) }
+    return "{ks} {len(bag.xs)}"
+}
+
+struct Bag { xs []int }
+impl Bag { func add(mut self, v int) { self.xs.append(v) } }
+
+struct Counter { n int, log []int }
+impl Counter {
+    func double(mut self) {
+        self.log = self.log.map(fn(v int) int { return v * self.n })
+    }
+}

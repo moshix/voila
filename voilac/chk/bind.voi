@@ -140,8 +140,19 @@ impl Checker {
 
     // bind_assign is the whole point of the file.
     func bind_assign(mut self, s int, scope map[str]int) {
-        let lhs = self.T.Kid(s, 0)
+        self.bind_assign_target(self.T.Kid(s, 0), scope)
+    }
+
+    // bind_assign_target judges one assignment target, `lhs`.
+    func bind_assign_target(mut self, lhs int, scope map[str]int) {
         if lhs == 0 { return }
+        // `t.0 = 5`: a tuple is a value with no settable members; the runtime
+        // has no way to write one in place. Rebuild it instead.
+        if self.T.Kind(lhs) == ast.INDEX and self.T.Get(lhs).Ival2 == 1 {
+            self.report_at(lhs, "cannot assign to `" || self.lhs_text(lhs) ||
+                "`: a tuple member cannot be assigned; build a new tuple")
+            return
+        }
         let root = self.lhs_root(lhs)
         let rk = self.T.Kind(root)
 
@@ -205,6 +216,10 @@ impl Checker {
             return self.lhs_text(self.T.Kid(e, 0)) || "." || n.Sval
         }
         if n.Kind == ast.INDEX {
+            if n.Ival2 == 1 {
+                return self.lhs_text(self.T.Kid(e, 0)) || "." ||
+                       self.T.Get(self.T.Kid(e, 1)).Sval
+            }
             return self.lhs_text(self.T.Kid(e, 0)) || "[…]"
         }
         return "?"
@@ -232,7 +247,14 @@ impl Checker {
         let k = n.Kind
 
         if k == ast.ASSIGN {
-            self.bind_assign(s, scope)
+            if self.T.Kind(self.T.Kid(s, 0)) == ast.TUPLE {
+                // Parallel assignment: every target is judged on its own.
+                each t in self.T.Get(self.T.Kid(s, 0)).Kids {
+                    self.bind_assign_target(t, scope)
+                }
+            } else {
+                self.bind_assign(s, scope)
+            }
             self.bind_exprs(self.T.Kid(s, 0), scope)
             self.bind_exprs(self.T.Kid(s, 1), scope)
         } else if k == ast.LET or k == ast.VAR {
@@ -364,6 +386,7 @@ impl Checker {
         if n.Kind == ast.LET {
             var how = B_LET
             if n.Ival2 == 1 { how = B_CONST }
+            if n.Ival2 == 2 { how = B_VAR }       // `var (a, b) = …`
             each nm in str.split(n.Sval, ",") {
                 enter(scope, nm, how)
             }
@@ -408,6 +431,21 @@ impl Checker {
         }
         if k == ast.SPAWNEXPR and n.Ival2 == 1 {
             self.bind_block(self.T.Kid(e, 0), scope)
+            return
+        }
+        if k == ast.IF or k == ast.MATCH {
+            // An `if`/`match` EXPRESSION is walked as the statement it is
+            // shaped like, in a copy so nothing it binds leaks out.
+            var inner = make(map[str]int)
+            each key in keys(scope) {
+                inner[key] = scope[key]
+            }
+            self.bind_stmt(e, inner)
+            return
+        }
+        if k == ast.ELSEEXPR and n.Ival2 == 2 {
+            self.bind_exprs(self.T.Kid(e, 0), scope)
+            self.bind_block(self.T.Kid(e, 1), scope)
             return
         }
         if (k == ast.ARM or k == ast.IF) and n.Ival != 0 {

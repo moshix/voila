@@ -1,0 +1,32 @@
+// A native whose C body assumes an argument's kind checks it at run time
+// where the compiler could not: a native called as a VALUE, or handed a
+// value whose type the checker does not know. The check unwraps a Box or a
+// newtype whose value is of the kind, and otherwise ABORTS cleanly — with
+// the native's name, the argument, and a stack trace — instead of casting
+// the wrong object (`os.run_capture("echo", "hello")` was a SIGSEGV).
+use "std/os"
+use "std/str"
+
+type Words []str
+
+func run(f fn(str, []str) (int, str, str)!, prog str, args []str) {
+    let r = must f(prog, args)
+    say r.1
+}
+
+func main() {
+    // A newtype and a Box over a slice are unwrapped for the native.
+    let w = Words(["x", "y", "z"])
+    say str.join(w, "-"), sum(Box([1, 2, 3]))
+
+    // Right kinds through a native used as a value.
+    let up = str.upper
+    say up("quiet")
+    run(os.run_capture, "echo", ["hello"])
+
+    // The wrong kind, through a value the checker cannot see into: a
+    // clean abort.
+    let j = str.join
+    let csv = "a,b"
+    say j(csv, ",")
+}

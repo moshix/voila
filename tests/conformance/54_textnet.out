@@ -1,0 +1,24 @@
+1.2.3 v1.2.3 aa
+main x 
+("key", "value=more", true) ("no-sep", "", false) ("", "x", true)
+Content-Type | text/plain true
+["", "year", "mon", ""]
+2024-06-15 2024 06 3
+nil
+{"0": "ada@example.org", "user": "ada", "host": "example.org"}
+Lovelace, Ada (Ada)
+["xy", "x", "y"]
+regex: duplicate group name in /(?P<a>x)(?P<a>y)/
+regex: a group name is letters, digits and `_`, closed by `>` in /(?P<>x)/
+regex: only the non-capturing group `(?:` is supported; lookaround is not in /(?<=x)y/
+a b c/d€ http: truncated escape in `bad%2`
+http: bad escape in `bad%zz`
+a+b%2Fc%3Fd%3D%C3%A9%26~_.-
+round trip: 100% & more
+{"a": ["1", "2"], "b": ["x y"], "flag": [""], "c": ["="]}
+200 hi ada l at /greet
+200 hi nobody at /x
+500 500 internal server error
+200
+server stopped cleanly
+refused after stop

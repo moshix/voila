@@ -1,0 +1,6 @@
+variant `Red` is declared by more than one enum; write `Light.Red` or `Flag.Red`
+12:13
+13:15
+!:9:
+!:10:
+!:11:

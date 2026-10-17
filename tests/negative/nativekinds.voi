@@ -1,0 +1,28 @@
+// A native's argument KINDS (low.NativeKinds) are judged at compile time
+// wherever the argument's static type is known: these calls would cast a
+// str to a slice (os.run_capture), a slice to a str (os.read), and so on.
+// The `!` lines of the .expect pin the calls that must stay legal: the
+// right kinds, a rune where a str-or-rune is wanted, an int where a number
+// is, a value of unknown type (left to the run-time check), and a name
+// that shadows the native.
+use "std/os"
+use "std/str"
+
+func unknown() []str { return ["x"] }
+
+func main() {
+    let r = os.run_capture("echo", "hello")
+    let s = os.read(["a", "b"])
+    say str.upper(42)
+    say sum("123")
+    say str.join(", ", ["a"])
+    say os.exists(1)
+
+    // legal
+    let ok1 = os.run_capture("echo", ["hello"])
+    say str.upper('x'), str.pad("a", 3), round_to(2.5, 0)
+    let parts = unknown()
+    say str.join(parts, ","), sum([1, 2])
+    let upper = fn(x int) int { return x }
+    say upper(3)
+}

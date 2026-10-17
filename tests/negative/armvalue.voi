@@ -1,0 +1,10 @@
+// A value-position arm must END in its value, or diverge. `say` does
+// neither.
+func main() {
+    let n = 3
+    let x = match n {
+        1 => "one"
+        _ => say "many"
+    }
+    say x
+}

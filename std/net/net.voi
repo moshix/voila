@@ -216,6 +216,15 @@ impl Conn {
     func close(self) {
         net._close(self.h)
     }
+
+    // shutdown ends the connection in both directions WITHOUT releasing the
+    // descriptor: a task blocked reading or writing it on another thread
+    // wakes with end-of-stream or an error, and closes it itself. It is how
+    // one task stops another's connection — closing it from outside could
+    // hand the descriptor's number to a new file while the read is pending.
+    func shutdown(self) {
+        net._shutdown(self.h)
+    }
 }
 
 // --------------------------------------------------------------------- Udp

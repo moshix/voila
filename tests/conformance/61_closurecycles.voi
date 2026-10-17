@@ -1,0 +1,92 @@
+// Closures that reach themselves through the frame they capture: held by a
+// register directly, or inside a struct, map, slice, Box or enum that only
+// the frame holds. The runtime frees each frame and its closures once
+// nothing outside holds them (manual D.7). Run under `leaks --atExit`
+// this program must report 0 leaks (TESTING.md §6); here it checks the
+// values.
+struct Holder { f fn(int) int, name str }
+struct Box2 { f fn() int }
+enum Slot { Empty, Fn(f fn(int) int) }
+
+func in_struct() int {
+    var h = Holder{f: fn(n int) int { return n }, name: "h"}
+    h.f = fn(n int) int { if n < 1 { return 0 }; return h.f(n - 1) + 1 }
+    return h.f(5)
+}
+
+func in_map() int {
+    var m = make(map[str]fn(int) int)
+    m["f"] = fn(n int) int { if n < 1 { return 0 }; return m["f"](n - 1) + 1 }
+    return m["f"](4)
+}
+
+func in_slice() int {
+    var fs = [fn(n int) int { return n }]
+    fs[0] = fn(n int) int { if n < 1 { return 0 }; return fs[0](n - 1) + 1 }
+    return fs[0](3)
+}
+
+func in_nested() int {
+    var hs = [Holder{f: fn(n int) int { return n }, name: "a"}]
+    hs[0].f = fn(n int) int { if n < 1 { return 0 }; return hs[0].f(n - 1) + 2 }
+    return hs[0].f(3)
+}
+
+func in_enum() int {
+    var s = Slot.Empty
+    s = Slot.Fn(fn(n int) int {
+        if n < 1 { return 0 }
+        match s { Slot.Fn(g) => return g(n - 1) + 3; _ => return 0 }
+        return 0
+    })
+    match s { Slot.Fn(g) => return g(2); _ => return 0 }
+    return 0
+}
+
+// The struct-held closure is read by an ESCAPED closure.
+func escaped_reader(k int) fn() int {
+    let b = Box2{f: fn() int { return k }}
+    return fn() int { return b.f() }
+}
+
+// Patterns the runtime already handled; kept passing.
+func mutual() int {
+    var is_even fn(int) bool = fn(n int) bool { return true }
+    var is_odd fn(int) bool = fn(n int) bool { return false }
+    is_even = fn(n int) bool { if n == 0 { return true }; return is_odd(n - 1) }
+    is_odd = fn(n int) bool { if n == 0 { return false }; return is_even(n - 1) }
+    if is_even(10) { return 1 }
+    return 0
+}
+
+func ycomb() int {
+    let y = fn(f fn(fn(int) int) fn(int) int) fn(int) int {
+        var g fn(int) int = fn(n int) int { return n }
+        g = fn(n int) int { return f(g)(n) }
+        return g
+    }
+    let fact = y(fn(self_ fn(int) int) fn(int) int {
+        return fn(n int) int { if n < 2 { return 1 }; return n * self_(n - 1) }
+    })
+    return fact(5)
+}
+
+func escaped_fib() fn(int) int {
+    var fib fn(int) int = fn(n int) int { return n }
+    fib = fn(n int) int { if n < 2 { return n }; return fib(n - 1) + fib(n - 2) }
+    return fib
+}
+
+func main() {
+    say in_struct(), in_map(), in_slice(), in_nested(), in_enum()
+    say escaped_reader(7)(), mutual(), ycomb(), escaped_fib()(10)
+    // Many rounds: a leak per call would show as thousands of objects.
+    var t = 0
+    var i = 0
+    while i < 300 {
+        t += in_struct() + in_map() + in_slice() + in_nested() + in_enum()
+        t += escaped_reader(i)() + mutual() + ycomb() + escaped_fib()(8)
+        i += 1
+    }
+    say t
+}

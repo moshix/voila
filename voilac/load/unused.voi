@@ -193,15 +193,16 @@ impl Loader {
 // file, because a bare trait name and a qualifier are told apart later, by
 // what the imported package turns out to declare.
 //
-// The five node kinds are the five places a package-provided name can be
+// The six node kinds are the six places a package-provided name can be
 // spelled. Adding a kind here can only ever SILENCE a warning, never invent
 // one, which is the direction this list is allowed to be incomplete in.
 //
 //   IDENT     `os` in `os.exit`, `g` in `g.Point`, a bare variant `Empty`
 //   TNAMED    dotted → the qualifier; undotted → a bare type or TRAIT name
 //   IMPLDEC   the trait of `impl Describe for Box` ("" when inherent)
-//   GENERIC   the bound of `[T: Describe]`, stored as "T|Describe"
+//   GENERIC   the bounds of `[T: Describe + Show]`, "T|Describe+Show"
 //   PVARIANT  a variant in pattern position, `Circle(r) =>`
+//   PSTRUCT   a struct type in pattern position, `geom.P{x: 0} =>`
 //
 // It ACCUMULATES rather than returning a set of its own so that a package's
 // files can be unioned without iterating one — the sets in this compiler are
@@ -213,7 +214,12 @@ func add_qualifiers(t ast.Tree, used mut set[str]) {
         let n = t.Nodes[i]
         if n.Kind == ast.IDENT {
             used.add(n.Sval)
-        } else if n.Kind == ast.PVARIANT or n.Kind == ast.IMPLDEC {
+        } else if n.Kind == ast.FFIDEC {
+            // An ffi block is a use of std/ffi even when no prototype in it
+            // has a pointer: the block cannot be written without the package.
+            used.add("ffi")
+        } else if n.Kind == ast.PVARIANT or n.Kind == ast.IMPLDEC or
+                  n.Kind == ast.PSTRUCT {
             // These two may now be QUALIFIED — `geom.Circle(r) =>`, `impl
             // geom.Named for Box` — so the qualifier half has to be added as
             // well, or an import reached only that way reads as unused and
@@ -227,8 +233,14 @@ func add_qualifiers(t ast.Tree, used mut set[str]) {
                 used.add(n.Sval)
             }
         } else if n.Kind == ast.GENERIC {
+            // Several bounds are joined by `+` ("T|Show+geom.Named"). Each
+            // one is also a TNAMED kid, which the arm above sees anyway.
             let parts = str.split(n.Sval, "|")
-            if len(parts) > 1 { add_bare_or_qualified(parts[1], used) }
+            if len(parts) > 1 {
+                each b in str.split(parts[1], "+") {
+                    add_bare_or_qualified(b, used)
+                }
+            }
         }
         i += 1
     }

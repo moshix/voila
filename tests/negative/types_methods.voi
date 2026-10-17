@@ -1,0 +1,39 @@
+// A method must exist on a receiver whose method set this program can see
+// whole (§3.6) — a struct, an enum, a newtype, a primitive, a builtin
+// collection — and a `mut self` method cannot be called through a
+// BORROWED parameter, which is read-only (§6.1).
+struct P { x int }
+enum E { A, B }
+type Names []str
+impl P {
+    func bump(mut self) { self.x += 1 }
+    func get(self) int { return self.x }
+}
+impl E { func name(self) str { return "e" } }
+func borrowed(p P) int {
+    p.bump()
+    return p.get()
+}
+func fine(p mut P) { p.bump() }
+func main() {
+    say "x".lstrip("-")
+    say "x".len()
+    let n = 3
+    say n.abs()
+    let xs = [1, 2]
+    say xs.push(3)
+    let m = map[str]int{"a": 1}
+    say m.contains("a")
+    var p = P{x: 1}
+    say p.nope()
+    say E.A.nope()
+    let ns = Names(["a"])
+    say ns.nope()
+    let dd = 2.5d
+    // Legal: the duality, builtin collection methods, the universal pair,
+    // a newtype's underlying methods, declared methods, a mut parameter.
+    say "x".upper(), xs.len(), xs.contains(1), m.has("a"), m.keys(), p.get()
+    say n.str(), p.clone(), E.A.name(), ns.len(), ns.join(","), dd.round()
+    fine(p)
+    say borrowed(p)
+}

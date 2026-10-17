@@ -1,0 +1,8 @@
+spawn_self.voi:14:
+a spawned task uses `self` of a `mut self` method
+spawn_self.voi:18:
+spawn_self.voi:19:
+spawn_self.voi:23:
+a closure that uses `self` of a `mut self` method may only be passed straight to a builtin collection method
+!spawn_self.voi:20:
+!spawn_self.voi:28:

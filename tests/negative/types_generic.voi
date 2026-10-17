@@ -1,0 +1,32 @@
+// Generics are instantiated by unification at the call (§3.7): the later
+// arguments and the result are judged at the types the earlier ones bound,
+// a type argument INFERRED from a value is judged against the bounds as a
+// written one is, and a value of a type parameter answers only the methods
+// its bounds declare.
+trait Tr { func go(self) int }
+trait Default { func default() Self }
+struct Other { a int }
+struct Stack[T] { items []T }
+impl[T] Stack[T] {
+    func push(mut self, v T) { self.items.append(v) }
+}
+impl Tr for Other { func go(self) int { return self.a } }
+impl Default for int { func default() int { return 42 } }
+
+func mx[T](a T, b T) T { return a }
+func like[T: Default](x T) T { return T.default() }
+func show[T: Tr](x T) int { return x.go() }
+func use_bound[T: Tr](a T, b T) int { return a.nonexistent(b) }
+func id[T](x T) T { return x }
+
+func main() {
+    say mx(1, "x")
+    let n int = id("s")
+    var st = Stack[int]{items: []}
+    st.push("oops")
+    say like(Other{a: 1})
+    say show(3.5)
+    // Legal: a literal binding widens, a bound satisfied, the bound's
+    // own method, an inferred result used at its type.
+    say mx(1, 2.5), mx("a", "b"), like(3), show(Other{a: 2}), id(4) + 1, n
+}

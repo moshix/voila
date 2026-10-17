@@ -1,0 +1,75 @@
+// std/flag: typed flags (str, int, bool, float, dur) with one-letter
+// aliases, `--name=value` and `--name value`, positional arguments, `--`,
+// generated usage text, and an error naming the flag for an unknown one or
+// a bad value. A Set's parse returns an error value; the package-level
+// flag.parse() parses os.args() — which does NOT include the program's own
+// name — and exits on --help or an error.
+use "std/flag"
+use "std/time"
+
+func report(r flag.Flags!) {
+    match r {
+        Ok(o)  => say "ok", o.args()
+        Err(e) => say "error:", e.message()
+    }
+}
+
+func main() {
+    var fs = flag.set("greet", "say hello to someone")
+    fs.str("name|n", "world", "who to greet")
+    fs.int("count|c", 1, "how many times")
+    fs.bool("loud|l", false, "shout it")
+    fs.float("ratio", 0.5, "how much")
+    fs.dur("pause", time.Millisecond * 250, "wait between greetings")
+
+    let o = must fs.parse(["-n", "ada", "first", "--count=3", "--loud",
+                           "--pause", "1m30s", "second", "--ratio", "2.25",
+                           "--", "--not-a-flag", "-"])
+    say o.str("name"), o.int("count"), o.bool("loud"), o.float("ratio")
+    say o.dur("pause"), o.args()
+    say o.has("name"), o.has("ratio")
+
+    // Defaults stand where nothing was given.
+    let d = must fs.parse([])
+    say d.str("name"), d.int("count"), d.bool("loud"), d.dur("pause"), d.args()
+
+    // Every spelling of a bool, and of an alias.
+    say must fs.parse(["-l=false"]).bool("loud"), must fs.parse(["--no-loud"]).bool("loud")
+    say must fs.parse(["-c", "7"]).int("count"), must fs.parse(["-c=8"]).int("count")
+    say must fs.parse(["--pause=0"]).dur("pause"), must fs.parse(["--pause", "2h5ms"]).dur("pause")
+
+    // Errors name the flag.
+    report(fs.parse(["--nope"]))
+    report(fs.parse(["-x"]))
+    report(fs.parse(["--count", "many"]))
+    report(fs.parse(["--count"]))
+    report(fs.parse(["--name"]))
+    report(fs.parse(["--loud=yes"]))
+    report(fs.parse(["--pause", "5"]))
+    report(fs.parse(["--pause", "5 parsecs"]))
+    report(fs.parse(["--ratio", "half"]))
+    report(fs.parse(["--count=5%d"]))         // a `%` is text, not a verb
+    report(fs.parse(["--50%"]))
+    report(fs.parse(["--help"]))
+    report(fs.parse(["-h"]))
+
+    // The usage text is generated from the declarations.
+    say fs.usage()
+
+    // A declaration twice is a program bug.
+    try { fs.int("count", 2, "again") } catch e: ValueError { say "caught:", e.message() }
+    try { fs.bool("verbose|vv", false, "x") } catch e: ValueError { say "caught:", e.message() }
+
+    // Asking for an undeclared flag is too.
+    try { say o.str("colour") } catch e: ValueError { say "caught:", e.message() }
+
+    // The default set: os.args() is empty here (no arguments were given),
+    // so the defaults stand.
+    flag.program("demo")
+    flag.about("the default set")
+    flag.str("mode", "fast", "how to run")
+    flag.bool("dry-run", false, "change nothing")
+    let g = flag.parse()
+    say g.str("mode"), g.bool("dry-run"), g.args()
+    say flag.usage()
+}

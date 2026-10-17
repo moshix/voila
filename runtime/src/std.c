@@ -18,6 +18,7 @@
 #include <netdb.h>
 #include <sys/un.h>
 #include <sys/time.h>     /* struct timeval for SO_RCVTIMEO */
+#include <fcntl.h>
 #include <poll.h>         /* poll() to bound accept() on every platform */
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
@@ -98,7 +99,7 @@ Value vl_file_method(Value self, const char *name, Value *argv, int argc,
   }
   if (eq(name, "name")) return vl_retain(f->name);
   if (eq(name, "read_all")) {
-    if (!f->f) return vl_err(vl_str("file not open for reading"));
+    if (!f->f) return vl_err_cstr("file not open for reading");
     return read_all_file(f->f);
   }
   if (eq(name, "lines")) {
@@ -119,7 +120,7 @@ Value vl_file_method(Value self, const char *name, Value *argv, int argc,
     return out;
   }
   if (eq(name, "write") || eq(name, "writeln")) {
-    if (!f->f) return vl_err(vl_str("file not open for writing"));
+    if (!f->f) return vl_err_cstr("file not open for writing");
     vl_fprint(f->f, argv, argc, eq(name, "writeln"));
     return vl_unit();
   }
@@ -156,9 +157,9 @@ BI(bi_assert) {
   if (!vl_truthy(argv[0])) {
     if (argc > 1) {
       Value m = vl_tostr(argv[1]);
-      vl_abort("assertion failed: %s", vl_cstr(m));
+      vl_fault("assertion failed: %s", vl_cstr(m));
     }
-    vl_abort("assertion failed");
+    vl_fault("assertion failed");
   }
   return vl_unit();
 }
@@ -197,10 +198,14 @@ BI(bi_abs) {
 
 BI(bi_sum) {
   UNUSED;
-  VlSlice *s = (VlSlice *)argv[0].u.o;
+  /* A set is summed in its insertion order, element by element, straight
+   * off its entry vector: nothing is allocated, so an OverflowError thrown
+   * by vl_add part-way through strands nothing. */
   Value acc = vl_int(0);
-  for (int64_t i = 0; i < s->len; i++) {
-    Value t = vl_add(acc, s->e[i]);
+  VlSeq q = vl_seq(argv[0]);
+  Value e;
+  while (vl_seq_next(&q, &e)) {
+    Value t = vl_add(acc, e);
     vl_release(acc);
     acc = t;
   }
@@ -209,15 +214,16 @@ BI(bi_sum) {
 
 BI(bi_avg) {
   UNUSED;
-  VlSlice *s = (VlSlice *)argv[0].u.o;
-  if (s->len == 0) vl_abort("avg() needs a non-empty slice");
+  VlSeq q = vl_seq(argv[0]);
+  if (vl_seq_len(argv[0]) == 0) vl_abort("avg() needs a non-empty slice");
   Value acc = vl_int(0);
-  for (int64_t i = 0; i < s->len; i++) {
-    Value t = vl_add(acc, s->e[i]);
+  Value e;
+  while (vl_seq_next(&q, &e)) {
+    Value t = vl_add(acc, e);
     vl_release(acc);
     acc = t;
   }
-  Value n = vl_int(s->len);
+  Value n = vl_int(vl_seq_len(argv[0]));
   Value out = vl_div(acc, n);
   vl_release(acc);
   return out;
@@ -271,6 +277,10 @@ static Value safe_conv(const char *type, Value *argv, int argc) {
   VlHandler h;
   Value out;
   if (VL_TRY(h)) {
+    /* A failed conversion is nil — but a FAULT passing through (an abort
+     * under a recovery point, err.c) keeps going to that point. */
+    Value p = vl_ctx()->pending;
+    if (vl_is_fault(p)) vl_rethrow(p);
     out = vl_nil();
   } else {
     Value base = argc > 1 ? argv[1] : vl_nil();
@@ -351,12 +361,11 @@ BI(bi_range) {
 
 BI(bi_zip) {
   UNUSED;
-  VlSlice *a = (VlSlice *)argv[0].u.o;
-  VlSlice *b = (VlSlice *)argv[1].u.o;
-  int64_t n = a->len < b->len ? a->len : b->len;
+  VlSeq a = vl_seq(argv[0]), b = vl_seq(argv[1]);
   Value out = vl_slice_new(0);
-  for (int64_t i = 0; i < n; i++) {
-    Value pair[2] = {a->e[i], b->e[i]};
+  Value x, y;
+  while (vl_seq_next(&a, &x) && vl_seq_next(&b, &y)) {
+    Value pair[2] = {x, y};
     vl_slice_append(out, vl_tuple_new(pair, 2));
   }
   return out;
@@ -364,10 +373,11 @@ BI(bi_zip) {
 
 BI(bi_enumerate) {
   UNUSED;
-  VlSlice *s = (VlSlice *)argv[0].u.o;
+  VlSeq q = vl_seq(argv[0]);
   Value out = vl_slice_new(0);
-  for (int64_t i = 0; i < s->len; i++) {
-    Value pair[2] = {vl_int(i), s->e[i]};
+  Value e;
+  for (int64_t i = 0; vl_seq_next(&q, &e); i++) {
+    Value pair[2] = {vl_int(i), e};
     vl_slice_append(out, vl_tuple_new(pair, 2));
   }
   return out;
@@ -376,6 +386,8 @@ BI(bi_enumerate) {
 BI(bi_keys) { UNUSED; return vl_map_keys(argv[0]); }
 BI(bi_values) { UNUSED; return vl_map_values(argv[0]); }
 BI(bi_shared) { UNUSED; return vl_shared(argv[0]); }
+/* Box(v): the owned, unique heap indirection of §6.3 (see VlBox). */
+BI(bi_box) { UNUSED; return vl_box_new(vl_retain(argv[0])); }
 BI(bi_cell) { UNUSED; return vl_cell(argv[0]); }
 BI(bi_weak) { UNUSED; return vl_weak(argv[0]); }
 
@@ -674,6 +686,23 @@ static Value os_err(const char *msg) {
   return e;
 }
 
+/* Every descriptor the runtime opens is CLOSE-ON-EXEC: a file or socket a
+ * program has open must not leak into the children os.run, os.run_capture
+ * and os.start start — a child holding a listening socket keeps the port
+ * busy, and one holding a pipe's write end keeps its reader from ever
+ * seeing EOF. (The flag is set just after the open, not atomically with it;
+ * os.start additionally serialises with itself, proc.c.) */
+static int cloexec_fd(int fd) {
+  if (fd >= 0) fcntl(fd, F_SETFD, FD_CLOEXEC);
+  return fd;
+}
+
+static FILE *fopen_ce(const char *path, const char *mode) {
+  FILE *f = fopen(path, mode);
+  if (f) cloexec_fd(fileno(f));
+  return f;
+}
+
 static Value os_errno(const char *op) {
   char buf[256];
   snprintf(buf, sizeof buf, "%s: %s", op, strerror(errno));
@@ -682,7 +711,7 @@ static Value os_errno(const char *op) {
 
 BI(os_read) {
   UNUSED;
-  FILE *f = fopen(vl_cstr(argv[0]), "rb");
+  FILE *f = fopen_ce(vl_cstr(argv[0]), "rb");
   if (!f) {
     Value m = vl_str("no such file or directory");
     Value e = vl_exc_new("IOError", &m, 1, NULL, NULL, 0);
@@ -696,7 +725,7 @@ BI(os_read) {
 
 BI(os_write) {
   UNUSED;
-  FILE *f = fopen(vl_cstr(argv[0]), "wb");
+  FILE *f = fopen_ce(vl_cstr(argv[0]), "wb");
   if (!f) {
     Value m = vl_str("cannot write file");
     Value e = vl_exc_new("IOError", &m, 1, NULL, NULL, 0);
@@ -712,7 +741,7 @@ BI(os_write) {
 
 BI(os_open) {
   UNUSED;
-  FILE *f = fopen(vl_cstr(argv[0]), "rb");
+  FILE *f = fopen_ce(vl_cstr(argv[0]), "rb");
   if (!f) {
     Value m = vl_str("no such file or directory");
     Value e = vl_exc_new("IOError", &m, 1, NULL, NULL, 0);
@@ -724,7 +753,7 @@ BI(os_open) {
 
 BI(os_create) {
   UNUSED;
-  FILE *f = fopen(vl_cstr(argv[0]), "wb");
+  FILE *f = fopen_ce(vl_cstr(argv[0]), "wb");
   if (!f) {
     Value m = vl_str("cannot create file");
     Value e = vl_exc_new("IOError", &m, 1, NULL, NULL, 0);
@@ -920,7 +949,7 @@ BI(os_rename) {
  * manufacture a privileged binary out of an unprivileged one. */
 BI(os_copy) {
   UNUSED;
-  FILE *in = fopen(vl_cstr(argv[0]), "rb");
+  FILE *in = fopen_ce(vl_cstr(argv[0]), "rb");
   if (!in) return os_errno("copy");
   struct stat st;
   bool have_mode = fstat(fileno(in), &st) == 0;
@@ -939,7 +968,7 @@ BI(os_copy) {
     vl_release(m);
     return e;
   }
-  FILE *out = fopen(vl_cstr(argv[1]), "wb");
+  FILE *out = fopen_ce(vl_cstr(argv[1]), "wb");
   if (!out) {
     int e = errno;
     fclose(in);
@@ -1092,6 +1121,12 @@ BI(os_run_capture) {
     errno = e;
     return os_errno("run_capture");
   }
+  /* The child dup2s its ends onto 1 and 2, which clears the flag on those
+   * copies; every other copy must not reach this child or a later one. */
+  cloexec_fd(outp[0]);
+  cloexec_fd(outp[1]);
+  cloexec_fd(errp[0]);
+  cloexec_fd(errp[1]);
   fflush(NULL); /* our own buffered output goes first — as in os.run */
   pid_t pid = fork();
   if (pid < 0) {
@@ -1315,10 +1350,44 @@ static Value vl_socket_new(int fd) {
   o->fd = fd;
   o->closed = false;
   o->timeout_ms = 0;
+  o->flt = vl_nil();
   Value v;
   v.t = VL_OBJ;
   v.u.o = &o->hdr;
   return v;
+}
+
+int vl_socket_fd(Value v) {
+  if (v.t != VL_OBJ || v.u.o->kind != O_SOCKET) return -1;
+  VlSocket *s = (VlSocket *)v.u.o;
+  return s->closed ? -1 : s->fd;
+}
+
+/* The check and the store are one step under g_flt_mu, so two tasks
+ * upgrading one socket at once cannot both install a filter (the second
+ * would leak the first). A filter is installed once and never removed, and
+ * a socket is only read by a task that has the Conn the upgrade returned. */
+static pthread_mutex_t g_flt_mu = PTHREAD_MUTEX_INITIALIZER;
+
+bool vl_socket_set_filter(Value sock, Value filter) {
+  if (sock.t != VL_OBJ || sock.u.o->kind != O_SOCKET) return false;
+  if (filter.t != VL_OBJ || filter.u.o->kind != O_HANDLE) return false;
+  VlSocket *s = (VlSocket *)sock.u.o;
+  pthread_mutex_lock(&g_flt_mu);
+  bool ok = s->flt.t == VL_NIL; /* one layer: TLS over TLS is a bug */
+  if (ok) s->flt = vl_retain(filter);
+  pthread_mutex_unlock(&g_flt_mu);
+  return ok;
+}
+
+Value vl_socket_filter(Value v) {
+  if (v.t != VL_OBJ || v.u.o->kind != O_SOCKET) return vl_nil();
+  return ((VlSocket *)v.u.o)->flt;
+}
+
+/* sock_filter is the socket's installed filter's handle, or NULL. */
+static VlHandle *sock_filter(VlSocket *s) {
+  return s->flt.t == VL_OBJ ? (VlHandle *)s->flt.u.o : NULL;
 }
 
 static VlSocket *want_sock(Value v) {
@@ -1403,7 +1472,7 @@ BI(net_listen_tcp) {
   int fam;
   int rc = net_fill(host, port, SOCK_STREAM, &ss, &slen, &fam);
   if (rc != 0) return net_err(gai_strerror(rc));
-  int fd = socket(fam, SOCK_STREAM, 0);
+  int fd = cloexec_fd(socket(fam, SOCK_STREAM, 0));
   if (fd < 0) return net_errno("socket");
   sock_setup(fd);
   int on = 1;
@@ -1430,7 +1499,7 @@ BI(net_connect_tcp) {
   int fam;
   int rc = net_fill(host, port, SOCK_STREAM, &ss, &slen, &fam);
   if (rc != 0) return net_err(gai_strerror(rc));
-  int fd = socket(fam, SOCK_STREAM, 0);
+  int fd = cloexec_fd(socket(fam, SOCK_STREAM, 0));
   if (fd < 0) return net_errno("socket");
   sock_setup(fd);
   if (connect(fd, (struct sockaddr *)&ss, slen) < 0) {
@@ -1455,7 +1524,7 @@ BI(net_accept) {
     if (pr == 0) return net_err("timed out");
     if (pr < 0) return net_errno("poll");
   }
-  int fd = accept(s->fd, NULL, NULL);
+  int fd = cloexec_fd(accept(s->fd, NULL, NULL));
   if (fd < 0) return net_recv_err("accept");
   sock_setup(fd);
   return vl_socket_new(fd);
@@ -1469,6 +1538,13 @@ BI(net_send) {
   if (s->closed) return net_err("socket is closed");
   const char *data = vl_cstr(argv[1]);
   int64_t len = vl_strlen(argv[1]);
+  VlHandle *f = sock_filter(s);
+  if (f) { /* a filtered socket: the filter owns the framing (TLS) */
+    if (len == 0) return vl_int(0);
+    Value err = vl_nil();
+    int64_t n = f->ops->write(f->ctx, data, len, &err);
+    return n < 0 ? err : vl_int(n);
+  }
   ssize_t sent = send(s->fd, data, (size_t)len, NET_SEND_FLAGS);
   if (sent < 0) {
     if (errno == EAGAIN || errno == EWOULDBLOCK) return net_err("timed out");
@@ -1485,6 +1561,18 @@ BI(net_recv) {
   if (n <= 0) return vl_str("");
   if (n > (1 << 24)) n = 1 << 24;   /* cap a single read at 16 MiB */
   char *buf = (char *)vl_alloc((size_t)n);
+  VlHandle *f = sock_filter(s);
+  if (f) {
+    Value err = vl_nil();
+    int64_t k = f->ops->read(f->ctx, buf, n, &err);
+    if (k < 0) {
+      free(buf);
+      return err;
+    }
+    Value r = vl_str_n(buf, k);
+    free(buf);
+    return r;
+  }
   ssize_t got = recv(s->fd, buf, (size_t)n, 0);
   if (got < 0) {
     Value e = net_recv_err("recv");
@@ -1547,7 +1635,7 @@ BI(net_udp) {
   int fam;
   int rc = net_fill(host, port, SOCK_DGRAM, &ss, &slen, &fam);
   if (rc != 0) return net_err(gai_strerror(rc));
-  int fd = socket(fam, SOCK_DGRAM, 0);
+  int fd = cloexec_fd(socket(fam, SOCK_DGRAM, 0));
   if (fd < 0) return net_errno("socket");
   sock_setup(fd);
   int on = 1;
@@ -1574,7 +1662,7 @@ BI(net_dial_udp) {
   int fam;
   int rc = net_fill(host, port, SOCK_DGRAM, &ss, &slen, &fam);
   if (rc != 0) return net_err(gai_strerror(rc));
-  int fd = socket(fam, SOCK_DGRAM, 0);
+  int fd = cloexec_fd(socket(fam, SOCK_DGRAM, 0));
   if (fd < 0) return net_errno("socket");
   sock_setup(fd);
   if (connect(fd, (struct sockaddr *)&ss, slen) < 0) {
@@ -1651,7 +1739,7 @@ BI(net_listen_unix) {
   un.sun_family = AF_UNIX;
   strncpy(un.sun_path, path, sizeof un.sun_path - 1);
   unlink(path);   /* a stale socket file makes bind fail with EADDRINUSE */
-  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  int fd = cloexec_fd(socket(AF_UNIX, SOCK_STREAM, 0));
   if (fd < 0) return net_errno("socket");
   sock_setup(fd);
   if (bind(fd, (struct sockaddr *)&un, sizeof un) < 0) {
@@ -1676,7 +1764,7 @@ BI(net_connect_unix) {
   memset(&un, 0, sizeof un);
   un.sun_family = AF_UNIX;
   strncpy(un.sun_path, path, sizeof un.sun_path - 1);
-  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  int fd = cloexec_fd(socket(AF_UNIX, SOCK_STREAM, 0));
   if (fd < 0) return net_errno("socket");
   sock_setup(fd);
   if (connect(fd, (struct sockaddr *)&un, sizeof un) < 0) {
@@ -1689,12 +1777,54 @@ BI(net_connect_unix) {
 
 /* ---- lifecycle & options ---- */
 
+/* close and shutdown may come from different tasks — http's serve_for shuts
+ * a straggler down from its tracker while the connection's own task may be
+ * closing it. Both take this lock and close() clears the descriptor under
+ * it, so a shutdown can never reach a descriptor NUMBER the close has
+ * already given back to the kernel (and that a new file may now have). */
+static pthread_mutex_t g_sockmu = PTHREAD_MUTEX_INITIALIZER;
+
 BI(net_close) {
   UNUSED;
   VlSocket *s = want_sock(argv[0]);
+  pthread_mutex_lock(&g_sockmu);
+  VlHandle *f = sock_filter(s);
+  if (f && !s->closed && !s->closing && f->ops->close) {
+    /* A filtered socket ends its protocol first (TLS's close_notify) — and
+     * NOT under g_sockmu, which every close and shutdown in the process
+     * takes: a peer that has stopped reading would hold them all for as
+     * long as the send may block. So the socket is marked `closing` under
+     * the lock — from here no other close releases the descriptor, so the
+     * number stays this socket's and cannot be reused under the send —
+     * the filter's close runs outside it (best-effort, and non-blocking:
+     * tls.c), and the descriptor is closed under the lock again. */
+    s->closing = true;
+    pthread_mutex_unlock(&g_sockmu);
+    Value err = vl_nil();
+    if (!f->ops->close(f->ctx, &err)) vl_release(err);
+    pthread_mutex_lock(&g_sockmu);
+    /* A task blocked in the filter's read must wake before the number is
+     * released for reuse: shutdown ends its recv at once. */
+    if (s->fd >= 0) shutdown(s->fd, SHUT_RDWR);
+  } else if (s->closing) {
+    /* Another task is closing it (sending close_notify): that close
+     * releases the descriptor. Nothing to wait for. */
+    pthread_mutex_unlock(&g_sockmu);
+    return vl_unit();
+  }
   if (!s->closed && s->fd >= 0) close(s->fd);
   s->closed = true;
   s->fd = -1;   /* defensive: no native touches the fd once closed */
+  pthread_mutex_unlock(&g_sockmu);
+  return vl_unit();
+}
+
+BI(net_shutdown) {
+  UNUSED;
+  VlSocket *s = want_sock(argv[0]);
+  pthread_mutex_lock(&g_sockmu);
+  if (!s->closed && s->fd >= 0) shutdown(s->fd, SHUT_RDWR);
+  pthread_mutex_unlock(&g_sockmu);
   return vl_unit();
 }
 
@@ -1842,301 +1972,38 @@ BI(sort_sort) { UNUSED; vl_sort_slice(argv[0], vl_nil()); return vl_unit(); }
 BI(sort_sort_by) { UNUSED; vl_sort_slice(argv[0], argv[1]); return vl_unit(); }
 BI(sort_reversed) {
   UNUSED;
-  VlSlice *s = (VlSlice *)argv[0].u.o;
+  /* Members in order, then reversed in place: a set has no index. */
+  VlSeq q = vl_seq(argv[0]);
   Value out = vl_slice_new(0);
-  for (int64_t i = s->len - 1; i >= 0; i--) vl_slice_append(out, vl_retain(s->e[i]));
+  Value e;
+  while (vl_seq_next(&q, &e)) vl_slice_append(out, vl_retain(e));
+  VlSlice *s = (VlSlice *)out.u.o;
+  for (int64_t i = 0, j = s->len - 1; i < j; i++, j--) {
+    Value t = s->e[i];
+    s->e[i] = s->e[j];
+    s->e[j] = t;
+  }
   return out;
 }
 
 /* ---------------------------------------------------------------- json */
 
-static void json_enc(Value b, Value v, const char *indent, const char *cur);
-
-static void jput(Value b, const char *s) {
-  Value t = vl_str(s);
-  vl_builder_write(b, t);
-  vl_release(t);
-}
-
-static void json_str(Value b, Value s) {
-  Value sv = vl_tostr(s);
-  const char *p = vl_cstr(sv);
-  int64_t n = vl_strlen(sv);
-  jput(b, "\"");
-  for (int64_t i = 0; i < n; i++) {
-    char c = p[i];
-    if (c == '"') jput(b, "\\\"");
-    else if (c == '\\') jput(b, "\\\\");
-    else if (c == '\n') jput(b, "\\n");
-    else if (c == '\t') jput(b, "\\t");
-    else if (c == '\r') jput(b, "\\r");
-    else {
-      Value cv = vl_str_n(&c, 1);
-      vl_builder_write(b, cv);
-      vl_release(cv);
-    }
-  }
-  jput(b, "\"");
-  vl_release(sv);
-}
-
-static void json_enc(Value b, Value v, const char *indent, const char *cur) {
-  char pad[256];
-  const char *nl = indent[0] ? "\n" : "";
-  snprintf(pad, sizeof pad, "%s%s", cur, indent);
-  const char *sep = indent[0] ? ": " : ":";
-
-  switch (v.t) {
-  case VL_NIL: jput(b, "null"); return;
-  case VL_BOOL: jput(b, v.u.b ? "true" : "false"); return;
-  case VL_INT:
-  case VL_FLOAT: {
-    Value s = vl_tostr(v);
-    vl_builder_write(b, s);
-    vl_release(s);
-    return;
-  }
-  case VL_OBJ: break;
-  default: {
-    Value s = vl_tostr(v);
-    json_str(b, s);
-    vl_release(s);
-    return;
-  }
-  }
-  switch ((VlKind)v.u.o->kind) {
-  case O_DEC: {
-    Value s = vl_tostr(v);
-    vl_builder_write(b, s);
-    vl_release(s);
-    return;
-  }
-  case O_STR:
-  case O_RANGE:
-    json_str(b, v);
-    return;
-  case O_SLICE: {
-    VlSlice *s = (VlSlice *)v.u.o;
-    if (s->len == 0) { jput(b, "[]"); return; }
-    jput(b, "[");
-    jput(b, nl);
-    for (int64_t i = 0; i < s->len; i++) {
-      jput(b, pad);
-      json_enc(b, s->e[i], indent, pad);
-      if (i < s->len - 1) jput(b, ",");
-      jput(b, nl);
-    }
-    jput(b, cur);
-    jput(b, "]");
-    return;
-  }
-  case O_MAP: {
-    VlMap *m = (VlMap *)v.u.o;
-    if (m->count == 0) { jput(b, "{}"); return; }
-    jput(b, "{");
-    jput(b, nl);
-    int64_t seen = 0;
-    for (int64_t i = 0; i < m->nents; i++) {
-      if (!m->ents[i].used) continue;
-      jput(b, pad);
-      json_str(b, m->ents[i].k);
-      jput(b, sep);
-      json_enc(b, m->ents[i].v, indent, pad);
-      if (++seen < m->count) jput(b, ",");
-      jput(b, nl);
-    }
-    jput(b, cur);
-    jput(b, "}");
-    return;
-  }
-  case O_STRUCT: {
-    VlStruct *s = (VlStruct *)v.u.o;
-    jput(b, "{");
-    jput(b, nl);
-    for (int i = 0; i < s->type->nfields; i++) {
-      jput(b, pad);
-      Value k = vl_str(s->type->fields[i]);
-      json_str(b, k);
-      vl_release(k);
-      jput(b, sep);
-      json_enc(b, s->f[i], indent, pad);
-      if (i < s->type->nfields - 1) jput(b, ",");
-      jput(b, nl);
-    }
-    jput(b, cur);
-    jput(b, "}");
-    return;
-  }
-  case O_SHARED:
-    json_enc(b, ((VlShared *)v.u.o)->v, indent, cur);
-    return;
-  default: {
-    Value s = vl_tostr(v);
-    json_str(b, s);
-    vl_release(s);
-    return;
-  }
-  }
-}
-
+/* std/json lives in json.c; these are the natives table's shims. */
 BI(json_encode) {
   UNUSED;
-  Value b = vl_builder_new();
-  json_enc(b, argv[0], "", "");
-  Value out = vl_builder_done(b);
-  vl_release(b);
-  return out;
+  return vl_json_encode(argv[0], false);
 }
 
 BI(json_pretty) {
   UNUSED;
-  Value b = vl_builder_new();
-  json_enc(b, argv[0], "  ", "");
-  Value out = vl_builder_done(b);
-  vl_release(b);
-  return out;
-}
-
-/* json decode */
-typedef struct {
-  const char *s;
-  int64_t i, n;
-} JP;
-
-static void jskip(JP *p) {
-  while (p->i < p->n && (p->s[p->i] == ' ' || p->s[p->i] == '\n' ||
-                         p->s[p->i] == '\t' || p->s[p->i] == '\r'))
-    p->i++;
-}
-
-static bool jvalue(JP *p, Value *out);
-
-static bool jstring(JP *p, Value *out) {
-  if (p->s[p->i] != '"') return false;
-  p->i++;
-  Value b = vl_builder_new();
-  while (p->i < p->n && p->s[p->i] != '"') {
-    char c = p->s[p->i++];
-    if (c == '\\' && p->i < p->n) {
-      char e = p->s[p->i++];
-      if (e == 'n') c = '\n';
-      else if (e == 't') c = '\t';
-      else if (e == 'r') c = '\r';
-      else c = e;
-    }
-    Value cv = vl_str_n(&c, 1);
-    vl_builder_write(b, cv);
-    vl_release(cv);
-  }
-  if (p->i >= p->n) { vl_release(b); return false; }
-  p->i++;
-  *out = vl_builder_done(b);
-  vl_release(b);
-  return true;
-}
-
-static bool jvalue(JP *p, Value *out) {
-  jskip(p);
-  if (p->i >= p->n) return false;
-  char c = p->s[p->i];
-  if (c == '{') {
-    p->i++;
-    Value m = vl_map_new();
-    jskip(p);
-    if (p->i < p->n && p->s[p->i] == '}') { p->i++; *out = m; return true; }
-    for (;;) {
-      jskip(p);
-      Value k;
-      if (!jstring(p, &k)) { vl_release(m); return false; }
-      jskip(p);
-      if (p->i >= p->n || p->s[p->i] != ':') { vl_release(k); vl_release(m); return false; }
-      p->i++;
-      Value v;
-      if (!jvalue(p, &v)) { vl_release(k); vl_release(m); return false; }
-      vl_map_set(m, k, v);
-      vl_release(k);
-      jskip(p);
-      if (p->i < p->n && p->s[p->i] == ',') { p->i++; continue; }
-      if (p->i < p->n && p->s[p->i] == '}') { p->i++; break; }
-      vl_release(m);
-      return false;
-    }
-    *out = m;
-    return true;
-  }
-  if (c == '[') {
-    p->i++;
-    Value a = vl_slice_new(0);
-    jskip(p);
-    if (p->i < p->n && p->s[p->i] == ']') { p->i++; *out = a; return true; }
-    for (;;) {
-      Value v;
-      if (!jvalue(p, &v)) { vl_release(a); return false; }
-      vl_slice_append(a, v);
-      jskip(p);
-      if (p->i < p->n && p->s[p->i] == ',') { p->i++; continue; }
-      if (p->i < p->n && p->s[p->i] == ']') { p->i++; break; }
-      vl_release(a);
-      return false;
-    }
-    *out = a;
-    return true;
-  }
-  if (c == '"') return jstring(p, out);
-  if (strncmp(p->s + p->i, "true", 4) == 0) { p->i += 4; *out = vl_bool(true); return true; }
-  if (strncmp(p->s + p->i, "false", 5) == 0) { p->i += 5; *out = vl_bool(false); return true; }
-  if (strncmp(p->s + p->i, "null", 4) == 0) { p->i += 4; *out = vl_nil(); return true; }
-  /* number: integers stay int, fractions become dec (money survives) */
-  int64_t start = p->i;
-  bool isfloat = false;
-  if (p->s[p->i] == '-' || p->s[p->i] == '+') p->i++;
-  while (p->i < p->n && (isdigit((unsigned char)p->s[p->i]) || p->s[p->i] == '.' ||
-                         p->s[p->i] == 'e' || p->s[p->i] == 'E' ||
-                         p->s[p->i] == '-' || p->s[p->i] == '+')) {
-    if (p->s[p->i] == '.' || p->s[p->i] == 'e' || p->s[p->i] == 'E') isfloat = true;
-    p->i++;
-  }
-  if (p->i == start) return false;
-  char *tmp = vl_strdup_n(p->s + start, p->i - start);
-  if (isfloat) *out = vl_dec_parse(tmp);
-  else *out = vl_int(strtoll(tmp, NULL, 10));
-  free(tmp);
-  return true;
+  return vl_json_encode(argv[0], true);
 }
 
 BI(json_decode) {
   UNUSED;
-  const char *type = NULL;
-  Value src = argv[0];
-  if (argc > 1) { /* json.decode[T](s): the generator passes T's name first */
-    type = vl_cstr(argv[0]);
-    src = argv[1];
-  }
-  JP p = {vl_cstr(src), 0, vl_strlen(src)};
-  Value v;
-  if (!jvalue(&p, &v)) return vl_err(vl_str("bad JSON"));
-  if (!type) return v;
-  const VlType *t = vl_find_type(type);
-  if (!t || v.t != VL_OBJ || v.u.o->kind != O_MAP) return v;
-  Value *named = (Value *)vl_alloc(sizeof(Value) * (size_t)(t->nfields ? t->nfields : 1));
-  const char **names = (const char **)vl_alloc(sizeof(char *) * (size_t)(t->nfields ? t->nfields : 1));
-  int n = 0;
-  for (int i = 0; i < t->nfields; i++) {
-    Value k = vl_str(t->fields[i]);
-    Value fv;
-    if (vl_map_get(v, k, &fv)) {
-      names[n] = t->fields[i];
-      named[n] = fv;
-      n++;
-    }
-    vl_release(k);
-  }
-  Value out = vl_struct_new(type, NULL, 0, names, named, n);
-  for (int i = 0; i < n; i++) vl_release(named[i]);
-  free(named);
-  free((void *)names);
-  vl_release(v);
-  return out;
+  /* json.decode[T](s): the generator passes T's type text first. */
+  if (argc > 1) return vl_json_decode(vl_cstr(argv[0]), argv[1]);
+  return vl_json_decode(NULL, argv[0]);
 }
 
 /* ---------------------------------------------------------------- rand */
@@ -2189,7 +2056,8 @@ STRFN(replace) STRFN(replace_n) STRFN(repeat) STRFN(reverse) STRFN(translate)
 STRFN(overlay) STRFN(insert) STRFN(delstr) STRFN(bytes) STRFN(from_bytes)
 STRFN(runes) STRFN(from_runes) STRFN(rune_len) STRFN(is_digit) STRFN(is_alpha)
 STRFN(is_space) STRFN(is_upper) STRFN(hex) STRFN(unhex) STRFN(b64) STRFN(unb64)
-STRFN(find_any) STRFN(skip_any)
+STRFN(find_any) STRFN(skip_any) STRFN(valid_utf8)
+STRFN(trim_prefix) STRFN(trim_suffix) STRFN(cut)
 #undef STRFN
 
 /* ---------------------------------------------------------------- table */
@@ -2213,6 +2081,11 @@ BI(regex_replace) {
   return vl_regex_replace(argv[0], argv[1], argv[2]);
 }
 BI(regex_split) { UNUSED; return vl_regex_split(argv[0], argv[1]); }
+BI(regex_find_named) {
+  UNUSED;
+  return vl_regex_find_named(argv[0], argv[1]);
+}
+BI(regex_names) { UNUSED; return vl_regex_names(argv[0]); }
 
 static const Entry table[] = {
     /* prelude */
@@ -2222,7 +2095,7 @@ static const Entry table[] = {
     {"avg", bi_avg}, {"round", bi_round}, {"floor", bi_floor},
     {"ceil", bi_ceil}, {"trunc", bi_trunc}, {"round_to", bi_round_to},
     {"range", bi_range}, {"zip", bi_zip}, {"enumerate", bi_enumerate},
-    {"keys", bi_keys}, {"values", bi_values}, {"shared", bi_shared},
+    {"keys", bi_keys}, {"values", bi_values}, {"shared", bi_shared}, {"Box", bi_box},
     {"cell", bi_cell}, {"weak", bi_weak}, {"set", bi_set},
     {"printf", bi_printf}, {"sprintf", bi_sprintf},
     {"to_int", bi_to_int}, {"to_i8", bi_to_i8}, {"to_i16", bi_to_i16},
@@ -2264,6 +2137,12 @@ static const Entry table[] = {
     {"os.realpath", os_realpath},
     {"os.setenv", os_setenv}, {"os.unsetenv", os_unsetenv},
     {"os.environ", os_environ},
+    /* proc.c: signals, kill, process handles, walk and glob */
+    {"os.kill", vl_os_kill}, {"os.getpid", os_pid},
+    {"os.signals", vl_os_signals}, {"os.start", vl_os_start},
+    {"os.walk", vl_os_walk}, {"os.glob", vl_os_glob},
+    {"os.walk_all", vl_os_walk_all}, {"os.kill_group", vl_os_kill_group},
+    {"os.signal_stop", vl_os_signal_stop},
 
     /* io (the reader/writer kinds live in io.c) */
     {"io.reader", vl_io_reader}, {"io.writer", vl_io_writer},
@@ -2281,6 +2160,10 @@ static const Entry table[] = {
     {"net._recvfrom", net_recvfrom}, {"net._listen_unix", net_listen_unix},
     {"net._connect_unix", net_connect_unix}, {"net._close", net_close},
     {"net._set_timeout", net_set_timeout}, {"net.resolve", net_resolve},
+    {"net._shutdown", net_shutdown},
+
+    /* std/http's recovery point around a handler call (err.c). */
+    {"http._contain", vl_call_contained},
 
     /* std/sync (sync.c). Internal shims only: Mutex/RWLock/Atomic/Once/
        WaitGroup and every closure-shaped call are Voilà source. */
@@ -2293,6 +2176,11 @@ static const Entry table[] = {
     {"sync._atomic", vl_sync_atomic}, {"sync._load", vl_sync_load},
     {"sync._store", vl_sync_store}, {"sync._add", vl_sync_add},
     {"sync._swap", vl_sync_swap}, {"sync._cas", vl_sync_cas},
+
+    /* std/ffi (ffi.c): raw memory. The API is Voilà, in std/ffi. */
+    {"ffi._alloc", vl_ffi_alloc}, {"ffi._free", vl_ffi_free},
+    {"ffi._read", vl_ffi_read}, {"ffi._write", vl_ffi_write},
+    {"ffi._read_str", vl_ffi_read_str}, {"ffi._write_str", vl_ffi_write_str},
 
     /* math */
     {"math.sqrt", math_sqrt}, {"math.sin", math_sin}, {"math.cos", math_cos},
@@ -2332,6 +2220,7 @@ static const Entry table[] = {
     {"regex.compile", regex_compile}, {"regex.matches", regex_matches},
     {"regex.find", regex_find}, {"regex.find_all", regex_find_all},
     {"regex.replace", regex_replace}, {"regex.split", regex_split},
+    {"regex.find_named", regex_find_named}, {"regex.names", regex_names},
     {"crypto.sha256", vl_crypto_sha256},
     {"crypto.sha256_raw", vl_crypto_sha256_raw},
     {"crypto.sha512", vl_crypto_sha512},
@@ -2364,9 +2253,139 @@ static const Entry str_table[] = {
     E(reverse) E(translate) E(overlay) E(insert) E(delstr) E(bytes)
     E(from_bytes) E(runes) E(from_runes) E(rune_len) E(is_digit) E(is_alpha)
     E(is_space) E(is_upper) E(hex) E(unhex) E(b64) E(unb64)
-    E(find_any) E(skip_any)
+    E(find_any) E(skip_any) E(valid_utf8)
+    E(trim_prefix) E(trim_suffix) E(cut)
 #undef E
 };
+
+/* ------------------------------------------------------- argument kinds
+ *
+ * kinds_table[] is the runtime copy of low.NativeKinds (voilac/low/
+ * names.voi; selftest holds the two equal): the natives whose C bodies
+ * ASSUME an argument's kind, one letter per argument, the last repeated.
+ * The code generator checks a direct call with vl_argk before it is made;
+ * a native reached as a VALUE carries its row in its closure (vl_native)
+ * and vl_call checks it. Either way a wrong kind is a clean abort with a
+ * trace, never a cast of the wrong object. */
+typedef struct {
+  const char *name;
+  const char *kinds;
+} KindRow;
+
+static const KindRow kinds_table[] = {
+    {"append", "la"}, {"close", "c"}, {"sum", "q"}, {"avg", "q"},
+    {"zip", "qq"}, {"enumerate", "q"}, {"keys", "m"}, {"values", "m"},
+    {"round_to", "ni"}, {"range", "i"}, {"printf", "sa"}, {"sprintf", "sa"},
+    {"errf", "sa"}, {"upper", "r"}, {"lower", "r"}, {"title", "r"},
+    {"trim", "r"}, {"trim_left", "r"}, {"trim_right", "r"}, {"strip", "rr"},
+    {"pad", "ri"}, {"pad_left", "ri"}, {"center", "ri"}, {"contains", "rr"},
+    {"index", "rr"}, {"last_index", "rr"}, {"starts_with", "rr"},
+    {"ends_with", "rr"}, {"count", "rr"}, {"equal_fold", "rr"},
+    {"substr", "rii"}, {"left", "ri"}, {"right", "ri"}, {"split", "rr"},
+    {"split_n", "rri"}, {"lines", "r"}, {"fields", "r"}, {"word", "ri"},
+    {"words", "r"}, {"subword", "rii"}, {"delword", "rii"}, {"join", "qa"},
+    {"replace", "rrr"}, {"replace_n", "rrri"}, {"repeat", "ri"},
+    {"reverse", "r"}, {"translate", "rrr"}, {"overlay", "rri"},
+    {"insert", "rri"}, {"delstr", "rii"}, {"bytes", "r"}, {"from_bytes", "q"},
+    {"runes", "r"}, {"from_runes", "l"}, {"rune_len", "r"}, {"is_digit", "r"},
+    {"is_alpha", "r"}, {"is_space", "r"}, {"is_upper", "r"}, {"hex", "r"},
+    {"unhex", "r"}, {"b64", "r"}, {"unb64", "r"}, {"find_any", "rri"},
+    {"skip_any", "rri"}, {"valid_utf8", "r"}, {"trim_prefix", "rr"},
+    {"trim_suffix", "rr"}, {"cut", "rr"}, {"fmt.printf", "sa"},
+    {"fmt.sprintf", "sa"}, {"fmt.eprintf", "sa"}, {"fmt.fprintf", "asa"},
+    {"fmt.pad", "ri"}, {"fmt.pad_left", "ri"}, {"fmt.center", "ri"},
+    {"fmt.table", "l"}, {"os.read", "s"}, {"os.write", "sa"}, {"os.open", "s"},
+    {"os.create", "s"}, {"os.exists", "s"}, {"os.remove", "s"},
+    {"os.env", "s"}, {"os.exit", "i"}, {"os.on_abort", "f"}, {"os.isdir", "s"},
+    {"os.listdir", "s"}, {"os.run", "sl"}, {"os.run_capture", "sl"},
+    {"os.mtime", "s"}, {"os.size", "s"}, {"os.mkdir", "s"},
+    {"os.mkdir_all", "s"}, {"os.rmdir", "s"}, {"os.rename", "ss"},
+    {"os.copy", "ss"}, {"os.realpath", "s"}, {"os.setenv", "sa"},
+    {"os.unsetenv", "s"}, {"os.kill", "ii"}, {"os.start", "sl"},
+    {"os.walk", "s"}, {"os.glob", "s"}, {"os.walk_all", "s"},
+    {"os.kill_group", "ii"}, {"os.signal_stop", "c"}, {"io.buffered", "ai"},
+    {"sort.sort", "l"},
+    {"sort.sort_by", "lf"}, {"sort.reversed", "q"},
+};
+
+const char *vl_native_kinds(const char *name) {
+  for (size_t i = 0; i < sizeof(kinds_table) / sizeof(kinds_table[0]); i++)
+    if (eq(kinds_table[i].name, name)) return kinds_table[i].kinds;
+  /* std/str is reachable as `str.NAME` too, under the bare row. */
+  if (strncmp(name, "str.", 4) == 0) return vl_native_kinds(name + 4);
+  return NULL;
+}
+
+static bool kind_ok(char k, Value v) {
+  bool obj = v.t == VL_OBJ;
+  switch (k) {
+  case 's': return obj && v.u.o->kind == O_STR;
+  case 'r': return (obj && v.u.o->kind == O_STR) || v.t == VL_RUNE;
+  case 'i': return v.t == VL_INT || v.t == VL_RUNE;
+  case 'n':
+    return v.t == VL_INT || v.t == VL_RUNE || v.t == VL_FLOAT ||
+           (obj && v.u.o->kind == O_DEC);
+  case 'l': return obj && v.u.o->kind == O_SLICE;
+  case 'q': return obj && (v.u.o->kind == O_SLICE || v.u.o->kind == O_SET);
+  case 'm': return obj && (v.u.o->kind == O_MAP || v.u.o->kind == O_SET);
+  case 'c': return obj && v.u.o->kind == O_CHAN;
+  case 'f': return obj && (v.u.o->kind == O_CLOSURE || v.u.o->kind == O_NATIVE);
+  case 'b': return v.t == VL_BOOL;
+  default: return true;
+  }
+}
+
+static const char *kind_word(char k) {
+  switch (k) {
+  case 's': return "a str";
+  case 'r': return "a str or a rune";
+  case 'i': return "an int";
+  case 'n': return "a number";
+  case 'l': return "a slice";
+  case 'q': return "a slice or a set";
+  case 'm': return "a map or a set";
+  case 'c': return "a channel";
+  case 'f': return "a function";
+  case 'b': return "a bool";
+  default: return "anything";
+  }
+}
+
+/* vl_argk checks a native call's arguments against its kinds row. A Box or
+ * a newtype whose value IS of the kind is unwrapped in place when `fix`
+ * (the argument vector is the call's own scratch array); a spread call's
+ * vector is a slice's storage, and is never written. */
+void vl_argk(const char *name, const char *kinds, Value *argv, int argc,
+             bool fix) {
+  int nk = (int)strlen(kinds);
+  if (nk == 0) return;
+  for (int i = 0; i < argc; i++) {
+    char k = kinds[i < nk ? i : nk - 1];
+    if (k == 'a' || kind_ok(k, argv[i])) continue;
+    Value d = vl_deref(argv[i]);
+    if (fix && kind_ok(k, d)) {
+      argv[i] = d;
+      continue;
+    }
+    vl_fault("%s: argument %d must be %s, got %s", name, i + 1,
+             kind_word(k), vl_kind_name(argv[i]));
+  }
+}
+
+/* The extension tables the program registered (vl_ext_register). There
+ * are three extensions today and the generated main() registers each at
+ * most once, before any task exists — so a fixed array, written only on
+ * the main thread before the first lookup, needs no lock. */
+#define VL_MAX_EXT 16
+static const VlExtEntry *g_ext[VL_MAX_EXT];
+static int g_next;
+
+void vl_ext_register(const VlExtEntry *t) {
+  for (int i = 0; i < g_next; i++)
+    if (g_ext[i] == t) return;
+  if (g_next == VL_MAX_EXT) vl_abort("too many runtime extensions");
+  g_ext[g_next++] = t;
+}
 
 VlFn vl_lookup_fn(const char *name) {
   for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++)
@@ -2375,6 +2394,9 @@ VlFn vl_lookup_fn(const char *name) {
   if (strncmp(name, "str.", 4) == 0) bare = name + 4;
   for (size_t i = 0; i < sizeof(str_table) / sizeof(str_table[0]); i++)
     if (eq(str_table[i].name, bare)) return str_table[i].fn;
+  for (int k = 0; k < g_next; k++)
+    for (const VlExtEntry *e = g_ext[k]; e->name; e++)
+      if (eq(e->name, name)) return e->fn;
   return NULL;
 }
 
@@ -2385,7 +2407,7 @@ bool vl_has_name(const char *name) {
          eq(name, "time.Minute") || eq(name, "time.Hour") ||
          eq(name, "math.pi") || eq(name, "math.e") ||
          eq(name, "os.stderr") || eq(name, "os.stdout") ||
-         eq(name, "os.stdin");
+         eq(name, "os.stdin") || vl_os_signal_const(name, &(int64_t){0});
 }
 
 Value vl_lookup_value(const char *name) {
@@ -2405,6 +2427,8 @@ Value vl_lookup_value(const char *name) {
   if (eq(name, "os.stderr")) return vl_retain(vl_stderr());
   if (eq(name, "os.stdout")) return vl_retain(vl_stdout());
   if (eq(name, "os.stdin")) return vl_retain(vl_stdin());
+  int64_t sig; /* os.SIGINT and friends: the platform's numbers (proc.c) */
+  if (vl_os_signal_const(name, &sig)) return vl_int(sig);
   VlFn fn = vl_lookup_fn(name);
   if (fn) return vl_native(name, fn);
   vl_abort("unknown name `%s`", name);
@@ -2413,7 +2437,34 @@ Value vl_lookup_value(const char *name) {
 
 /* ---------------------------------------------------------------- match */
 
+/* pat_ordered reports whether a value can be ordered against a range
+ * pattern's bound: both of the SAME kind — two ints, two floats, two runes,
+ * two decimals or two strings. A subject of any other kind simply does not
+ * match the range (the spec says so, and vl_compare would throw on some of
+ * them — a failed match must never throw): `98` is not in 'a'..='z', and
+ * 0.5 is not in 0..1. */
+static bool pat_ordered(Value a, Value b) {
+  if (a.t != b.t) return false;
+  if (a.t == VL_INT || a.t == VL_FLOAT || a.t == VL_RUNE) return true;
+  if (a.t != VL_OBJ) return false;
+  return a.u.o->kind == b.u.o->kind &&
+         (a.u.o->kind == O_DEC || a.u.o->kind == O_STR);
+}
+
 bool vl_match(VlFrame *f, Value subject, const VlPat *p, const Value *consts) {
+  /* Pattern matching sees THROUGH a Box, and through a newtype to its
+   * underlying value: `Node(v, Leaf, _)` matches a node whose left child is
+   * a `Box[Tree]` holding `Leaf`. A binding, a wildcard and an or-pattern
+   * take the subject as it is — a bind of a Box binds the Box. */
+  if (p->kind != VL_P_WILD && p->kind != VL_P_BIND && p->kind != VL_P_OR &&
+      subject.t == VL_OBJ) {
+    if (subject.u.o->kind == O_BOX)
+      return vl_match(f, ((VlBox *)subject.u.o)->v, p, consts);
+    if (vl_is_newtype(subject) &&
+        !(p->kind == VL_P_STRUCT &&
+          strcmp(((VlStruct *)subject.u.o)->type->name, p->name) == 0))
+      return vl_match(f, ((VlStruct *)subject.u.o)->f[0], p, consts);
+  }
   switch (p->kind) {
   case VL_P_WILD:
     return true;
@@ -2424,6 +2475,49 @@ bool vl_match(VlFrame *f, Value subject, const VlPat *p, const Value *consts) {
   case VL_P_BIND:
     vl_set(&f->r[p->slot], vl_retain(subject));
     return true;
+  case VL_P_OR:
+    /* Alternatives bind the same names into the same registers, so a later
+     * alternative simply overwrites what a failed earlier one wrote. */
+    for (int i = 0; i < p->nelems; i++)
+      if (vl_match(f, subject, &p->elems[i], consts)) return true;
+    return false;
+  case VL_P_RANGE: {
+    Value lo = consts[p->elems[0].lit], hi = consts[p->elems[1].lit];
+    if (!pat_ordered(subject, lo) || !pat_ordered(subject, hi)) return false;
+    if (vl_compare(subject, lo) < 0) return false;
+    int c = vl_compare(subject, hi);
+    return p->name[0] == '=' ? c <= 0 : c < 0;
+  }
+  case VL_P_TUPLE: {
+    if (!(subject.t == VL_OBJ && subject.u.o->kind == O_TUPLE)) return false;
+    VlTuple *t = (VlTuple *)subject.u.o;
+    if (t->n != p->nelems) return false;
+    for (int i = 0; i < p->nelems; i++)
+      if (!vl_match(f, t->e[i], &p->elems[i], consts)) return false;
+    return true;
+  }
+  case VL_P_STRUCT: {
+    if (subject.t == VL_OBJ && subject.u.o->kind == O_SHARED)
+      return vl_match(f, ((VlShared *)subject.u.o)->v, p, consts);
+    if (!(subject.t == VL_OBJ && subject.u.o->kind == O_STRUCT)) return false;
+    VlStruct *s = (VlStruct *)subject.u.o;
+    if (strcmp(s->type->name, p->name) != 0) return false;
+    /* Each VL_P_FIELD names one field; the ones not listed are not looked
+     * at. A field the type does not have matches nothing. */
+    for (int i = 0; i < p->nelems; i++) {
+      const VlPat *fp = &p->elems[i];
+      int j = 0;
+      while (j < s->type->nfields && strcmp(s->type->fields[j], fp->name) != 0)
+        j++;
+      if (j == s->type->nfields) return false;
+      if (fp->nelems == 1 && !vl_match(f, s->f[j], &fp->elems[0], consts))
+        return false;
+    }
+    return true;
+  }
+  case VL_P_FIELD:
+    /* Only ever reached through VL_P_STRUCT, which reads it directly. */
+    return false;
   case VL_P_VARIANT:
     break;
   }
@@ -2457,8 +2551,14 @@ bool vl_match(VlFrame *f, Value subject, const VlPat *p, const Value *consts) {
   const char *pname = p->name;
   const char *dot = strrchr(pname, '.');
   if (dot) {
+    /* The qualifier is either the PACKAGE (`geom.Circle`, a prefix of the
+     * type `geom.Shape`) or the ENUM itself (`Shape.Circle`,
+     * `geom.Shape.Circle`), which must then equal the type exactly. */
     size_t qlen = (size_t)(dot - pname);
-    if (strncmp(e->var->type, pname, qlen) != 0 || e->var->type[qlen] != '.')
+    bool is_type = strlen(e->var->type) == qlen &&
+                   strncmp(e->var->type, pname, qlen) == 0;
+    if (!is_type && (strncmp(e->var->type, pname, qlen) != 0 ||
+                     e->var->type[qlen] != '.'))
       return false;
     pname = dot + 1;
   }

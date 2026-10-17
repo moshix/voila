@@ -1,0 +1,11 @@
+// insert and remove are slice METHODS now (in place, like append and pop),
+// so the static check knows them — and still refuses a name that is not a
+// slice method, at compile time rather than with an abort at run time.
+func main() {
+    var xs = [1, 2, 3]
+    xs.insrt(0, 9)
+    say xs.rmove(0)
+    // Legal: the in-place pair.
+    xs.insert(0, 9)
+    say xs.remove(0), xs
+}

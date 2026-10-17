@@ -81,6 +81,78 @@ struct Checker {
     eSelf int
     eRes  int
     eFn   str
+    // … its results when it declares several, and the generic parameters
+    // in scope (an impl's or trait's and the function's own), name →
+    // GENERIC node, whose bounds say what a value of a parameter answers.
+    eResList []int
+    eGens    map[str]int
+    // … and whether its `self` may be written (`mut self`/`own self`).
+    eSelfW   bool
+    // The names the enclosing function NARROWS somewhere (a nil test, an
+    // `if let`, a `match`, an `else`, `must`, `try`): see direct_opt.
+    eVolatile set[str]
+    // The module-level `var`s (any function may reassign one), and whether
+    // the walk is inside a function body (a binding there is local).
+    gVars     set[str]
+    inFunc    bool
+    // The narrowing state of the point the walk is at (expr.voi): the
+    // names and paths certainly non-nil (1), whether the walk is past a
+    // statement that leaves, the optional `let`s ever marked immutable, and
+    // the method names some declaration (or builtin) writes `self` with.
+    nn        map[str]int
+    dead      bool
+    immNames  set[str]
+    mutNames  set[str]
+    // Set once some path indexed by a location (`xs[i]`) is narrowed:
+    // until then a write to a name need not scan nn for such paths.
+    idxKeys   bool
+    // Inside a `spawn` (expr.voi, spawn_write/spawn_call): how many are
+    // open, the names visible where the innermost began — the variables
+    // the task shares with its group — and the names bound since inside it.
+    spawnDepth int
+    spawnCaps  map[str]int
+    spawnLocal set[str]
+    // … whether a closure's body is only being PROBED for those rules
+    // (no report: probeHit is set), the closures found task-unsafe, the
+    // names bound to them, and the nodes already reported.
+    probe       bool
+    probeHit    bool
+    unsafeClos  set[int]
+    unsafeNames set[str]
+    spawnRep    set[int]
+    taskParams  map[str]set[int]
+    // Open `lock()` regions and `with` closures (the user's critical
+    // sections), where the spawned-body rules do not report.
+    lockDepth   int
+    // Whether the walk met `self` inside the closure being walked, and the
+    // closure literals passed straight to a method that runs them at once.
+    closSelf    bool
+    syncClos    set[int]
+
+    // The inference's tables (infer.voi): the per-node type memo (type id
+    // + 1, so that a stored 0 still means "computed"), the alias-resolution
+    // and Copy memos, aliases and newtypes by name → their target's type
+    // node, and every variant → its enum ("" when two enums declare it) and
+    // its VARIANTDEC.
+    tyMemo    map[int]int
+    canonMemo map[int]int
+    copyMemo  map[int]int
+    aliasOf   map[str]int
+    ntUnder   map[str]int
+    varEnum   map[str]str
+    varDecl   map[str]int
+    // The `if`/`match` values a hole already pushed a type into (their
+    // branches were judged against it, not against each other), and the
+    // bare names a binding, an assignment or a send MOVES — read by
+    // check_moves, which runs after this walk.
+    holeDone   set[int]
+    moveIdents set[int]
+    // … and the names handed to an `own` parameter whose type is Copy.
+    copyArgs   set[int]
+    // The literals accepted into a newtype hole (Result.Conv), and the
+    // nodes already recorded.
+    convs      []str
+    convSeen   set[int]
 
     // Binding-discipline state (bind.voi). The enclosing method's self-mode
     // is recorded rather than threaded through the recursion, so a closure
@@ -125,6 +197,8 @@ struct Checker {
     natMax     map[str]int
     natBare    set[str]
     natShadow  set[str]
+    // A native's argument kinds (low.NativeKinds), keyed like natMin.
+    natKinds   map[str]str
 
     // Every diagnostic this pass produces, in the order the checks ran.
     // Sorting and rendering belong to diag.Bag, which is also what gives a
@@ -132,9 +206,49 @@ struct Checker {
     D diag.Bag
 }
 
-// Check runs every static check over a loaded, flattened program and returns
-// the diagnostics — empty when the program is clean.
+// Result is what CheckProgram learns: the diagnostics, and the untyped
+// LITERALS the type check accepted into a NEWTYPE hole, as "node|Newtype"
+// in the order it met them. A literal converts to a newtype implicitly
+// wherever it is stored (§3.8) — a map key, a collection element, an
+// argument of a generic call at the newtype — and only the type check
+// knows the hole's type in all of them; ApplyConversions writes the
+// conversion into the tree for the lowerer.
+struct Result {
+    D    diag.Bag
+    Conv []str
+}
+
+// Check runs every static check and returns the diagnostics.
 func Check(t ast.Tree, file int) diag.Bag {
+    let r = CheckProgram(t, file)
+    return r.D
+}
+
+// ApplyConversions rewrites each literal CheckProgram recorded into the
+// explicit conversion `Newtype(literal)`: the literal node itself becomes
+// the CALL (its parent still points at it) and the literal moves to a new
+// node beneath it.
+func ApplyConversions(t mut ast.Tree, convs []str) {
+    each c in convs {
+        let parts = str.split(c, "|")
+        if len(parts) != 2 { continue }
+        let id = to_int(parts[0])
+        if id == nil { continue }
+        let old = t.Get(id)
+        let lit = t.Add(old.Kind, old.Line, old.Col, old.Ival, old.Ival2,
+                        old.Sval, old.Kids)
+        let callee = t.Add(ast.IDENT, old.Line, old.Col, 0, 0, parts[1], [])
+        let arg = t.Add(ast.ARG, old.Line, old.Col, 0, 0, "", [lit])
+        let args = t.List([arg])
+        let targs = t.List([])
+        t.Nodes[id] = ast.Node{Kind: ast.CALL, Line: old.Line, Col: old.Col,
+                               Ival: 0, Ival2: 0, Sval: "",
+                               Kids: [callee, args, targs]}
+    }
+}
+
+// CheckProgram runs every static check over a loaded, flattened program.
+func CheckProgram(t ast.Tree, file int) Result {
     var c = Checker{
         T: t, file: file,
         structs: make(map[str]int), enums: make(map[str]int),
@@ -146,13 +260,27 @@ func Check(t ast.Tree, file int) diag.Bag {
         mset: make(map[str]int),
         flds: make(map[str]int), implOf: make(map[str]int),
         mnames: set([]),
-        eSelf: 0, eRes: 0, eFn: "",
+        eSelf: 0, eRes: 0, eFn: "", eResList: [], eGens: make(map[str]int),
+        eSelfW: true, eVolatile: set([]), gVars: set([]), inFunc: false,
+        nn: make(map[str]int), dead: false, idxKeys: false,
+        spawnDepth: 0, spawnCaps: make(map[str]int), spawnLocal: set([]),
+        probe: false, probeHit: false, unsafeClos: set([]),
+        unsafeNames: set([]), spawnRep: set([]),
+        taskParams: make(map[str]set[int]), lockDepth: 0,
+        closSelf: false, syncClos: set([]),
+        immNames: set([]),
+        mutNames: set([]),
+        tyMemo: make(map[int]int), canonMemo: make(map[int]int),
+        copyMemo: make(map[int]int), aliasOf: make(map[str]int),
+        ntUnder: make(map[str]int), varEnum: make(map[str]str),
+        varDecl: make(map[str]int), holeDone: set([]), moveIdents: set([]),
+        copyArgs: set([]), convs: [], convSeen: set([]),
         bFn: "", bSelfMut: false,
         sdSrc: set([]), sdC: set([]), sdUser: set([]), sdPkgs: set([]),
         sdHave: set([]), sdNames: [],
         sdGlobals: set([]),
         natMin: make(map[str]int), natMax: make(map[str]int),
-        natBare: set([]), natShadow: set([]),
+        natBare: set([]), natShadow: set([]), natKinds: make(map[str]str),
     }
     c.collect()
     c.collect_types()
@@ -160,7 +288,6 @@ func Check(t ast.Tree, file int) diag.Bag {
     c.check_acyclicity()
     c.check_lattice()
     c.check_exhaustiveness()
-    c.check_moves()
     c.check_format_strings()
     c.check_call_sites()
     c.check_composites()
@@ -178,7 +305,10 @@ func Check(t ast.Tree, file int) diag.Bag {
     // natShadow, which is what stops `int(x)` being read as a conversion when
     // the program declares something else of that name.
     c.check_expr_types()
-    return c.D
+    // AFTER the expression types: what MOVES on assignment depends on the
+    // value's type (§6.4), and only that walk knows it (moveIdents).
+    c.check_moves()
+    return Result{D: c.D, Conv: c.convs}
 }
 
 impl Checker {
@@ -332,6 +462,14 @@ impl Checker {
         var out = []
         if s == 0 { return out }
         out.append(s)
+        // The `if`/`match` EXPRESSIONS and `else { … }` blocks written in
+        // this statement's own expressions are statements too, as far as
+        // these checks go: a match used as a value must be exhaustive like
+        // any other, and the statements in its arms are as live as the ones
+        // in a statement-form match.
+        each e in self.stmt_exprs(s) {
+            self.value_forms(e, out)
+        }
         let k = self.T.Kind(s)
         if k == ast.BLOCK {
             each x in self.walk_block(s) { out.append(x) }
@@ -370,6 +508,65 @@ impl Checker {
         return out
     }
 
+    // stmt_exprs lists the EXPRESSION slots of one statement — not its
+    // blocks, which walk_stmt descends into itself.
+    func stmt_exprs(self, s int) []int {
+        let n = self.T.Get(s)
+        let k = n.Kind
+        var out = []
+        if k == ast.LET or k == ast.VAR or k == ast.EXPRSTMT or
+           k == ast.IF or k == ast.FOR or k == ast.EACH or k == ast.WHILE or
+           k == ast.GROUP or k == ast.PARSESTMT {
+            out.append(self.T.Kid(s, 0))
+        } else if k == ast.ASSIGN or k == ast.THROW {
+            out.append(self.T.Kid(s, 0))
+            out.append(self.T.Kid(s, 1))
+        } else if k == ast.SAY or k == ast.RETURN {
+            each a in n.Kids { out.append(a) }
+        } else if k == ast.DEFERSTMT and n.Ival2 != 1 {
+            out.append(self.T.Kid(s, 0))
+        } else if k == ast.SWITCH {
+            out.append(self.T.Kid(s, 0))
+            each c in self.T.Get(self.T.Kid(s, 1)).Kids {
+                each v in self.T.Get(self.T.Kid(c, 0)).Kids { out.append(v) }
+            }
+        } else if k == ast.MATCH {
+            out.append(self.T.Kid(s, 0))
+            each a in self.T.Get(self.T.Kid(s, 1)).Kids {
+                out.append(self.T.Kid(a, 0))           // the guard
+            }
+        } else if k == ast.SELECTSTMT {
+            each c in self.T.Get(self.T.Kid(s, 0)).Kids {
+                out.append(self.T.Kid(c, 0))
+                out.append(self.T.Kid(c, 1))
+            }
+        }
+        return out
+    }
+
+    // value_forms appends, for every `if`/`match` expression and `else`
+    // block inside e, the statements walk_stmt finds there. Closure bodies
+    // and `spawn { … }` blocks are not entered — all_stmts never has.
+    func value_forms(self, e int, out mut []int) {
+        if e == 0 { return }
+        let n = self.T.Get(e)
+        let k = n.Kind
+        if k == ast.CLOSURE { return }
+        if k == ast.SPAWNEXPR and n.Ival2 == 1 { return }
+        if k == ast.IF or k == ast.MATCH {
+            each x in self.walk_stmt(e) { out.append(x) }
+            return
+        }
+        if k == ast.ELSEEXPR and n.Ival2 == 2 {
+            self.value_forms(self.T.Kid(e, 0), out)
+            each x in self.walk_stmt(self.T.Kid(e, 1)) { out.append(x) }
+            return
+        }
+        each c in n.Kids {
+            self.value_forms(c, out)
+        }
+    }
+
     // walk_expr returns e and every sub-expression Go's walkExpr visits, in
     // the same pre-order. A closure's body is a BLOCK, not an expression, and
     // is not entered; nor is a spawn block or an `else` whose alternative is a
@@ -400,7 +597,7 @@ impl Checker {
             each f in n.Kids {
                 each x in self.walk_expr(self.T.Kid(f, 0)) { out.append(x) }
             }
-        } else if k == ast.SLICELIT or k == ast.TUPLE {
+        } else if k == ast.SLICELIT or k == ast.TUPLE or k == ast.MAPLIT {
             each el in n.Kids {
                 each x in self.walk_expr(el) { out.append(x) }
             }
@@ -414,8 +611,21 @@ impl Checker {
             }
         } else if k == ast.ELSEEXPR {
             each x in self.walk_expr(self.T.Kid(e, 0)) { out.append(x) }
-            if n.Ival2 != 1 {
+            // A statement or BLOCK alternative (Ival2 1 or 2) is not an
+            // expression; a block's statements reach the checks through
+            // all_stmts (see value_forms).
+            if n.Ival2 == 0 {
                 each x in self.walk_expr(self.T.Kid(e, 1)) { out.append(x) }
+            }
+        } else if k == ast.IF {
+            // An `if` EXPRESSION: only the condition is an expression. Its
+            // branches are blocks, reached through all_stmts like the
+            // branches of a statement-form `if`.
+            each x in self.walk_expr(self.T.Kid(e, 0)) { out.append(x) }
+        } else if k == ast.MATCH {
+            each x in self.walk_expr(self.T.Kid(e, 0)) { out.append(x) }
+            each a in self.T.Get(self.T.Kid(e, 1)).Kids {
+                each x in self.walk_expr(self.T.Kid(a, 0)) { out.append(x) }
             }
         } else if k == ast.SPAWNEXPR {
             if n.Ival2 != 1 {

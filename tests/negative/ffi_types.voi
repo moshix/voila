@@ -1,0 +1,22 @@
+// A function of an ffi block is typed by its C prototype (§12): a `*char`
+// parameter takes a str, an integer one an int, a pointer an ffi.Ptr, and a
+// `*char` result is a ?str. A call is judged like any other function's.
+use "std/ffi"
+
+ffi "C" {
+    func strlen(s *char) usize
+    func abs(n int) int
+    func memset(p *void, c int, n usize) *void
+    func getenv(name *char) *char
+}
+
+func main() {
+    say strlen(5)
+    say abs("x")
+    let buf = ffi.alloc(8)
+    say memset("buf", 0, 8)
+    let home str = getenv("HOME")
+    // Legal: the declared types.
+    say strlen("ok"), abs(-1), memset(buf, 0, 8).is_null(), getenv("X") else ""
+    ffi.free(buf)
+}

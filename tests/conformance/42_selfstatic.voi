@@ -1,0 +1,86 @@
+// `Self` and static trait methods (§3.6, §3.7).
+//
+// In a trait, `Self` is the implementing type; in an impl block it is an
+// alias for the target, in type and expression position alike. A trait
+// method without `self` is STATIC: `Point.default()` calls it directly, and
+// `T.default()` calls it through a type parameter. Generics are erased, so
+// a top-level generic function whose bound declares a static method
+// receives each such parameter's type at run time as a hidden descriptor —
+// from an explicit `make[Point]()`, from a value argument declared `T`, or
+// forwarded by another generic function's own descriptor.
+
+trait Default {
+    func default() Self
+    func reset(self) Self = Self.default()    // Self, through the receiver
+}
+
+trait Eq2 { func same(self, o Self) bool }
+
+trait Named {
+    func name() str = "anon"                  // an inherited static default
+    func label(self) str = "<" || Self.name() || ">"
+}
+
+struct Point { x int, y int }
+type Cel int
+
+impl Default for Point {
+    func default() Self { return Self{x: 1, y: 2} }
+}
+impl Eq2 for Point {
+    func same(self, o Self) bool { return self.x == o.x and self.y == o.y }
+}
+impl Named for Point { }
+
+impl Default for Cel { func default() Cel { return Cel(37) } }
+impl Named for Cel { func name() str { return "cel" } }
+
+impl Default for int { func default() int { return 42 } }
+impl Default for u8 { func default() u8 { return 8 } }
+
+impl Point {
+    func doubled(self) Self { return Self{x: self.x * 2, y: self.y * 2} }
+    func origin(self) bool {
+        match self {
+            Self{x: 0, y: 0} => return true
+            _ => return false
+        }
+    }
+    func tell(self) str { return "{Self.name()}@{self.x}" }
+    func maker(self) fn() Self { return fn() Self { return Self.default() } }
+}
+
+func make[T: Default]() T { return T.default() }
+func like[T: Default](x T) T { return T.default() }
+func forward[T: Default]() T { return make[T]() }
+func two[A: Default, B](b B) (A, B) { return A.default(), b }
+func name_of[T: Named]() str { return T.name() }
+func in_closure[T: Default]() T {
+    let f = fn() T { return T.default() }
+    return f()
+}
+func with_default[T: Default](n int = 3) (T, int) { return T.default(), n }
+
+func main() {
+    say Point.default(), Cel.default(), int.default()
+    say make[Point](), make[Cel](), make[int]()
+    say like(Point{9, 9}), like(Cel(1)), like(5)
+    let small u8 = 3
+    say like(small), make[u8]()        // the static type, not `int`
+    say forward[Point](), forward[Cel]()
+    say two[Cel, str]("b")
+    say name_of[Point](), name_of[Cel]()
+    say in_closure[Point](), with_default[Cel](), with_default[int](n: 8)
+    say Point{5, 6}.reset(), Cel(3).reset()
+    say Point{1, 2}.same(Point.default()), Point{0, 0}.origin()
+    say Point{2, 3}.doubled(), Point{4, 4}.tell(), Point{1, 1}.label()
+    say Cel(0).label()
+    let mk = Point{0, 0}.maker()
+    say mk()
+
+    // A spawned call carries its descriptor too.
+    group {
+        let t = spawn like(Cel(2))
+        say t.await()
+    }
+}

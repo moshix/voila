@@ -4,7 +4,7 @@
 
 **A small, fast, safe language that compiles itself.**
 
-![language](https://img.shields.io/badge/language-Voil%C3%A0%200.5.0-blueviolet?style=for-the-badge)
+![language](https://img.shields.io/badge/language-Voil%C3%A0%200.6.0-blueviolet?style=for-the-badge)
 ![gc](https://img.shields.io/badge/GC-none-orange?style=for-the-badge)
 
 </div>
@@ -148,8 +148,8 @@ let r = attempt risky()            // or turn a crash into a value I can inspect
 | | |
 |---|---|
 | `voilac/` | **the compiler, written in Voilà** |
-| `runtime/` | the small C library every compiled program links against |
-| `std/` | the standard library: `fmt` `str` `os` `io` `net` `http` `math` `time` `json` `csv` `regex` `crypto` `log` `conv` `sort` `path` `sync` `test` `rand` `uuid` |
+| `runtime/` | the small C library every compiled program links against, and the vendored C libraries (BearSSL, miniz, SQLite) compiled in only for the programs that use them |
+| `std/` | the standard library: `fmt` `str` `os` `io` `net` `http` `tls` `math` `time` `json` `csv` `regex` `crypto` `compress` `sqlite` `log` `conv` `sort` `slices` `maps` `heap` `chan` `iter` `flag` `path` `sync` `test` `rand` `uuid` `ffi` |
 | `bootstrap/` | one generation of the compiler's own C output, so a machine with only a C compiler can get started |
 | `tests/` | the test suite (see [TESTING.md](TESTING.md)) |
 
@@ -163,7 +163,7 @@ $ ./build.sh
 ==> bootstrap: prebuilt binary  bin/voila  (0.4.1)
   ✓ fixpoint: C(voilac-1) == C(voilac-2)
   ✓ optimized fixpoint: C(-O3, gen1) == C(-O3, gen2)
-  ✓ bin/voila-0.5.0
+  ✓ bin/voila-0.6.0
 ```
 
 On a machine with no Voilà at all, `./bootstrap.bash` compiles the checked-in
@@ -172,7 +172,7 @@ C file into a first working compiler, then uses that:
 ```console
 $ ./bootstrap.bash
   ✓ build/voila-seed
-  ✓ bin/voila-0.5.0
+  ✓ bin/voila-0.6.0
 ```
 
 Then:
@@ -238,25 +238,50 @@ Full tables in `bench/BASELINE.md` and `bench/RESULTS.md`.
   table tests for testing your own code (`std/test`)
 - An HTTP/1.1 client and server (`std/http`) — `get`, `post`, `request`, a
   handler-based server, URL parsing and chunked bodies, written in Voilà over
-  `std/net`. Plaintext only: there is no TLS, and an `https://` URL is refused
-  rather than fetched in the clear
-- Checks that catch mistakes before you run: unimplemented trait methods,
-  generic constraints, assigning to a `let`, unknown type names, missing
-  `return`s, wrong numbers of arguments
+  `std/net`, with query decoding and a server that stops gracefully —
+  and HTTPS both ways, the server's certificate verified against the
+  system's authorities
+- TLS 1.2 for any `std/net` connection (`std/tls`, on BearSSL), compression
+  — gzip, zlib, DEFLATE, zip and tar, with a bound on every decoder
+  (`std/compress`, on miniz) — and an embedded SQL database (`std/sqlite`,
+  on SQLite). The libraries are vendored and compiled into a program only
+  when it uses them; the binary still links libc alone
+- Typed JSON: `json.decode[T]` builds nested structs, slices, maps,
+  optionals, enums and newtypes, and says where a document is wrong
+  (`limits.max_mb: expected int, got string`)
+- Generic collections (`std/slices`, `std/maps`, a priority queue in
+  `std/heap`), channel pipelines with fan-in, fan-out and rate limiting
+  (`std/chan`), and typed command-line flags with generated `--help`
+  (`std/flag`)
+- Processes you do not have to wait for (`os.start`, with pipes to the
+  child), signals delivered on a channel (`os.signals`), `os.kill`,
+  directory walks and globs
+- Calling C (`std/ffi`): an `ffi "C" { … }` block of prototypes, `link`
+  for a library, and raw memory — outside the safety guarantees, so
+  `voila check --strict` refuses it. A program that does not use it still
+  depends on libc alone
+- Checks that catch mistakes before you run: a static type check of every
+  expression (`f("s")` for an `int` parameter, `n = "three"` for an `int`
+  variable, `1 == "x"`, `"x".lstrip(…)`, a newtype mixed with another,
+  a `?T` used as a `T`), use of a moved value, unimplemented trait methods,
+  generic constraints — written or inferred — assigning to a `let`, unknown
+  type names, missing `return`s, wrong numbers of arguments
 - Warnings you can tune or promote to errors (`-Wall`, `-Werror`, `--strict`)
 
 ## What is still missing
 
-- **Type checking is partial.** Declared types are verified in many places,
-  but not everywhere — the compiler does not yet check every expression.
+- **Type checking is local, not total.** Every expression is typed and
+  judged, but where a type is genuinely not written down — an untyped JSON
+  value, a trait-typed value, a name holding a `?T` (which code normally
+  narrows before use) — the check stays silent rather than guess, and
+  use-after-move is judged straight-line, not by a full flow analysis.
 - **No package manager.** You can only use code inside your own project;
   there is no way to depend on someone else's library yet.
 - **Some standard library gaps**: no named time zones (`std/time` knows UTC,
   a fixed offset, and the machine's own offset — there is no tzdata).
   `std/crypto` has hashes, HMAC and a cryptographically secure random source,
-  but no signatures — and there is **no TLS at all**, so `std/http` speaks
-  plaintext HTTP and refuses an `https://` URL rather than fetching it in the
-  clear. No XML or YAML.
+  but no signatures. `std/tls` is TLS 1.2 only (no 1.3, no client
+  certificates). No XML or YAML.
 - **No editor support, formatter, debugger, or `voila test` runner.**
   `std/test` gives you assertions and a pass/fail tally; a suite is an
   ordinary program you run yourself.

@@ -1,0 +1,27 @@
+4
+3
+2
+1
+2
+3
+0a!
+1b!
+0
+1
+4
+hits 3
+00
+01
+10
+11
+[0, 10, 20, 30]
+count 1 0
+count 2 1
+count 3 2
+111
+112
+loop / closures
+end
+deferred 3
+deferred 2
+deferred 1

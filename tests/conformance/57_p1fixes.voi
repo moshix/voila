@@ -1,0 +1,116 @@
+// Follow-ups to the first package batch's review: JSON numbers out of range
+// are errors, map keys of any type round-trip, a value too deep to encode is
+// a clean error and too deep to print is cut short, a `*char` argument may
+// not hold a NUL, a struct field that holds data is not a method, chan.tee's
+// outputs may be drained one after the other, os.signal_stop, os.walk_all,
+// os.kill's refusal of a pid <= 0, and float conversions that overflow.
+use "std/json"
+use "std/ffi"
+use "std/chan"
+use "std/os"
+use "std/path"
+
+ffi "C" {
+    func strlen(s *char) usize
+}
+
+enum Color { Red, Green }
+struct Node { v int, next ?Box[Node] }
+
+func show(r str!) {
+    match r {
+        Ok(v)  => say "ok", v
+        Err(e) => say "error:", e.message()
+    }
+}
+
+func main() {
+    // ---- numbers out of range
+    say json.decode("1e9999999999999999999")
+    say json.decode("1e-9999999999")
+    say json.decode[float]("1e400")
+    say json.decode[float]("1e300"), json.decode("1e400")
+    try { say dec("1e4294967297") } catch e: ConvError { say "dec: refused" }
+    try { say float("1e400") } catch e: ConvError { say "float: refused" }
+    try { say float(1e400d) } catch e: ConvError { say "float of dec: refused" }
+    say float("1e-400"), float("2.5")
+
+    // ---- every map key type round-trips through encode/decode
+    let byColor = map[Color]int{Color.Red: 1, Color.Green: 2}
+    let t1 = json.encode(byColor)
+    say t1, json.decode[map[Color]int](t1)
+    let byBool = map[bool]str{true: "yes", false: "no"}
+    let t2 = json.encode(byBool)
+    say t2, json.decode[map[bool]str](t2)
+    let byInt = map[int]str{80: "http"}
+    say json.decode[map[int]str](json.encode(byInt))
+    let byRune = map[rune]int{'a': 1}
+    say json.decode[map[rune]int](json.encode(byRune))
+    say json.decode[map[Color]int](`{"Blue": 1}`)
+    say json.decode[map[bool]int](`{"maybe": 1}`)
+
+    // ---- depth: encode refuses past 512 levels; printing is cut short
+    var n = Node{v: 0, next: nil}
+    var i = 1
+    while i < 600 {
+        n = Node{v: i, next: Box(n)}
+        i += 1
+    }
+    try { say len(json.encode(n)) } catch e: ValueError { say "caught:", e.message() }
+    var deep = Node{v: 0, next: nil}
+    i = 1
+    while i < 20000 {
+        deep = Node{v: i, next: Box(deep)}
+        i += 1
+    }
+    let shown = str(deep)
+    say shown.ends_with("…") or shown.contains("…"), len(shown) < 2000000
+
+    // ---- a NUL inside a `*char` argument
+    say strlen("abc")
+    try { say strlen("a\u{0}b") } catch e: ValueError { say "caught:", e.message() }
+
+    // ---- tee: the two outputs drained one after the other
+    group {
+        let a, b = chan.tee(chan.from([1, 2, 3]))
+        say chan.collect(a)
+        say chan.collect(b)
+    }
+
+    // ---- os.signal_stop ends a subscription and closes its channel
+    let sigs = must os.signals(os.SIGUSR1)
+    must os.signal_stop(sigs)
+    var got = 0
+    each s in sigs { got += 1 }
+    say "after stop", got
+    say os.signal_stop(sigs)
+
+    // ---- os.kill refuses a pid that is not a process
+    say os.kill(0, os.SIGTERM), os.kill(-1, os.SIGTERM)
+    say os.kill_group(0, os.SIGTERM)
+
+    // ---- os.walk_all goes on past an unreadable subdirectory
+    let root = path.join(os.tempdir(), "voila-56-{os.getpid()}")
+    must os.mkdir_all(path.join(root, "open"))
+    must os.mkdir_all(path.join(root, "shut"))
+    must os.write(path.join(root, "open/a.txt"), "a")
+    must os.write(path.join(root, "shut/b.txt"), "b")
+    os.run("chmod", ["000", path.join(root, "shut")])
+    // As root a mode-000 directory is still readable, so the expectation is
+    // computed rather than assumed.
+    let readable = match os.listdir(path.join(root, "shut")) {
+        Ok(xs) => true
+        Err(e) => false
+    }
+    let entries, skipped = must os.walk_all(root)
+    say len(skipped) == (if readable { 0 } else { 1 })
+    say entries.contains(path.join(root, "open/a.txt"))
+    // os.walk itself still fails on the unreadable directory.
+    match os.walk(root) {
+        Ok(es) => say "walk as expected:", readable
+        Err(e) => say "walk as expected:", not readable
+    }
+    os.run("chmod", ["755", path.join(root, "shut")])
+    os.run("rm", ["-rf", root])
+    show(json.encode(1.5) || "")
+}

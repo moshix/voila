@@ -1,0 +1,7 @@
+// Nothing at this call says what T is: no type argument, and no argument
+// declared T to read it from.
+trait Default { func default() Self }
+struct P { x int }
+impl Default for P { func default() Self { return Self{x: 0} } }
+func make_it[T: Default]() T { return T.default() }
+func main() { say make_it() }

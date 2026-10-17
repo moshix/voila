@@ -7,7 +7,7 @@
 package low
 
 func PreludeNames() []str {
-    return ["abs", "append", "assert", "avg", "b64", "bytes", "ceil", "cell",
+    return ["Box", "abs", "append", "assert", "avg", "b64", "bytes", "ceil", "cell",
             "center", "close", "contains", "ends_with", "enumerate", "err",
             "errf", "fields", "floor", "from_bytes", "from_runes", "hex",
             "index", "is_alpha", "is_digit", "is_space", "is_upper", "join",
@@ -19,9 +19,10 @@ func PreludeNames() []str {
             "substr", "sum", "title", "to_byte", "to_dec", "to_float",
             "to_i16", "to_i32", "to_i64", "to_i8", "to_int", "to_rune",
             "to_u16", "to_u32", "to_u64", "to_u8", "translate", "trim",
-            "trunc", "unb64", "unhex", "upper", "values", "weak", "word",
-            "words", "wrap_add", "wrap_i16", "wrap_i32", "wrap_i64", "wrap_i8",
-            "wrap_mul", "wrap_u16", "wrap_u32", "wrap_u64", "wrap_u8", "zip"]
+            "trunc", "unb64", "unhex", "upper", "valid_utf8", "values", "weak",
+            "word", "words", "wrap_add", "wrap_i16", "wrap_i32", "wrap_i64",
+            "wrap_i8", "wrap_mul", "wrap_u16", "wrap_u32", "wrap_u64", "wrap_u8",
+            "zip"]
 }
 
 // StrMethodNames are std/str's functions, which are reachable BOTH as
@@ -41,7 +42,8 @@ func StrMethodNames() []str {
             "replace_n", "repeat", "reverse", "translate", "overlay",
             "insert", "delstr", "bytes", "from_bytes", "runes", "from_runes",
             "rune_len", "is_digit", "is_alpha", "is_space", "is_upper", "hex",
-            "unhex", "b64", "unb64"]
+            "unhex", "b64", "unb64", "valid_utf8",
+            "trim_prefix", "trim_suffix", "cut"]
 }
 
 // StdCNatives are the package-qualified names the C runtime provides for the
@@ -59,6 +61,7 @@ func StrMethodNames() []str {
 func StdCNatives() []str {
     return ["regex.compile", "regex.matches", "regex.find",
             "regex.find_all", "regex.replace", "regex.split",
+            "regex.find_named", "regex.names",
             "fmt.printf", "fmt.sprintf", "fmt.eprintf", "fmt.fprintf",
             "fmt.print", "fmt.println", "fmt.comma", "fmt.bytes", "fmt.pad",
             "fmt.pad_left", "fmt.center", "fmt.table",
@@ -72,7 +75,12 @@ func StdCNatives() []str {
             "os.mkdir", "os.mkdir_all", "os.rmdir", "os.rename", "os.copy",
             "os.tempdir", "os.realpath",
             "os.setenv", "os.unsetenv", "os.environ",
+            "os.kill", "os.getpid", "os.signals", "os.start", "os.walk",
+            "os.glob", "os.walk_all", "os.kill_group", "os.signal_stop",
             "os.stderr", "os.stdout", "os.stdin",
+            "os.SIGHUP", "os.SIGINT", "os.SIGQUIT", "os.SIGKILL",
+            "os.SIGUSR1", "os.SIGUSR2", "os.SIGPIPE", "os.SIGALRM",
+            "os.SIGTERM", "os.SIGCONT", "os.SIGSTOP",
             "io.reader", "io.writer", "io.buffered", "io.copy", "io.pipe",
             "io.read_all", "io.discard",
             "math.sqrt", "math.sin", "math.cos", "math.tan", "math.asin",
@@ -106,7 +114,10 @@ func StdCNatives() []str {
 func PkgConstantNames() []str {
     return ["time.Nanosecond", "time.Microsecond", "time.Millisecond",
             "time.Second", "time.Minute", "time.Hour",
-            "math.pi", "math.e", "os.stderr", "os.stdout", "os.stdin"]
+            "math.pi", "math.e", "os.stderr", "os.stdout", "os.stdin",
+            "os.SIGHUP", "os.SIGINT", "os.SIGQUIT", "os.SIGKILL",
+            "os.SIGUSR1", "os.SIGUSR2", "os.SIGPIPE", "os.SIGALRM",
+            "os.SIGTERM", "os.SIGCONT", "os.SIGSTOP"]
 }
 
 // StdSrcNatives are the natives of the std packages that have VOILÀ SOURCE —
@@ -138,12 +149,32 @@ func StdSrcNatives() []str {
             "net._udp", "net._dial_udp",
             "net._sendto", "net._recvfrom",
             "net._listen_unix", "net._connect_unix", "net._close",
-            "net._set_timeout", "net.resolve",
+            "net._set_timeout", "net.resolve", "net._shutdown",
             "sync._mutex", "sync._lock", "sync._unlock", "sync._try_lock",
             "sync._rwlock", "sync._rlock", "sync._wlock", "sync._rwunlock",
             "sync._try_rlock", "sync._try_wlock",
             "sync._atomic", "sync._load", "sync._store", "sync._add",
-            "sync._swap", "sync._cas"]
+            "sync._swap", "sync._cas",
+            "ffi._alloc", "ffi._free", "ffi._read", "ffi._write",
+            "ffi._read_str", "ffi._write_str", "http._contain",
+            // The runtime EXTENSIONS (VendorOf below): natives that live in
+            // runtime/src/ext, not in libvoila, and are linked only into a
+            // program that calls them.
+            "tls._client", "tls._server", "tls._check_server",
+            "tls._system_ca", "tls._version",
+            "compress._encode", "compress._decode", "compress._crc32",
+            "compress._adler32", "compress._writer", "compress._reader",
+            "compress._zip_open", "compress._zip_count", "compress._zip_entry",
+            "compress._zip_read", "compress._zip_stream",
+            "compress._zip_writer", "compress._zip_add",
+            "compress._zip_finish",
+            "sqlite._open", "sqlite._close", "sqlite._exec", "sqlite._prepare",
+            "sqlite._bind", "sqlite._step", "sqlite._reset",
+            "sqlite._finalize", "sqlite._columns", "sqlite._col_type",
+            "sqlite._col_int", "sqlite._col_float", "sqlite._col_text",
+            "sqlite._col_blob", "sqlite._changes", "sqlite._last_id",
+            "sqlite._busy_timeout", "sqlite._in_tx", "sqlite._version",
+            "sqlite._begin", "sqlite.decode"]
 }
 
 // PackageNames are the qualifiers a dotted name may carry. Only packages this
@@ -154,15 +185,98 @@ func StdSrcNatives() []str {
 // chk/stdpkg.voi subtracts std.Packages() from this to get the C-only
 // packages, so a qualifier admitted here is one that check will judge.
 func PackageNames() []str {
-    return ["conv", "crypto", "csv", "fmt", "http", "io", "json", "log",
-            "math", "net", "os", "path", "rand", "regex", "sort", "str",
-            "sync", "test", "time", "uuid"]
+    return ["chan", "compress", "conv", "crypto", "csv", "ffi", "flag", "fmt",
+            "heap", "http", "io", "iter", "json", "log", "maps", "math", "net",
+            "os", "path", "rand", "regex", "slices", "sort", "sqlite", "str",
+            "sync", "test", "time", "tls", "uuid"]
+}
+
+// VendorOf names the runtime EXTENSION a native lives in, or "" for one of
+// libvoila's own. Three std packages are built on a vendored C library —
+// std/tls on BearSSL, std/compress on miniz, std/sqlite on SQLite — and
+// their natives are compiled into a separate archive that is linked only
+// into a program that calls one (cg's ext_units, main.voi's vendor_lib). The
+// package IS the extension: every native of those packages, and only those,
+// belongs to it.
+func VendorOf(native str) str {
+    if starts_with(native, "tls.") { return "tls" }
+    if starts_with(native, "compress.") { return "compress" }
+    if starts_with(native, "sqlite.") { return "sqlite" }
+    return ""
 }
 
 func BuiltinExceptions() []str {
     return ["ConvError", "RangeError", "OverflowError", "FormatError",
             "ValueError", "RuntimeError", "IOError", "KeyError", "Timeout",
             "Cancelled"]
+}
+
+// NativeKinds is the ARGUMENT KINDS of the natives whose bodies assume one,
+// as `name|kinds`: one letter per positional argument, the last letter
+// repeated for any further (variadic) argument. NativeArities says how
+// many arguments a native reads; this says what each must be, because a C
+// body that casts `argv[1]` to a slice is a SIGSEGV when handed a str —
+// `os.run_capture("echo", "hello")` was one.
+//
+//   a  anything          s  a str            r  a str or a rune
+//   i  an int (or rune)  n  a number         l  a slice
+//   m  a map or a set    c  a channel        f  a function
+//   b  a bool
+//
+// Two readers. chk/expr.voi refuses a call at COMPILE time when an
+// argument's static type is known and is not of the kind; cg emits a
+// vl_argk() check before the call, which aborts cleanly at RUN time where
+// the type was not known (and unwraps a Box or a newtype whose value is of
+// the kind). runtime/src/std.c's kinds_table[] holds the same rows for a
+// native called as a VALUE (`let f = str.upper`), and selftest holds the
+// two tables equal. A native absent here takes anything: its body checks
+// for itself (std/io's natives, std/crypto's) or reads its arguments
+// through a converting accessor (vl_tostr, vl_cstr) that aborts cleanly.
+func NativeKinds() []str {
+    return [// prelude
+            "append|la", "close|c", "sum|q", "avg|q", "zip|qq",
+            "enumerate|q", "keys|m", "values|m", "round_to|ni",
+            "range|i", "printf|sa", "sprintf|sa", "errf|sa",
+
+            // std/str: the subject is a str (or a rune); positions and
+            // counts are ints; join, from_bytes and from_runes take a slice.
+            "upper|r", "lower|r", "title|r", "trim|r", "trim_left|r",
+            "trim_right|r", "strip|rr", "pad|ri", "pad_left|ri",
+            "center|ri", "contains|rr", "index|rr", "last_index|rr",
+            "starts_with|rr", "ends_with|rr", "count|rr", "equal_fold|rr",
+            "substr|rii", "left|ri", "right|ri", "split|rr", "split_n|rri",
+            "lines|r", "fields|r", "word|ri", "words|r", "subword|rii",
+            "delword|rii", "join|qa", "replace|rrr", "replace_n|rrri",
+            "repeat|ri", "reverse|r", "translate|rrr", "overlay|rri",
+            "insert|rri", "delstr|rii", "bytes|r", "from_bytes|q",
+            "runes|r", "from_runes|l", "rune_len|r", "is_digit|r",
+            "is_alpha|r", "is_space|r", "is_upper|r", "hex|r", "unhex|r",
+            "b64|r", "unb64|r", "find_any|rri", "skip_any|rri",
+            "valid_utf8|r", "trim_prefix|rr", "trim_suffix|rr", "cut|rr",
+
+            // std/fmt
+            "fmt.printf|sa", "fmt.sprintf|sa", "fmt.eprintf|sa",
+            "fmt.fprintf|asa", "fmt.pad|ri", "fmt.pad_left|ri",
+            "fmt.center|ri", "fmt.table|l",
+
+            // std/os: paths and names are strs; a command's arguments are a
+            // slice of them.
+            "os.read|s", "os.write|sa", "os.open|s", "os.create|s",
+            "os.exists|s", "os.remove|s", "os.env|s", "os.exit|i",
+            "os.on_abort|f", "os.isdir|s", "os.listdir|s", "os.run|sl",
+            "os.run_capture|sl", "os.mtime|s", "os.size|s",
+            "os.mkdir|s", "os.mkdir_all|s", "os.rmdir|s", "os.rename|ss",
+            "os.copy|ss", "os.realpath|s", "os.setenv|sa",
+            "os.unsetenv|s", "os.kill|ii", "os.start|sl", "os.walk|s",
+            "os.glob|s", "os.walk_all|s", "os.kill_group|ii",
+            "os.signal_stop|c",
+
+            // std/io: the handles are checked by the natives themselves;
+            // the buffer capacity is an int.
+            "io.buffered|ai",
+
+            // std/sort
+            "sort.sort|l", "sort.sort_by|lf", "sort.reversed|q"]
 }
 
 // NativeArities is every native's argument count, as `name|min|max` with -1
@@ -221,12 +335,13 @@ func NativeArities() []str {
             // string, so every one of these takes the pattern first.
             "regex.compile|1|1", "regex.matches|2|2", "regex.find|2|2",
             "regex.find_all|2|2", "regex.replace|3|3", "regex.split|2|2",
+            "regex.find_named|2|2", "regex.names|1|1",
             // prelude (runtime/src/std.c's table[], the section above fmt)
             "len|1|1", "append|1|-1", "close|1|1", "err|0|1", "errf|1|-1",
             "assert|1|2", "min|1|-1", "max|1|-1", "abs|1|1", "sum|1|1",
             "avg|1|1", "round|1|1", "floor|1|1", "ceil|1|1", "trunc|1|1",
             "round_to|2|2", "range|1|3", "zip|2|2", "enumerate|1|1",
-            "keys|1|1", "values|1|1", "shared|1|1", "cell|1|1", "weak|1|1",
+            "keys|1|1", "values|1|1", "shared|1|1", "Box|1|1", "cell|1|1", "weak|1|1",
             "set|0|-1", "printf|1|-1", "sprintf|1|-1",
             "to_int|1|2", "to_i8|1|2", "to_i16|1|2", "to_i32|1|2",
             "to_i64|1|2", "to_u8|1|2", "to_u16|1|2", "to_u32|1|2",
@@ -253,7 +368,8 @@ func NativeArities() []str {
             "runes|1|1", "from_runes|1|1", "rune_len|1|1", "is_digit|1|1",
             "is_alpha|1|1", "is_space|1|1", "is_upper|1|1", "hex|1|1",
             "unhex|1|1", "b64|1|1", "unb64|1|1", "find_any|2|3",
-            "skip_any|2|3",
+            "skip_any|2|3", "valid_utf8|1|1", "trim_prefix|2|2",
+            "trim_suffix|2|2", "cut|2|2",
 
             // std/fmt. The printf family is variadic after its format; pad,
             // pad_left and center are std/str's, under a second name.
@@ -272,7 +388,9 @@ func NativeArities() []str {
             "os.mkdir|1|1", "os.mkdir_all|1|1", "os.rmdir|1|1",
             "os.rename|2|2", "os.copy|2|2", "os.tempdir|0|0",
             "os.realpath|1|1", "os.setenv|2|2", "os.unsetenv|1|1",
-            "os.environ|0|0",
+            "os.environ|0|0", "os.kill|2|2", "os.getpid|0|0",
+            "os.signals|1|-1", "os.start|2|2", "os.walk|1|1", "os.glob|1|1",
+            "os.walk_all|1|1", "os.kill_group|2|2", "os.signal_stop|1|1",
 
             // std/io
             "io.reader|1|1", "io.writer|1|1", "io.buffered|1|2",
@@ -328,7 +446,7 @@ func NativeArities() []str {
             "net._remote_addr|1|1", "net._udp|2|2", "net._dial_udp|2|2",
             "net._sendto|4|4", "net._recvfrom|2|2", "net._listen_unix|2|2",
             "net._connect_unix|1|1", "net._close|1|1",
-            "net._set_timeout|2|2", "net.resolve|1|1",
+            "net._set_timeout|2|2", "net.resolve|1|1", "net._shutdown|1|1",
 
             // std/sync's shim. runtime/src/sync.c already refuses a missing
             // handle at run time (want_mutex and friends); these move the
@@ -338,5 +456,39 @@ func NativeArities() []str {
             "sync._wlock|1|1", "sync._rwunlock|1|1", "sync._try_rlock|1|1",
             "sync._try_wlock|1|1", "sync._atomic|0|1", "sync._load|1|1",
             "sync._store|2|2", "sync._add|2|2", "sync._swap|2|2",
-            "sync._cas|3|3"]
+            "sync._cas|3|3",
+
+            // std/ffi's raw-memory shim (runtime/src/ffi.c).
+            "ffi._alloc|1|1", "ffi._free|1|1", "ffi._read|2|2",
+            "ffi._write|3|3", "ffi._read_str|2|3", "ffi._write_str|2|2",
+
+            // std/http's recovery point: the handler, then its arguments.
+            "http._contain|1|-1",
+
+            // std/tls (runtime/src/ext/tls.c, over BearSSL).
+            "tls._client|4|4", "tls._server|3|3", "tls._check_server|2|2",
+            "tls._system_ca|0|0", "tls._version|1|1",
+
+            // std/compress (runtime/src/ext/compress.c, over miniz).
+            "compress._encode|3|3", "compress._decode|3|3",
+            "compress._crc32|2|2", "compress._adler32|2|2",
+            "compress._writer|3|3", "compress._reader|3|3",
+            "compress._zip_open|1|1", "compress._zip_count|1|1",
+            "compress._zip_entry|2|2", "compress._zip_read|3|3",
+            "compress._zip_stream|4|4",
+            "compress._zip_writer|0|0", "compress._zip_add|5|5",
+            "compress._zip_finish|1|1",
+
+            // std/sqlite (runtime/src/ext/sqlite.c, over SQLite).
+            // sqlite.decode's GENERIC form passes the type name as a hidden
+            // first argument, exactly as json.decode's does.
+            "sqlite._open|2|2", "sqlite._close|1|1", "sqlite._exec|2|2",
+            "sqlite._prepare|2|2", "sqlite._bind|2|2", "sqlite._step|1|1",
+            "sqlite._reset|1|1", "sqlite._finalize|1|1",
+            "sqlite._columns|1|1", "sqlite._col_type|2|2",
+            "sqlite._col_int|2|2", "sqlite._col_float|2|2",
+            "sqlite._col_text|2|2", "sqlite._col_blob|2|2",
+            "sqlite._changes|1|1", "sqlite._last_id|1|1",
+            "sqlite._busy_timeout|2|2", "sqlite._in_tx|1|1",
+            "sqlite._version|0|0", "sqlite._begin|1|1", "sqlite.decode|1|1"]
 }

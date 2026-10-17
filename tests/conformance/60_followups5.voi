@@ -1,0 +1,111 @@
+// The follow-ups to round five's review.
+//
+//  1. A self-referential closure (`fib` calling `fib` through the frame
+//     that holds it) is freed with its frame once nothing else holds it —
+//     run under `leaks`: a hundred of them leak nothing.
+//  2. Nil narrowing of LOCATIONS — a field, an element at a literal index,
+//     a map entry at a literal key — holds until something writes under
+//     the root (tests/negative/narrow_paths.voi has the refusals); an
+//     operator's result is never nil, so `x = x + 1` keeps `x` narrowed.
+//  3. An untyped literal on the left of `in` converts to the newtype of the
+//     key or element it is looked up as.
+//  4. A binding's value dies at the end of its loop iteration: a `weak` to
+//     the last iteration's `shared` no longer upgrades after the loop.
+//  5. Two mutually recursive closures over one frame, dropped by two tasks
+//     at once, are freed exactly once (the cycle is broken by one thread).
+type Idx int
+struct S { v ?int, w ?int }
+struct Node { name str }
+
+func self_ref() fn(int) int {
+    var fib fn(int) int = fn(n int) int { return n }
+    fib = fn(n int) int {
+        if n < 2 { return n }
+        return fib(n - 1) + fib(n - 2)
+    }
+    return fib
+}
+
+func pair() (fn(int) int, fn(int) int) {
+    var ev = fn(n int) int { return 0 }
+    var od = fn(n int) int { return 0 }
+    ev = fn(n int) int {
+        if n == 0 { return 1 }
+        return od(n - 1)
+    }
+    od = fn(n int) int {
+        if n == 0 { return 0 }
+        return ev(n - 1)
+    }
+    return ev, od
+}
+
+func fields() int {
+    var s = S{v: 1, w: 2}
+    var total = 0
+    if s.v != nil and s.w != nil { total = s.v + s.w }
+    if s.v == nil { return 0 }
+    s.w = 5                             // a write to a sibling keeps s.v
+    total += s.v
+    var ss = [S{v: 3, w: nil}]
+    if ss[0].v != nil { total += ss[0].v }
+    let m = map[str]?int{"a": 4}
+    if m["a"] != nil { total += m["a"] }
+    return total
+}
+
+func counting() int {
+    var x ?int = 3
+    x = x + 1                           // an operator's result: not nil
+    let y = x * 2
+    x = y
+    if x == nil { x = 1 } else { x = x + 1 }
+    return x
+}
+
+func main() {
+    var i = 0
+    var last = 0
+    while i < 100 {
+        let f = self_ref()
+        last = f(10)
+        i += 1
+    }
+    say "1:", last
+
+    say "2:", fields(), counting()
+
+    var m = make(map[Idx]str)
+    m[2] = "b"
+    let s = set[Idx]{1, 2}
+    let xs []Idx = [7]
+    say "3:", 2 in m, 1 in s, 3 in s, 7 in xs
+
+    var ws = []weak[Node]{}
+    var k = 0
+    while k < 3 {
+        let n = shared(Node{name: "n" || str(k)})
+        ws.append(weak(n))
+        k += 1
+    }
+    var alive = 0
+    each w in ws {
+        if w.upgrade() != nil { alive += 1 }
+    }
+    say "4:", alive
+
+    var t = 0
+    var r = 0
+    while r < 2000 {
+        let a = chan[int](2)
+        group {
+            let (e, o) = pair()
+            spawn { a <- e(4) }
+            spawn { a <- o(4) }
+        }
+        t += <-a
+        t += <-a
+        r += 1
+    }
+    say "5:", t
+}

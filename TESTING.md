@@ -47,6 +47,10 @@ probes live in `tests/opt/`:
   (run under `leaks`: the unwinder must release them);
 - `traps.voi` — every arithmetic trap message, byte-compared across levels
   (the messages live once, in the runtime's cold `vl_trap_*` functions);
+- `sized_traps.voi` — the same for the SIZED integer types: at `-O3` the
+  operands sit in typed registers and the sized forms are native
+  (`vl_iadd_sz` and friends), and every message must still come from the
+  one cold `vl_trap_sz*` function the boxed path uses;
 - `typing_adv.voi` — adversarial cases for the `-O3` inference: match-bind
   counters, parse targets, closure-captured counters, setjmp interplay,
   int/float joins, loop-carried temporaries, hot-loop overflow, `dec`;
@@ -59,7 +63,102 @@ probes live in `tests/opt/`:
 strings, collections, control flow, errors, ownership, concurrency, decimals,
 parse/format, traits and generics, name binding, networking, standard input and
 `std/io`, generic bounds, `std/sync`, `std/path`, `std/time`'s calendar,
-`use` aliases, `std/test`, `std/csv`, `std/crypto`, `std/regex`, `std/http`) —
+`use` aliases, `std/test`, `std/csv`, `std/crypto`, `std/regex`, `std/http`,
+and the expression syntax of `31_exprsyntax.voi`: `if`/`match` as values,
+typed collection literals, open-ended slices, postfix `?`, tuples, parallel
+assignment, or/range/struct/tuple patterns and `else { … }`; and the second
+batch: per-enum variant namespaces (`34_variants`), the follow-ups to the
+first batch — a parenthesised tuple in a subscript, structural tuple keys and
+`?` in a function with no result (`35_followups`) — `Box[T]` and recursive
+sum types (`36_box`, which also builds and frees a million-cell list),
+newtypes and aliases (`37_newtype`), the sized-integer range traps
+(`38_sized`), closures over loop variables (`39_loopclosure`), and the
+run-time half of the native argument kinds (`40_argkinds`, whose `.err`
+golden pins an abort's stack trace)); and the third batch: generic traits,
+multiple and `where` bounds, `std/iter` and the `Ord` protocol
+(`41_generictraits`), `Self` and static trait methods through a type
+parameter's hidden descriptor (`42_selfstatic`), Box value semantics and
+the cycle a `set` can no longer form (`43_boxvalue`, run it under `leaks`),
+the sized-integer stores the second batch missed (`44_sizedstores`), and
+natives reached as values and over sets (`45_nativesets`); and the fourth
+batch: struct value semantics (`46_valuesemantics` — copies through every
+write path, `mut self` and `mut` parameters, the Box-in-a-field cycle that
+leaked; run it under `leaks`), the programs the static type check must
+ACCEPT (`47_typecheck`), and the third batch's review follow-ups — a
+forwarded type descriptor, `Wrap[int].make()` and impls on builtin types in
+method-call form (`48_followups3`); and the first PACKAGE batch:
+std/slices, std/maps, std/heap, std/chan and the in-place slice methods
+`insert`/`remove` (`49_collections`), typed recursive `json.decode[T]` with
+path-naming errors and its inverse `encode` (`50_jsontyped`), std/flag
+(`51_flag`), std/ffi against the C library — prototypes, varargs, raw
+memory and its checks (`52_ffi`), process handles, signals on a channel,
+`os.walk`/`os.glob` and `path.matches` (`53_process`), and `trim_prefix`,
+`cut`, regex named groups, URL decoding and `Server.serve`'s graceful stop
+(`54_textnet`); and containers' value semantics with
+the fourth batch's review follow-ups — a slice or map in a struct, in an element, in a
+literal, through a `mut` parameter; a closure into a function newtype;
+`nil` inferring an optional; a sized receiver's `Self`; a long append loop
+that must copy nothing (`55_containers`, run it under `leaks`); and the
+follow-ups to its review — flow-sensitive nil narrowing, newtype literals
+as map keys and elements, a `weak` outliving its value, float map keys, a
+closure an escaped closure reads, the package batch's write paths
+(`56_followups4`, run it under `leaks`); and the
+package batch's review follow-ups — JSON numbers out of range, map keys of
+every type round-tripping, encode's depth limit, a NUL in a `*char`,
+`chan.tee` drained sequentially, `os.signal_stop`, `os.walk_all`, the
+refusal of `os.kill(0)` (`57_p1fixes`); an abort in an http handler
+contained to its request and `serve_for`'s deadline (`58_contain`, whose
+`.err` pins the abort reports); and the ffi registry after a long
+alloc/free churn, a linear decode of 200,000 strings and the double-free
+abort (`59_fficheck`, `.err` pins the abort); and round five's review
+follow-ups — a self-referential closure freed with its frame, narrowing of
+fields, elements and map entries, `x = x + 1` on a narrowed `x`, a literal
+on the left of `in`, a binding's value dying at the end of its loop
+iteration (`60_followups5`, run it under `leaks`); and round six's —
+a closure reaching itself through a struct, map, slice, enum or Box its
+frame alone holds, freed with the frame (`61_closurecycles`, run it under
+`leaks`), narrowing at a variable index or key and the writes that keep
+it (`62_narrowindex`), and `?`/`try` in a finally raising instead of
+returning (`63_finallyq`); `sort.sort`, `sort.sort_by` and the prelude
+`append` keep a second name's value, and a `mut` argument in a captured
+variable is copied in once a closure captured the frame (`65_nativemut`);
+round seven's — a captured variable's value
+keeps copy-on-write with tasks: a snapshot taken by a task, before the
+tasks or after the join is unchanged by their stores, and every scenario
+prints the same with tasks and without (`64_tasksnapshot`); and the package
+review's second round — a contained abort runs `finally` blocks (a lock taken around the
+body is released for the next request), a defer or finally that aborts or
+throws while one is unwinding is contained too, and `$abort` is never
+printed (`66_faultunwind`, `.err`); a throw through xs.map, filter,
+reduce, sort_by, a `show` reached by printing or join, or a bad printf
+releases the natives' temporaries (`67_unwindnatives` — run it under
+`leaks`); and chan.tee as one task, a fast and a slow consumer over
+200,000 values, and 10,000 values read one output after the other or
+alternately (`68_tee`); and the second package batch,
+the packages over vendored C libraries (from 70): std/compress's codecs —
+streams made by zlib itself decoded byte for byte, round trips at every
+level, every corruption an error, the decompression-bomb bound, and the
+`io` streams (`70_compress`) — its zip archives, one made by Python's
+zipfile among them, with the CRC check and the zip-slip refusal
+(`71_zip`), and its tar, including Python's pax and GNU long names
+(`72_tar`); std/sqlite — every parameter and column kind, typed rows,
+transactions rolled back on an error and on a throw, SQLite's own error
+messages, and tasks on several connections and on one (`73_sqlite`); and
+std/tls and HTTPS on loopback with the test-only certificates in
+`tests/tls` — verification that succeeds, and that FAILS for a wrong host
+name and for an untrusted authority (`74_tls`, `75_https`); the
+verification policy std/tls adds over BearSSL — EKU, a required
+subjectAltName, no SHA-1, the wildcard rule, IP-address SANs
+(`76_tlspolicy`, with the extra leaves `tests/tls/gen.sh policy` makes);
+and a transaction taking its shared connection from other tasks
+(`77_sqlitetx`); and that closing a TLS connection whose peer has stopped
+reading is quick, and does not hold up an unrelated close meanwhile
+(`78_tlsclose`, bounds of a second against a 1.5 s send timeout). Run all nine under `leaks`. A stage of its own forges a
+cache claim whose builder died — a runtime archive's and an extension's —
+and checks that the next build heals it. None needs the network: every
+server is the program's own, on 127.0.0.1, and `tests/tls/gen.sh` (which
+the suite never runs) is how the certificates — valid for a century —
+were made —
 each with a checked-in
 `.out` (and `.err` where the program writes to stderr). `samples/*.voi` likewise, with
 goldens under `samples/golden/`.
@@ -132,11 +231,138 @@ legal — the union rule, a nested type argument, a generic parameter at the
 definition site, a trait as the argument, and a builtin bound, which has no
 method set for anything to be judged against.
 
+`exhaustive_expr.voi` holds a `match` used as a VALUE to the same
+exhaustiveness rule as the statement, nested patterns included (a refutable
+payload such as `Some(0)` does not cover `Some`), and carries the nested
+matches that are complete and must stay silent. `structpat.voi`,
+`orbind.voi`, `ifnoelse.voi`, `armvalue.voi`, `elseblock.voi` and
+`openrange.voi` pin the other refusals of the expression syntax, and
+`closurematch`, `openincl`, `somevariant`, `optnil`, `tuplewidth`,
+`tupleassign`, `tuplesep`, `dupbind` and `typeargcount` those a review
+added (with `33_exprsyntax2.voi` as their legal counterpart).
+
+The second batch adds `variantns.voi` (a bare variant name two enums of
+one file declare, beside the qualified and unique spellings that must stay
+legal), `recenum.voi` (a sum type that contains itself DIRECTLY, beside the
+`Box`, `?Box` and `?T` spellings that must stay silent), `loopassign.voi` and
+`loopassign2.voi` (a closure over a loop variable that is assigned after the
+closure copied it — in the closure, and in the loop — refused at the closure
+by name, beside the captures that stay legal) and `nativekinds.voi` (native
+calls whose argument is statically of the wrong kind, with `!` lines for the
+legal calls: a rune for a str-or-rune, a value of unknown type, a local that
+shadows the native).
+
+The third batch adds `generic_impl.voi` (a generic trait implemented or
+bounded at the wrong number of arguments, two impls of one generic trait
+that both write a method, and a bound at arguments the type does not
+implement the trait at — beside a marker trait at two arguments and a
+`where` clause that must stay silent), `where_param.voi`, `assoc_type.voi`,
+and one fixture per refusal of a static method through a type parameter:
+`static_nobound` (no bound declares it), `static_method` (a method's type
+parameter carries no descriptor), `static_selfdefault` (`Self.m()` in a
+default without `self`), `static_value` (a function taking descriptors used
+as a value) and `static_infer` (nothing at the call says what `T` is). All
+five are the lowerer's refusals, and the lowerer stops at the first, so each
+has a file of its own.
+
+The fourth batch is the static type check (chk/expr.voi, chk/infer.voi),
+and its fixtures carry the legal neighbours of every refusal as `!` lines:
+`types_holes` (an argument, a returned value — one of several too —, an
+initialiser, an assignment, a struct field, the elements, keys and values of
+typed collection literals, a value sent on a channel, a lossy numeric
+store), `types_ops` (cross-kind comparisons, `+` on a string, arithmetic and
+logic on the wrong kinds, truthiness), `types_newtype`, `types_optional`
+(`nil` and a `?T` straight from a call where a `T` is wanted — a NAME
+holding one stays silent), `types_branches` (`if`/`match` values against
+the expected type and against each other), `types_generic` (unification at
+the call, a bound judged at an INFERRED type argument, a method no bound
+declares), `types_userbox`, `types_methods` (unknown methods on every
+receiver whose method set is visible, and a `mut self` method through a
+borrowed parameter), `types_readonly` (an in-place write through `self`
+in a method without `mut self`, a borrowed parameter handed to a `mut` one,
+and a `mut self` method on a tuple member), `types_var` (an unannotated
+`var` keeps its type),
+`narrow_paths` (a narrowed field, element or map entry written under its
+root — assigned, reset by a `mut self` method or a `mut` argument, the root
+reassigned, a map entry removed, a closure writing through the root),
+`spawn_self` (a spawned body using `self` of a `mut self` method, and a
+closure over it spawned, sent over a channel or stored in a struct; one
+passed straight to `map`, and a read-only `self`, are allowed),
+`spawn_closures` (a task-unsafe closure captured by a spawned body,
+handed to a parameter run in a task — directly or relayed — or sent over
+a channel; a closure that only stores elements, or writes under a lock, is
+allowed), `spawn_races` (a spawned task assigning a variable it shares with its
+group, storing into a map in it, growing, shrinking or reordering a
+collection in it, calling a `mut self` method on it, handing it to a `mut`
+parameter — and the element and field stores it may make), `type_value`
+(a type's name where a value is wanted: `[int]`, `xs.map(str)`, a struct
+or enum name),
+`narrow_index` (a location at a variable index written through an index
+that may be equal, its index variable assigned, bumped, passed `mut`,
+changed in a loop or by a closure or shadowed; an index that is no
+location),
+`narrow` (an optional used where the flow has not proved it non-nil — an
+`if` that neither leaves nor assigns, a narrowing undone, a loop, a
+closure), `types_cheap` (an optional never narrowed in arithmetic, a map key, a
+function value's arity, `len`/`each` of a number, a primitive's field, a
+destructuring width, a non-integer index, a std native's stated result),
+`moved_value` (a value that owns storage moves on `let`, assignment and
+send — beside Copy structs, revived names, a borrowed parameter bound
+twice, and a loop variable or pattern bind that reuses a moved name), `default_twice` (two traits defaulting one method), and
+`typemismatch`, which was the warning fixture of the partial check.
+
+The first package batch adds `ffi_nouse` (an `ffi` block with no `use
+"std/ffi"`), `ffi_ctype` (the C side of a block: an unknown C type, `void`
+as a parameter, a `link` that is not a library name, an ABI other than
+"C" — beside the C spellings that must stay legal), `ffi_types` (a call to
+a block's function judged by the Voilà types its prototype implies) and
+`slice_methods` (`insert` and `remove` are known slice methods, and a
+misspelling of them is still refused), `fieldcall` (a struct field
+called like a method is refused unless it holds a function), and
+`finally_return`, `finally_break` and `finally_continue` (control may not
+leave a finally block — lowering one used to recurse until the compiler
+crashed — beside the loop and the closure inside a finally that stay
+legal). `tests/warn/ffistrict`, `ffiwall`
+and `ffidefault` pin the `ffi` mark: fatal under `--strict`, printed under
+`-Wall`, silent by default — and an ffi block counts as a use of std/ffi,
+so none of them says `unused-import`.
+
+`tests/ffi/*.voi` call real C libraries — the system's libz and
+libsqlite3 — and each names its library in a `.lib` file. Their stage asks
+`cc` whether that library LINKS on this machine and skips the fixture,
+saying so, where it does not (macOS ships both; a Linux machine may lack
+the development packages), so the suite stays green there. With `otool`
+(macOS) or `ldd` (Linux) it also checks that such a binary links the library, and that
+a program with no ffi block still links nothing but libc. The same stage
+holds the promise the vendored libraries make: a program that uses
+std/sqlite, std/compress and std/tls links nothing but libc either (the
+libraries are compiled into it), and — with `nm` — a program that uses none
+of them carries none of their code.
+
+The second package batch adds `vendor_native_arity` (a vendored package's
+native is bounded like any other, before its library is ever compiled),
+`vendor_member` (a misspelt member of std/sqlite or std/tls, with the near
+miss) and `vendor_nouse` (std/sqlite without its `use`).
+
 `tests/multipkg-bad/*/` are programs the loader must reject: an import cycle, a
 private name, a duplicate package qualifier, a wildcard import of a user package,
-a nonexistent import, a bare variant name two imports both offer, and a
+a nonexistent import, a bare variant name two imports both offer, a
 package-private variant reached by its BARE name — short-name resolution has to
-be a convenience on top of package privacy, never a way around it.
+be a convenience on top of package privacy, never a way around it — and
+(`variantns`) a variant name that two enums of ONE imported package declare,
+written bare and as `pkg.Name`, where only `pkg.Enum.Name` says which.
+
+`tests/multipkg-enums/` is that refusal's positive counterpart: two enums of
+one package share a variant name, the importer writes `shapes.Shape.Unit`,
+`shapes.Size.Big(7)` and the patterns of both, the package itself writes
+`Shape.Unit`, and the entry file's own enums share a name too.
+
+`tests/multipkg-traits/` carries the third batch across a package
+boundary: a package's generic trait implemented by the importer under its
+bare name, a trait with a static method implemented under its qualified one,
+and the package's generic function that calls the static method through its
+type parameter — so the importer's call supplies the hidden type descriptor,
+for the package's type and for its own.
 
 `tests/multipkg-shared/` is the positive counterpart, and it used to be a
 refusal: two packages each declare `Empty`, `Node` and a trait `Named`. Enum
@@ -170,9 +396,11 @@ fixture red on purpose.
 `tests/negative-native/*.voi` are the backend's **documented refusals** —
 programs the checker lets through because they are well-formed, and the C
 backend declines to translate rather than answer differently from the
-specification (today: a closure capturing a loop variable, whose fix is
-per-iteration frames). They are rejected by `build`, not by `check`, which is
-what puts them in their own stage.
+specification (today: the implicit `ctx` of a task, `ctx.voi`). They are
+rejected by `build`, not by `check`, which is what puts them in their own
+stage. The fixture this stage was written for — a closure capturing a loop
+variable — is a legal program since the per-iteration environments, and it
+now runs as part of `tests/conformance/39_loopclosure.voi`.
 
 Each `.expect` file is matched **line by line as a substring** of the
 diagnostics, not byte-compared. Adding a diagnostic therefore cannot break an
@@ -208,6 +436,26 @@ builds, runs, and exits 0.
 bin/voila build tests/stress/churn.voi -o /tmp/churn
 leaks --atExit -- /tmp/churn         # 0 leaks for 0 total leaked bytes
 ```
+
+`selftest.bash`'s "native writers" stage greps runtime/src for natives that
+hand an argument to a collection writer (`vl_slice_append(argv[k]`,
+`vl_sort_slice(argv[k]` and the like) and wants exactly `sort.sort`,
+`sort.sort_by` and the prelude `append` — the natives the lowerer treats as
+`mut` arguments (native_mut_positions). A native that writes a collection's
+storage directly through a cast of argv[k] is not seen; review such code by
+hand.
+
+`tests/stress/sharedwrites.voi` (golden `.out`) has tasks store into
+different elements and nested fields of one captured variable, take
+snapshots of it, and grow captured collections through closures that
+reach the tasks inside a struct, a slice, a map, a global and a return
+value, while other tasks index, measure, iterate and call natives (with
+callbacks) on the same collection and the owner appends inside the group
+body; and `mut` arguments and `mut self` receivers in captured variables
+written from tasks while others read them. A write lost to a copy-on-write,
+or a read torn by one, shows only now and then, so `selftest.bash` builds
+it and `39_loopclosure` at -O0 through -O3 and runs each binary 64 times,
+16 at once; every run must match the golden.
 
 Undefined behaviour is checked with UBSan over the emitted C:
 
@@ -248,7 +496,12 @@ and `chk` must not import `cg`:
   Read again by `typ.PrimitiveMethod`, which judges a generic bound against it.
 - `StdCNatives()` — the packages that are only C (fmt, os, io, math, …).
 - `StdSrcNatives()` — the natives of the packages that also have Voilà source
-  grafted alongside (net, sync, time).
+  grafted alongside (net, sync, time) — among them the natives of the runtime
+  EXTENSIONS (tls, compress, sqlite), whose C side is not in `std.c` but in
+  `runtime/src/ext/<package>.c`, each in its own `vl_ext_<package>[]` table.
+  Those tables join the C side of the diff, and each must exist and hold
+  only its own package's natives: the package is how cg decides which
+  extension to link (`low.VendorOf`).
 - `PkgConstantNames()` — `time.Second`, `math.pi`, `os.stdout`, …
 
 All four are read again by `chk/stdpkg.voi`, which judges `pkg.member` against
@@ -273,6 +526,18 @@ function pointers, so they belong in `PkgConstantNames()` and must **not** be
 in `table[]`. `chk/stdpkg.voi` adds them back, because a constant is a member a
 program may legitimately name and no natives table will ever hold it.
 
+### 8a. The native argument kinds
+
+`NativeKinds()` (`voilac/low/names.voi`) gives the natives whose C bodies
+assume an argument's kind a `name|kinds` row — one letter per argument (`s`
+str, `r` str or rune, `i` int, `n` number, `l` slice, `q` slice or set,
+`m` map or set, `c` channel, `f` function, `b` bool, `a` anything), the last repeated. It is
+read three times: `chk/expr.voi` refuses a call whose argument is statically
+of the wrong kind, `cg` emits a `vl_argk` check before every direct call to
+such a native, and `runtime/src/std.c`'s `kinds_table[]` — the same rows
+again — checks a native called as a VALUE, which the generated code cannot
+see. A stage compares the two copies row for row.
+
 ### 8b. The native arities
 
 A native carries **no static signature**: the code generator knows only a bare
@@ -286,7 +551,7 @@ time, which is where the check/build agreement main.voi guards requires it.
 Two stages guard the table, because both of its failure modes are silent:
 
 - **coverage** — `NativeArities()` and the four name lists above must hold the
-  same 233 names, minus the constants. A native added without an arity is
+  same 277 names, minus the constants. A native added without an arity is
   simply not judged, which is the same silent gap stage 8 closes for the names.
 - **agreement with the runtime** — `str_arity[]` in `runtime/src/str.c` bounds
   the std/str half a second time, at run time, because that is what still
@@ -335,13 +600,12 @@ switched off by the first project it annoys. `tests/warn/` records both halves.
              refusal, until -Werror says otherwise)
 ```
 
-`typemismatch.voi` fires every diagnostic `chk/expr.voi` can produce, once
-each: an initialiser, an assignment, an argument (including one whose declared
-type is a generic parameter that the receiver's own type argument resolves,
-which is the only caller of `typ.Subst`), a returned value, an undeclared
-field, an unknown method, a method arity, and an unknown method on a
-trait-typed receiver. `typesilent.voi` beside it is the more important half
-and its `.expect` is nothing but absence lines: generics at their definition
+The type check these two fixtures were written for reports ERRORS since
+the fourth batch (`tests/negative/types_*.voi`, and `typemismatch.voi`, which
+moved there from this directory); the `type-mismatch` code is kept as a
+valid spelling and carries nothing. `typesilent.voi` is still here, and its
+`.expect` is still nothing but absence lines — it now proves that none of
+those shapes is refused: generics at their definition
 site, a method inherited from a trait default, trait-typed values and
 receivers, the `str` primitive/package duality in all three spellings, `?T`
 and `T!` through `must`/`else`/`nil`, the numeric lattice, a variadic
@@ -411,16 +675,23 @@ them a genuinely unused `use` (now removed, along with three more found by
 checking package files one at a time). A code that had produced false
 positives would default off and live behind `-Wall`.
 
-`type-mismatch` defaults **off**, and that is a rollout decision rather than a
-measurement: the same sweep, run over **156** programs (`voilac/main.voi` and
-`tools/*.voi`, which between them `use` every `voilac` package, plus every
-file under `std/`, `samples/`, `samples/guide/`, `tests/` and `bench/`), left
-exactly **one** report — `tests/negative/trait_missing.voi`, where `Canvas`
-genuinely has no `describe` and the trait check already refuses the program.
-It is off all the same because it is the youngest and largest check in the
-compiler, it reasons about a partial *inference* rather than about a
-declaration, and the failure mode of getting it wrong is refusing a working
-program. Ask for it with `-Wtype-mismatch`, `-Wall` or `--strict`.
+The partial check that `type-mismatch` named defaulted **off** — the
+youngest and largest check in the compiler, refusing a working program if
+wrong. The fourth batch replaced it with the static type check, whose
+findings are ERRORS, and the promotion was measured the same way: swept
+over every entry point (`voilac/main.voi`, `tools/`, `std/`, `samples/`,
+`samples/guide/`, `tests/conformance`, `tests/opt`, `tests/stress`, `bench/`
+and the multi-package fixtures). Every finding was a genuine violation of
+the specification, fixed in the program rather than silenced in the
+checker: two uses of a moved slice and map in the compiler itself
+(`chk/traits.voi`, `opt/typing.voi`); in `std/http`, a `mut self` method
+called through a borrowed parameter (the `Stream` readers) and a stream
+advanced from a method without `mut self` (`Session.read_request`); and in
+three network samples `conn.read_line()` on a borrowed `net.Conn`, the last
+of which the guide prints. Two of its first rules were wrong and the
+sweep caught them before anything else did: a rune compares equal to the
+one-character string it denotes (`11_regressions` pins it), and an integer
+stored into a sized type is range-checked at RUN time (§3.2), not refused.
 
 Sweeping a single file of a MULTI-FILE package is not a valid measurement and
 must not be counted: the loader loads that file alone, so the sibling `impl
@@ -429,15 +700,13 @@ Checker { … }` blocks are missing and every `self.method()` call in
 one file and is therefore complete on its own; the `voilac/` packages are
 covered whole through `voilac/main.voi` and `tools/*.voi`.
 
-This is worth stating plainly because `type-mismatch` is the **first** check
-that turns a clean single-file `check` into a wall of diagnostics.
-`voila check voilac/par/par.voi` says `ok` today, and with `-Wall` it reports
-nine missing `Parser` methods that live in `par/expr.voi` and `par/stmt.voi`.
-The other multi-file packages already error out on the same input
-(`unknown type \`Edge\``), so nobody had to notice before. There is no way for
-`chk` to tell an entry point from a fragment — it is handed one flattened
-arena either way — so the answer is the sweep methodology, not a rule in the
-checker.
+This is worth stating plainly because the type check turns a single-file
+`check` of a package fragment into a wall of errors: `voila check
+voilac/par/par.voi` reports `Parser` methods missing that live in
+`par/expr.voi` and `par/stmt.voi`. A fragment is not a program, and there is
+no way for `chk` to tell an entry point from one — it is handed one flattened
+arena either way — so the answer is to check the entry point, not a rule in
+the checker.
 
 Two more stages stand beside the fixtures, because `voila run` caches its
 binaries under `~/.cache/voila` and two different things have to hold:
@@ -453,7 +722,10 @@ binaries under `~/.cache/voila` and two different things have to hold:
   entries, and one `-W` state must produce the same entry twice. That second
   half is the determinism gate — a `Key()` that walked a map instead of
   `diag.Codes()` would quietly stop caching, and nothing else would notice.
-  The probe removes the entries it created.
+  The probe runs with a PRIVATE `HOME` under the suite's temporary directory,
+  warmed first: `~/.cache/voila` is shared with every other `voila` the
+  machine runs, and a build in another terminal adding entries between the
+  snapshots used to flake this check.
 
 ## Adding a test
 

@@ -1,0 +1,16 @@
+cannot compare `int` with `str` using `==`
+`+` does not concatenate: `int` + `str`
+operator `-` needs numbers, but `str` and `int` are given
+operator `*` needs numbers, but `bool` and `int` are given
+cannot compare `P` with `Q` using `==`
+cannot compare `[]int` with `str` using `==`
+an `if` condition must be `bool`, but `int` is given
+a `while` condition must be `bool`, but `str` is given
+`and` needs `bool` operands, but `int` is given
+`not` needs `bool` operands, but `str` is given
+unary `-` needs a number, but `str` is given
+!`rune`
+!`int` with `float`
+!`int` + `float`
+!`dec`
+!`P` with `P`

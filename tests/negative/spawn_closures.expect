@@ -1,0 +1,10 @@
+spawn_closures.voi:19:17: a spawned task runs `grow`
+spawn_closures.voi:20:17: a spawned task runs `count`
+spawn_closures.voi:24:8: `go` runs this closure in a task
+spawn_closures.voi:25:11: `relay` runs this closure in a task
+spawn_closures.voi:28:11: this closure is sent over a channel
+spawn_closures.voi:32:21: a spawned task runs `fresh`
+!spawn_closures.voi:21:
+!spawn_closures.voi:22:
+!spawn_closures.voi:26:
+!spawn_closures.voi:29:

@@ -1,0 +1,11 @@
+`a` is `int`, but its initialiser is `nil` — only an optional `?T` holds nil
+`b` is `int`, but its initialiser is `?int` — unwrap the optional first
+argument 1 of `want` is `int`, but `?int` is given
+`?int` is used in arithmetic
+`give` returns `int`, but `nil` is given
+`pt` returns `P`, but `?int` is given
+`p` is `P`, but its initialiser is `nil`
+!`c` is
+!`d` is
+!`e` is
+!argument 1 of `want` is `int`, but `int`

@@ -1,0 +1,35 @@
+// `self` of a `mut self` method is the caller's value, written in place by
+// the method: a spawned task may not use it, and a closure that uses it may
+// only be passed straight to a BUILTIN COLLECTION method that runs it at
+// once (`xs.map`, `xs.each`) — judged by the receiver's type, not the name:
+// `chan.map` runs its function in a task. Not spawned, sent over a channel
+// or stored either (§10). A method whose `self` is read-only may hand it to
+// its tasks.
+use "std/chan"
+struct Job { run fn() }
+struct Counter { n int, log []int }
+impl Counter {
+    func run(mut self) {
+        group {
+            spawn { say self.n }
+            self.log.append(1)
+        }
+        let ch = chan[fn()](1)
+        ch <- fn() { self.log.append(2) }
+        let j = Job{run: fn() { say len(self.log) }}
+        self.log = self.log.map(fn(v int) int { return v + self.n })
+        group {
+            let src = chan.from([1, 2, 3])
+            let out = chan.map(src, fn(v int) int { self.log.append(v); return v })
+            say chan.collect(out)
+        }
+    }
+    func show(self) {
+        group { spawn { say self.n } }
+    }
+}
+func main() {
+    var c = Counter{n: 1, log: []}
+    c.run()
+    c.show()
+}

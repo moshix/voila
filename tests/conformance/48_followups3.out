@@ -1,0 +1,3 @@
+C: 8 8 8 42 s
+E: Wrap{v: nil} true
+F: int 5 int 5! str hi str hi! int 7! float

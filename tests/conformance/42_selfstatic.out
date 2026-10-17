@@ -1,0 +1,14 @@
+Point{x: 1, y: 2} 37 42
+Point{x: 1, y: 2} 37 42
+Point{x: 1, y: 2} 37 42
+8 8
+Point{x: 1, y: 2} 37
+(37, "b")
+anon cel
+Point{x: 1, y: 2} (37, 3) (42, 8)
+Point{x: 1, y: 2} 37
+true true
+Point{x: 4, y: 6} anon@4 <anon>
+<cel>
+Point{x: 1, y: 2}
+37

@@ -1,0 +1,62 @@
+// A throw that unwinds through a native which called back into Voilà —
+// xs.map, filter, reduce, sort_by, a `show` reached by printing or join,
+// a printf whose format is bad — releases the native's temporaries on the
+// way (the runtime's unwind cleanups); run it under `leaks` to see none
+// left. It also leaves things usable: a sort interrupted by its comparator
+// leaves the slice a permutation of what it held.
+use "std/sort"
+use "std/fmt"
+
+struct Loud { n int }
+impl Show for Loud {
+    func show(self) str {
+        if self.n == 3 { throw ValueError{msg: "show refuses 3"} }
+        return "L{self.n}"
+    }
+}
+
+func main() {
+    var xs = [5, 3, 9, 1, 7]
+    var caught = 0
+    var i = 0
+    while i < 200 {
+        try {
+            let ys = xs.map(fn(x int) str {
+                if x == 9 { throw ValueError{msg: "map"} }
+                return "s" || str(x)
+            })
+            say "unreachable", ys
+        } catch e { caught += 1 }
+        try {
+            let ys = xs.filter(fn(x int) bool {
+                if x == 1 { throw ValueError{msg: "filter"} }
+                return x > 4
+            })
+            say "unreachable", ys
+        } catch e { caught += 1 }
+        try {
+            let t = xs.reduce(fn(a str, x int) str {
+                if x == 7 { throw ValueError{msg: "reduce"} }
+                return a || str(x)
+            }, "")
+            say "unreachable", t
+        } catch e { caught += 1 }
+        try {
+            sort.sort_by(xs, fn(a int, b int) bool {
+                if a == 9 or b == 9 { throw ValueError{msg: "cmp"} }
+                return a < b
+            })
+        } catch e { caught += 1 }
+        let ls = [Loud{n: 1}, Loud{n: 3}]
+        try { say ls } catch e { caught += 1 }
+        try { say ls.join(",") } catch e { caught += 1 }
+        try { say "{ls}" } catch e { caught += 1 }
+        try { say fmt.sprintf("%v %d", ls[1], 2) } catch e { caught += 1 }
+        try { say fmt.sprintf("%q %d", "x") } catch e: FormatError { caught += 1 }
+        i += 1
+    }
+    say "caught", caught
+    var sorted = xs.sorted()
+    say "still a permutation:", sorted
+    say [Loud{n: 1}, Loud{n: 2}], Loud{n: 4}
+}

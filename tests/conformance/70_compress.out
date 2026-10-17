@@ -1,0 +1,50 @@
+-- interop --
+true
+true
+true
+part one
+part two
+
+1838399800 1807749092
+true
+true
+-- round trips --
+0 true true true true
+2 true true true true
+4 true true true true
+6 true true true true
+8 true true true true
+true
+20 true
+level 10 ERR compress: level 10 is not in 0..9
+level -1 ERR compress: level -1 is not in 0..9
+-- corrupt input --
+garbage ERR compress: gzip: not gzip data (bad magic number)
+empty ERR compress: gzip: unexpected end of gzip header
+truncated ERR compress: gzip: unexpected end of compressed data
+no trailer ERR compress: gzip: unexpected end of gzip data (missing trailer)
+bad crc ERR compress: gzip: gzip checksum mismatch (corrupt data)
+trailing ERR compress: zlib: trailing data after the compressed stream
+bad zlib ERR compress: zlib: corrupt compressed data
+reserved block type ERR compress: deflate: corrupt compressed data
+truncated block ERR compress: deflate: unexpected end of compressed data
+gzip as zlib ERR compress: zlib: corrupt compressed data
+mangled copies refused or changed: true
+-- limits --
+true
+bomb, 1 MiB max ERR compress: gzip output exceeds the limit of 1048576 bytes
+bomb, exact max ok 10000000
+bomb, no limit ok 10000000
+negative max ERR compress: max -5 is negative (0 means no limit)
+inflate max ERR compress: deflate output exceeds the limit of 10 bytes
+-- streams --
+4390 line 0
+
+500 line 499
+gzip file as zlib stream ERR compress: zlib: corrupt compressed data
+true
+true
+true
+write after close: writer is closed
+bounded stream ERR compress: gzip output exceeds the limit of 100 bytes
+truncated stream ERR compress: gzip: unexpected end of compressed data

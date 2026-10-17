@@ -1,0 +1,12 @@
+// The other half of loopassign.voi: the loop variable is assigned in the
+// LOOP, after the closure took its copy, so the closure would keep the old
+// value where a shared binding would see the new one. Refused at the closure.
+func main() {
+    var fs = []
+    for j in 0..3 {
+        var k = j
+        fs.append(fn() int { return k })
+        k = 10
+    }
+    say len(fs)
+}

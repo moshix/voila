@@ -5,9 +5,10 @@
   scheme=http host=example.com port=80 path=/search query=q=voila target=/search?q=voila text=http://example.com/search?q=voila
   scheme=http host=::1 port=9000 path=/v6 query= target=/v6 text=http://[::1]:9000/v6
   scheme=http host=example.com port=80 path=/page query= target=/page text=http://example.com/page
+  scheme=https host=example.com port=443 path=/secret query= target=/secret text=https://example.com/secret
+  scheme=https host=example.com port=8443 path=/x query= target=/x text=https://example.com:8443/x
 -- urls this package refuses --
-  ERR http: `https://example.com/secret` is https, and this release has no TLS — std/http speaks plaintext HTTP only. It will not fetch an https URL in the clear. Terminate TLS outside the program and use its http:// address.
-  ERR http: unsupported URL scheme `ftp` (std/http speaks http only)
+  ERR http: unsupported URL scheme `ftp` (std/http speaks http and https)
   ERR http: URL `example.com/no-scheme` has no scheme (want http://host/path)
   ERR http: URL `http:///no-host` has no host
   ERR http: userinfo (`user@host`) in a URL is not supported: `http://user:pw@example.com/`

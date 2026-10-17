@@ -64,9 +64,13 @@ impl Checker {
                     self.sig_fn(m)
                 }
             } else if n.Kind == ast.TRAITDEC {
+                // A generic trait's parameters and `Self` are in scope in
+                // every method of it (§3.6).
+                self.Ty.PushParams(self.trait_params(d))
                 each m in self.T.Get(self.T.Kid(d, 0)).Kids {
                     self.sig_fn(m)
                 }
+                self.Ty.PopParams()
             } else if n.Kind == ast.IMPLDEC {
                 // The impl's own generics are in scope for every method in
                 // it: `impl[T] Stack[T] { func push(mut self, own v T) }`.
@@ -133,6 +137,17 @@ impl Checker {
         return out
     }
 
+    // trait_params names what a TRAIT's methods may write as a type besides
+    // the program's own: the trait's generic parameters, and `Self` — the
+    // implementing type, unknown inside the trait and therefore a parameter
+    // in everything but name. (In an impl block the parser has already
+    // replaced `Self` by the target.)
+    func trait_params(self, d int) []str {
+        var out = self.generic_names(self.T.Kid(d, 1))
+        out.append("Self")
+        return out
+    }
+
     // ------------------------------------------------------- unknown types
 
     // sweep_types finds the annotations hiding inside a body: `let x Foo`,
@@ -142,7 +157,8 @@ impl Checker {
         let n = self.T.Get(node)
         let k = n.Kind
         if k == ast.LET or k == ast.VAR or k == ast.PARAM or
-           k == ast.FIELDDECL or k == ast.COMPOSITE or k == ast.CLOSURE {
+           k == ast.FIELDDECL or k == ast.COMPOSITE or k == ast.CLOSURE or
+           k == ast.SLICELIT or k == ast.MAPLIT {
             self.check_type(n.Ival)
         } else if k == ast.CATCH {
             each ty in self.T.Get(self.T.Kid(node, 1)).Kids {
@@ -151,6 +167,12 @@ impl Checker {
         } else if k == ast.CALL {
             each ta in self.T.Get(self.T.Kid(node, 2)).Kids {
                 self.check_type(ta)
+            }
+        } else if k == ast.INDEX and n.Ival2 == 2 {
+            var i = 1
+            while i < len(n.Kids) {
+                self.check_type(n.Kids[i])
+                i += 1
             }
         }
         each kid in n.Kids {
@@ -522,3 +544,4 @@ func results_text(n int) str {
     if n == 0 { return "no results" }
     return str(n) || plural(n, " result", " results")
 }
+

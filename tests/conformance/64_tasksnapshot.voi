@@ -1,0 +1,44 @@
+// §10: a captured VARIABLE is shared with the tasks of its group — their
+// element and field stores land in it — while its VALUE keeps copy-on-write
+// everywhere: a value taken from it is a snapshot, whatever ran before.
+// Each scenario is run twice, once with tasks and once without, and must
+// print the same.
+struct P { x int }
+
+func scenario(tasks bool) str {
+    var out = [P{x: 1}, P{x: 2}]
+    if tasks {
+        group { for j in 0..2 { spawn { out[j].x = out[j].x * 10 } } }
+    } else {
+        for j in 0..2 { out[j].x = out[j].x * 10 }
+    }
+    let row = out[0]                    // a snapshot
+    out[0].x = 50
+    let el = out[1]                     // another snapshot
+    let f = fn() { out[1].x += 1 }      // a closure's write lands in out
+    f()
+    return "{row.x} {out[0].x} {out[1].x} {el.x}"
+}
+
+// A task's own snapshot keeps its value while other tasks write the
+// element it was taken from.
+func task_snapshots() str {
+    var cells = [P{x: 1}, P{x: 2}, P{x: 3}]
+    var seen = make([]int, 3)
+    group {
+        for j in 0..3 {
+            spawn {
+                let mine = cells[j]
+                cells[j].x = 0
+                seen[j] = mine.x
+            }
+        }
+    }
+    return "{seen} {cells[0].x}{cells[1].x}{cells[2].x}"
+}
+
+func main() {
+    say scenario(true)
+    say scenario(false)
+    say task_snapshots()
+}
